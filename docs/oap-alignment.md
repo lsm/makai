@@ -42,7 +42,7 @@ numbers in both directions.
 
 | Makai identity | OAP identity | Status | Rule |
 | --- | --- | --- | --- |
-| envelope `session_id` + payload `session_id` (legacy `resume_session_id` alias on `agent_start`) | `session_id` | aligned | Correlation + session-container key only; never a resume/replay handle (#198 renamed the `agent_start` wire key to `session_id`; the old key survives as a server-accepted parse alias only). OAP `session.open` returns a stable id; makai's `agent_start`/`agent_started` pair plays that role. |
+| envelope `session_id` + payload `session_id` (legacy `resume_session_id` alias on `agent_start`) | `session_id` | aligned | Correlation + session-container key only; never a resume/replay handle (#198 renamed the `agent_start` wire key to `session_id`; the old key survives as a server-accepted parse alias, also emitted by the TS SDK transitionally with the same value for pre-rename-server compat). OAP `session.open` returns a stable id; makai's `agent_start`/`agent_started` pair plays that role. |
 | envelope `message_id` / `in_reply_to` | envelope `id` / `in_reply_to` | aligned | `in_reply_to` references the request envelope's `message_id` only; set on synchronous replies, absent on async run output. |
 | envelope `sequence` | `sequence` | deviating: scope | Makai: per-direction, per-session. Inbound consumption is accepted-only: each ACCEPTED `agent_message` advances the counter (an accepted `agent_stop` removes it with the session); rejected requests and the non-consuming request types (`agent_status`, `ping`, `tool_list`, `models_request`, `goodbye` — accepted silently, no teardown, no reply) never advance it. Outbound has two frame classes: allocated frames draw a monotonic counter scoped to the session-container registration (a re-registered id restarts) — monotonic ABSENT allocation failure (`nextOutgoingSequence` ignores its map-update failure, so duplicate values are possible under memory pressure, #204) — while echo replies (`session_info`, `pong`, `tool_list_response`) copy the inbound sequence verbatim and validation errors carry 0 — a permanent deviation (decision (b) of #204; see the deviations ledger entry on echo-reply sequencing). OAP v0.1: run-scoped, positive, contiguous, and requests/responses do not consume it. Adapters must renumber per OAP run sequence from native receive order and must not order echo replies by sequence. |
 | provider `stream_id` / auth `flow_id` | none (binding-private) | aligned by analogy | Correlation values private to their adjacent protocols on the same connection; never OAP identities (OAP Decision 0001 keeps native IDs out of portable identity). |
@@ -55,7 +55,7 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 
 | OAP term | Makai construct | Status | Notes |
 | --- | --- | --- | --- |
-| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias. |
+| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias (the TS SDK emits it transitionally alongside the canonical key for the same reason). |
 | endpoint / participant identity | none | deviating: no endpoint or participant exists to address | Required for OAP initialization and reverse-interaction ownership; a makai introduction needs its own spec pass. |
 | `submission_id` / `run_id` split | none — one `agent_message` per run in SDK usage | absent by design (v1) | No admission receipt: `agent_message` has no synchronous reply. A run is identified operationally by `(session_id, settlement frame)`. Candidate future revision if the adapter needs stable run identity; nothing queued. |
 | `message_id` / `in_reply_to` / `sequence` | envelope fields of the same names | aligned (`in_reply_to`), deviating: sequence scope (see identity table) | Per §13.1/§13.3. |
@@ -133,10 +133,11 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    so a retry can duplicate its side effects).
 4. #198 — LANDED: the `agent_start` payload key `resume_session_id` → `session_id`
    rename (wire change; semantics already fixed by §13.1/§13.5 — the rename rests on
-   them). The TS SDK and the Zig serializer emit only the canonical `session_id` key;
-   the Zig deserializer accepts `resume_session_id` as a permanent legacy alias
-   (canonical key wins when both appear), and the §13.1 envelope-agreement check
-   applies to whichever key carried the id.
+   them). The Zig serializer emits only the canonical `session_id` key; the TS SDK
+   emits the canonical key plus the legacy alias (same value) so pre-rename servers
+   keep binding the caller's id. The Zig deserializer accepts `resume_session_id` as
+   a permanent legacy alias (canonical key wins when both appear), and the §13.1
+   envelope-agreement check applies to whichever key carried the id.
 
 Landed: #202 — server-side idle-TTL eviction (§13.2.6 rule 6) shipped with the
 30-minute default, `AgentProtocolServer.Options.session_idle_ttl_ms` +

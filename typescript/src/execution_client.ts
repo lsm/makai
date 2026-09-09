@@ -1047,10 +1047,16 @@ function buildExecutionPayload(
 function buildAgentStartPayload(request: AgentRunRequest, sessionId: string): Record<string, unknown> {
   validateExecutionRequest(request);
   // #198: `session_id` is the canonical agent_start payload key — a correlation
-  // key, never a resume handle. The server also accepts the legacy
-  // `resume_session_id` alias; this SDK sends only the canonical key.
+  // key, never a resume handle. The legacy `resume_session_id` alias is ALSO
+  // sent, with the same value: a pre-rename server cannot read the canonical
+  // key, and without the alias it would treat the payload id as absent,
+  // generate its own id, and reject this client's subsequent session-scoped
+  // frames (agent_not_found) — the alias keeps old servers binding the
+  // caller's id, while dual-key servers take the canonical value when both
+  // keys appear.
   return {
     session_id: sessionId,
+    resume_session_id: sessionId,
     config_json: JSON.stringify({ model_ref: request.model_ref, tools: request.tools ?? [] }),
   };
 }

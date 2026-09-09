@@ -162,7 +162,10 @@ test "agent_start dual-key parse binds the session under either payload key (#19
         var server = AgentProtocolServer.init(allocator);
         defer server.deinit();
 
-        const sid = agent_types.parseSessionId("aaaaaaaaaaaaaaaaaaaaa").?;
+        // The chain test's `agent_types` import is the agent-LAYER types
+        // module, which has no id parsers; the protocol agent types (and
+        // their parseSessionId) are re-exported by the envelope module.
+        const sid = agent_envelope.protocol_types.parseSessionId("aaaaaaaaaaaaaaaaaaaaa").?;
         const mid = "00000000000000000000000002";
         const json = try std.fmt.allocPrint(
             allocator,
