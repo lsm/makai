@@ -205,11 +205,17 @@ pub const AgentProtocolServer = struct {
         }
 
         const model = try self.allocator.dupe(u8, "unknown");
-        errdefer self.allocator.free(model);
+        // Once the session container is stored it owns these three strings;
+        // the flag keeps the error paths from freeing what the map holds
+        // (#210 gap 5 review: the reply literal's sequence-map write can
+        // now propagate, so a failure AFTER `sessions.put` used to free the
+        // strings out from under the stored session — dangling map entry).
+        var owned_by_session = false;
+        errdefer if (!owned_by_session) self.allocator.free(model);
         const config_json = try self.allocator.dupe(u8, req.config_json);
-        errdefer self.allocator.free(config_json);
+        errdefer if (!owned_by_session) self.allocator.free(config_json);
         const system_prompt = try self.allocator.dupe(u8, req.getSystemPrompt() orelse "");
-        errdefer self.allocator.free(system_prompt);
+        errdefer if (!owned_by_session) self.allocator.free(system_prompt);
 
         try self.expected_sequences.put(session_id, 2);
         errdefer _ = self.expected_sequences.remove(session_id);
@@ -230,6 +236,8 @@ pub const AgentProtocolServer = struct {
             .last_activity_ms = try compat.time.monotonicMillis(),
             .generation = self.next_session_generation,
         });
+        errdefer _ = self.removeSession(session_id);
+        owned_by_session = true;
 
         return .{
             .session_id = session_id,
@@ -454,6 +462,11 @@ pub const AgentProtocolServer = struct {
         msg: []const u8,
     ) !agent_types.Envelope {
         const reason = try self.allocator.dupe(u8, msg);
+        // The sequence-map write can now propagate (nextOutgoingSequence is
+        // transactional, #210 gap 5 review): without this errdefer the
+        // duped reason leaked when the allocation aborted the envelope
+        // literal before it took ownership.
+        errdefer self.allocator.free(reason);
         return .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
@@ -836,6 +849,68 @@ test "AgentProtocolServer publish paths are transactional under allocation failu
 
 fn publishAgentEventCase(server: *AgentProtocolServer, sid: agent_types.SessionId) !void {
     try server.publishAgentEvent(sid, "{\"type\":\"message_update\"}");
+}
+
+// #210 gap 5 (review): the sequence-map write propagates, so every path
+// that allocates before it must free on its failure — sweeping fail_index
+// across the start and models-request handlers catches the leaks (and the
+// dangling-session hazard on a failed start) via the testing allocator's
+// leak check and the Debug double-free detector at deinit.
+test "AgentProtocolServer start and models nack are leak-free under allocation failure" {
+    const allocator = std.testing.allocator;
+
+    var fail_index: usize = 0;
+    while (fail_index <= 12) : (fail_index += 1) {
+        {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            var server = AgentProtocolServer.init(failing.allocator());
+            defer server.deinit();
+
+            var start = agent_types.Envelope{
+                .session_id = agent_types.generateSessionId(),
+                .message_id = agent_types.generateUlid(),
+                .sequence = 1,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
+            };
+            defer start.deinit(allocator);
+
+            if (server.handleEnvelope(start)) |maybe_response| {
+                if (maybe_response) |response| {
+                    var owned = response;
+                    defer owned.deinit(allocator);
+                }
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                // A failed start leaves no half-registered session (its
+                // stored strings freed with the rollback, not dangling).
+                try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+            }
+        }
+        {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            var server = AgentProtocolServer.init(failing.allocator());
+            defer server.deinit();
+
+            var request = agent_types.Envelope{
+                .session_id = agent_types.generateSessionId(),
+                .message_id = agent_types.generateUlid(),
+                .sequence = 1,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .models_request = .{} },
+            };
+            defer request.deinit(allocator);
+
+            if (server.handleEnvelope(request)) |maybe_response| {
+                if (maybe_response) |response| {
+                    var owned = response;
+                    defer owned.deinit(allocator);
+                }
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            }
+        }
+    }
 }
 
 fn publishAgentResultCase(server: *AgentProtocolServer, sid: agent_types.SessionId) !void {
