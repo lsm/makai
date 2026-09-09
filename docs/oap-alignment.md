@@ -164,7 +164,14 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    correlated reads, acceptance at either settles; both `run()` and
    `stream()`, awaited on error paths so the probe's reads cannot race a
    same-id follow-up). Same-sequence retries and unknown-outcome cleanup
-   are supported in both clients (§13.1/§13.4.1). With gap 7, every gap of
+   are supported in both clients (§13.1/§13.4.1). Residual, documented
+   (§13.1): the admission gate cannot prove CURRENT-registration ownership of
+   a caller-supplied id after a silent TTL eviction — eviction emits no
+   frame, so a foreign re-registration and our own are wire-indistinguishable
+   until the next request — the same residual class as §6.1/#205's
+   buffered-`agent_started` evidence and §13.4.5's no-generation-on-the-wire
+   caveat; closing it needs a client-visible registration generation (future
+   wire revision). With gap 7, every gap of
    #210 (4–7) has landed; the issue can close with this slice.
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on

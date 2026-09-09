@@ -166,7 +166,12 @@ pub const AgentProtocolClient = struct {
     pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
         const seq = try self.advanceSequence(sid);
-        try self.recordPendingSend(sid, msg_id, seq, .start);
+        self.recordPendingSend(sid, msg_id, seq, .start) catch |err| {
+            // Nothing reached the wire: restore the tracker so a retry of the
+            // start reuses `seq` instead of running ahead of the server.
+            self.next_sequence_by_session.put(sid, seq) catch {};
+            return err;
+        };
 
         var payload = agent_types.Payload{ .agent_start = .{ .config_json = try self.allocator.dupe(u8, config_json), .session_id = sid } };
         defer payload.deinit(self.allocator);
@@ -199,7 +204,13 @@ pub const AgentProtocolClient = struct {
         const msg_id = agent_types.generateUlid();
         try self.next_sequence_by_session.put(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
-        try self.recordPendingSend(session_id, msg_id, sequence, .message);
+        self.recordPendingSend(session_id, msg_id, sequence, .message) catch |err| {
+            // Nothing reached the wire: restore the tracker so a retry of the
+            // same message reuses `sequence` instead of running ahead of the
+            // server (#210 gap 7).
+            self.next_sequence_by_session.put(session_id, sequence) catch {};
+            return err;
+        };
 
         var payload = agent_types.Payload{ .agent_message = .{
             .session_id = session_id,
@@ -283,15 +294,20 @@ pub const AgentProtocolClient = struct {
         }
         const pre_send = last_message_sequence orelse return null;
 
+        // A probe is already in flight for this session: return ITS stop id
+        // instead of superseding it. Two stops at the same candidate sequence
+        // would race server-side (one accepted, one agent_not_found), and the
+        // orphaned rejection — its probe entry replaced — would surface as a
+        // false session failure even though cleanup succeeded (#210 gap 7).
+        if (self.stop_probes_by_session.get(session_id)) |existing| {
+            return existing.first_msg_id;
+        }
+
         // Register the probe BEFORE the stop reaches the wire so the
         // post-send bookkeeping is infallible; a failed write unregisters it.
         const msg_id = agent_types.generateUlid();
         var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
         errdefer owned_reason.deinit(self.allocator);
-        if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
-            var superseded = entry.value;
-            superseded.reason.deinit(self.allocator);
-        }
         try self.stop_probes_by_session.put(session_id, .{
             .first_msg_id = msg_id,
             .second_sequence = pre_send + 1,
@@ -356,6 +372,10 @@ pub const AgentProtocolClient = struct {
                 // start was accepted — the stop probe may reconcile a message
                 // send's unknown outcome against the session it created.
                 try self.admitted_by_session.put(p.session_id, true);
+                // The start's outcome resolved (accepted): retire its pending
+                // record so long-lived sessions do not accumulate resolved
+                // sends (#210 gap 7).
+                self.retirePendingSend(p.session_id, env.in_reply_to);
                 try self.session_complete_flags.put(p.session_id, false);
             },
             .agent_event => |json| {
@@ -370,6 +390,11 @@ pub const AgentProtocolClient = struct {
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
                 try self.setSessionResult(env.session_id, json);
+                // A settlement resolves EVERY outstanding send of the session
+                // (each was accepted and settled, or rejected long ago):
+                // retire them all so long-lived multi-message sessions do not
+                // accumulate resolved records (#210 gap 7).
+                self.retireAllPendingSends(env.session_id);
             },
             .agent_error => |e| {
                 // Probe-control replies are consumed BEFORE terminal
@@ -382,6 +407,12 @@ pub const AgentProtocolClient = struct {
                     self.last_error.deinit(self.allocator);
                     self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, e.message));
                     try self.setSessionError(env.session_id, e.message);
+                    if (env.in_reply_to == null) {
+                        // An UNCORRELATED agent_error is a settlement
+                        // (§13.4.2): like agent_result, it resolves every
+                        // outstanding send of the session.
+                        self.retireAllPendingSends(env.session_id);
+                    }
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
                 }
             },
@@ -409,7 +440,11 @@ pub const AgentProtocolClient = struct {
     fn agentCodeFromNack(code: ?agent_types.ErrorCode) ?agent_types.AgentErrorCode {
         const c = code orelse return null;
         return switch (c) {
-            .invalid_request => .invalid_request,
+            // The shared protocol's invalid_sequence is the same wrong-counter
+            // rejection the agent surface spells invalid_request — peers may
+            // answer a stop either way, so both drive the probe's retry and
+            // the tracker's rollback (#210 gap 7).
+            .invalid_request, .invalid_sequence => .invalid_request,
             else => null,
         };
     }
@@ -468,6 +503,28 @@ pub const AgentProtocolClient = struct {
             try self.session_complete_flags.put(session_id, true);
         }
         return true;
+    }
+
+    /// Retires the pending-send record whose request a reply names (e.g. the
+    /// `agent_started` replying to an `agent_start`) — its outcome resolved.
+    fn retirePendingSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid) void {
+        const reply_to = in_reply_to orelse return;
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        for (list.items, 0..) |pending, index| {
+            if (!std.mem.eql(u8, &reply_to, &pending.msg_id)) continue;
+            _ = list.orderedRemove(index);
+            return;
+        }
+    }
+
+    /// Retires every pending-send record of a session — used when a
+    /// settlement (`agent_result`, or the uncorrelated settlement
+    /// `agent_error`) resolves all outstanding sends at once.
+    fn retireAllPendingSends(self: *Self, session_id: agent_types.SessionId) void {
+        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
+            var list = entry.value;
+            list.deinit(self.allocator);
+        }
     }
 
     /// Applies #210 gap 7's client sequence-control rules to a correlated
@@ -1064,6 +1121,127 @@ test "AgentProtocolClient pipelined sends roll back monotonically to the oldest 
     var retried = try harness.envelopeAt(3);
     defer retried.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), retried.sequence);
+}
+
+test "AgentProtocolClient probing stop is idempotent while in flight (#210 gap 7)" {
+    // Two teardown paths probing the same session before any reply arrives:
+    // the second returns the in-flight stop's id instead of superseding it —
+    // two stops at the same candidate sequence would race server-side and
+    // the orphaned rejection would surface as a false session failure.
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(std.testing.allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    const first = try client.sendAgentStopProbing(sid, "timeout");
+    const second = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(first != null);
+    try std.testing.expect(second != null);
+    try std.testing.expectEqual(first.?, second.?);
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len); // start, message, ONE stop
+}
+
+test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    // The run settles: every outstanding send of the session resolved — the
+    // pending records are retired (no growth across turns) and a later probe
+    // (whose message outcome is now resolved) sends nothing.
+    var result_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer result_env.deinit(allocator);
+    try client.processEnvelope(result_env);
+
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    const probe = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(probe == null);
+    try std.testing.expectEqual(@as(usize, 2), harness.writes.items.len); // start + message — no probe stop
+}
+
+test "AgentProtocolClient probing stop retries on a nack invalid_sequence rejection (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+
+    // A compatible peer rejects the pre-send stop with the shared protocol's
+    // invalid_sequence code — the same wrong-counter evidence, driving the
+    // same post-send retry.
+    var nack_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = probe_stop_id,
+            .reason = OwnedSlice(u8).initBorrowed("invalid sequence"),
+            .error_code = .invalid_sequence,
+        } },
+    };
+    defer nack_rejection.deinit(allocator);
+    try client.processEnvelope(nack_rejection);
+
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len); // start, message, stop(2), stop(3)
+    var second_stop = try harness.envelopeAt(3);
+    defer second_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), second_stop.sequence);
 }
 
 test "AgentProtocolClient probing stop consumes the retry's own rejection and marks a vanished session complete (#210 gap 7)" {

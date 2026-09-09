@@ -1001,8 +1001,21 @@ Rules:
   registration: without either it sends nothing at all, since a message sent
   without admission evidence may have been accepted by a foreign caller's fresh
   session on the same id, and even a single stop at the tracker's value would
-  validate against that session — §6.1's leak-over-destroy rule) — so recovery
-  paths are not forced
+  validate against that session — §6.1's leak-over-destroy rule. Residual,
+  documented: admission evidence bounds the probe's blast radius but cannot
+  PROVE ownership of the registration currently occupying a caller-supplied id —
+  a silent TTL eviction emits no frame (§13.2.6), so an id admitted here may be
+  re-registered by another caller before this client's next message, and a
+  message of ours accepted by that foreign registration (its fresh counter
+  matches ours) is indistinguishable on the wire from our own registration
+  accepting it. The same residual class is recorded at §6.1/#205 (a buffered
+  correlated `agent_started` outliving removal and re-registration) and
+  §13.4.5 (frames carry no registration generation on the wire); closing it
+  requires a client-visible registration generation — a future wire revision.
+  Until then an exclusive client-generated id remains the only sufficient
+  ownership evidence, and a stop probe already in flight is idempotent (a
+  second probe returns the in-flight stop's id instead of superseding it)) —
+  so recovery paths are not forced
   to guess a counter state.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
