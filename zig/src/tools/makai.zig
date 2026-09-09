@@ -4193,7 +4193,7 @@ test "tool result delivered before the disconnect latch settles its wait" {
     };
 
     try bridge.markInFlight(allocator, session_id, "call-1", request_id);
-    var delivered = StdioToolResult{
+    const delivered = StdioToolResult{
         .session_id = session_id,
         .tool_call_id = try allocator.dupe(u8, "call-1"),
         .in_reply_to = request_id,
