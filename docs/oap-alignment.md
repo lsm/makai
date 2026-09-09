@@ -14,7 +14,10 @@ Frame Routing, V1.1") defines the semantics summarized here.
   `main` @ `bad82f0` ("feat(agent): server-side idle-session TTL eviction (#202)
   (#206)") for the §13.2.6-rule-6 eviction claims, and `main` @ `9a3e5df`
   ("fix(sdk): teardown guards — ownership-evidence stop, failure-pair drain
-  (#208)") for the §6.1/§13.4.2 teardown-guard claims. The
+  (#208)") for the §6.1/§13.4.2 teardown-guard claims, and the #210 gap-7
+  client sequence-control PR (rollback + bounded counter probing in both
+  clients; update this pin with its merge sha on landing) for the §13.1
+  client-side sequence-discipline and §13.4.1 cleanup-probing claims. The
   session-lifecycle pass itself was verified against `67ad514`
   ("fix(agent): send agent_stop on session teardown — terminal, error, and
   auth-retry paths (#200)"). The §13.1/§13.5 wire-key (rename) claims pin to the
@@ -99,8 +102,28 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    and the process drains instead of hanging (§13.2.7 rule 7; deviations
    ledger) — and stale-`tool_result` correlation for reused `tool_call_id`s
    (`in_reply_to` validated against the current outstanding `tool_execute`;
-   mismatched/absent/unsolicited replies discarded, §13.1). Still open (#210
-   gaps 5+7): settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
+   mismatched/absent/unsolicited replies discarded, §13.1). LANDED (#210
+   gap 7): client sequence control in BOTH clients — the `AgentProtocolClient`
+   rolls its per-session counter back when a correlated `agent_error`/`nack`
+   names the send (`processEnvelope` matches `in_reply_to` against the session's
+   last counter-advancing send; a correlated `agent_not_found` drops the counter
+   state instead), never advances the counter on stop sends (a rejected stop
+   leaves the expected value in place for its retry), and exposes the control
+   surface recovery paths need: `peekNextSequence`,
+   `sendAgentMessageWithSequence`, `sendAgentStopWithSequence`, and
+   `sendAgentStopProbing` — a bounded two-state probe (stop at the last send's
+   PRE-send sequence; on a correlated `invalid_request` reply processed through
+   `processEnvelope`, exactly one retry at the post-send value; any other reply
+   retires the probe). The TS SDK's tracker (`ActiveAgentSession`) marks the
+   `agent_message` send unresolved at send, rolls back to the pre-send sequence
+   on a correlated rejection, confirms the advanced counter on the first run
+   output, and — while the outcome is unresolved — tears down with the same
+   bounded probe (`stopAgentWithSequenceProbe`: pre-send stop, one
+   correlated-`invalid_request` retry at the post-send value, acceptance at
+   either settles; both `run()` and `stream()`, awaited on error paths so the
+   probe's reads cannot race a same-id follow-up). Same-sequence retries and
+   unknown-outcome cleanup are supported in both clients (§13.1/§13.4.1).
+   Still open (#210 gap 5): settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
    publication failure instead of the swallowed/propagating OOM (settle or
    propagate once, never re-publish a processed terminal; tool-request
    publication, outbox delivery, the final pipe-to-stdout drain, and ORDINARY
@@ -112,14 +135,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    already removed, leaving no settlement and nothing to retry — transactionality
    extends through the final pipe-to-stdout handoff: the stdio drain advances the
    pipe read position before its buffer append, and a failure there is swallowed,
-   dropping an already-delivered frame) — gap 5 —
-   plus gap 7: client sequence control in BOTH clients — `AgentProtocolClient`
-   (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
-   (its tracker advances before the outcome is known) — where "control" includes
-   bounded probing of BOTH counter states after an uncorrelated outcome (pre-send,
-   then post-send on a correlated `invalid_request`): rollback alone is wrong when
-   the message was actually accepted and output was merely delayed or lost.
-   Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
+   dropping an already-delivered frame).
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused

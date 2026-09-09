@@ -12,6 +12,7 @@ import {
   MakaiAuthRequiredError,
   MakaiProtocolError,
   MakaiStreamError,
+  stopAgentWithSequenceProbe,
   type AgentStreamEvent,
   type ProviderStreamEvent,
   type StdioFrame,
@@ -2351,16 +2352,21 @@ test("client.agent.run does not stop a session owned by another run after agent_
     );
 
     // The live session survives the busy attempt untouched; it is stopped
-    // only by its own run's timeout teardown.
+    // only by its own run's timeout teardown — a two-state probe (#210 gap
+    // 7): the first run's message was accepted (the fixture advanced the
+    // counter) but its output was suppressed, so the outcome is unknown and
+    // the teardown tries the pre-send sequence first (rejected
+    // invalid_request), then the post-send sequence, which removes the
+    // session. The busy attempt contributed no stop of its own.
     await assert.rejects(
       () => first,
       (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
     );
-    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2);
     const stops = logged.filter((entry) => entry.type === "agent_stop");
-    assert.equal(stops.length, 1);
+    assert.equal(stops.length, 2);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
-    assert.equal(stops[0]?.sequence, 3);
+    assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
   } finally {
     await harness.cleanup();
   }
@@ -2758,5 +2764,228 @@ test("client.agent.run drains the failure pair's settlement before the error sur
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run rolls the sequence tracker back on a correlated agent_message rejection and retries with the right sequence (#210 gap 7)", async () => {
+  // §13.1/#210 gap 7: a rejected agent_message never advances the server's
+  // expected counter. The first message on the session is rejected with a
+  // request-correlated invalid_request, so the teardown stop MUST carry the
+  // pre-send sequence (2) — the eager post-send value (3) would be rejected
+  // invalid_request and leak the owned session — and the corrected retry on
+  // the same id must succeed.
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "invalid_request" && err.message === "invalid sequence",
+    );
+
+    // The teardown stop used the rolled-back pre-send sequence and removed
+    // the session, so the id is immediately reusable.
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
+    assert.equal(stops[0]?.sequence, 2);
+
+    // Corrected retry: the fixture's one-shot rejection already fired, so the
+    // new run's message carries sequence 2 against the fresh registration
+    // (no duplicate-sequence error) and completes normally.
+    const second = await agent.run(request());
+    assert.equal(second.stop_reason, "end_turn");
+    const loggedAfter = await waitForLoggedRequests(
+      harness.logPath,
+      (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2,
+    );
+    const stopsAfter = loggedAfter.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stopsAfter.length, 2);
+    assert.equal(stopsAfter[1]?.sequence, 3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run probes both counter states after an unknown message outcome, so timeout-then-retry on a caller-supplied id works (#210 gap 7)", async () => {
+  // §13.4.1/#210 gap 7: acceptance has no positive receipt. The fixture
+  // ACCEPTS the message (counter advances 2→3) but suppresses all run
+  // output, so the run times out with the send's outcome unknown. The §6.1
+  // ownership guard passes (this attempt observed its own agent_started), so
+  // the teardown MUST probe: a stop at the pre-send sequence first — rejected
+  // correlated invalid_request because the counter advanced — then one retry
+  // at the post-send value, which removes the session. The probe consumed the
+  // rejection, so an immediate same-id retry starts fresh (no agent_busy, no
+  // duplicate-sequence error) and completes.
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    const logged = await waitForLoggedRequests(
+      harness.logPath,
+      (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2,
+    );
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
+    assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
+
+    // The probe's second stop removed the session: the immediate same-id
+    // retry is not refused agent_busy and the suppressed-message knob fired
+    // once, so its message is accepted at sequence 2 and the run completes.
+    const second = await agent.run(request());
+    assert.equal(second.stop_reason, "end_turn");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.stream probes both counter states after an unknown message outcome (#210 gap 7)", async () => {
+  // Stream-mode parity with the run() probe test: the same tracker feeds both
+  // consumption modes, so an unresolved message outcome in stream() must
+  // produce the same two-state teardown.
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
+    await assert.rejects(
+      () => collect(agent.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    const logged = await waitForLoggedRequests(
+      harness.logPath,
+      (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2,
+    );
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlated invalid_request and settles at the accepted value (#210 gap 7)", async () => {
+  // Unit coverage for the probe helper itself (mock transport, mirroring the
+  // drain helper's test): the first stop (pre-send 2) is rejected with a
+  // correlated agent_error — the real server's validation shape — so the
+  // probe retries once at the post-send value and reports where it settled.
+  const sessionId = "testNanoIdSess1234567";
+  const sentStops: Array<{ sequence: number; messageId: string }> = [];
+  const replies: StdioFrame[] = [];
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      const messageId = String(frame.message_id);
+      sentStops.push({ sequence: frame.sequence as number, messageId });
+      if (sentStops.length === 1) {
+        replies.push({ type: "agent_error", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: messageId, payload: { code: "invalid_request", message: "invalid sequence" } });
+      } else {
+        replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: messageId, payload: {} });
+      }
+    },
+    nextFrameForSession: async (sid: string, timeoutMs?: number) => {
+      const frame = replies.shift();
+      if (!frame) throw new Error(`timed out waiting for frame for session ${sid} after ${timeoutMs ?? 1000}ms`);
+      return frame;
+    },
+  };
+
+  const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
+  assert.equal(acceptedAt, 3);
+  assert.deepEqual(sentStops.map((stop) => stop.sequence), [2, 3]);
+});
+
+test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and recognizes the nack rejection shape (#210 gap 7)", async () => {
+  const sessionId = "testNanoIdSess1234567";
+
+  // Acceptance at the pre-send value: one stop, no retry.
+  {
+    const replies: StdioFrame[] = [];
+    const sentStops: number[] = [];
+    const transport = {
+      send: (frame: StdioFrame) => {
+        if (frame.type !== "agent_stop") return;
+        sentStops.push(frame.sequence as number);
+        replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+      },
+      nextFrameForSession: async () => {
+        const frame = replies.shift();
+        if (!frame) throw new Error("timed out");
+        return frame;
+      },
+    };
+    const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
+    assert.equal(acceptedAt, 2);
+    assert.deepEqual(sentStops, [2]);
+  }
+
+  // The nack rejection shape (peers/fixtures) also triggers the one retry.
+  {
+    const replies: StdioFrame[] = [];
+    const sentStops: number[] = [];
+    const transport = {
+      send: (frame: StdioFrame) => {
+        if (frame.type !== "agent_stop") return;
+        sentStops.push(frame.sequence as number);
+        if (sentStops.length === 1) {
+          replies.push({ type: "nack", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { error_code: "invalid_request", reason: "invalid sequence" } });
+        } else {
+          replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+        }
+      },
+      nextFrameForSession: async () => {
+        const frame = replies.shift();
+        if (!frame) throw new Error("timed out");
+        return frame;
+      },
+    };
+    const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
+    assert.equal(acceptedAt, 3);
+    assert.deepEqual(sentStops, [2, 3]);
+  }
+});
+
+test("stopAgentWithSequenceProbe is bounded: no reply and a non-invalid_request rejection both end the probe without a retry (#210 gap 7)", async () => {
+  const sessionId = "testNanoIdSess1234567";
+
+  // No reply at all: the bounded wait expires unresolved (undefined).
+  {
+    const sentStops: number[] = [];
+    const transport = {
+      send: (frame: StdioFrame) => {
+        if (frame.type === "agent_stop") sentStops.push(frame.sequence as number);
+      },
+      nextFrameForSession: async () => {
+        throw new Error("timed out");
+      },
+    };
+    const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 60);
+    assert.equal(acceptedAt, undefined);
+    assert.deepEqual(sentStops, [2]);
+  }
+
+  // agent_not_found: the session is already gone — no retry.
+  {
+    const replies: StdioFrame[] = [];
+    const sentStops: number[] = [];
+    const transport = {
+      send: (frame: StdioFrame) => {
+        if (frame.type !== "agent_stop") return;
+        sentStops.push(frame.sequence as number);
+        replies.push({ type: "agent_error", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "agent_not_found", message: "session not found" } });
+      },
+      nextFrameForSession: async () => {
+        const frame = replies.shift();
+        if (!frame) throw new Error("timed out");
+        return frame;
+      },
+    };
+    const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
+    assert.equal(acceptedAt, undefined);
+    assert.deepEqual(sentStops, [2]);
   }
 });

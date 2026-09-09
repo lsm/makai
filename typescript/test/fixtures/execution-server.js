@@ -152,6 +152,16 @@ const authFlows = new Map();
 // Without this env the fixture stays a stateless line responder.
 const trackAgentSessions = Boolean(process.env.MAKAI_TEST_TRACK_AGENT_SESSIONS);
 const agentSessions = new Map();
+// Sessions whose first agent_message was rejected by the
+// MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE knob (one-shot per session).
+const agentMessageRejectionsDone = new Set();
+// Sessions whose first agent_message output was suppressed by
+// MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE (one-shot per session): the
+// message is ACCEPTED (counter advanced) but no run output follows — the
+// unknown-outcome scenario of §13.4.1/#210 gap 7. Later messages on the same
+// session flow normally so a same-id retry can succeed once the probe's stop
+// removed the session.
+const agentMessageSuppressionsDone = new Set();
 
 function loadAuthState() {
   if (!authStatePath || !fs.existsSync(authStatePath)) return;
@@ -247,11 +257,31 @@ rl.on("line", (line) => {
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
+    // One-shot correlated rejection knob (#210 gap 7): the FIRST message on a
+    // session is rejected exactly like a real-server validation failure
+    // (request-correlated agent_error, sequence 0) and admits nothing — the
+    // expected counter does not advance.
+    if (process.env.MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE && !agentMessageRejectionsDone.has(env.session_id)) {
+      agentMessageRejectionsDone.add(env.session_id);
+      emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
+      return;
+    }
     if (trackAgentSessions) {
+      // Real-server validation (§13.1): an out-of-sequence message is
+      // rejected with a request-correlated agent_error (sequence 0) and the
+      // expected counter does not advance. A true duplicate sequence is
+      // rejected here.
       const expected = agentSessions.get(env.session_id) ?? 1;
+      if (env.sequence !== expected) {
+        emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
+        return;
+      }
       agentSessions.set(env.session_id, expected + 1);
     }
-    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE) return;
+    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE && !agentMessageSuppressionsDone.has(env.session_id)) {
+      agentMessageSuppressionsDone.add(env.session_id);
+      return;
+    }
     if (process.env.MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON) {
       emit(frame(env, "agent_result", { result_json: "not-json" }, 3));
     } else if (process.env.MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON) {
@@ -285,7 +315,10 @@ rl.on("line", (line) => {
     if (trackAgentSessions) {
       const expected = agentSessions.get(env.session_id) ?? 1;
       if (env.sequence !== expected) {
-        emit(frame(env, "nack", { error_code: "invalid_request", reason: "invalid sequence" }, 3));
+        // Real-server validation shape (§13.1): a request-correlated
+        // agent_error carrying sequence 0 — the two-state stop probe (#210
+        // gap 7) keys its retry on this rejection.
+        emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
         return;
       }
       agentSessions.delete(env.session_id);

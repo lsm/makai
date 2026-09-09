@@ -976,13 +976,23 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  `[current deviation]` the built-in `AgentProtocolClient` does not honor this yet:
-  it advances its per-session counter eagerly on every send and does not restore it
-  when the send is rejected (`client.zig` `nextSequence`), and it offers no
-  sequence control surface (no rollback, no explicit-sequence send), so
-  same-sequence retries through that client are unsupported — callers needing that
-  discipline must drive the transport directly until sequence control is exposed
-  (`[planned — #210 gap 7]`).
+  Client sequence discipline `[current — #210 gap 7]`: both built-in clients
+  mirror the server's counter optimistically — the tracker advances at SEND, before
+  the outcome is known — and reconcile on evidence. A CORRELATED rejection (an
+  `agent_error`/`nack` whose `in_reply_to` names the client's own send) rolls the
+  tracker back to the rejected send's own sequence, so a corrected retry reuses it;
+  the Zig client drops the per-session counter state instead when the correlated
+  rejection is `agent_not_found` (the session is gone, its counter meaningless).
+  Stop sends never advance the tracker in either client: an accepted stop consumes
+  the counter with the session, and a rejected stop leaves the expected value in
+  place for its retry. An UNCORRELATED outcome (timeout, lost output) reconciles
+  through the bounded two-state cleanup probe of §13.4.1, not a blind send at the
+  advanced value. The Zig `AgentProtocolClient` additionally exposes the control
+  surface directly — `peekNextSequence`, `sendAgentMessageWithSequence`,
+  `sendAgentStopWithSequence`, and `sendAgentStopProbing` (the probe's second stop
+  is emitted from `processEnvelope` when the first stop's correlated
+  `invalid_request` reply arrives) — so recovery paths are not forced to guess a
+  counter state.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
@@ -1250,10 +1260,18 @@ server eviction (rule 6), and holds no transcript and no persistence.
    or the acceptance may have failed with the counter rolled back to its
    PRE-SEND value. A cleanup stop therefore tries the pre-send sequence and, if
    rejected with a correlated `invalid_request`, the post-send value; acceptance
-   at either settles cleanup. Both current clients advance before the outcome is
-   known and send only the advanced value, so their cleanup stop fails in the
-   rolled-back case and the owned session leaks indefinitely; the fix (probing,
-   or rollback/explicit-sequence control) is `[planned — #210 gap 7]`. A start
+   at either settles cleanup. Both clients implement this reconciliation
+   `[current — #210 gap 7]`: the tracker marks the message send unresolved at
+   send; a correlated rejection rolls it back (§13.1) so the ordinary teardown
+   stop carries the pre-send sequence, and while the outcome is unresolved the
+   teardown stop IS the probe — pre-send first, at most one
+   correlated-`invalid_request` retry at the post-send value, bounded, consuming
+   its own replies so nothing it reads poisons a later same-id attempt (the
+   earlier behavior — advance before the outcome is known, send only the
+   advanced value, cleanup stop fails in the rolled-back case, owned session
+   leaks indefinitely — is closed). The Zig client exposes the same probe
+   directly (`sendAgentStopProbing`) for recovery paths that drive it manually.
+   A start
    rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
