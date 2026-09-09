@@ -5158,7 +5158,10 @@ test "event publication failure marks the stream truncated and converts the sett
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.active_agent_runs.items.len);
     try std.testing.expect(stdio_loop.active_agent_runs.items[0].event_publication_failed);
 
-    _ = try stdio_loop.pumpAgentRuns();
+    // Recovery via the full background pump: it settles the run through the
+    // truncation pair AND flushes the outbox into the pipe — the run pump
+    // alone only queues the frames server-side.
+    _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
 
     var saw_truncation_settlement = false;
