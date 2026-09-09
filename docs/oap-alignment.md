@@ -10,9 +10,11 @@ Frame Routing, V1.1") defines the semantics summarized here.
 ## Provenance
 
 - Makai pins: `lsm/makai` `main` @ `1413ef7` ("fix(sdk): in_reply_to-aware waiter
-  routing in the stdio transport (#207)") for the §13.3 routing claims, and
-  `lsm/makai` `main` @ `bad82f0c` ("feat(agent): server-side idle-session TTL
-  eviction (#202) (#206)") for the §13.2.6-rule-6 eviction claims. The
+  routing in the stdio transport (#207)") for the §13.3 routing claims,
+  `main` @ `bad82f0` ("feat(agent): server-side idle-session TTL eviction (#202)
+  (#206)") for the §13.2.6-rule-6 eviction claims, and `main` @ `9a3e5df`
+  ("fix(sdk): teardown guards — ownership-evidence stop, failure-pair drain
+  (#208)") for the §6.1/§13.4.2 teardown-guard claims. The
   session-lifecycle pass itself was verified against `67ad514`
   ("fix(agent): send agent_stop on session teardown — terminal, error, and
   auth-retry paths (#200)"). Every `[current]` claim in §13 and every status
@@ -112,16 +114,21 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    then post-send on a correlated `invalid_request`): rollback alone is wrong when
    the message was actually accepted and output was merely delayed or lost.
    Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
-3. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
-   outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused client-generated id
-   is the only sufficient evidence until #204 supplies generation tokens (a buffered
-   correlated `agent_started` can outlive removal and re-registration of the id and
-   authorize a stop of the NEW session) — a mandatory drain (or
-   correlation/generation discard) of the failure pair's second frame before id
-   reuse, and independent tool-execution tracking for the `auto_once` retry gate
-   (§13.5.3: a tool executed while its lifecycle events were dropped by a
-   publication failure is invisible to the yielded-event gate, so a retry can
-   duplicate its side effects).
+3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
+   IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
+   unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused
+   client-generated id is the only sufficient evidence until #204 supplies
+   generation tokens (a buffered correlated `agent_started` can outlive removal
+   and re-registration of the id and authorize a stop of the NEW session) — now
+   holds in the SDK: teardown settles without sending when no reply to the
+   attempt's own `agent_start` was observed and the id was caller-supplied. The
+   mandatory drain (or correlation/generation discard) of the failure pair's
+   second frame before id reuse now holds for `run()` via a bounded quiescent
+   drain on the failure-pair termination (`stream()` drained via its terminal
+   teardown already); still pending: independent tool-execution tracking for the
+   `auto_once` retry gate (§13.5.3: a tool executed while its lifecycle events
+   were dropped by a publication failure is invisible to the yielded-event gate,
+   so a retry can duplicate its side effects).
 4. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
    (wire change; semantics already fixed by §13.1/§13.5 — the rename rests on them).
 

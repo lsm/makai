@@ -50,13 +50,18 @@ export function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: st
  * `sequence` must be the session's next expected inbound sequence (start=1,
  * message=2, then one per follow-up message) — the server rejects
  * out-of-order stops, which would silently leave the session registered.
+ *
+ * @returns The stop envelope's `message_id` — the server correlates its
+ * `agent_stopped` reply to it, so a subsequent drain can distinguish the
+ * current stop's reply from stale terminal frames on the same route.
  */
-export function bestEffortStopAgent(transport: MakaiStdioClient, sessionId: string, sequence: number, reason: string): void {
+export function bestEffortStopAgent(transport: MakaiStdioClient, sessionId: string, sequence: number, reason: string): string {
+  const messageId = ulid();
   try {
     transport.send({
       type: "agent_stop",
       session_id: sessionId,
-      message_id: ulid(),
+      message_id: messageId,
       sequence,
       timestamp: Date.now(),
       version: ENVELOPE_VERSION,
@@ -64,8 +69,11 @@ export function bestEffortStopAgent(transport: MakaiStdioClient, sessionId: stri
     });
   } catch {
     // Best-effort teardown; ignore transport errors here so we keep
-    // surfacing the caller's own result or failure.
+    // surfacing the caller's own result or failure. The id is still
+    // returned: no reply will name it, so a correlated drain simply runs
+    // to quiescence.
   }
+  return messageId;
 }
 
 /**
@@ -118,9 +126,22 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * Drains remaining frames for a finished agent session until the transport
  * buffer goes quiet. Unlike {@link drainSessionFrames}, which always runs to
  * its deadline, this returns as soon as the peer acknowledges the session's
- * teardown — an `agent_stopped` (or `agent_error`) reply is the server's last
- * possible frame for the session, so nothing further can poison a later run
- * reusing the id — or when an idle window passes with no frame.
+ * teardown — the CURRENT stop's `agent_stopped` reply (identified by
+ * `opts.stopReplyTo`, the message id {@link bestEffortStopAgent} returned) is
+ * the server's last possible frame for the session, so nothing further can
+ * poison a later run reusing the id — or when an idle window passes with no
+ * frame.
+ *
+ * Only a reply correlated to the current stop ends the drain early. Terminal-
+ * SHAPED frames that do not name it are stale or belong to the just-failed
+ * run: the failure pair's uncorrelated settlement `agent_error` (§13.4.2)
+ * arrives BEFORE the stop's reply, and an `agent_stopped` replying to an
+ * earlier stop on the same id may still sit on the route — exiting on either
+ * (the old any-terminal-frame rule) left the current stop's reply queued,
+ * where a LATER run's drain could terminate on it early and leave that run's
+ * trailing terminal frame for a subsequent run to claim as its own
+ * completion. Without `stopReplyTo` no frame ends the drain early; it runs to
+ * quiescence.
  *
  * The `maxMs` budget covers read-lock acquisition too: the per-read timeout
  * only starts once the transport's read lock is granted, and the lock can be
@@ -128,12 +149,18 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * is raced against the remaining budget — and on timeout the pending read is
  * aborted via its signal, which re-routes any frame it had dequeued instead
  * of letting it be consumed after this drain has given up.
+ *
+ * `opts` is APPENDED after the pre-existing positional arguments so callers
+ * written against the original `(transport, sessionId, idleMs, maxMs)`
+ * signature keep compiling — and already-built JavaScript keeps landing each
+ * positional argument where it belongs.
  */
 export async function drainSessionFramesUntilQuiescent(
   transport: MakaiStdioClient,
   sessionId: string,
   idleMs = 50,
   maxMs = 250,
+  opts: { stopReplyTo?: string } = {},
 ): Promise<void> {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
@@ -154,9 +181,11 @@ export async function drainSessionFramesUntilQuiescent(
     // keep the event loop alive (or accumulate timers) until the deadline.
     if (budgetTimer !== undefined) clearTimeout(budgetTimer);
     if (!frame) return;
-    // The stop's correlated reply is the server's final word for the session;
-    // exiting on positive acknowledgement beats waiting out the idle window
-    // and cannot miss a later trailing frame.
-    if (frame.type === "agent_stopped" || frame.type === "agent_error") return;
+    // The CURRENT stop's correlated reply is the server's final word for the
+    // session; exiting on positive acknowledgement beats waiting out the idle
+    // window and cannot miss a later trailing frame. Frames not naming our
+    // stop keep draining (see the doc comment for why terminal-shaped alone
+    // is not sufficient).
+    if (opts.stopReplyTo !== undefined && frame.type === "agent_stopped" && frame.in_reply_to === opts.stopReplyTo) return;
   }
 }

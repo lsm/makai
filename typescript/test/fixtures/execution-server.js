@@ -43,6 +43,25 @@ function frame(env, type, payload, sequence) {
   };
 }
 
+// The real agent server publishes async run output (agent_event projections
+// and agent_result/agent_error settlements) WITHOUT in_reply_to — it is
+// session-routed, not a reply (spec §13.3.2). Every other fixture frame
+// replies to its request (unfaithfully, for simplicity); frames built here
+// model the real uncorrelated shape so tests exercise the stale-frame
+// hazards a correlated-only fixture cannot reproduce (#205).
+function asyncFrame(env, type, payload, sequence) {
+  const id = env.stream_id || env.session_id;
+  return {
+    type,
+    ...(env.stream_id ? { stream_id: env.stream_id } : { session_id: env.session_id }),
+    message_id: `${id}-async-${sequence}`,
+    sequence,
+    timestamp: Date.now(),
+    version: 1,
+    payload,
+  };
+}
+
 const defaultProviderResult = {
   role: "assistant",
   content: [{ type: "text", text: "hello" }],
@@ -95,6 +114,13 @@ const providerResult = loadJson(process.env.MAKAI_TEST_PROVIDER_RESULT_PATH, def
 const agentEvents = loadJson(process.env.MAKAI_TEST_AGENT_EVENTS_PATH, defaultAgentEvents);
 const agentResult = loadJson(process.env.MAKAI_TEST_AGENT_RESULT_PATH, null);
 const agentError = loadJson(process.env.MAKAI_TEST_AGENT_ERROR_PATH, null);
+// Loop-internal failure payload ({ code, message }) for the failure-pair knob
+// below; null when the knob is off.
+const agentFailurePair = loadJson(process.env.MAKAI_TEST_AGENT_FAILURE_PAIR_PATH, null);
+// The failure pair fires ONCE (a one-off internal failure); later messages on
+// the session run the normal event flow so a same-id follow-up run can
+// succeed and prove it was not poisoned by the first run's settlement.
+let failurePairFired = false;
 const defaultModelsResponse = {
   models: [{
     model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
@@ -213,6 +239,12 @@ rl.on("line", (line) => {
       emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
+    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE) {
+      // Start admitted (the session registers above when tracking) but the
+      // reply never arrives: the start's outcome is UNKNOWABLE to the client
+      // — the §6.1/#205 timeout scenario.
+      return;
+    }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
     if (trackAgentSessions) {
@@ -225,6 +257,15 @@ rl.on("line", (line) => {
     } else if (process.env.MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON) {
       emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
       emit(frame(env, "agent_event", { event_json: "not-json" }, 4));
+    } else if (agentFailurePair && !failurePairFired) {
+      // Real-server loop-internal failure shape (§13.4.2): the pair
+      // agent_event(error) + settlement agent_error is ONE settlement, both
+      // frames published as uncorrelated async output. A consumer that
+      // terminates on the first frame must drain the second before the id is
+      // reused (#205).
+      failurePairFired = true;
+      emit(asyncFrame(env, "agent_event", { event_json: JSON.stringify({ type: "error", code: agentFailurePair.code, message: agentFailurePair.message }) }, 3));
+      emit(asyncFrame(env, "agent_error", { code: agentFailurePair.code, message: agentFailurePair.message }, 4));
     } else if (agentError) {
       emit(frame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
