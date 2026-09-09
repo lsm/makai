@@ -193,13 +193,11 @@ test "AgentProtocolRuntime outbox delivery is transactional under allocation fai
     };
     _ = try client.sendAgentStart("{}", null);
     try setup_runtime.pumpClientMessages();
-    const sid = client.session_id.?;
-    // Drain the synchronous agent_started reply so only the queued
+    // Deliver the synchronous agent_started reply into the client (this is
+    // what adopts the session id) and consume it, so only the queued
     // agent_result is read at the end of this test.
-    {
-        var receiver = pipe.clientReceiver();
-        while (try receiver.readLine(allocator)) |line| allocator.free(line);
-    }
+    try setup_runtime.pumpServerMessagesIntoClient(&client);
+    const sid = client.session_id.?;
 
     try server.publishAgentResult(sid, "{\"messages\":[]}");
 

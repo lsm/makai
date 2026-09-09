@@ -997,14 +997,14 @@ const StdioProtocolLoop = struct {
                         // dropped rather than published after the pair.
                         self.dropTerminalProjection(run);
                         self.publishRunFailurePair(run, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE) catch |err| {
-                            self.handleFailurePairPublicationError(err, run, idx);
+                            self.handleFailurePairPublicationError(run, idx);
                             return err;
                         };
                         forwarded += 1;
                     } else if (run.stream.getError()) |msg| {
                         self.dropTerminalProjection(run);
                         self.publishRunFailurePair(run, .internal_error, msg) catch |err| {
-                            self.handleFailurePairPublicationError(err, run, idx);
+                            self.handleFailurePairPublicationError(run, idx);
                             return err;
                         };
                         forwarded += 1;
@@ -1016,7 +1016,7 @@ const StdioProtocolLoop = struct {
                         // one terminal error event, no trailing agent_end.
                         self.dropTerminalProjection(run);
                         self.publishRunFailurePair(run, .internal_error, STDIO_EVENT_PUBLICATION_FAILED_MESSAGE) catch |err| {
-                            self.handleFailurePairPublicationError(err, run, idx);
+                            self.handleFailurePairPublicationError(run, idx);
                             return err;
                         };
                         forwarded += 1;
@@ -1129,8 +1129,7 @@ const StdioProtocolLoop = struct {
     /// projection; the caller still propagates the error for the host to
     /// surface. Before the projection — nothing was published — the run
     /// stays queued and the next pump retries the pair whole.
-    fn handleFailurePairPublicationError(self: *Self, err: anyerror, run: *ActiveAgentRun, idx: usize) void {
-        _ = err;
+    fn handleFailurePairPublicationError(self: *Self, run: *ActiveAgentRun, idx: usize) void {
         if (run.failure_event_published) {
             var removed = self.active_agent_runs.orderedRemove(idx);
             removed.deinit(self.allocator);
