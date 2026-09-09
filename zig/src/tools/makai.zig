@@ -263,6 +263,14 @@ const StdioToolBridge = struct {
         errdefer allocator.free(owned_tool_call_id);
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        // A new execution of the same (session, tool_call_id) supersedes
+        // any key already present (#210 gap 6): the correlation lookup is
+        // first-match, so a leaked stale key — e.g. one that survived a
+        // stop whose reply publication failed before the bridge discard
+        // (§13.4.4) — must not shadow the current execution's request, or
+        // it would both accept a stale reply and reject the current
+        // execution's own correctly-correlated reply.
+        self.removeInFlightLocked(allocator, session_id, tool_call_id);
         try self.in_flight.append(allocator, .{
             .session_id = session_id,
             .tool_call_id = owned_tool_call_id,
@@ -827,18 +835,27 @@ const StdioProtocolLoop = struct {
             }
 
             if (registration_current) {
-                if (run.stream.getError()) |msg| {
-                    try self.publishAgentLoopError(run.session_id, .internal_error, msg);
-                    self.agent_server.markSessionError(run.session_id) catch {};
-                    forwarded += 1;
-                } else if (run.disconnect_failed.load(.acquire)) {
+                if (run.disconnect_failed.load(.acquire)) {
                     // §13.2.7/§13.4.6 (#210 gap 4): the run needed client
                     // input after stdin EOF — a distributed tool wait can
                     // never be satisfied by a disconnected tool host, so
                     // whatever termination the loop reached afterwards, the
                     // settlement is a typed failure, never a success
-                    // `agent_result`.
+                    // `agent_result`. Checked before the stream error: the
+                    // disconnect is the root cause even when the stream
+                    // also failed later. §3.5's loop-internal failure shape
+                    // carries one terminal error event and no trailing
+                    // `agent_end`, so the captured terminal projection is
+                    // dropped rather than published after the pair.
+                    if (run.terminal_event_json) |event_json| {
+                        self.allocator.free(event_json);
+                        run.terminal_event_json = null;
+                    }
                     try self.publishAgentLoopError(run.session_id, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE);
+                    self.agent_server.markSessionError(run.session_id) catch {};
+                    forwarded += 1;
+                } else if (run.stream.getError()) |msg| {
+                    try self.publishAgentLoopError(run.session_id, .internal_error, msg);
                     self.agent_server.markSessionError(run.session_id) catch {};
                     forwarded += 1;
                 } else if (run.stream.getResult()) |result| {
@@ -1409,11 +1426,14 @@ fn executeStdioToolViaAgentProtocol(
     const executor: *StdioAgentToolExecutor = @ptrCast(@alignCast(ctx.?));
     try executor.bridge.enqueueRequest(allocator, executor.session_id, executor.generation, tool_call_id, tool_name, args_json);
 
-    while (true) {
-        if (cancel_token) |token| {
-            if (token.isCancelled()) return error.Cancelled;
-        }
-        if (executor.bridge.popResult(allocator, executor.session_id, tool_call_id)) |result| {
+    const popAndBuild = struct {
+        fn run(
+            bridge: *StdioToolBridge,
+            allocator: std.mem.Allocator,
+            session_id: AgentProtocolTypes.SessionId,
+            tool_call_id: []const u8,
+        ) !?agent_loop.AgentToolResult {
+            const result = bridge.popResult(allocator, session_id, tool_call_id) orelse return null;
             var owned_result = result;
             defer owned_result.deinit(allocator);
             const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
@@ -1426,13 +1446,22 @@ fn executeStdioToolViaAgentProtocol(
                 .is_error = owned_result.is_error,
             };
         }
+    }.run;
+
+    while (true) {
+        if (cancel_token) |token| {
+            if (token.isCancelled()) return error.Cancelled;
+        }
+        if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id)) |tool_result| return tool_result;
         // §13.2.7/§13.4.6 (#210 gap 4): stdin EOF means the tool host is
-        // disconnected — this wait can never be satisfied. A result
-        // delivered before EOF wins (checked above); past that, fail the
-        // wait with a typed error, flag the run so its settlement is the
-        // failure pair rather than whatever the loop reaches next, and set
-        // the cancel token so the loop stops issuing further turns.
+        // disconnected — this wait can never be satisfied by a new reply.
+        // A result delivered before EOF wins: the host latches the
+        // disconnect only after stdin's ring is fully drained, so no
+        // further result can be enqueued past this point — but this
+        // iteration's pop may have raced the last dispatch, so re-check
+        // once before failing.
         if (executor.bridge.isDisconnected()) {
+            if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id)) |tool_result| return tool_result;
             executor.disconnect_failed.store(true, .release);
             if (cancel_token) |token| token.cancelled.store(true, .release);
             return error.ClientDisconnected;
@@ -2236,13 +2265,15 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
             }
         }
 
-        // §13.2.7 (#210 gap 4): buffered input was dispatched above; a done
-        // receive stream means stdin EOF — the client hosting every
-        // distributed tool is gone. Latch the disconnect so active tool
-        // waits fail with a typed error (a result delivered before EOF
-        // already won its wait) and the loop below can actually drain
-        // `hasActiveAgentRuns()` instead of blocking forever.
-        if (stdin_stream.isDone()) stdio_loop.markStdinDisconnected();
+        // §13.2.7 (#210 gap 4): a done receive stream means stdin EOF — the
+        // client hosting every distributed tool is gone. A done stream can
+        // still hold a final undispatched chunk (the reader pushes the last
+        // line before completing), so the latch waits for the ring to drain
+        // too: every frame delivered before EOF — possibly the tool_result
+        // that must win its wait — is dispatched first, and from the latch
+        // on no further result can arrive. The loop below can then actually
+        // drain `hasActiveAgentRuns()` instead of blocking forever.
+        if (stdin_stream.isDone() and !stdin_stream.hasPending()) stdio_loop.markStdinDisconnected();
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
             try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
@@ -4223,6 +4254,92 @@ test "tool result delivered before the disconnect latch settles its wait" {
     try std.testing.expect(!cancel_flag.load(.acquire));
 }
 
+test "tool result enqueued after the disconnect latch still wins the wait" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const request_id = AgentProtocolTypes.generateUlid();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var disconnect_flag = std.atomic.Value(bool).init(false);
+    var executor = StdioAgentToolExecutor{
+        .bridge = &bridge,
+        .session_id = session_id,
+        .generation = 0,
+        .disconnect_failed = &disconnect_flag,
+    };
+
+    // The straddle the single pre-latch pop cannot close: the wait's poll
+    // missed the last dispatch, the host then latched EOF, and only now is
+    // the delivered result visible in the bridge. The latch makes further
+    // enqueues impossible, so the post-latch re-check is final — a result
+    // delivered before EOF still wins (§13.2.7 rule 7).
+    bridge.markDisconnected();
+    try bridge.markInFlight(allocator, session_id, "call-1", request_id);
+    const delivered = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "call-1"),
+        .in_reply_to = request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"late-visible\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, delivered));
+
+    var tool_result = try executeStdioToolViaAgentProtocol(@ptrCast(&executor), "call-1", "lookup", "{}", .{ .cancelled = &cancel_flag }, null, null, allocator);
+    defer tool_result.deinit(allocator);
+    try std.testing.expect(!tool_result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.content.slice().len);
+    try std.testing.expect(!disconnect_flag.load(.acquire));
+    try std.testing.expect(!cancel_flag.load(.acquire));
+}
+
+test "a new execution supersedes a leaked in-flight key for the same tool_call_id" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const stale_request_id = AgentProtocolTypes.generateUlid();
+    const current_request_id = AgentProtocolTypes.generateUlid();
+
+    // A key leaked past a stop whose reply publication failed before the
+    // bridge discard (§13.4.4), then the id re-registered and the provider
+    // reused the tool_call_id: the new execution's key must supersede the
+    // stale one — first-match correlation must never see the leak.
+    try bridge.markInFlight(allocator, session_id, "dup-call", stale_request_id);
+    try bridge.markInFlight(allocator, session_id, "dup-call", current_request_id);
+    try std.testing.expectEqual(@as(usize, 1), bridge.in_flight.items.len);
+
+    var stale_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = stale_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"stale\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    const queued_stale = try bridge.enqueueResult(allocator, stale_result);
+    if (!queued_stale) stale_result.deinit(allocator);
+    try std.testing.expect(!queued_stale);
+
+    const current_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = current_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"current\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, current_result));
+    var popped = bridge.popResult(allocator, session_id, "dup-call").?;
+    defer popped.deinit(allocator);
+    try std.testing.expect(std.mem.find(u8, popped.result_json, "current") != null);
+}
+
 test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     const allocator = std.testing.allocator;
 
@@ -4304,6 +4421,10 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     var saw_disconnect_settlement = false;
     for (outbound.items) |line| {
         try std.testing.expect(std.mem.find(u8, line, "\"type\":\"agent_result\"") == null);
+        // §3.5's loop-internal failure shape carries one terminal error
+        // event and no trailing agent_end — the disconnect settlement must
+        // not publish the run's captured terminal projection after the pair.
+        try std.testing.expect(std.mem.find(u8, line, "\"agent_end\"") == null);
         if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
             std.mem.find(u8, line, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE) != null)
         {
