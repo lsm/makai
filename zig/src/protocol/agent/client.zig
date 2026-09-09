@@ -34,15 +34,19 @@ const PendingSend = struct {
     kind: PendingSendKind,
 };
 
-/// An in-flight bounded stop probe (#210 gap 7): after an uncorrelated outcome
-/// the cleanup stop first tries the PRE-send counter state; a correlated
-/// `invalid_request` rejection naming the probe's first stop triggers exactly
-/// one retry at the post-send value. Any other reply — or removal of the
-/// session — retires the probe without a retry.
+/// An in-flight bounded stop probe (#210 gap 7): after an uncorrelated
+/// `agent_message` outcome the cleanup stop first tries the PRE-send counter
+/// state; a correlated `invalid_request` rejection naming the probe's first
+/// stop triggers exactly one retry at the post-send value. `final` marks the
+/// second phase — the retry is in flight and its OWN replies are consumed
+/// without any further retry (a session that vanished between the two stops
+/// answers `agent_not_found`; both candidates missing answers
+/// `invalid_request`) so cleanup mechanics never surface as run errors.
 const StopProbe = struct {
     first_msg_id: agent_types.Ulid,
     second_sequence: u64,
     reason: OwnedSlice(u8),
+    final: bool = false,
 };
 
 pub const AgentProtocolClient = struct {
@@ -227,26 +231,21 @@ pub const AgentProtocolClient = struct {
     /// counter rolled back), and a correlated `invalid_request` rejection
     /// processed later through `processEnvelope` triggers exactly one retry
     /// at the post-send value (the message may have been accepted with its
-    /// output lost or delayed). Acceptance at either value settles cleanup;
-    /// no other reply retries.
+    /// output lost or delayed); the retry's own replies are consumed the
+    /// same way. Acceptance at either value settles cleanup; no other reply
+    /// retries.
     ///
-    /// Probing is a MESSAGE-send recovery only: a start-only unknown outcome
-    /// on a caller-supplied id carries no ownership evidence (§6.1) — the
-    /// probe's second stop would validate against a foreign owner's freshly
-    /// started session (it expects inbound sequence 2) and destroy it. With
-    /// no recorded message send, this falls back to a plain tracked stop.
-    pub fn sendAgentStopProbing(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !agent_types.Ulid {
-        const last = self.last_send_by_session.get(session_id) orelse {
-            // No counter-advancing send recorded for the session: there is no
-            // pre/post pair to probe — fall back to a plain tracked stop.
-            return self.sendAgentStop(session_id, reason);
-        };
-        if (last.kind != .message) {
-            // Last send was an agent_start (or an explicit-sequence message
-            // never landed): no admitted-message outcome to reconcile — a
-            // probe here could stop a foreign owner's session (§6.1).
-            return self.sendAgentStop(session_id, reason);
-        }
+    /// Probing is a MESSAGE-send recovery ONLY, and requires one: with no
+    /// recorded `agent_message` send (start-only unknown outcome, or nothing
+    /// sent at all) there is no ownership evidence (§6.1) — a stop at the
+    /// tracker's value would validate against a foreign owner's freshly
+    /// started session (it expects inbound sequence 2) and destroy it. This
+    /// then sends NOTHING and returns null: leaking a session that might be
+    /// ours is strictly preferable to stopping one that is not. A caller
+    /// with positive evidence can still issue `sendAgentStopWithSequence`.
+    pub fn sendAgentStopProbing(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !?agent_types.Ulid {
+        const last = self.last_send_by_session.get(session_id) orelse return null;
+        if (last.kind != .message) return null;
         const msg_id = try self.sendAgentStopWithSequence(session_id, reason, last.sequence);
         var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
         errdefer owned_reason.deinit(self.allocator);
@@ -373,53 +372,73 @@ pub const AgentProtocolClient = struct {
         }
     }
 
-    /// Handles a reply correlated to an active stop probe's first stop.
-    /// Returns true when the envelope IS a probe-control reply and has been
-    /// fully consumed (callers must then skip terminal bookkeeping — the
-    /// probe's intentional first-stop rejection is not a run failure).
-    /// A correlated `invalid_request` triggers the one bounded retry at the
-    /// post-send value; any other answer retires the probe, and
-    /// `agent_not_found` additionally drops the session's sequence state (the
-    /// session is gone server-side — a re-registration of the id must start
-    /// from sequence 1, not the stale optimistic counter).
+    /// Handles a reply correlated to an active stop probe. Returns true when
+    /// the envelope IS a probe-control reply and has been fully consumed
+    /// (callers must then skip terminal bookkeeping — the probe's replies are
+    /// cleanup mechanics, not run failures). In the first phase a correlated
+    /// `invalid_request` triggers the one bounded retry at the post-send
+    /// value and re-registers the probe in its final phase so the retry's own
+    /// replies are consumed too. In any phase, `agent_not_found` drops the
+    /// session's sequence state (the session is gone server-side — a
+    /// re-registration of the id must start from sequence 1, not the stale
+    /// optimistic counter) and marks the session complete: no `agent_stopped`
+    /// can ever follow for a nonexistent session.
     fn handleProbeReply(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !bool {
         const reply_to = in_reply_to orelse return false;
         const probe = self.stop_probes_by_session.get(session_id) orelse return false;
         if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return false;
 
-        const retry = if (code) |c| c == .invalid_request else false;
+        const retry = !probe.final and (if (code) |c| c == .invalid_request else false);
         const session_gone = if (code) |c| c == .agent_not_found else false;
         const second_sequence = probe.second_sequence;
         var reason = probe.reason;
         _ = self.stop_probes_by_session.remove(session_id);
         defer reason.deinit(self.allocator);
         if (retry) {
-            _ = self.sendAgentStopWithSequence(session_id, reason.slice(), second_sequence) catch {};
+            const second_msg_id = self.sendAgentStopWithSequence(session_id, reason.slice(), second_sequence) catch {
+                // The retry never reached the wire — no reply will name it,
+                // so there is nothing to register for consumption.
+                return true;
+            };
+            // Final phase: consume the retry's own replies. The reason is not
+            // used for another send, so a borrowed empty slice suffices.
+            try self.stop_probes_by_session.put(session_id, .{
+                .first_msg_id = second_msg_id,
+                .second_sequence = 0,
+                .reason = OwnedSlice(u8).initBorrowed(""),
+                .final = true,
+            });
         } else if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.last_send_by_session.remove(session_id);
+            try self.session_complete_flags.put(session_id, true);
         }
         return true;
     }
 
     /// Applies #210 gap 7's client sequence-control rules to a correlated
     /// rejection (an `agent_error`/`nack` whose `in_reply_to` names this
-    /// client's own counter-advancing send): a rejected send rolls the tracker
+    /// client's own send): a rejected counter-advancing send rolls the tracker
     /// back so a corrected retry reuses the same sequence (§13.1 — a rejected
     /// request never advances the server's expected counter).
     fn handleCorrelatedRejection(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !void {
         const reply_to = in_reply_to orelse return;
 
+        const session_gone = if (code) |c| c == .agent_not_found else false;
+        if (session_gone) {
+            // A correlated agent_not_found — whether it names a
+            // counter-advancing send or a plain stop (whose id the client
+            // does not track): the session does not exist server-side, so
+            // its tracked sequence state is meaningless. Drop it — a
+            // re-registration of the id must start at sequence 1, not the
+            // stale optimistic counter.
+            _ = self.next_sequence_by_session.remove(session_id);
+            _ = self.last_send_by_session.remove(session_id);
+            return;
+        }
+
         if (self.last_send_by_session.get(session_id)) |pending| {
             if (!std.mem.eql(u8, &reply_to, &pending.msg_id)) return;
-            const session_gone = if (code) |c| c == .agent_not_found else false;
-            if (session_gone) {
-                // The session is gone server-side; its counter state is
-                // meaningless — drop it rather than rolling back.
-                _ = self.next_sequence_by_session.remove(session_id);
-                _ = self.last_send_by_session.remove(session_id);
-                return;
-            }
             // Roll the tracker back to the rejected send's own sequence: the
             // server did not advance, so a corrected retry MUST reuse it.
             try self.next_sequence_by_session.put(session_id, pending.sequence);
@@ -855,12 +874,14 @@ test "AgentProtocolClient probing stop is bounded: no retry on a non-invalid_req
     try std.testing.expect(!client.last_send_by_session.contains(sid));
 }
 
-test "AgentProtocolClient probing stop requires a message send: a start-only outcome falls back to a plain stop (#210 gap 7)" {
+test "AgentProtocolClient probing stop requires a message send: a start-only outcome sends NOTHING (#210 gap 7)" {
     // §6.1 via #210 gap 7: a start-only unknown outcome on a caller-supplied
-    // id carries no ownership evidence — the probe's second stop (sequence 2)
-    // would validate against a foreign owner's freshly started session and
-    // destroy it. With no agent_message recorded, sendAgentStopProbing must
-    // degrade to a single plain tracked stop and register no probe.
+    // id carries no ownership evidence — even a single plain stop at the
+    // tracker's value (sequence 2) would validate against a foreign owner's
+    // freshly started session and destroy it. With no agent_message recorded,
+    // sendAgentStopProbing must send nothing and register no probe: leaking a
+    // session that might be ours is strictly preferable to stopping one that
+    // is not.
     const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
@@ -870,12 +891,99 @@ test "AgentProtocolClient probing stop requires a message send: a start-only out
     const sid = agent_types.generateSessionId();
     _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
 
-    _ = try client.sendAgentStopProbing(sid, "timeout");
-    try std.testing.expectEqual(@as(usize, 2), harness.writes.items.len);
-    var stop_env = try harness.envelopeAt(1);
-    defer stop_env.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 2), stop_env.sequence); // plain stop at the tracker's expected value
+    const result = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(result == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len); // the start only — no stop
     try std.testing.expect(!client.stop_probes_by_session.contains(sid));
+
+    // Same no-send rule with no recorded send at all.
+    const other = agent_types.generateSessionId();
+    const other_result = try client.sendAgentStopProbing(other, "timeout");
+    try std.testing.expect(other_result == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len);
+}
+
+test "AgentProtocolClient probing stop consumes the retry's own rejection and marks a vanished session complete (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+
+    const probe_stop_id = try client.sendAgentStopProbing(sid, "timeout");
+    // First stop rejected invalid_request → the retry (sequence 3) goes out
+    // and the probe re-registers in its final phase.
+    var first_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+    };
+    defer first_rejection.deinit(allocator);
+    try client.processEnvelope(first_rejection);
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len); // start, message, stop(2), stop(3)
+    try std.testing.expect(client.stop_probes_by_session.contains(sid)); // final-phase entry awaits the retry's reply
+
+    // The session vanished between the two stops: the retry answers
+    // correlated agent_not_found. The reply must be CONSUMED (no false run
+    // error), clear the sequence state, and mark the session complete — no
+    // agent_stopped can ever follow.
+    const second_stop_id = blk: {
+        var env = try harness.envelopeAt(3);
+        defer env.deinit(allocator);
+        break :blk env.message_id;
+    };
+    var second_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = second_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+    };
+    defer second_rejection.deinit(allocator);
+    try client.processEnvelope(second_rejection);
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len); // bounded: no third stop
+    try std.testing.expect(!client.stop_probes_by_session.contains(sid));
+    try std.testing.expect(client.isSessionComplete(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+}
+
+test "AgentProtocolClient correlated agent_not_found on a plain stop clears the tracked sequence state (#210 gap 7)" {
+    // The reply names the STOP's message id, which the client does not track
+    // in last_send_by_session — the not-found cleanup must not depend on
+    // matching a counter-advancing send, or the stale counter would make a
+    // re-registration of the id start at sequence 2/3 and fail its start.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+    const stop_id = try client.sendAgentStop(sid, "completed"); // sequence 2
+
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+    };
+    defer rejection.deinit(allocator);
+    try client.processEnvelope(rejection);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.last_send_by_session.contains(sid));
 }
 
 test "AgentProtocolClient stop sends never advance the tracker (#210 gap 7)" {

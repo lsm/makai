@@ -111,10 +111,17 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    leaves the expected value in place for its retry), and exposes the control
    surface recovery paths need: `peekNextSequence`,
    `sendAgentMessageWithSequence`, `sendAgentStopWithSequence`, and
-   `sendAgentStopProbing` — a bounded two-state probe (stop at the last send's
-   PRE-send sequence; on a correlated `invalid_request` reply processed through
-   `processEnvelope`, exactly one retry at the post-send value; any other reply
-   retires the probe). The TS SDK's tracker (`ActiveAgentSession`) marks the
+   `sendAgentStopProbing` — a bounded two-state probe (stop at the last
+   message send's PRE-send sequence; on a correlated `invalid_request` reply
+   processed through `processEnvelope`, exactly one retry at the post-send
+   value whose own replies are consumed identically; any other reply retires
+   the probe, with `agent_not_found` clearing the tracked sequence state and
+   marking the session complete; probe replies are consumed as cleanup
+   mechanics, never session errors — and probing requires a recorded
+   `agent_message` send, else it sends NOTHING: a start-only unknown outcome
+   has no §6.1 ownership evidence and a stop at the tracker's value would
+   destroy a foreign owner's fresh session). The TS SDK's tracker
+   (`ActiveAgentSession`) marks the
    `agent_message` send unresolved at send, rolls back to the pre-send sequence
    on a correlated rejection, confirms the advanced counter on the first run
    output, and — while the outcome is unresolved — tears down with the same

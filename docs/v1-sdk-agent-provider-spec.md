@@ -991,11 +991,14 @@ Rules:
   surface directly — `peekNextSequence`, `sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`, and `sendAgentStopProbing` (the probe's second stop
   is emitted from `processEnvelope` when the first stop's correlated
-  `invalid_request` reply arrives; probe replies are consumed as cleanup
-  mechanics rather than session errors, and probing is a MESSAGE-send recovery —
-  with no recorded `agent_message` send it degrades to a plain stop, since a
-  start-only unknown outcome carries no ownership evidence, §6.1) — so recovery
-  paths are not forced to guess a counter state.
+  `invalid_request` reply arrives, and BOTH stops' replies — including the
+  retry's own rejection — are consumed as cleanup mechanics rather than session
+  errors; probing is a MESSAGE-send recovery and REQUIRES a recorded
+  `agent_message` send: with none, it sends nothing at all, since a start-only
+  unknown outcome carries no ownership evidence and even a single stop at the
+  tracker's value would validate against a foreign owner's freshly started
+  session — §6.1's leak-over-destroy rule) — so recovery paths are not forced
+  to guess a counter state.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
