@@ -44,7 +44,7 @@ numbers in both directions.
 | envelope `message_id` / `in_reply_to` | envelope `id` / `in_reply_to` | aligned | `in_reply_to` references the request envelope's `message_id` only; set on synchronous replies, absent on async run output. |
 | envelope `sequence` | `sequence` | deviating: scope | Makai: per-direction, per-session. Inbound consumption is accepted-only: each ACCEPTED `agent_message` advances the counter (an accepted `agent_stop` removes it with the session); rejected requests and the non-consuming request types (`agent_status`, `ping`, `tool_list`, `models_request`, `goodbye` — accepted silently, no teardown, no reply) never advance it. Outbound has two frame classes: allocated frames draw a monotonic counter scoped to the session-container registration (a re-registered id restarts) — monotonic ABSENT allocation failure (`nextOutgoingSequence` ignores its map-update failure, so duplicate values are possible under memory pressure, #204) — while echo replies (`session_info`, `pong`, `tool_list_response`) copy the inbound sequence verbatim and validation errors carry 0 — a permanent deviation (decision (b) of #204; see the deviations ledger entry on echo-reply sequencing). OAP v0.1: run-scoped, positive, contiguous, and requests/responses do not consume it. Adapters must renumber per OAP run sequence from native receive order and must not order echo replies by sequence. |
 | provider `stream_id` / auth `flow_id` | none (binding-private) | aligned by analogy | Correlation values private to their adjacent protocols on the same connection; never OAP identities (OAP Decision 0001 keeps native IDs out of portable identity). |
-| payload `tool_call_id` | `tool_call_id` | deviating: uniqueness scope | Correlates concurrently in-flight calls only. Ids originate from provider output and the server keeps no session-wide registry — a provider may reuse a value across turns or runs of one session. Adapters must not key tool history by bare `tool_call_id` (namespacing or per-run scoping required). |
+| payload `tool_call_id` | `tool_call_id` | deviating: uniqueness scope | Correlates concurrently in-flight calls only. Ids originate from provider output and the server keeps no session-wide registry — a provider may reuse a value across turns or runs of one session. Adapters must not key tool history by bare `tool_call_id` (namespacing or per-run scoping required). Reuse no longer misattributes in-flight waits (#210 gap 6, §13.1): the stdio interception correlates each `tool_result` by `in_reply_to` against the CURRENT outstanding `tool_execute`'s `message_id` — mismatched, absent, and unsolicited replies are discarded. |
 | — | `endpoint_id`, `participant_id` | absent (deviation) | Makai has no endpoint or participant identity; the transport connection is implicit and there is exactly one server per stdio process. Affects reverse-interaction ownership: `tool_execute` is the only server-initiated request and its ownership is implicitly "the session's client." |
 
 ## Deviations ledger
@@ -71,7 +71,7 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | delivery modes `queue`/`steer`/`btw` | none — `agent_busy` on concurrent delivery | absent by design | §13.2.4; OAP optional units, unavailable here. |
 | envelope shape | flat envelope: `version`, `type`, `session_id`, `message_id`, `sequence`, `in_reply_to`, `timestamp`, `payload` | aligned structurally | OAP's envelope adds `protocol`/`profile` strings and scope fields (`run_id`, `turn_id`, …) makai does not carry; mapping is mechanical for the adapter. |
 | process exit before settlement | transport rejects the registered frame wait; reads queued behind the transport read lock surface the death as their response timeout; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule; adapters must keep timeout handling for lock-queued reads rather than expecting prompt rejection for every concurrent request. |
-| stdin EOF while a run waits on a distributed `tool_result` | server process stays alive; the client observes silence until its response timeout | deviating: tracked (#204 gap 4) | The tool wait has no EOF-triggered cancel (`makai.zig` `executeStdioToolViaAgentProtocol` polls until result or run-cancel), so the process and its sessions hang indefinitely (§13.2.7); client frame waits are rejected only on process exit, so this case surfaces as timeout, not a prompt terminal. |
+| stdin EOF while a run waits on a distributed `tool_result` | the host latches the disconnect; the wait fails with a typed error and the run settles through the failure pair (`tool_execution_error` settlement), then the process drains and exits | aligned (#210 gap 4) | §13.2.7 rule 7: EOF-cancel applies to the tool-waiting case — the tool host IS the disconnected client. A `tool_result` delivered before EOF wins its wait (checked before the latch); a run needing client input after EOF settles failed, never success (§13.4.6), with pending tool requests dropped unpublished; provider-executing runs keep being pumped toward settlement until they need client input. Late frames from the cancelled run settle nothing — the pump's disconnect classification publishes the failure pair once and the run is removed, working with (not around) the §13.4.5 generation guard. |
 
 ## P0 makai follow-ups (queued)
 
@@ -83,16 +83,22 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    pre-acceptance `agent_started` correlation check). Overlapping same-session
    calls now each receive their own replies; the pre-#201 modes (duplicate
    timing out, established run destroyed, wrong request proceeding) are closed.
-2. #204 — server enforcement gaps the spec marks `[planned]`. LANDED (first
-   slice): envelope/payload session-id agreement rejection (all four
+2. #204/#210 — server enforcement gaps the spec marks `[planned]`. LANDED (first
+   slice, #209): envelope/payload session-id agreement rejection (all four
    session-scoped handlers plus the stdio host's stop validation), the
    echo-reply sequence decision — decision (b): echo kept as a permanent
    deviation, see the deviations ledger — and the session generation counter
    so a stopped OR evicted session's cancelled run cannot settle a re-created
    id (stale-generation publications discarded; a listed stale run no longer
-   fails the fresh id's run start with `agent_busy`). Still open: EOF /
-   disconnect-triggered cancellation of active runs (the distributed-tool EOF hang),
-   settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
+   fails the fresh id's run start with `agent_busy`). LANDED (#210 gaps 4+6):
+   EOF/disconnect-triggered cancellation of the distributed-tool wait — stdin
+   EOF latches the bridge disconnected, the wait fails with a typed error, the
+   run settles through the failure pair (`tool_execution_error` settlement)
+   and the process drains instead of hanging (§13.2.7 rule 7; deviations
+   ledger) — and stale-`tool_result` correlation for reused `tool_call_id`s
+   (`in_reply_to` validated against the current outstanding `tool_execute`;
+   mismatched/absent/unsolicited replies discarded, §13.1). Still open (#210
+   gaps 5+7): settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
    publication failure instead of the swallowed/propagating OOM (settle or
    propagate once, never re-publish a processed terminal; tool-request
    publication, outbox delivery, the final pipe-to-stdout drain, and ORDINARY
@@ -104,9 +110,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    already removed, leaving no settlement and nothing to retry — transactionality
    extends through the final pipe-to-stdout handoff: the stdio drain advances the
    pipe read position before its buffer append, and a failure there is swallowed,
-   dropping an already-delivered frame), and
-   stale-`tool_result` correlation for reused
-   `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`) —
+   dropping an already-delivered frame) — gap 5 —
    plus gap 7: client sequence control in BOTH clients — `AgentProtocolClient`
    (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
    (its tracker advances before the outcome is known) — where "control" includes
