@@ -982,7 +982,7 @@ Rules:
   sequence control surface (no rollback, no explicit-sequence send), so
   same-sequence retries through that client are unsupported — callers needing that
   discipline must drive the transport directly until sequence control is exposed
-  (`[planned — #204 gap 7]`).
+  (`[planned — #210 gap 7]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
@@ -1047,12 +1047,17 @@ Rules:
   from provider output and the server keeps no session-wide registry: a provider MAY
   reuse a value in a later turn or a later run of the same multi-message session.
   Consumers and adapters MUST NOT key tool history by bare `tool_call_id`. Reuse
-  carries a `[current]` hazard: `tool_result` frames are matched by
-  `(session_id, tool_call_id)` only — the stdio interception discards their
-  `in_reply_to` — so a delayed or retried result from an earlier call can complete a
-  later call reusing the id while its real reply is dropped; correlating results
-  against the current `tool_execute` (or enforcing per-session id uniqueness) is
-  `[planned — #204 gap 6]`.
+  hazard closed for in-flight waits `[current — #210]`: the stdio interception
+  correlates a `tool_result` against the CURRENT outstanding `tool_execute` — the
+  in-flight key records the published request's `message_id`, and only a reply
+  whose `in_reply_to` names it settles the wait. A delayed or retried result from
+  an earlier execution of a reused id (wrong `in_reply_to`), an uncorrelated reply
+  (no `in_reply_to`), and an unsolicited or already-consumed reply (no in-flight
+  key) are all DISCARDED — the interception rejects the frame and the host emits
+  its `unknown_envelope` runtime error, so a stale result can no longer complete a
+  later call reusing the id while its real reply is dropped. History beyond the
+  in-flight window remains uncorrelated (adapters still MUST NOT key tool history
+  by bare `tool_call_id`).
 
 ### 13.2 Session Lifecycle & Ownership (Normative)
 
@@ -1144,22 +1149,25 @@ server eviction (rule 6), and holds no transcript and no persistence.
      protocol-reporting only.
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
-   by the connection. Disconnect does not cancel in-flight work in V1, with two
-   distinct outcomes: a run executing against a provider is pumped to completion
-   and its settlement frames are still drained to stdout — stdin and stdout are
-   independent pipes, so a client that closed only its write side but keeps
-   reading still receives them (lost only when the read side is gone), and only
-   until the run needs client input: a provider turn that returns
-   `stop_reason = tool_use` after EOF moves the run into the tool-waiting case
-   when the call reaches the distributed executor (unknown tools, invalid
-   arguments, and approval-required calls synthesize local results and the loop
-   continues);
-   a run WAITING on a distributed
-   `tool_result` cannot complete — the tool host is the disconnected client, the
-   tool wait polls with no EOF-triggered cancel, and the host loop never sees the
-   run go idle — so the process (and every session it owns) stays alive
-   indefinitely until killed. EOF-triggered cancellation of active runs is tracked
-   with the disconnect-cleanup family in #204. Future multi-connection hosts
+   by the connection. Disconnect does not cancel provider work in V1: a run
+   executing against a provider is pumped to completion and its settlement frames
+   are still drained to stdout — stdin and stdout are independent pipes, so a
+   client that closed only its write side but keeps reading still receives them
+   (lost only when the read side is gone), and only until the run needs client
+   input: a provider turn that returns `stop_reason = tool_use` after EOF moves the
+   run into the tool-waiting case when the call reaches the distributed executor
+   (unknown tools, invalid arguments, and approval-required calls synthesize local
+   results and the loop continues). The tool-waiting case is EOF-cancelled
+   `[current — #210]`: when the host observes stdin EOF it latches the connection
+   disconnected, and every distributed tool wait — one already parked or one a
+   post-EOF turn reaches — fails promptly with a typed error instead of polling
+   forever (the tool host IS the disconnected client; a `tool_result` delivered
+   before EOF wins its wait). A run whose wait failed on the latch settles through
+   the failure pair (a settlement `agent_error` carrying
+   `tool_execution_error` and a disconnect message — EOF before settlement is
+   failure, never success), pending tool requests are dropped unpublished, and the
+   host loop sees the run go idle so the process drains and exits instead of
+   staying alive indefinitely. Future multi-connection hosts
    MUST scope sessions to their owning connection (rule 2) and evict on disconnect
    (beyond the idle TTL of rule 6; per-connection ownership is not built yet).
 
@@ -1208,7 +1216,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
 4. Tool side channel `[current]`: `tool_execute` is delivered on the session route;
    `tool_result` replies carry `in_reply_to` referencing the `tool_execute`
    `message_id` but are intercepted by the stdio host before the agent protocol
-   (§13.1 sequence rule) and never appear on the session route.
+   (§13.1 sequence rule) and never appear on the session route. The interception
+   CORRELATES the reply `[current — #210]`: only a `tool_result` whose
+   `in_reply_to` names the current outstanding `tool_execute` for the
+   `(session_id, tool_call_id)` settles the wait (§13.1); anything else is
+   discarded as an unknown observation.
 
 ### 13.4 Admission, Settlement, and the Single Terminal Arbiter (Normative)
 
@@ -1241,7 +1253,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
    at either settles cleanup. Both current clients advance before the outcome is
    known and send only the advanced value, so their cleanup stop fails in the
    rolled-back case and the owned session leaks indefinitely; the fix (probing,
-   or rollback/explicit-sequence control) is `[planned — #204 gap 7]`. A start
+   or rollback/explicit-sequence control) is `[planned — #210 gap 7]`. A start
    rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
@@ -1290,7 +1302,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
        out-of-memory failure in the RESULT-publication path is a further current
        exception: the host ignores publication errors (`makai.zig` `pumpAgentRuns`
        `catch {}`), so under memory pressure an admitted run can emit no
-       settlement at all (#204 gap 5). Worse, the host does not stop at that
+       settlement at all (#210 gap 5). Worse, the host does not stop at that
        failure: it proceeds to publish the saved trailing `agent_end`, and if that
        second publication succeeds, SDK consumers report SUCCESS despite no
        authoritative `agent_result` having been emitted — a false-success
@@ -1299,7 +1311,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
        the pending tool request is removed from the bridge before its envelope is
        built, so an allocation failure in between frees the request without
        emitting `tool_execute` — the agent thread blocks in the tool wait forever
-       and the run settles never (transactional publication required, #204 gap 5).
+       and the run settles never (transactional publication required, #210 gap 5).
        Outbox delivery shares the failure: an envelope is popped (removed) before
        it is serialized and written, so an allocation or write failure destroys an
        already-built frame — an `agent_result` lost this way leaves the completed
@@ -1311,13 +1323,13 @@ server eviction (rule 6), and holds no transcript and no persistence.
        stream before publication and publication failures are swallowed, so a
        dropped delta or tool-lifecycle event is never reconstructed — a stream
        that still settles successfully can be silently truncated (all part of
-       #204 gap 5's transactional-publication scope). An OOM BETWEEN the two
+       #210 gap 5's transactional-publication scope). An OOM BETWEEN the two
        frames of the
        failure pair is the same exception from the other side: the event is
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the
        terminal event projection — consumers can observe multiple projections
-       under sustained memory pressure (also #204 gap 5). Run-START failures
+       under sustained memory pressure (also #210 gap 5). Run-START failures
        differ from active-stream errors: the pending message is consumed before
        the error pair is published and no active run exists to stay queued, so a
        mid-pair failure there emits only the lone event projection, never
@@ -1340,7 +1352,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
    exactly once, via result XOR error, never both — absent publication failure:
    under memory pressure a run can emit no settlement or re-emit its terminal
-   projection (§13.4.2's OOM exceptions; #204 gap 5). Children settle first: pending
+   projection (§13.4.2's OOM exceptions; #210 gap 5). Children settle first: pending
    tool work resolves and the trailing `agent_end` is published only after
    `agent_result`. Duplicate or late frames after settlement (e.g. a stale
    `agent_end` read by a follow-up run on the same id) MUST NOT produce a second
@@ -1356,9 +1368,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
    or times out although teardown succeeded, AND tool-bridge cleanup is skipped
    (the stop's dispatch returns before reaching the run-cancel path, the only
    caller of the bridge's session discard): stale pending/in-flight tool keys
-   survive, so a delayed old `tool_result` can be accepted against a later
-   same-id call (compounding §13.1's tool-call-id hazard) and the bridge memory
-   persists until process exit. The same failure occurs even when the reply IS
+   survive and the bridge memory persists until process exit. Misattribution is
+   nonetheless closed by `in_reply_to` correlation (`[current — #210]`, §13.1): a
+   delayed old `tool_result` names the old `tool_execute`'s `message_id` and is
+   discarded against a later same-id call; only the leaked bridge memory remains
+   (still part of the stop transaction in #210 gap 5). The same failure occurs even when the reply IS
    built: synchronous replies are serialized and written directly, outside the
    outbox, and a failure there propagates before the run-cancel path — session
    removed, no `agent_stopped`, cleanup skipped (the stop transaction in #204
@@ -1409,13 +1423,18 @@ server eviction (rule 6), and holds no transcript and no persistence.
    further client input: if the in-flight provider turn returns
    `stop_reason = tool_use` after EOF AND the call reaches the distributed
    executor (a configured tool with schema-valid arguments whose approval path
-   permits execution), the run transitions into the tool-waiting case below and
-   produces no terminal; an unknown tool, schema-invalid arguments, or an
+   permits execution), the run transitions into the tool-waiting case below,
+   which the disconnect latch then fails (see the next sentence — it settles
+   through the failure pair, not silence); an unknown tool, schema-invalid
+   arguments, or an
    approval-required call (the stdio host locally rejects those without a
    reachable approver) synthesizes a local error tool-result instead, the loop
-   continues, and the run can still settle on stdout. A run waiting on a distributed `tool_result` produces
-   NO terminal at all — the server process hangs (#204 gap 4) and only the
-   client's response timeout surfaces an error. In every case an unsettled run is
+   continues, and the run can still settle on stdout. A run waiting on a distributed
+   `tool_result` is EOF-cancelled `[current — #210]`: the wait fails with a typed
+   error on the disconnect latch, the run settles through the failure pair
+   (§13.2.7 rule 7), and the process drains and exits — a half-closed client that
+   keeps reading receives the failure settlement; one that is gone surfaces the
+   error through transport death below. In every case an unsettled run is
    never a success. Recovery is not unconditional: makai has no run identity,
    reconciliation, or replay (§13.5), so a client cannot prove an unsettled
    attempt did not execute — if the run used tools or other non-idempotent side
@@ -1454,7 +1473,7 @@ Rules:
    duplicate provider content or tool side effects (the SDK gates retry on no content
    yielded and no tools executed). `[current exception]` the gate is
    event-delivery-based: a `tool_execute` that was executed while its tool-lifecycle
-   events were dropped by a publication failure (§13.4.2, #204 gap 5) is invisible
+   events were dropped by a publication failure (§13.4.2, #210 gap 5) is invisible
    to the retry gate, so `auto_once` can re-run after a tool already executed.
    Tracking tool execution independently of event delivery is `[planned — #205]`;
    until then the no-duplicate guarantee holds absent publication failure.

@@ -45,6 +45,11 @@ const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
 /// idle-session sweep inside it is throttled to this interval so the O(n)
 /// scan over registered sessions does not spin with the pump.
 const SESSION_SWEEP_INTERVAL_MS: i64 = 1_000;
+/// Settlement message for a run whose distributed tool wait failed because
+/// stdin closed (§13.2.7, #210 gap 4): the tool host is the disconnected
+/// client, so the wait can never be satisfied — EOF before settlement is
+/// failure, never success.
+const STDIO_DISCONNECT_TOOL_WAIT_MESSAGE = "client disconnected while the run waited for a distributed tool_result";
 
 const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
@@ -165,6 +170,18 @@ const StdioToolRequest = struct {
 const StdioToolKey = struct {
     session_id: AgentProtocolTypes.SessionId,
     tool_call_id: []u8,
+    /// The `message_id` of the `tool_execute` envelope this key tracks
+    /// (§13.1, #210 gap 6): only a `tool_result` whose `in_reply_to` names
+    /// it may settle the wait, so a stale reply from an earlier execution
+    /// of a reused `tool_call_id` cannot be attributed to the current
+    /// execution.
+    request_message_id: AgentProtocolTypes.Ulid,
+    /// The registration generation of the run whose `tool_execute` this
+    /// key tracks (§13.4.5, #210): result CONSUMPTION is generation-bound
+    /// too — a stopped run's cancelled wait can resume after the id was
+    /// re-registered and the new run published the same `tool_call_id`,
+    /// and a pair-only pop would steal the new run's result and key.
+    generation: u64,
 
     fn deinit(self: *StdioToolKey, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
@@ -175,6 +192,9 @@ const StdioToolKey = struct {
 const StdioToolResult = struct {
     session_id: AgentProtocolTypes.SessionId,
     tool_call_id: []u8,
+    /// The reply's `in_reply_to` (§13.3.4, #210 gap 6): must name the
+    /// `message_id` of the `tool_execute` the current wait is parked on.
+    in_reply_to: ?AgentProtocolTypes.Ulid,
     result_json: []u8,
     details_json: []u8,
     is_error: bool,
@@ -192,6 +212,18 @@ const StdioToolBridge = struct {
     requests: std.ArrayList(StdioToolRequest) = .empty,
     in_flight: std.ArrayList(StdioToolKey) = .empty,
     results: std.ArrayList(StdioToolResult) = .empty,
+    /// Latched once the host observed stdin EOF (§13.2.7, #210 gap 4): the
+    /// tool host is the disconnected client, so every distributed tool wait
+    /// fails from here on instead of polling forever.
+    disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn markDisconnected(self: *StdioToolBridge) void {
+        self.disconnected.store(true, .release);
+    }
+
+    fn isDisconnected(self: *StdioToolBridge) bool {
+        return self.disconnected.load(.acquire);
+    }
 
     fn deinit(self: *StdioToolBridge, allocator: std.mem.Allocator) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -232,32 +264,68 @@ const StdioToolBridge = struct {
         });
     }
 
-    fn markInFlight(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) !void {
+    fn markInFlight(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8, request_message_id: AgentProtocolTypes.Ulid, generation: u64) !void {
         const owned_tool_call_id = try allocator.dupe(u8, tool_call_id);
         errdefer allocator.free(owned_tool_call_id);
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        // A new execution of the same (session, tool_call_id) supersedes
+        // any key already present (#210 gap 6): the correlation lookup is
+        // first-match, so a leaked stale key — e.g. one that survived a
+        // stop whose reply publication failed before the bridge discard
+        // (§13.4.4) — must not shadow the current execution's request, or
+        // it would both accept a stale reply and reject the current
+        // execution's own correctly-correlated reply. A queued result that
+        // already passed the OLD key's correlation survives the same leak
+        // and must be purged with it: the pop matches by (session,
+        // tool_call_id) only, so it would hand the stale result to the new
+        // execution while the duplicate-result check rejects the new
+        // execution's own reply.
+        self.removeInFlightLocked(allocator, session_id, tool_call_id);
+        self.removeResultsLocked(allocator, session_id, tool_call_id);
         try self.in_flight.append(allocator, .{
             .session_id = session_id,
             .tool_call_id = owned_tool_call_id,
+            .request_message_id = request_message_id,
+            .generation = generation,
         });
     }
 
     fn enqueueResult(self: *StdioToolBridge, allocator: std.mem.Allocator, result: StdioToolResult) !bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        if (!self.hasInFlightLocked(result.session_id, result.tool_call_id)) return false;
+        // §13.1 (#210 gap 6): a result settles the current wait only when it
+        // is correlated to the outstanding `tool_execute` — the in-flight key
+        // must exist (no unsolicited or already-consumed reply) and the
+        // reply's `in_reply_to` must name that request's `message_id`, so a
+        // delayed or retried result from an earlier execution of a reused
+        // `tool_call_id` is discarded instead of misattributed.
+        const in_flight_key = self.findInFlightLocked(result.session_id, result.tool_call_id) orelse return false;
+        const reply_to = result.in_reply_to orelse return false;
+        if (!std.mem.eql(u8, &reply_to, &in_flight_key.request_message_id)) return false;
         if (self.hasResultLocked(result.session_id, result.tool_call_id)) return false;
         try self.results.append(allocator, result);
         return true;
     }
 
-    fn popResult(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) ?StdioToolResult {
+    /// Pops the queued result settling THIS generation's wait (#210): the
+    /// consumption is bound to the waiting execution's registration
+    /// generation and, through its in-flight key, to the request the reply
+    /// correlates to. A stopped run's cancelled wait that resumes after the
+    /// id was re-registered and the new run published the same
+    /// `tool_call_id` finds no key of its own generation and consumes
+    /// nothing — the new run's result and key survive for the new run.
+    fn popResult(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8, generation: u64) ?StdioToolResult {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        const key_idx = self.findInFlightIndexForGenerationLocked(session_id, tool_call_id, generation) orelse return null;
+        const key = self.in_flight.items[key_idx];
         for (self.results.items, 0..) |result, idx| {
             if (std.mem.eql(u8, &result.session_id, &session_id) and std.mem.eql(u8, result.tool_call_id, tool_call_id)) {
-                self.removeInFlightLocked(allocator, session_id, tool_call_id);
+                const reply_to = result.in_reply_to orelse continue;
+                if (!std.mem.eql(u8, &reply_to, &key.request_message_id)) continue;
+                var removed_key = self.in_flight.orderedRemove(key_idx);
+                removed_key.deinit(allocator);
                 return self.results.orderedRemove(idx);
             }
         }
@@ -302,11 +370,18 @@ const StdioToolBridge = struct {
         }
     }
 
-    fn hasInFlightLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) bool {
+    fn findInFlightLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) ?StdioToolKey {
         for (self.in_flight.items) |key| {
-            if (std.mem.eql(u8, &key.session_id, &session_id) and std.mem.eql(u8, key.tool_call_id, tool_call_id)) return true;
+            if (std.mem.eql(u8, &key.session_id, &session_id) and std.mem.eql(u8, key.tool_call_id, tool_call_id)) return key;
         }
-        return false;
+        return null;
+    }
+
+    fn findInFlightIndexForGenerationLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8, generation: u64) ?usize {
+        for (self.in_flight.items, 0..) |key, idx| {
+            if (key.generation == generation and std.mem.eql(u8, &key.session_id, &session_id) and std.mem.eql(u8, key.tool_call_id, tool_call_id)) return idx;
+        }
+        return null;
     }
 
     fn hasResultLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) bool {
@@ -327,6 +402,23 @@ const StdioToolBridge = struct {
             idx += 1;
         }
     }
+
+    /// Removes every queued result for the (session, tool_call_id) pair —
+    /// the results-queue half of `markInFlight`'s supersession (#210 gap 6):
+    /// a result that passed the OLD request's correlation and survived a
+    /// §13.4.4 bridge-discard leak must not be handed to the new execution
+    /// by the key-only pop. Caller must hold the mutex.
+    fn removeResultsLocked(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) void {
+        var idx: usize = 0;
+        while (idx < self.results.items.len) {
+            if (std.mem.eql(u8, &self.results.items[idx].session_id, &session_id) and std.mem.eql(u8, self.results.items[idx].tool_call_id, tool_call_id)) {
+                var removed = self.results.orderedRemove(idx);
+                removed.deinit(allocator);
+                continue;
+            }
+            idx += 1;
+        }
+    }
 };
 
 const StdioAgentToolExecutor = struct {
@@ -337,6 +429,11 @@ const StdioAgentToolExecutor = struct {
     /// publication can discard requests whose registration is no longer
     /// current.
     generation: u64,
+    /// Shared with the owning `ActiveAgentRun` (#210 gap 4): set by the
+    /// tool wait when it fails on the disconnect latch, read by the run
+    /// pump so the run settles through the failure pair instead of
+    /// whatever termination the loop reached after losing its tool host.
+    disconnect_failed: *std.atomic.Value(bool),
 };
 
 const ActiveAgentRun = struct {
@@ -353,6 +450,11 @@ const ActiveAgentRun = struct {
     prompts: []ai_types.Message,
     tools: []agent_loop.AgentTool,
     cancel_flag: *std.atomic.Value(bool),
+    /// Set when one of the run's distributed tool waits failed on the
+    /// disconnect latch (#210 gap 4): the run needed client input after
+    /// EOF, so its settlement is a typed failure — never a success
+    /// `agent_result` (§13.4.6's EOF-before-settlement rule).
+    disconnect_failed: *std.atomic.Value(bool),
     tool_executor: *StdioAgentToolExecutor,
     terminal_event_json: ?[]u8 = null,
 
@@ -370,6 +472,7 @@ const ActiveAgentRun = struct {
         allocator.free(self.prompts);
         deinitAgentTools(allocator, self.tools);
         allocator.destroy(self.cancel_flag);
+        allocator.destroy(self.disconnect_failed);
         allocator.destroy(self.tool_executor);
         if (self.terminal_event_json) |event_json| allocator.free(event_json);
         self.* = undefined;
@@ -604,6 +707,16 @@ const StdioProtocolLoop = struct {
         return self.auth_server.activeFlowCount() > 0;
     }
 
+    /// Latch stdin EOF (§13.2.7, #210 gap 4). Called by the stdio host once
+    /// the receive stream is done: the client — the host of every
+    /// distributed tool — is gone, so active tool waits fail with a typed
+    /// error, their runs settle through the failure pair, and the run pump
+    /// drains instead of blocking `hasActiveAgentRuns()` forever.
+    /// Idempotent.
+    pub fn markStdinDisconnected(self: *Self) void {
+        self.tool_bridge.markDisconnected();
+    }
+
     fn startPendingAgentRuns(self: *Self) !usize {
         var started: usize = 0;
         while (self.agent_server.popPendingAgentMessage()) |pending| {
@@ -612,7 +725,7 @@ const StdioProtocolLoop = struct {
 
             self.startAgentRun(owned_pending) catch |err| {
                 if (err == error.OutOfMemory) return err;
-                try self.publishAgentLoopError(owned_pending.session_id, @errorName(err));
+                try self.publishAgentLoopError(owned_pending.session_id, .internal_error, @errorName(err));
                 self.agent_server.markSessionError(owned_pending.session_id) catch {};
                 continue;
             };
@@ -657,6 +770,11 @@ const StdioProtocolLoop = struct {
         errdefer if (!cancel_owned_by_run) self.allocator.destroy(cancel_flag);
         cancel_flag.* = std.atomic.Value(bool).init(false);
 
+        const disconnect_failed = try self.allocator.create(std.atomic.Value(bool));
+        var disconnect_owned_by_run = false;
+        errdefer if (!disconnect_owned_by_run) self.allocator.destroy(disconnect_failed);
+        disconnect_failed.* = std.atomic.Value(bool).init(false);
+
         const tool_executor = try self.allocator.create(StdioAgentToolExecutor);
         var tool_executor_owned_by_run = false;
         errdefer if (!tool_executor_owned_by_run) self.allocator.destroy(tool_executor);
@@ -664,6 +782,7 @@ const StdioProtocolLoop = struct {
             .bridge = &self.tool_bridge,
             .session_id = pending.session_id,
             .generation = generation,
+            .disconnect_failed = disconnect_failed,
         };
 
         const session_id_text = try AgentProtocolTypes.sessionIdToString(pending.session_id, self.allocator);
@@ -700,11 +819,13 @@ const StdioProtocolLoop = struct {
             .prompts = prepared.prompts,
             .tools = prepared.tools,
             .cancel_flag = cancel_flag,
+            .disconnect_failed = disconnect_failed,
             .tool_executor = tool_executor,
         };
         prepared.options.deinit(self.allocator);
         context_owned_by_run = true;
         cancel_owned_by_run = true;
+        disconnect_owned_by_run = true;
         tool_executor_owned_by_run = true;
         stream_owned_by_run = true;
         prepared.disarm();
@@ -763,8 +884,27 @@ const StdioProtocolLoop = struct {
             }
 
             if (registration_current) {
-                if (run.stream.getError()) |msg| {
-                    try self.publishAgentLoopError(run.session_id, msg);
+                if (run.disconnect_failed.load(.acquire)) {
+                    // §13.2.7/§13.4.6 (#210 gap 4): the run needed client
+                    // input after stdin EOF — a distributed tool wait can
+                    // never be satisfied by a disconnected tool host, so
+                    // whatever termination the loop reached afterwards, the
+                    // settlement is a typed failure, never a success
+                    // `agent_result`. Checked before the stream error: the
+                    // disconnect is the root cause even when the stream
+                    // also failed later. §3.5's loop-internal failure shape
+                    // carries one terminal error event and no trailing
+                    // `agent_end`, so the captured terminal projection is
+                    // dropped rather than published after the pair.
+                    if (run.terminal_event_json) |event_json| {
+                        self.allocator.free(event_json);
+                        run.terminal_event_json = null;
+                    }
+                    try self.publishAgentLoopError(run.session_id, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE);
+                    self.agent_server.markSessionError(run.session_id) catch {};
+                    forwarded += 1;
+                } else if (run.stream.getError()) |msg| {
+                    try self.publishAgentLoopError(run.session_id, .internal_error, msg);
                     self.agent_server.markSessionError(run.session_id) catch {};
                     forwarded += 1;
                 } else if (run.stream.getResult()) |result| {
@@ -824,13 +964,13 @@ const StdioProtocolLoop = struct {
         self.tool_bridge.discardSession(self.allocator, session_id);
     }
 
-    fn publishAgentLoopError(self: *Self, session_id: AgentProtocolTypes.SessionId, message: []const u8) !void {
-        const event_json = try serializeAgentErrorEvent(self.allocator, message, "internal_error");
+    fn publishAgentLoopError(self: *Self, session_id: AgentProtocolTypes.SessionId, code: AgentProtocolTypes.AgentErrorCode, message: []const u8) !void {
+        const event_json = try serializeAgentErrorEvent(self.allocator, message, @tagName(code));
         defer self.allocator.free(event_json);
         self.agent_server.publishAgentEvent(session_id, event_json) catch |err| {
             if (err == error.OutOfMemory) return err;
         };
-        self.agent_server.publishAgentError(session_id, .internal_error, message) catch |err| {
+        self.agent_server.publishAgentError(session_id, code, message) catch |err| {
             if (err == error.OutOfMemory) return err;
         };
     }
@@ -859,8 +999,11 @@ const StdioProtocolLoop = struct {
                 break :blk current != null and current.? == request.generation;
             };
             if (!registration_current) continue;
-            try self.tool_bridge.markInFlight(self.allocator, request.session_id, request.tool_call_id);
-            errdefer self.tool_bridge.discardInFlight(self.allocator, request.session_id, request.tool_call_id);
+            // §13.2.7 (#210 gap 4): once stdin has closed, no client can
+            // answer a `tool_execute` — drop the request instead of
+            // publishing into a dead pipe; the enqueueing wait fails
+            // through the bridge's disconnect latch.
+            if (self.tool_bridge.isDisconnected()) continue;
 
             var env = AgentProtocolTypes.Envelope{
                 .session_id = request.session_id,
@@ -874,6 +1017,14 @@ const StdioProtocolLoop = struct {
                 } },
             };
             errdefer env.deinit(self.allocator);
+
+            // The in-flight key carries the published request's
+            // `message_id` (so a later `tool_result` must be correlated to
+            // THIS `tool_execute` to settle the wait, #210 gap 6, §13.1)
+            // and the run's registration generation (so result CONSUMPTION
+            // is bound to the waiting execution, §13.4.5).
+            try self.tool_bridge.markInFlight(self.allocator, request.session_id, request.tool_call_id, env.message_id, request.generation);
+            errdefer self.tool_bridge.discardInFlight(self.allocator, request.session_id, request.tool_call_id);
             try self.agent_server.enqueueEnvelope(env);
             published += 1;
         }
@@ -1326,22 +1477,46 @@ fn executeStdioToolViaAgentProtocol(
     const executor: *StdioAgentToolExecutor = @ptrCast(@alignCast(ctx.?));
     try executor.bridge.enqueueRequest(allocator, executor.session_id, executor.generation, tool_call_id, tool_name, args_json);
 
-    while (true) {
-        if (cancel_token) |token| {
-            if (token.isCancelled()) return error.Cancelled;
-        }
-        if (executor.bridge.popResult(allocator, executor.session_id, tool_call_id)) |result| {
+    const popAndBuild = struct {
+        fn run(
+            bridge: *StdioToolBridge,
+            alloc: std.mem.Allocator,
+            pop_session_id: AgentProtocolTypes.SessionId,
+            pop_tool_call_id: []const u8,
+            pop_generation: u64,
+        ) !?agent_loop.AgentToolResult {
+            const result = bridge.popResult(alloc, pop_session_id, pop_tool_call_id, pop_generation) orelse return null;
             var owned_result = result;
-            defer owned_result.deinit(allocator);
-            const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
-            errdefer deinitUserContentParts(allocator, content);
-            const details_json = try allocator.dupe(u8, owned_result.details_json);
-            errdefer allocator.free(details_json);
+            defer owned_result.deinit(alloc);
+            const content = try parseToolResultContentPartsJson(alloc, owned_result.result_json);
+            errdefer deinitUserContentParts(alloc, content);
+            const details_json = try alloc.dupe(u8, owned_result.details_json);
+            errdefer alloc.free(details_json);
             return .{
                 .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
                 .details_json = ai_types.OwnedSlice(u8).initOwned(details_json),
                 .is_error = owned_result.is_error,
             };
+        }
+    }.run;
+
+    while (true) {
+        if (cancel_token) |token| {
+            if (token.isCancelled()) return error.Cancelled;
+        }
+        if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id, executor.generation)) |tool_result| return tool_result;
+        // §13.2.7/§13.4.6 (#210 gap 4): stdin EOF means the tool host is
+        // disconnected — this wait can never be satisfied by a new reply.
+        // A result delivered before EOF wins: the host latches the
+        // disconnect only after stdin's ring is fully drained, so no
+        // further result can be enqueued past this point — but this
+        // iteration's pop may have raced the last dispatch, so re-check
+        // once before failing.
+        if (executor.bridge.isDisconnected()) {
+            if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id, executor.generation)) |tool_result| return tool_result;
+            executor.disconnect_failed.store(true, .release);
+            if (cancel_token) |token| token.cancelled.store(true, .release);
+            return error.ClientDisconnected;
         }
         compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
@@ -1978,6 +2153,7 @@ fn parseStdioToolResultFromLine(line: []const u8, allocator: std.mem.Allocator) 
     return .{
         .session_id = env.session_id,
         .tool_call_id = owned_tool_call_id,
+        .in_reply_to = env.in_reply_to,
         .result_json = owned_result_json,
         .details_json = owned_details_json,
         .is_error = result.is_error,
@@ -2140,6 +2316,16 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
                 did_work = true;
             }
         }
+
+        // §13.2.7 (#210 gap 4): a done receive stream means stdin EOF — the
+        // client hosting every distributed tool is gone. A done stream can
+        // still hold a final undispatched chunk (the reader pushes the last
+        // line before completing), so the latch waits for the ring to drain
+        // too: every frame delivered before EOF — possibly the tool_result
+        // that must win its wait — is dispatched first, and from the latch
+        // on no further result can arrive. The loop below can then actually
+        // drain `hasActiveAgentRuns()` instead of blocking forever.
+        if (stdin_stream.isDone() and !stdin_stream.hasPending()) stdio_loop.markStdinDisconnected();
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
             try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
@@ -2791,6 +2977,64 @@ fn fixtureToolUseStreamSimple(
     return fixtureToolUseStream(model, context, null, allocator);
 }
 
+fn fixtureDistributedToolStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+    _ = options;
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    // Content-block strings of a completed result are freed UNCONDITIONALLY
+    // at stream deinit (AssistantMessage.deinit's ownership contract), so
+    // the fixture must hand over allocator-owned strings — no literals.
+    const owned_id = try allocator.dupe(u8, "dist-call-1");
+    errdefer allocator.free(owned_id);
+    const owned_name = try allocator.dupe(u8, "lookup");
+    errdefer allocator.free(owned_name);
+    const owned_args = try allocator.dupe(u8, "{}");
+    errdefer allocator.free(owned_args);
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .tool_call = .{
+        .id = owned_id,
+        .name = owned_name,
+        .arguments_json = owned_args,
+    } };
+
+    // Every turn emits one distributed tool call, so a run driven by this
+    // fixture parks in `executeStdioToolViaAgentProtocol`'s wait.
+    s.complete(.{
+        .content = content,
+        .api = "fixture-dist-api",
+        .provider = "fixture",
+        .model = "fixture-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = compat.time.nowMillis(),
+    });
+    s.markThreadDone();
+    return s;
+}
+
+fn fixtureDistributedToolStreamSimple(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.SimpleStreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = options;
+    return fixtureDistributedToolStream(model, context, null, allocator);
+}
+
 fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     const env = ProviderProtocolTypes.Envelope{
         .stream_id = ProviderProtocolTypes.generateUlid(),
@@ -2894,6 +3138,30 @@ fn makeAgentMessageEnvelopeJsonWithOptions(
             .session_id = session_id,
             .message_json = message_json,
             .options_json = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"api_key\":\"test-key\"}")),
+        } },
+    };
+    defer env.deinit(allocator);
+    return agent_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeToolResultEnvelopeJson(
+    allocator: std.mem.Allocator,
+    session_id: AgentProtocolTypes.SessionId,
+    tool_call_id: []const u8,
+    in_reply_to: ?AgentProtocolTypes.Ulid,
+    text: []const u8,
+) ![]u8 {
+    const result_json = try std.fmt.allocPrint(allocator, "[{{\"type\":\"text\",\"text\":\"{s}\"}}]", .{text});
+    defer allocator.free(result_json);
+    var env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .in_reply_to = in_reply_to,
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_result = .{
+            .tool_call_id = try allocator.dupe(u8, tool_call_id),
+            .result_json = try allocator.dupe(u8, result_json),
         } },
     };
     defer env.deinit(allocator);
@@ -3438,8 +3706,10 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
     const prompts = try allocator.alloc(ai_types.Message, 0);
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    disconnect_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = 0 };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = 0, .disconnect_failed = disconnect_flag };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -3453,6 +3723,7 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
         .prompts = prompts,
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .disconnect_failed = disconnect_flag,
         .tool_executor = tool_executor,
     });
 
@@ -3746,9 +4017,33 @@ test "stdio tool bridge publishes tool requests and consumes tool results" {
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(wrong_session_json)));
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
 
+    // A result whose `in_reply_to` does not name the outstanding
+    // `tool_execute` is discarded (#210 gap 6): the wait stays parked.
+    var mismatched_env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .in_reply_to = AgentProtocolTypes.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_result = .{
+            .tool_call_id = try allocator.dupe(u8, "call-1"),
+            .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"wrong correlation\"}]"),
+        } },
+    };
+    defer mismatched_env.deinit(allocator);
+    const mismatched_json = try agent_protocol_envelope.serializeEnvelope(mismatched_env, allocator);
+    defer allocator.free(mismatched_json);
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(mismatched_json)));
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
+
+    var tool_execute_env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+    defer tool_execute_env.deinit(allocator);
+    try std.testing.expect(tool_execute_env.payload == .tool_execute);
+
     var result_env = AgentProtocolTypes.Envelope{
         .session_id = session_id,
         .message_id = AgentProtocolTypes.generateUlid(),
+        .in_reply_to = tool_execute_env.message_id,
         .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_result = .{
@@ -3763,7 +4058,7 @@ test "stdio tool bridge publishes tool requests and consumes tool results" {
     try std.testing.expect(try stdio_loop.dispatchInboundLine(result_json));
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(result_json)));
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.results.items.len);
-    var result = stdio_loop.tool_bridge.popResult(allocator, session_id, "call-1").?;
+    var result = stdio_loop.tool_bridge.popResult(allocator, session_id, "call-1", stdio_loop.agent_server.sessionGeneration(session_id).?).?;
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"done\"}]", result.result_json);
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
@@ -3792,7 +4087,7 @@ test "stdio tool bridge clears queued and in-flight calls when cancelling sessio
     clearOwnedLines(allocator, &outbound);
 
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "queued-call", "lookup", "{}");
-    try stdio_loop.tool_bridge.markInFlight(allocator, session_id, "running-call");
+    try stdio_loop.tool_bridge.markInFlight(allocator, session_id, "running-call", AgentProtocolTypes.generateUlid(), 0);
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.requests.items.len);
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.in_flight.items.len);
 
@@ -3873,6 +4168,384 @@ test "publishPendingToolRequests drops stale-generation requests after id re-reg
     // The new registration's own request publishes normally.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, second_generation, "fresh-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
+}
+
+test "stale tool_result for a reused tool_call_id is rejected by in_reply_to correlation" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    clearOwnedLines(allocator, &outbound);
+
+    // First execution of the reused id: published, answered, consumed. The
+    // publish only enqueues the frame into the server outbox — a background
+    // pump must move it to the pipe before the drain can observe it.
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
+    try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    var first_env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+    defer first_env.deinit(allocator);
+    const first_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", first_env.message_id, "first");
+    defer allocator.free(first_result_json);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(first_result_json));
+    var consumed = stdio_loop.tool_bridge.popResult(allocator, session_id, "dup-call", stdio_loop.agent_server.sessionGeneration(session_id).?).?;
+    consumed.deinit(allocator);
+
+    // A later execution REUSES the tool_call_id; its outstanding
+    // tool_execute is a different message. A delayed reply to the FIRST
+    // execution must not settle the second wait (#210 gap 6).
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
+    try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    var second_env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[1], allocator);
+    defer second_env.deinit(allocator);
+    try std.testing.expect(!std.mem.eql(u8, &first_env.message_id, &second_env.message_id));
+
+    // Stale reply (in_reply_to names the first execution): discarded.
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(first_result_json)));
+    // Uncorrelated reply (no in_reply_to): discarded.
+    const bare_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", null, "bare");
+    defer allocator.free(bare_result_json);
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(bare_result_json)));
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
+
+    // The correctly-correlated reply settles the CURRENT execution.
+    const second_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", second_env.message_id, "second");
+    defer allocator.free(second_result_json);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(second_result_json));
+    try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.results.items.len);
+    var final_result = stdio_loop.tool_bridge.popResult(allocator, session_id, "dup-call", stdio_loop.agent_server.sessionGeneration(session_id).?).?;
+    defer final_result.deinit(allocator);
+    try std.testing.expect(std.mem.find(u8, final_result.result_json, "second") != null);
+}
+
+test "distributed tool wait fails promptly on the disconnect latch" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var disconnect_flag = std.atomic.Value(bool).init(false);
+    var executor = StdioAgentToolExecutor{
+        .bridge = &bridge,
+        .session_id = session_id,
+        .generation = 0,
+        .disconnect_failed = &disconnect_flag,
+    };
+
+    // Stdin EOF latched before the wait runs: it enqueues its request, then
+    // fails on the first poll iteration with the typed error, flags the run
+    // disconnect-failed, and marks the run cancelled so the loop stops
+    // issuing turns (#210 gap 4). No sleep-spin, no hang.
+    bridge.markDisconnected();
+    try std.testing.expectError(
+        error.ClientDisconnected,
+        executeStdioToolViaAgentProtocol(@ptrCast(&executor), "call-1", "lookup", "{}", .{ .cancelled = &cancel_flag }, null, null, allocator),
+    );
+    try std.testing.expect(disconnect_flag.load(.acquire));
+    try std.testing.expect(cancel_flag.load(.acquire));
+    // The wait's own request stays unpublished (the publisher drops it on
+    // the latch); its bridge entry is freed at deinit.
+    try std.testing.expectEqual(@as(usize, 1), bridge.requests.items.len);
+}
+
+test "tool result delivered before the disconnect latch settles its wait" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const request_id = AgentProtocolTypes.generateUlid();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var disconnect_flag = std.atomic.Value(bool).init(false);
+    var executor = StdioAgentToolExecutor{
+        .bridge = &bridge,
+        .session_id = session_id,
+        .generation = 0,
+        .disconnect_failed = &disconnect_flag,
+    };
+
+    try bridge.markInFlight(allocator, session_id, "call-1", request_id, 0);
+    const delivered = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "call-1"),
+        .in_reply_to = request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"delivered\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, delivered));
+
+    // The client answered and only then closed stdin: the queued result is
+    // checked before the latch, so the wait settles with the answer — EOF
+    // before settlement is failure, but this settlement already happened.
+    bridge.markDisconnected();
+    var tool_result = try executeStdioToolViaAgentProtocol(@ptrCast(&executor), "call-1", "lookup", "{}", .{ .cancelled = &cancel_flag }, null, null, allocator);
+    defer tool_result.deinit(allocator);
+    try std.testing.expect(!tool_result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.content.slice().len);
+    try std.testing.expect(!disconnect_flag.load(.acquire));
+    try std.testing.expect(!cancel_flag.load(.acquire));
+}
+
+test "tool result enqueued after the disconnect latch still wins the wait" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const request_id = AgentProtocolTypes.generateUlid();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var disconnect_flag = std.atomic.Value(bool).init(false);
+    var executor = StdioAgentToolExecutor{
+        .bridge = &bridge,
+        .session_id = session_id,
+        .generation = 0,
+        .disconnect_failed = &disconnect_flag,
+    };
+
+    // The straddle the single pre-latch pop cannot close: the wait's poll
+    // missed the last dispatch, the host then latched EOF, and only now is
+    // the delivered result visible in the bridge. The latch makes further
+    // enqueues impossible, so the post-latch re-check is final — a result
+    // delivered before EOF still wins (§13.2.7 rule 7).
+    bridge.markDisconnected();
+    try bridge.markInFlight(allocator, session_id, "call-1", request_id, 0);
+    const delivered = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "call-1"),
+        .in_reply_to = request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"late-visible\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, delivered));
+
+    var tool_result = try executeStdioToolViaAgentProtocol(@ptrCast(&executor), "call-1", "lookup", "{}", .{ .cancelled = &cancel_flag }, null, null, allocator);
+    defer tool_result.deinit(allocator);
+    try std.testing.expect(!tool_result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.content.slice().len);
+    try std.testing.expect(!disconnect_flag.load(.acquire));
+    try std.testing.expect(!cancel_flag.load(.acquire));
+}
+
+test "a new execution supersedes a leaked in-flight key for the same tool_call_id" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const stale_request_id = AgentProtocolTypes.generateUlid();
+    const current_request_id = AgentProtocolTypes.generateUlid();
+
+    // A key leaked past a stop whose reply publication failed before the
+    // bridge discard (§13.4.4), then the id re-registered and the provider
+    // reused the tool_call_id: the new execution's key must supersede the
+    // stale one — first-match correlation must never see the leak.
+    try bridge.markInFlight(allocator, session_id, "dup-call", stale_request_id, 1);
+    // A reply to the stale request that already passed its correlation and
+    // queued before the leak: it must be purged together with the key, or
+    // the key-only pop would hand it to the new execution while the
+    // duplicate-result check rejects the new execution's own reply.
+    const stale_queued_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = stale_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"stale queued\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, stale_queued_result));
+    try std.testing.expectEqual(@as(usize, 1), bridge.results.items.len);
+
+    try bridge.markInFlight(allocator, session_id, "dup-call", current_request_id, 1);
+    try std.testing.expectEqual(@as(usize, 1), bridge.in_flight.items.len);
+    try std.testing.expectEqual(@as(usize, 0), bridge.results.items.len);
+
+    var stale_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = stale_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"stale\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    const queued_stale = try bridge.enqueueResult(allocator, stale_result);
+    if (!queued_stale) stale_result.deinit(allocator);
+    try std.testing.expect(!queued_stale);
+
+    const current_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = current_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"current\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, current_result));
+    var popped = bridge.popResult(allocator, session_id, "dup-call", 1).?;
+    defer popped.deinit(allocator);
+    try std.testing.expect(std.mem.find(u8, popped.result_json, "current") != null);
+}
+
+test "result consumption is generation-bound: a stale wait cannot steal the new run's result" {
+    const allocator = std.testing.allocator;
+
+    var bridge = StdioToolBridge{};
+    defer bridge.deinit(allocator);
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const new_request_id = AgentProtocolTypes.generateUlid();
+
+    // The stop discarded the old registration's bridge state, the id was
+    // re-registered, and the new run published and received its correctly
+    // correlated reply — while the OLD run's cancelled wait thread was
+    // preempted between its cancel check and its pop (#210, §13.4.5). The
+    // stale wait (generation 1) must consume nothing: the queued result
+    // and the in-flight key belong to the new registration's run
+    // (generation 2), and a pair-only pop would have stolen both.
+    try bridge.markInFlight(allocator, session_id, "dup-call", new_request_id, 2);
+    const new_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = new_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"new run\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, new_result));
+
+    try std.testing.expect(bridge.popResult(allocator, session_id, "dup-call", 1) == null);
+    try std.testing.expectEqual(@as(usize, 1), bridge.results.items.len);
+    try std.testing.expectEqual(@as(usize, 1), bridge.in_flight.items.len);
+
+    var owned = bridge.popResult(allocator, session_id, "dup-call", 2).?;
+    defer owned.deinit(allocator);
+    try std.testing.expect(std.mem.find(u8, owned.result_json, "new run") != null);
+    try std.testing.expectEqual(@as(usize, 0), bridge.results.items.len);
+    try std.testing.expectEqual(@as(usize, 0), bridge.in_flight.items.len);
+}
+
+test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-dist-api",
+        .stream = fixtureDistributedToolStream,
+        .stream_simple = fixtureDistributedToolStreamSimple,
+    }, "test-fixtures");
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-dist-api@fixture-model";
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+
+    const tools_json =
+        \\[{"name":"lookup","description":"Lookup","parameters_schema":{"type":"object"}}]
+    ;
+    // `message_json` is freed by the envelope's payload deinit (it owns the
+    // slice), mirroring `makeAgentMessageEnvelopeJson`. The small iteration
+    // cap bounds the fixture's post-EOF turn ping-pong (every turn requests
+    // the same distributed tool).
+    const message_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}],\"tools\":{s},\"options\":{{\"max_iterations\":3}}}}",
+        .{ model_ref_text, tools_json },
+    );
+    var message_env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_message = .{
+            .session_id = session_id,
+            .message_json = message_json,
+            .options_json = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"api_key\":\"test-key\"}")),
+        } },
+    };
+    defer message_env.deinit(allocator);
+    const message_req = try agent_protocol_envelope.serializeEnvelope(message_env, allocator);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+
+    // The real run thread parks in the distributed tool wait: pump until
+    // its tool_execute is published.
+    var saw_tool_execute = false;
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            if (std.mem.find(u8, line, "\"type\":\"tool_execute\"") != null) saw_tool_execute = true;
+        }
+        if (saw_tool_execute) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(saw_tool_execute);
+
+    // The host observes stdin EOF (§13.2.7, #210 gap 4): the wait fails
+    // with the typed error, the run settles through the failure pair, and
+    // the run pump drains instead of hanging on the wait forever.
+    stdio_loop.markStdinDisconnected();
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        if (!stdio_loop.hasActiveAgentRuns()) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+
+    var saw_disconnect_settlement = false;
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "\"type\":\"agent_result\"") == null);
+        // §3.5's loop-internal failure shape carries one terminal error
+        // event and no trailing agent_end — the disconnect settlement must
+        // not publish the run's captured terminal projection after the pair.
+        try std.testing.expect(std.mem.find(u8, line, "\"agent_end\"") == null);
+        if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
+            std.mem.find(u8, line, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE) != null)
+        {
+            saw_disconnect_settlement = true;
+        }
+    }
+    try std.testing.expect(saw_disconnect_settlement);
+
+    // The failed run marks the session .error, and no tool request
+    // enqueued after EOF is published into the dead pipe.
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.@"error",
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {
@@ -4448,8 +5121,10 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
 
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    disconnect_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = stdio_loop.agent_server.sessionGeneration(session_id).? };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = stdio_loop.agent_server.sessionGeneration(session_id).?, .disconnect_failed = disconnect_flag };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4462,6 +5137,7 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
         .prompts = try allocator.alloc(ai_types.Message, 0),
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .disconnect_failed = disconnect_flag,
         .tool_executor = tool_executor,
     });
 
@@ -4525,8 +5201,10 @@ test "stopped session's late run publications are discarded after id re-registra
 
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    disconnect_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation, .disconnect_failed = disconnect_flag };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4537,6 +5215,7 @@ test "stopped session's late run publications are discarded after id re-registra
         .prompts = try allocator.alloc(ai_types.Message, 0),
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .disconnect_failed = disconnect_flag,
         .tool_executor = tool_executor,
     });
 
@@ -4620,8 +5299,10 @@ test "re-created session's admitted run is not failed by the stopped registratio
 
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    disconnect_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation, .disconnect_failed = disconnect_flag };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4632,6 +5313,7 @@ test "re-created session's admitted run is not failed by the stopped registratio
         .prompts = try allocator.alloc(ai_types.Message, 0),
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .disconnect_failed = disconnect_flag,
         .tool_executor = tool_executor,
     });
 
@@ -4706,13 +5388,15 @@ test "agent_stop cancels every listed run for the id, including the current regi
 
     const stale_flag = try allocator.create(std.atomic.Value(bool));
     stale_flag.* = std.atomic.Value(bool).init(false);
+    const stale_disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    stale_disconnect_flag.* = std.atomic.Value(bool).init(false);
     {
         const stream = try allocator.create(agent_loop.AgentEventStream);
         stream.* = agent_loop.AgentEventStream.init(allocator);
         const context = try allocator.create(agent_loop.AgentContext);
         context.* = agent_loop.AgentContext.init(allocator);
         const tool_executor = try allocator.create(StdioAgentToolExecutor);
-        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
+        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation, .disconnect_failed = stale_disconnect_flag };
         try stdio_loop.active_agent_runs.append(allocator, .{
             .session_id = session_id,
             .generation = first_generation,
@@ -4722,6 +5406,7 @@ test "agent_stop cancels every listed run for the id, including the current regi
             .prompts = try allocator.alloc(ai_types.Message, 0),
             .tools = try allocator.alloc(agent_loop.AgentTool, 0),
             .cancel_flag = stale_flag,
+            .disconnect_failed = stale_disconnect_flag,
             .tool_executor = tool_executor,
         });
     }
@@ -4738,13 +5423,15 @@ test "agent_stop cancels every listed run for the id, including the current regi
 
     const current_flag = try allocator.create(std.atomic.Value(bool));
     current_flag.* = std.atomic.Value(bool).init(false);
+    const current_disconnect_flag = try allocator.create(std.atomic.Value(bool));
+    current_disconnect_flag.* = std.atomic.Value(bool).init(false);
     {
         const stream = try allocator.create(agent_loop.AgentEventStream);
         stream.* = agent_loop.AgentEventStream.init(allocator);
         const context = try allocator.create(agent_loop.AgentContext);
         context.* = agent_loop.AgentContext.init(allocator);
         const tool_executor = try allocator.create(StdioAgentToolExecutor);
-        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = second_generation };
+        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = second_generation, .disconnect_failed = current_disconnect_flag };
         try stdio_loop.active_agent_runs.append(allocator, .{
             .session_id = session_id,
             .generation = second_generation,
@@ -4754,6 +5441,7 @@ test "agent_stop cancels every listed run for the id, including the current regi
             .prompts = try allocator.alloc(ai_types.Message, 0),
             .tools = try allocator.alloc(agent_loop.AgentTool, 0),
             .cancel_flag = current_flag,
+            .disconnect_failed = current_disconnect_flag,
             .tool_executor = tool_executor,
         });
     }
@@ -4862,6 +5550,89 @@ test "stdio mode preserves ready handshake compatibility" {
 
     compat.stdio.close(stdin_write);
     stdin_write_closed = true;
+    try std.testing.expect(runner.err == null);
+}
+
+test "stdio mode exits promptly on stdin EOF with a registered session" {
+    const allocator = std.testing.allocator;
+
+    const stdin_pipe = try compat.stdio.pipe();
+    const stdout_pipe = try compat.stdio.pipe();
+
+    const stdin_read = stdin_pipe[0];
+    const stdin_write = stdin_pipe[1];
+    const stdout_read = stdout_pipe[0];
+    const stdout_write = stdout_pipe[1];
+    errdefer {
+        compat.stdio.close(stdin_read);
+        compat.stdio.close(stdin_write);
+        compat.stdio.close(stdout_read);
+        compat.stdio.close(stdout_write);
+    }
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
+        err: ?anyerror = null,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            runStdioMode(self.allocator, self.stdin_file, self.stdout_file) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .release);
+            compat.stdio.close(self.stdin_file);
+            compat.stdio.close(self.stdout_file);
+        }
+    };
+
+    var runner = Runner{
+        .allocator = allocator,
+        .stdin_file = stdin_read,
+        .stdout_file = stdout_write,
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    defer thread.join();
+
+    var stdin_write_closed = false;
+    defer if (!stdin_write_closed) compat.stdio.close(stdin_write);
+
+    var out_receiver = stdio.StdioReceiver.initWithFile(stdout_read, allocator);
+    defer out_receiver.deinit();
+    defer compat.stdio.close(stdout_read);
+
+    var receiver = out_receiver.receiver();
+
+    const ready_line = (try receiver.read(allocator)).?;
+    defer allocator.free(ready_line);
+    try std.testing.expectEqualStrings("{\"type\":\"ready\",\"protocol_version\":\"1\"}", ready_line);
+
+    // Register a session so the EOF path runs with live agent-protocol
+    // state, then drop the write side of stdin: the host must observe EOF,
+    // latch the disconnect, and exit cleanly (§13.2.7, #210 gap 4) instead
+    // of outliving the connection.
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try compat.stdio.writeLine(stdin_write, start_req);
+
+    const started_line = (try receiver.read(allocator)).?;
+    defer allocator.free(started_line);
+    try std.testing.expect(std.mem.find(u8, started_line, "\"type\":\"agent_started\"") != null);
+
+    compat.stdio.close(stdin_write);
+    stdin_write_closed = true;
+
+    var exited = false;
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        if (runner.done.load(.acquire)) {
+            exited = true;
+            break;
+        }
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(exited);
     try std.testing.expect(runner.err == null);
 }
 
