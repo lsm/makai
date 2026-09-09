@@ -738,10 +738,14 @@ pub const TuiRuntime = struct {
                 // client-generated (exclusive, §6.1), so when the probe is
                 // ineligible — outcome already resolved, or nothing sent — the
                 // plain tracked stop is safe and its sequence is the correct
-                // one.
-                if (client.sendAgentStopProbing(sid, "client disconnect") catch null) |_| {} else {
-                    _ = client.sendAgentStop(sid, "client disconnect") catch {};
-                }
+                // one. A probe ERROR (pre-wire failure or ambiguous write) is
+                // distinct: no fallback stop is sent, since it could race a
+                // partially delivered probe stop or carry the wrong sequence.
+                if (client.sendAgentStopProbing(sid, "client disconnect")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                    }
+                } else |_| {}
                 self.driveRemoteStopProbe(client, sid);
                 client.removeSessionState(sid);
             }
@@ -1101,10 +1105,13 @@ pub const TuiRuntime = struct {
             if (self.remote_session_id orelse self.remote_pending_session_id) |sid| {
                 // Same probe-first teardown as the disconnect path (#210 gap
                 // 7): the pump below processes the stop's replies, driving
-                // the probe's post-send retry when the first was rejected.
-                if (client.sendAgentStopProbing(sid, "cancelled") catch null) |_| {} else {
-                    _ = client.sendAgentStop(sid, "cancelled") catch {};
-                }
+                // the probe's post-send retry when the first was rejected;
+                // a probe ERROR sends no fallback (see the disconnect path).
+                if (client.sendAgentStopProbing(sid, "cancelled")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(sid, "cancelled") catch {};
+                    }
+                } else |_| {}
                 self.pumpRemoteIncoming() catch {};
                 self.driveRemoteStopProbe(client, sid);
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
@@ -1439,15 +1446,43 @@ pub const TuiRuntime = struct {
     /// client's `processEnvelope` once the first stop's correlated rejection
     /// arrives, so pump (bounded) until the probe settles or the budget
     /// expires — a reply not already buffered must still get the chance to
-    /// trigger the retry before the caller drops the session state.
+    /// trigger the retry before the caller drops the session state. Uses the
+    /// teardown pump: a disconnect while tearing down is terminal — the
+    /// normal reconnect path would register a fresh session that nothing
+    /// ever stops.
     fn driveRemoteStopProbe(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient, sid: agent_protocol_types.SessionId) void {
         const budget_ms: i64 = 150;
         const deadline = compat.time.nowMillis() + budget_ms;
         while (client.hasActiveStopProbe(sid)) {
-            self.pumpRemoteIncoming() catch {};
+            self.pumpRemoteIncomingForTeardown();
             if (!client.hasActiveStopProbe(sid)) break;
             if (compat.time.nowMillis() >= deadline) break;
             compat.time.sleepNs(5 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Teardown-only variant of `pumpRemoteIncoming`: identical frame
+    /// processing, but a disconnect is TERMINAL — reconnecting during
+    /// stop/cancel would create a new pending session that the ongoing
+    /// teardown then clears without stopping, leaking it server-side until
+    /// eviction (#210 gap 7). All failures simply end the pump.
+    fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) void {
+        var receiver = &(self.remote_receiver orelse return);
+        const client = &(self.remote_client orelse return);
+        while (true) {
+            switch (receiver.read(self.allocator) catch return) {
+                .line => |line| {
+                    defer self.allocator.free(line);
+                    var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return;
+                    defer env.deinit(self.allocator);
+                    if (env.version != 1) return;
+                    client.processEnvelope(env) catch return;
+                    self.syncRemoteSessionFromClient(client) catch return;
+                    self.drainRemoteClientEvents(client) catch return;
+                },
+                .pending => return,
+                .disconnected => return,
+            }
         }
     }
 

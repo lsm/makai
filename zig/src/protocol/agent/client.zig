@@ -297,6 +297,13 @@ pub const AgentProtocolClient = struct {
     /// that is not. A caller with positive evidence can still issue
     /// `sendAgentStopWithSequence`.
     pub fn sendAgentStopProbing(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !?agent_types.Ulid {
+        // An in-flight probe wins over re-eligibility: a settlement or run
+        // output may have retired the pending message the probe is still
+        // reconciling, and a second teardown caller must not fall back to a
+        // racing plain stop at the same candidate sequence (#210 gap 7).
+        if (self.stop_probes_by_session.get(session_id)) |existing| {
+            return existing.first_msg_id;
+        }
         if (self.admitted_by_session.get(session_id) != true) return null;
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
         // The OLDEST unresolved message brackets the server's counter: within
@@ -312,15 +319,6 @@ pub const AgentProtocolClient = struct {
             }
         }
         const pre_send = oldest_message_sequence orelse return null;
-
-        // A probe is already in flight for this session: return ITS stop id
-        // instead of superseding it. Two stops at the same candidate sequence
-        // would race server-side (one accepted, one agent_not_found), and the
-        // orphaned rejection — its probe entry replaced — would surface as a
-        // false session failure even though cleanup succeeded (#210 gap 7).
-        if (self.stop_probes_by_session.get(session_id)) |existing| {
-            return existing.first_msg_id;
-        }
 
         // Register the probe BEFORE the stop reaches the wire so the
         // post-send bookkeeping is infallible; a failed write unregisters it.
@@ -419,6 +417,12 @@ pub const AgentProtocolClient = struct {
                     .session_id = env.session_id,
                     .json = owned_json,
                 });
+                // Run output proves the session's SOLE pending message was
+                // accepted (the TS tracker clears its unresolved marker on
+                // output the same way): retire it so a later cancellation
+                // stops directly at the advanced counter instead of probing
+                // the stale pre-send sequence (#210 gap 7).
+                self.retireSolePendingMessage(env.session_id);
             },
             .agent_result => |json| {
                 self.last_result_json.deinit(self.allocator);
@@ -437,8 +441,12 @@ pub const AgentProtocolClient = struct {
                 // isSessionComplete/getLastErrorForSession callers (#210
                 // gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, e.code)) {
+                    // Allocate the replacement BEFORE releasing the previous
+                    // value: a failed dupe must not leave last_error
+                    // undefined (a later update or deinit would double-free).
+                    const error_copy = try self.allocator.dupe(u8, e.message);
                     self.last_error.deinit(self.allocator);
-                    self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, e.message));
+                    self.last_error = OwnedSlice(u8).initOwned(error_copy);
                     try self.setSessionError(env.session_id, e.message);
                     if (env.in_reply_to == null) {
                         // An UNCORRELATED agent_error is a settlement
@@ -458,8 +466,11 @@ pub const AgentProtocolClient = struct {
                 // by nack would leave the TUI treating the submit as
                 // accepted with no settlement ever coming (#210 gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) {
+                    // Allocate the replacement BEFORE releasing the previous
+                    // value (see the agent_error arm).
+                    const reason_copy = try self.allocator.dupe(u8, n.reason.slice());
                     self.last_error.deinit(self.allocator);
-                    self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, n.reason.slice()));
+                    self.last_error = OwnedSlice(u8).initOwned(reason_copy);
                     try self.setSessionError(env.session_id, n.reason.slice());
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
                 }
@@ -542,6 +553,17 @@ pub const AgentProtocolClient = struct {
             try self.session_complete_flags.put(session_id, true);
         }
         return true;
+    }
+
+    /// Retires the session's pending record when it is exactly one message
+    /// send — used when run output arrives: the output proves that message
+    /// was accepted. With more than one pending send the accepting message
+    /// cannot be identified, so nothing is retired.
+    fn retireSolePendingMessage(self: *Self, session_id: agent_types.SessionId) void {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        if (list.items.len != 1) return;
+        if (list.items[0].kind != .message) return;
+        _ = list.orderedRemove(0);
     }
 
     /// Retires the pending-send record whose request a reply names (e.g. the
