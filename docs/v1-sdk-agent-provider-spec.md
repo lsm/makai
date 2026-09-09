@@ -1002,10 +1002,12 @@ Rules:
   the counter to 0 (overwriting any numbers the id consumed for `models_request`s
   issued before the start), and an id re-registered after a stop restarts it, so
   sequence values may repeat across registrations of the same id. Consumers MUST
-  treat the outbound counter as per-registration. `[current exception]` the
-  counter update itself ignores allocation failure (`nextOutgoingSequence`'s map
-  put is `catch {}`), so under memory pressure two frames can receive the same
-  sequence — monotonic allocation holds absent allocation failure (#204). Echo
+  treat the outbound counter as per-registration. `[current — #210 gap 5]` a
+  failed counter update now propagates instead of being swallowed: the frame
+  whose publication failed is not built, so allocated sequences remain
+  monotonic (a retried publication may burn the already-recorded value and
+  leave a GAP — gaps are already possible across allocated frames and MUST
+  NOT be treated as loss). Echo
   replies (`session_info`, `pong`, `tool_list_response`) copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
@@ -1298,45 +1300,70 @@ server eviction (rule 6), and holds no transcript and no persistence.
        quiescent drain — stop, then consume the settlement — before surfacing
        the error, and `stream()` already drained via its terminal teardown;
        the residual race for a settlement arriving after the bounded drain
-       remains, as in §13.4.5). An
-       out-of-memory failure in the RESULT-publication path is a further current
-       exception: the host ignores publication errors (`makai.zig` `pumpAgentRuns`
-       `catch {}`), so under memory pressure an admitted run can emit no
-       settlement at all (#210 gap 5). Worse, the host does not stop at that
-       failure: it proceeds to publish the saved trailing `agent_end`, and if that
-       second publication succeeds, SDK consumers report SUCCESS despite no
-       authoritative `agent_result` having been emitted — a false-success
-       projection (the gap-5 fix must suppress or couple the trailing event to the
-       result publication). Tool-request publication has the same failure family:
-       the pending tool request is removed from the bridge before its envelope is
-       built, so an allocation failure in between frees the request without
-       emitting `tool_execute` — the agent thread blocks in the tool wait forever
-       and the run settles never (transactional publication required, #210 gap 5).
-       Outbox delivery shares the failure: an envelope is popped (removed) before
-       it is serialized and written, so an allocation or write failure destroys an
-       already-built frame — an `agent_result` lost this way leaves the completed
-       run removed with no settlement and nothing to retry. The final stdio drain
-       extends the exposure: it advances the pipe read position before buffering
-       the line, and its failure is swallowed, so an already-delivered frame can
-       still be dropped after a successful outbox transaction. Ordinary
-       `agent_event` frames share it too: each event is consumed from the run
-       stream before publication and publication failures are swallowed, so a
-       dropped delta or tool-lifecycle event is never reconstructed — a stream
-       that still settles successfully can be silently truncated (all part of
-       #210 gap 5's transactional-publication scope). An OOM BETWEEN the two
-       frames of the
-       failure pair is the same exception from the other side: the event is
-       published, the envelope publication fails, the completed run stays queued,
-       and the next pump re-processes the same stream error and re-emits the
-       terminal event projection — consumers can observe multiple projections
-       under sustained memory pressure (also #210 gap 5). Run-START failures
-       differ from active-stream errors: the pending message is consumed before
-       the error pair is published and no active run exists to stay queued, so a
-       mid-pair failure there emits only the lone event projection, never
-       settles, and does NOT re-emit (the re-process behavior above applies only
-       to active-stream errors). The surviving session is `.error`, not
-       `.processing` (the status is set before the settlement frame is built),
-       so `agent_status` reports `.error` and another `agent_message` is
+       remains, as in §13.4.5).
+       Publication failures are transactional `[current — #210 gap 5]` —
+       settle-or-propagate exactly once through every publication path, with
+       the failure surfacing as the host's typed runtime error frame rather
+       than vanishing:
+       - RESULT publication: the run records settlement progress; a failed
+         `agent_result` publication keeps the run queued and propagates, the
+         next pump retries the frame, and the trailing `agent_end` projection
+         publishes ONLY after the frame commits — a failed result publication
+         can no longer produce a false-success projection. The session's
+         status flip rides the append (commit-then-flip): while the result
+         publication is pending the session stays `.processing`, so a
+         follow-up `agent_message` is rejected `agent_busy` at admission
+         (clean non-admission) rather than accepted and later converted into
+         an `AgentBusy` internal-error settlement by the retained run. A run
+         whose settlement frame committed no longer occupies the session's
+         one-active-run slot while it retries the trailing projection: the
+         next `agent_message` is admitted (the late trailing `agent_end` is
+         the §13.4.3 stale-`agent_end` interleave consumers drain per §6.1).
+       - the failure pair: the leading error-event projection and the
+         settlement envelope each record their commitment; a failure before
+         the projection retries the pair whole; a failure BETWEEN them (the
+         projection delivered, the envelope not) retries ONLY the envelope —
+         the projection is never re-emitted, and the envelope is never
+         abandoned after its projection because it is the frame clients
+         settle on (the Zig `AgentProtocolClient` marks a session complete
+         only on `agent_error`/`agent_result`/`agent_stopped`; a bare
+         `agent_event` is merely queued). The session's `.error` flip rides
+         the envelope's commit, so a pair being published or retried keeps
+         the session non-admissible exactly like a pending result.
+       - a stream that completed with NEITHER a result nor a recoverable
+         error — `completeWithError` marks the stream done even when copying
+         its error message hits OOM, leaving no outcome to publish and none
+         that a retry could produce — settles through the failure pair with
+         a generic typed failure; the run is never retained on an outcome
+         that cannot appear (the stdio shutdown drain waits on the run
+         list).
+       - ORDINARY `agent_event` frames: an event consumed from the run stream
+         but not committed to the outbox (serialization or publication
+         failure) cannot be reconstructed; the run is marked truncated and
+         its settlement converts to the loop-internal failure pair — a
+         truncated stream never settles "successfully".
+       - tool-request publication: the pending request stays queued until its
+         `tool_execute` envelope is committed to the outbox, so a failure
+         retries instead of freeing the request under the agent thread's
+         parked tool wait.
+       - outbox delivery: the envelope is peeked, serialized, and written
+         BEFORE being removed — a failed delivery retries the queued frame;
+         the pipe write reserves data + newline before appending
+         (all-or-nothing), so a retry never lands on a partial line.
+       - the final stdio drain reserves its buffer slot before reading the
+         pipe (buffer-before-advance): an allocation failure leaves the frame
+         in the pipe for the next drain instead of dropping an
+         already-delivered one.
+       - the per-session outgoing-sequence counter update is no longer
+         swallowed (a failed counter write propagates; two frames can no
+         longer share a sequence).
+       Run-START failures remain the exception `[current]`: the pending
+       message is consumed before the error pair is published and no active
+       run exists to resume, so a mid-pair failure there emits only the lone
+       event projection, never settles, and does NOT re-emit — but the
+       session is marked `.error` BEFORE the pair is published, so a
+       mid-pair OOM leaves recoverable state rather than a `.processing`
+       wedge: `agent_status` reports `.error` and another `agent_message` is
        permitted — recovery logic MUST NOT wait on a processing run that no
        longer exists.
      - provider-originated failures (auth, network, invalid URL): the provider turn
@@ -1350,33 +1377,31 @@ server eviction (rule 6), and holds no transcript and no persistence.
        error detail); §3.5's one-terminal-`error`/no-`agent_end` rule applies to the
        loop-internal shape above, not to this one.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
-   exactly once, via result XOR error, never both — absent publication failure:
-   under memory pressure a run can emit no settlement or re-emit its terminal
-   projection (§13.4.2's OOM exceptions; #210 gap 5). Children settle first: pending
-   tool work resolves and the trailing `agent_end` is published only after
-   `agent_result`. Duplicate or late frames after settlement (e.g. a stale
-   `agent_end` read by a follow-up run on the same id) MUST NOT produce a second
-   settlement — clients drain per §6.1.
+   exactly once, via result XOR error, never both — including under publication
+   failure `[current — #210 gap 5]`: a failed settlement publication propagates
+   (the host surfaces it as a typed runtime error frame) and is retried with the
+   run's recorded progress, so no terminal frame or projection is re-published
+   after committing (the run-start mid-pair exception aside, §13.4.2). Children
+   settle first: pending tool work resolves and the trailing `agent_end` is
+   published only after `agent_result`. Duplicate or late frames after settlement
+   (e.g. a stale `agent_end` read by a follow-up run on the same id) MUST NOT
+   produce a second settlement — clients drain per §6.1.
 4. Cancellation is session settlement, not run settlement `[current]`: a validated
    `agent_stop` removes the session mid-run and cancels the run; the cancelled run's
    subsequent result/error publications are discarded because the session no longer
    exists. A cancelled run therefore produces NO run settlement frame — the
    `agent_stopped` reply correlated to the stop request is the client's terminal
-   observation `[current exception]`: the server removes the session BEFORE
-   building the reply, so an allocation failure in between tears the session down
-   with no `agent_stopped` at all — the client sees an uncorrelated runtime error
-   or times out although teardown succeeded, AND tool-bridge cleanup is skipped
-   (the stop's dispatch returns before reaching the run-cancel path, the only
-   caller of the bridge's session discard): stale pending/in-flight tool keys
-   survive and the bridge memory persists until process exit. Misattribution is
+   observation `[current exception]`: if that reply's own publication fails —
+   `[current — #210 gap 5]` the reply's owned fields are built BEFORE the
+   removal, and the stop's dispatch completes run cancellation and tool-bridge
+   cleanup (the bridge session discard) even when the reply's serialization or
+   its direct synchronous write — outside the outbox — fails, surfacing the
+   failure as the host's dispatch error frame — the client still sees no
+   `agent_stopped`, only that uncorrelated runtime error or a timeout, although
+   teardown succeeded and no bridge memory leaks. Misattribution is
    nonetheless closed by `in_reply_to` correlation (`[current — #210]`, §13.1): a
    delayed old `tool_result` names the old `tool_execute`'s `message_id` and is
-   discarded against a later same-id call; only the leaked bridge memory remains
-   (still part of the stop transaction in #210 gap 5). The same failure occurs even when the reply IS
-   built: synchronous replies are serialized and written directly, outside the
-   outbox, and a failure there propagates before the run-cancel path — session
-   removed, no `agent_stopped`, cleanup skipped (the stop transaction in #204
-   gap 5 covers direct reply delivery as well as the outbox).
+   discarded against a later same-id call.
    Makai has no run-scoped cancelled terminal (OAP
    `run.cancelled` is a ledger deviation); there is nothing for a consumer to wait
    on after `agent_stopped`.
