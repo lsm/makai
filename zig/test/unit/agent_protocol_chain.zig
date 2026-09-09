@@ -9,6 +9,7 @@ const agent_bridge = @import("agent_bridge");
 const protocol_agent_server = @import("protocol_agent_server");
 const protocol_agent_client = @import("protocol_agent_client");
 const protocol_agent_runtime = @import("protocol_agent_runtime");
+const agent_envelope = @import("agent_envelope");
 const in_process = @import("transports/in_process");
 
 const InProcessProviderProtocolBridge = agent_bridge.InProcessProviderProtocolBridge;
@@ -146,4 +147,42 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
     defer ev.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"turn_end\"}", ev.json.slice());
     try std.testing.expectEqualStrings("{\"ok\":true}", client.getLastResultJson().?);
+}
+
+test "agent_start dual-key parse binds the session under either payload key (#198)" {
+    // Wire-level: the payload id travels under the canonical `session_id`
+    // key (new clients) or the legacy `resume_session_id` alias (older
+    // clients); the server binds the session container to that id in both
+    // cases, and the §13.1 envelope-agreement check applies to whichever
+    // key carried it.
+    const allocator = std.testing.allocator;
+
+    const keys = [_][]const u8{ "session_id", "resume_session_id" };
+    for (keys) |key| {
+        var server = AgentProtocolServer.init(allocator);
+        defer server.deinit();
+
+        const sid = agent_types.parseSessionId("aaaaaaaaaaaaaaaaaaaaa").?;
+        const mid = "00000000000000000000000002";
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{}}\",\"{s}\":\"{s}\"}}}}",
+            .{ &sid, mid, key, &sid },
+        );
+        defer allocator.free(json);
+
+        var env = try agent_envelope.deserializeEnvelope(json, allocator);
+        defer env.deinit(allocator);
+        try std.testing.expectEqual(sid, env.payload.agent_start.session_id.?);
+
+        var resp = (try server.handleEnvelope(env)).?;
+        defer resp.deinit(allocator);
+
+        // The container is bound to the payload id (not a server-generated
+        // one) and the reply travels under the same id.
+        try std.testing.expect(resp.payload == .agent_started);
+        try std.testing.expectEqual(sid, resp.payload.agent_started.session_id);
+        try std.testing.expectEqual(sid, resp.session_id);
+        try std.testing.expect(server.hasSession(sid));
+    }
 }

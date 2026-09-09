@@ -1605,6 +1605,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_agent_server", .module = protocol_agent_server_mod },
                 .{ .name = "protocol_agent_client", .module = protocol_agent_client_mod },
                 .{ .name = "protocol_agent_runtime", .module = protocol_agent_runtime_mod },
+                .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),

@@ -864,6 +864,11 @@ Backward compatibility:
 - Feature detect by attempting models request and handling `not_implemented`.
 - V1 evolution rule: additive-only changes. Do not repurpose existing fields.
 - Unknown fields must be ignored by parsers.
+- `agent_start` payload session key (#198): `session_id` is canonical; servers accept
+  the legacy `resume_session_id` alias permanently (dual-key parse; the canonical key
+  wins when both appear). Emitters send only the canonical key. A pre-rename server
+  reading a new-client start treats the payload id as absent and generates its own
+  (§13.1 id-omitting exception).
 
 Capability negotiation:
 - V1 uses implicit feature detection (`not_implemented` probing).
@@ -894,8 +899,11 @@ Capability negotiation:
 
 ## 13. Session Lifecycle & Frame Routing (V1.1)
 
-Status: normative revision (docs-only; no wire-format changes). Amends §6, §6.1, and
-§12. Vocabulary is aligned to the Open Agent Protocol (OAP) agent-control core — the
+Status: normative revision. Amends §6, §6.1, and §12. Originally docs-only (no
+wire-format changes); since amended by the #198 rename — the `agent_start` payload key
+`resume_session_id` → `session_id` with permanent dual-key parse compat — the
+section's one wire change. Vocabulary is aligned to the Open Agent Protocol (OAP)
+agent-control core — the
 full OAP term → makai construct mapping is the deviations ledger in
 [`docs/oap-alignment.md`](oap-alignment.md); the governing OAP references are
 Decision 0001 ("Agent-Control v0.1 Executable Core") and the cross-repo coordination
@@ -918,7 +926,7 @@ even when their string values happen to coincide.
 
 | Domain | Wire format | Carried by | Role |
 | --- | --- | --- | --- |
-| Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_message`/`agent_stop`/`agent_status`; payload `resume_session_id` on `agent_start` | Session-container key and frame-correlation scope ONLY (see the `agent_start` id-allocation exception below) |
+| Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_start`/`agent_message`/`agent_stop`/`agent_status` (`resume_session_id` on `agent_start` is a legacy alias — see rules) | Session-container key and frame-correlation scope ONLY (see the `agent_start` id-allocation exception below) |
 | Envelope message | 26-char Crockford Base32 ULID (§3.1) | envelope `message_id`; envelope `in_reply_to` | Per-envelope identity; request/reply correlation |
 | Ordering | `u64` | envelope `sequence` | Per-direction, per-session ALLOCATION counter — never an identity; observed wire order can interleave and echo/validation frames do not participate (see rules) |
 | Provider stream / auth flow | 26-char ULID | `stream_id` / `flow_id` on provider/auth frames of the same connection | Adjacent protocol domains; never valid agent-domain identifiers despite the shared format |
@@ -928,10 +936,19 @@ Rules:
 
 - `session_id` is a correlation key and the server-side session-container key. It is
   NOT a resume, replay, or persistence handle (§13.5); treating it as one is the error
-  makai #198 exists to correct. The `agent_start` payload key is currently spelled
-  `resume_session_id` for historical reasons; its semantics are those of `session_id`,
-  and the rename is tracked in #198 (this revision defines semantics only and does not
-  change the wire).
+  makai #198 exists to correct. #198 also renamed the `agent_start` payload key
+  `resume_session_id` → `session_id` (a wire change landing on the semantics this
+  section defined), unifying payload vocabulary with
+  `agent_message`/`agent_stop`/`agent_status`. The canonical `agent_start` payload key
+  is `session_id` `[current]`; the server accepts `resume_session_id` as a permanent
+  legacy alias carrying the same value, and when both keys appear the canonical one
+  wins. The envelope-agreement rule below compares the effective payload id whichever
+  key carried it. Emitters SHOULD send only the canonical key (the TS SDK and the Zig
+  serializer do). Mixed-version note: a new client against a pre-rename server sends
+  only `session_id`, which the old server does not read — it treats the payload id as
+  absent and generates its own (the id-omitting exception below). The SDK and the Zig
+  runtime each pair with a same-version server binary, so same-version pairs are the
+  norm and unaffected.
 - `in_reply_to` references the request envelope's `message_id` ONLY (OAP Decision 0001
   rule). It never references a session id, stream id, flow id, or payload-level id,
   even where values coincide. Synchronous server replies (`agent_started`,
@@ -1007,7 +1024,9 @@ Rules:
   unreachable and the generated session leaks registered. Enforcement of the
   agreement rule is
   `[current — #204]`: every session-scoped handler (`agent_start` when the payload
-  id is present, `agent_message`, `agent_stop`, `agent_status`) compares the two
+  id is present — the effective payload id, whichever key (`session_id` or the
+  legacy `resume_session_id` alias) carried it — `agent_message`, `agent_stop`,
+  `agent_status`) compares the two
   ids FIRST and rejects a mismatch with a request-correlated `invalid_request`
   before any lookup, mutation, removal, or cancellation — the expected inbound
   sequence is not consumed and the idleness clock is not touched. The stdio host
@@ -1413,7 +1432,8 @@ Rules:
    sessions hold no transcript; `session_info` exposes status and counters only; no
    persistence, cursor, or journal exists.
 2. No V1 field implies any of the three `[normative]`. A session id — including the
-   `agent_start` payload key `resume_session_id`, whose name is historical (#198) — is
+   `agent_start` payload `session_id` (formerly misnamed `resume_session_id`; renamed
+   by #198, which changed only the key, never the semantics) — is
    a correlation and container key only. Supplying a previously-used id to
    `agent_start` either creates a fresh, empty container (unknown, stopped, or
    evicted id) or is rejected `agent_busy` (registered id); it never restores state.

@@ -1046,8 +1046,11 @@ function buildExecutionPayload(
 
 function buildAgentStartPayload(request: AgentRunRequest, sessionId: string): Record<string, unknown> {
   validateExecutionRequest(request);
+  // #198: `session_id` is the canonical agent_start payload key — a correlation
+  // key, never a resume handle. The server also accepts the legacy
+  // `resume_session_id` alias; this SDK sends only the canonical key.
   return {
-    resume_session_id: sessionId,
+    session_id: sessionId,
     config_json: JSON.stringify({ model_ref: request.model_ref, tools: request.tools ?? [] }),
   };
 }
