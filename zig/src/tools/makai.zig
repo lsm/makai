@@ -143,6 +143,13 @@ const PreparedAgentRun = struct {
 
 const StdioToolRequest = struct {
     session_id: AgentProtocolTypes.SessionId,
+    /// The registration generation the requesting run was admitted under
+    /// (§13.4.5, #204): the request may be published as a `tool_execute`
+    /// only while this is still the id's current generation. The run's
+    /// agent thread enqueues without observing its cancel token first, so a
+    /// request can land after a stop's bridge discard — existence alone
+    /// would then route it into an id a new `agent_start` re-registered.
+    generation: u64,
     tool_call_id: []u8,
     tool_name: []u8,
     args_json: []u8,
@@ -202,6 +209,7 @@ const StdioToolBridge = struct {
         self: *StdioToolBridge,
         allocator: std.mem.Allocator,
         session_id: AgentProtocolTypes.SessionId,
+        generation: u64,
         tool_call_id: []const u8,
         tool_name: []const u8,
         args_json: []const u8,
@@ -217,6 +225,7 @@ const StdioToolBridge = struct {
         defer self.mutex.unlock();
         try self.requests.append(allocator, .{
             .session_id = session_id,
+            .generation = generation,
             .tool_call_id = owned_tool_call_id,
             .tool_name = owned_tool_name,
             .args_json = owned_args_json,
@@ -323,6 +332,11 @@ const StdioToolBridge = struct {
 const StdioAgentToolExecutor = struct {
     bridge: *StdioToolBridge,
     session_id: AgentProtocolTypes.SessionId,
+    /// The registration generation of the run this executor serves
+    /// (§13.4.5, #204) — stamped onto every tool request it enqueues so
+    /// publication can discard requests whose registration is no longer
+    /// current.
+    generation: u64,
 };
 
 const ActiveAgentRun = struct {
@@ -649,6 +663,7 @@ const StdioProtocolLoop = struct {
         tool_executor.* = .{
             .bridge = &self.tool_bridge,
             .session_id = pending.session_id,
+            .generation = generation,
         };
 
         const session_id_text = try AgentProtocolTypes.sessionIdToString(pending.session_id, self.allocator);
@@ -832,7 +847,18 @@ const StdioProtocolLoop = struct {
 
             var request = maybe_request orelse break;
             defer request.deinit(self.allocator);
-            if (!self.agent_server.hasSession(request.session_id)) continue;
+            // §13.4.5 (#204): a tool request publishes only while its run's
+            // registration is still the CURRENT one for the id. The
+            // enqueuing agent thread does not observe its cancel token
+            // before enqueueing, so a request can land after a stop's
+            // bridge discard — session existence alone would then emit a
+            // stale `tool_execute` into an id a new `agent_start`
+            // re-registered.
+            const registration_current = blk: {
+                const current = self.agent_server.sessionGeneration(request.session_id);
+                break :blk current != null and current.? == request.generation;
+            };
+            if (!registration_current) continue;
             try self.tool_bridge.markInFlight(self.allocator, request.session_id, request.tool_call_id);
             errdefer self.tool_bridge.discardInFlight(self.allocator, request.session_id, request.tool_call_id);
 
@@ -1298,7 +1324,7 @@ fn executeStdioToolViaAgentProtocol(
     _ = on_update_ctx;
     _ = on_update;
     const executor: *StdioAgentToolExecutor = @ptrCast(@alignCast(ctx.?));
-    try executor.bridge.enqueueRequest(allocator, executor.session_id, tool_call_id, tool_name, args_json);
+    try executor.bridge.enqueueRequest(allocator, executor.session_id, executor.generation, tool_call_id, tool_name, args_json);
 
     while (true) {
         if (cancel_token) |token| {
@@ -3413,7 +3439,7 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = 0 };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -3680,7 +3706,7 @@ test "stdio tool bridge publishes tool requests and consumes tool results" {
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     clearOwnedLines(allocator, &outbound);
 
-    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, "call-1", "lookup", "{\"query\":\"zig\"}");
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "call-1", "lookup", "{\"query\":\"zig\"}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
@@ -3765,7 +3791,7 @@ test "stdio tool bridge clears queued and in-flight calls when cancelling sessio
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     clearOwnedLines(allocator, &outbound);
 
-    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, "queued-call", "lookup", "{}");
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "queued-call", "lookup", "{}");
     try stdio_loop.tool_bridge.markInFlight(allocator, session_id, "running-call");
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.requests.items.len);
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.in_flight.items.len);
@@ -3801,10 +3827,52 @@ test "stdio tool bridge drops queued requests for stopped sessions" {
     defer stdio_loop.deinit();
 
     const session_id = AgentProtocolTypes.generateSessionId();
-    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, "call-1", "lookup", "{}");
+    // Generation 0 matches no registration (this id was never registered) —
+    // the request must be dropped exactly as it was on the existence check.
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, 0, "call-1", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 0), try stdio_loop.publishPendingToolRequests());
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
+}
+
+test "publishPendingToolRequests drops stale-generation requests after id re-registration" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const first_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
+    defer allocator.free(stop_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
+
+    const restart_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(restart_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(restart_req));
+    const second_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+    try std.testing.expect(second_generation > first_generation);
+
+    // A request enqueued by the OLD registration's agent thread after the
+    // stop's bridge discard (its enqueue precedes the cancel-token check,
+    // so the discard cannot prevent it): the id exists again, but not for
+    // that generation — the stale `tool_execute` must not be emitted into
+    // the new registration.
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, first_generation, "stale-call", "lookup", "{}");
+    try std.testing.expectEqual(@as(usize, 0), try stdio_loop.publishPendingToolRequests());
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
+
+    // The new registration's own request publishes normally.
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, second_generation, "fresh-call", "lookup", "{}");
+    try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {
@@ -4381,7 +4449,7 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = stdio_loop.agent_server.sessionGeneration(session_id).? };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4458,7 +4526,7 @@ test "stopped session's late run publications are discarded after id re-registra
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4553,7 +4621,7 @@ test "re-created session's admitted run is not failed by the stopped registratio
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
     const tool_executor = try allocator.create(StdioAgentToolExecutor);
-    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -4644,7 +4712,7 @@ test "agent_stop cancels every listed run for the id, including the current regi
         const context = try allocator.create(agent_loop.AgentContext);
         context.* = agent_loop.AgentContext.init(allocator);
         const tool_executor = try allocator.create(StdioAgentToolExecutor);
-        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = first_generation };
         try stdio_loop.active_agent_runs.append(allocator, .{
             .session_id = session_id,
             .generation = first_generation,
@@ -4676,7 +4744,7 @@ test "agent_stop cancels every listed run for the id, including the current regi
         const context = try allocator.create(agent_loop.AgentContext);
         context.* = agent_loop.AgentContext.init(allocator);
         const tool_executor = try allocator.create(StdioAgentToolExecutor);
-        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+        tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id, .generation = second_generation };
         try stdio_loop.active_agent_runs.append(allocator, .{
             .session_id = session_id,
             .generation = second_generation,

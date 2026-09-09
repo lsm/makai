@@ -1347,7 +1347,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
    generation) or a re-registered one (a newer generation) makes the run
    stale, and every stale publication is discarded — no run events, no
    settlement, no state mutation: the re-created container is never marked
-   `.error` by the stale run's failure, and its idleness clock is untouched.
+   `.error` by the stale run's failure, its idleness clock is untouched, and
+   a stale run's queued `tool_execute` requests are dropped at publication
+   (the enqueuing agent thread does not observe its cancel token before
+   enqueueing, so a request can land after the stop's bridge discard —
+   requests carry their registration generation and publication validates
+   it against the id's current one).
    The generation check also scopes the one-active-run rule (§13.2.4): a
    listed stale run no longer fails the re-created id's ADMITTED run at start
    with an `internal_error` settlement — the fresh registration's run starts
