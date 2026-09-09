@@ -321,6 +321,20 @@ pub const SerializedPipe = struct {
         read_pos.* = 0;
     }
 
+    /// Appends `data` plus its newline frame delimiter as ONE indivisible
+    /// transaction: capacity for both is reserved before anything is
+    /// appended, so an allocation failure leaves the buffer exactly as it
+    /// was. A partial line (data without its newline) would wedge the
+    /// receiver's line framing forever, and a caller that retries the write
+    /// after such a failure would append a duplicate onto the partial frame,
+    /// corrupting it (#210 gap 5: transactional publication extends through
+    /// the pipe handoff).
+    fn appendFramed(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) !void {
+        try buffer.ensureUnusedCapacity(allocator, data.len + 1);
+        buffer.appendSliceAssumeCapacity(data);
+        buffer.appendAssumeCapacity('\n');
+    }
+
     /// Server writes to this to send to client
     pub fn serverSender(self: *SerializedPipe) transport_mod.AsyncSender {
         return .{
@@ -328,8 +342,7 @@ pub const SerializedPipe = struct {
             .write_fn = struct {
                 fn write(ctx: *anyopaque, data: []const u8) !void {
                     const s: *SerializedPipe = @ptrCast(@alignCast(ctx));
-                    try s.to_client.appendSlice(s.allocator, data);
-                    try s.to_client.append(s.allocator, '\n');
+                    try appendFramed(&s.to_client, s.allocator, data);
                 }
             }.write,
             .flush_fn = struct {
@@ -354,8 +367,7 @@ pub const SerializedPipe = struct {
             .write_fn = struct {
                 fn write(ctx: *anyopaque, data: []const u8) !void {
                     const s: *SerializedPipe = @ptrCast(@alignCast(ctx));
-                    try s.to_server.appendSlice(s.allocator, data);
-                    try s.to_server.append(s.allocator, '\n');
+                    try appendFramed(&s.to_server, s.allocator, data);
                 }
             }.write,
             .flush_fn = struct {
@@ -793,6 +805,42 @@ test "SerializedPipe full round trip" {
     const received_resp = try client_receiver.readLine(allocator) orelse return error.NoDataReceived;
     defer allocator.free(received_resp);
     try std.testing.expectEqualStrings(response, received_resp);
+}
+
+test "SerializedPipe write is all-or-nothing under allocation failure" {
+    const allocator = std.testing.allocator;
+    // Longer than the pipe's 4096-byte initial capacity so every write must
+    // allocate.
+    const payload = try allocator.alloc(u8, 8192);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    payload[0] = '{';
+    payload[payload.len - 1] = '}';
+
+    // #210 gap 5: a failed write must leave NOTHING in the buffer — a
+    // partial line (payload without its newline) is undeliverable, and a
+    // retried write onto it would corrupt the frame.
+    var fail_index: usize = 0;
+    while (fail_index <= 4) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var pipe = SerializedPipe.init(failing.allocator());
+        defer pipe.deinit();
+
+        failing.fail_index = fail_index;
+        var sender = pipe.serverSender();
+        if (sender.write(payload)) |_| {
+            var receiver = pipe.clientReceiver();
+            const line = try receiver.readLine(allocator) orelse return error.NoDataReceived;
+            defer allocator.free(line);
+            try std.testing.expectEqualStrings(payload, line);
+            try std.testing.expectEqual(@as(?[]const u8, null), try receiver.readLine(allocator));
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // Nothing landed: no partial frame for a retry to corrupt.
+            var receiver = pipe.clientReceiver();
+            try std.testing.expectEqual(@as(?[]const u8, null), try receiver.readLine(allocator));
+        }
+    }
 }
 
 test "InProcessTransport applies queue backpressure under burst writes" {

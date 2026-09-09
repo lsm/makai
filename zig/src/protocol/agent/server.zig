@@ -205,11 +205,17 @@ pub const AgentProtocolServer = struct {
         }
 
         const model = try self.allocator.dupe(u8, "unknown");
-        errdefer self.allocator.free(model);
+        // Once the session container is stored it owns these three strings;
+        // the flag keeps the error paths from freeing what the map holds
+        // (#210 gap 5 review: the reply literal's sequence-map write can
+        // now propagate, so a failure AFTER `sessions.put` used to free the
+        // strings out from under the stored session — dangling map entry).
+        var owned_by_session = false;
+        errdefer if (!owned_by_session) self.allocator.free(model);
         const config_json = try self.allocator.dupe(u8, req.config_json);
-        errdefer self.allocator.free(config_json);
+        errdefer if (!owned_by_session) self.allocator.free(config_json);
         const system_prompt = try self.allocator.dupe(u8, req.getSystemPrompt() orelse "");
-        errdefer self.allocator.free(system_prompt);
+        errdefer if (!owned_by_session) self.allocator.free(system_prompt);
 
         try self.expected_sequences.put(session_id, 2);
         errdefer _ = self.expected_sequences.remove(session_id);
@@ -230,11 +236,13 @@ pub const AgentProtocolServer = struct {
             .last_activity_ms = try compat.time.monotonicMillis(),
             .generation = self.next_session_generation,
         });
+        errdefer _ = self.removeSession(session_id);
+        owned_by_session = true;
 
         return .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = self.nextOutgoingSequence(session_id),
+            .sequence = try self.nextOutgoingSequence(session_id),
             .in_reply_to = env.message_id,
             .timestamp = now,
             .payload = .{ .agent_started = .{ .session_id = session_id } },
@@ -306,12 +314,20 @@ pub const AgentProtocolServer = struct {
             return try self.makeError(env.session_id, env.message_id, .invalid_request, "invalid sequence");
         }
 
-        const stop_sequence = self.nextOutgoingSequence(req.session_id);
+        // Build the reply's owned fields BEFORE removing the session
+        // (#210 gap 5): the stop transaction is "remove + reply", and an
+        // allocation failure while building the reply must strike while the
+        // session is still registered — the alternative removed the id and
+        // then failed with no `agent_stopped` at all. The remaining failure
+        // window (reply serialization/write, outside this server) is one
+        // the stdio host cleans up after (§13.4.4).
+        const reason = if (req.getReason()) |r| try self.allocator.dupe(u8, r) else try self.allocator.dupe(u8, "stopped");
+        errdefer self.allocator.free(reason);
+        const stop_sequence = try self.nextOutgoingSequence(req.session_id);
         if (!self.removeSession(req.session_id)) {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         }
 
-        const reason = if (req.getReason()) |r| try self.allocator.dupe(u8, r) else try self.allocator.dupe(u8, "stopped");
         return .{
             .session_id = req.session_id,
             .message_id = agent_types.generateUlid(),
@@ -415,7 +431,7 @@ pub const AgentProtocolServer = struct {
         };
         errdefer response.deinit(self.allocator);
 
-        const ack_seq = self.nextOutgoingSequence(env.session_id);
+        const ack_seq = try self.nextOutgoingSequence(env.session_id);
         const ack_envelope = agent_types.Envelope{
             .session_id = env.session_id,
             .message_id = agent_types.generateUlid(),
@@ -425,7 +441,7 @@ pub const AgentProtocolServer = struct {
             .payload = .{ .ack = .{ .acknowledged_id = env.message_id } },
         };
 
-        const response_seq = self.nextOutgoingSequence(env.session_id);
+        const response_seq = try self.nextOutgoingSequence(env.session_id);
         try self.outbox.append(self.allocator, .{
             .session_id = env.session_id,
             .message_id = agent_types.generateUlid(),
@@ -446,10 +462,15 @@ pub const AgentProtocolServer = struct {
         msg: []const u8,
     ) !agent_types.Envelope {
         const reason = try self.allocator.dupe(u8, msg);
+        // The sequence-map write can now propagate (nextOutgoingSequence is
+        // transactional, #210 gap 5 review): without this errdefer the
+        // duped reason leaked when the allocation aborted the envelope
+        // literal before it took ownership.
+        errdefer self.allocator.free(reason);
         return .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = self.nextOutgoingSequence(session_id),
+            .sequence = try self.nextOutgoingSequence(session_id),
             .in_reply_to = in_reply_to,
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .nack = .{
@@ -474,54 +495,81 @@ pub const AgentProtocolServer = struct {
         };
     }
 
-    pub fn nextOutgoingSequence(self: *Self, session_id: agent_types.SessionId) u64 {
+    /// Advances and persists the session's outgoing sequence counter. The
+    /// counter update is part of the publication transaction (#210 gap 5):
+    /// swallowing a failed `put` would hand out a sequence number that was
+    /// never recorded, so the next publication reuses it and two frames go
+    /// out with the same sequence.
+    pub fn nextOutgoingSequence(self: *Self, session_id: agent_types.SessionId) !u64 {
         const cur = self.outgoing_sequences.get(session_id) orelse 0;
         const next = cur + 1;
-        self.outgoing_sequences.put(session_id, next) catch {};
+        try self.outgoing_sequences.put(session_id, next);
         return next;
     }
 
     pub fn publishAgentEvent(self: *Self, session_id: agent_types.SessionId, event_json: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        // Transactional enqueue (#210 gap 5): own the copy before touching
+        // the outbox, so an append failure under memory pressure propagates
+        // without leaking the copy and leaves the outbox unchanged — the
+        // caller's retry re-attempts the whole publication.
+        const owned_json = try self.allocator.dupe(u8, event_json);
+        errdefer self.allocator.free(owned_json);
         // Run activity (event publication) refreshes the idleness clock
         // ahead of TTL eviction (§13.2.6).
         try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = self.nextOutgoingSequence(session_id),
+            .sequence = try self.nextOutgoingSequence(session_id),
             .timestamp = compat.time.nowMillis(),
-            .payload = .{ .agent_event = try self.allocator.dupe(u8, event_json) },
+            .payload = .{ .agent_event = owned_json },
         });
     }
 
     pub fn publishAgentResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
-        session.status = .ready;
+        const owned_json = try self.allocator.dupe(u8, result_json);
+        errdefer self.allocator.free(owned_json);
         try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = self.nextOutgoingSequence(session_id),
+            .sequence = try self.nextOutgoingSequence(session_id),
             .timestamp = compat.time.nowMillis(),
-            .payload = .{ .agent_result = try self.allocator.dupe(u8, result_json) },
+            .payload = .{ .agent_result = owned_json },
         });
+        // The status follows the COMMITTED frame (#210 gap 5, review):
+        // flipping `.ready` before the append admitted a follow-up
+        // `agent_message` while the result publication was still pending —
+        // the retained run then tripped the one-active-run rule and turned
+        // the ACCEPTED message into an `AgentBusy` internal-error
+        // settlement. With the flip after the append, a failed publication
+        // leaves the session `.processing`: follow-ups are rejected
+        // `agent_busy` at admission (clean non-admission) until the retry
+        // commits.
+        session.status = .ready;
     }
 
     pub fn publishAgentError(self: *Self, session_id: agent_types.SessionId, code: agent_types.AgentErrorCode, message: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
-        session.status = .@"error";
+        const owned_message = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(owned_message);
         try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = self.nextOutgoingSequence(session_id),
+            .sequence = try self.nextOutgoingSequence(session_id),
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_error = .{
                 .code = code,
-                .message = try self.allocator.dupe(u8, message),
+                .message = owned_message,
             } },
         });
+        // Same commit-then-flip ordering as `publishAgentResult`: while the
+        // settlement envelope's publication is being retried the session
+        // stays non-admissible (`.processing`) instead of `.error`.
+        session.status = .@"error";
     }
 
     pub fn enqueueEnvelope(self: *Self, env: agent_types.Envelope) !void {
@@ -531,6 +579,16 @@ pub const AgentProtocolServer = struct {
     pub fn popOutbound(self: *Self) ?agent_types.Envelope {
         if (self.outbox.items.len == 0) return null;
         return self.outbox.orderedRemove(0);
+    }
+
+    /// The head of the outbox WITHOUT removing it — the read side of the
+    /// transactional delivery handshake (#210 gap 5): the runtime peeks,
+    /// serializes, writes, and only then pops, so a serialization or write
+    /// failure leaves the already-built frame queued for the next pump
+    /// instead of destroying it (`popOutbound` alone dropped it).
+    pub fn peekOutbound(self: *Self) ?*agent_types.Envelope {
+        if (self.outbox.items.len == 0) return null;
+        return &self.outbox.items[0];
     }
 
     pub fn popPendingAgentMessage(self: *Self) ?PendingAgentMessage {
@@ -728,6 +786,153 @@ test "AgentProtocolServer rejects unknown session message" {
 
     try std.testing.expect(resp.payload == .agent_error);
     try std.testing.expectEqual(agent_types.AgentErrorCode.agent_not_found, resp.payload.agent_error.code);
+}
+
+fn registerTestSession(server: *AgentProtocolServer, allocator: std.mem.Allocator) !agent_types.SessionId {
+    var start = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
+    };
+    defer start.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(start)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_started);
+    return resp.payload.agent_started.session_id;
+}
+
+// #210 gap 5: a publication that fails partway (dupe succeeds, outbox
+// append hits OOM) must leave the outbox UNCHANGED, leak nothing, and leave
+// the session status untouched — the status flips only after the frame
+// commits, so a failed publication keeps the session non-admissible
+// (`.processing`) until the retry succeeds. Sweeping fail_index covers
+// every allocation of each publish path; the std.testing.allocator's leak
+// check guards the copies.
+test "AgentProtocolServer publish paths are transactional under allocation failure" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        .{ .publish = publishAgentEventCase, .success_status = agent_types.AgentStatus.processing },
+        .{ .publish = publishAgentResultCase, .success_status = agent_types.AgentStatus.ready },
+        .{ .publish = publishAgentErrorCase, .success_status = agent_types.AgentStatus.@"error" },
+    }) |case| {
+        var fail_index: usize = 0;
+        while (fail_index <= 6) : (fail_index += 1) {
+            var server = AgentProtocolServer.init(allocator);
+            defer server.deinit();
+            const sid = try registerTestSession(&server, allocator);
+            server.sessions.getPtr(sid).?.status = .processing;
+
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            // Re-point the server's allocator at the failing wrapper: the
+            // session map itself is already populated, so only the
+            // publication's allocations can fail.
+            server.allocator = failing.allocator();
+            if (case.publish(&server, sid)) |_| {
+                var popped = server.popOutbound().?;
+                popped.deinit(allocator);
+                try std.testing.expect(server.popOutbound() == null);
+                try std.testing.expectEqual(case.success_status, server.sessions.getPtr(sid).?.status);
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                // The append failed atomically: no half-queued frame, no
+                // status flip.
+                try std.testing.expect(server.popOutbound() == null);
+                try std.testing.expectEqual(agent_types.AgentStatus.processing, server.sessions.getPtr(sid).?.status);
+            }
+        }
+    }
+}
+
+fn publishAgentEventCase(server: *AgentProtocolServer, sid: agent_types.SessionId) !void {
+    try server.publishAgentEvent(sid, "{\"type\":\"message_update\"}");
+}
+
+// #210 gap 5 (review): the sequence-map write propagates, so every path
+// that allocates before it must free on its failure — sweeping fail_index
+// across the start and models-request handlers catches the leaks (and the
+// dangling-session hazard on a failed start) via the testing allocator's
+// leak check and the Debug double-free detector at deinit.
+test "AgentProtocolServer start and models nack are leak-free under allocation failure" {
+    const allocator = std.testing.allocator;
+
+    var fail_index: usize = 0;
+    while (fail_index <= 12) : (fail_index += 1) {
+        {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            var server = AgentProtocolServer.init(failing.allocator());
+            defer server.deinit();
+
+            var start = agent_types.Envelope{
+                .session_id = agent_types.generateSessionId(),
+                .message_id = agent_types.generateUlid(),
+                .sequence = 1,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
+            };
+            defer start.deinit(allocator);
+
+            if (server.handleEnvelope(start)) |maybe_response| {
+                if (maybe_response) |response| {
+                    var owned = response;
+                    defer owned.deinit(allocator);
+                }
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                // A failed start leaves no half-registered session (its
+                // stored strings freed with the rollback, not dangling).
+                try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+            }
+        }
+        {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            var server = AgentProtocolServer.init(failing.allocator());
+            defer server.deinit();
+
+            var request = agent_types.Envelope{
+                .session_id = agent_types.generateSessionId(),
+                .message_id = agent_types.generateUlid(),
+                .sequence = 1,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .models_request = .{} },
+            };
+            defer request.deinit(allocator);
+
+            if (server.handleEnvelope(request)) |maybe_response| {
+                if (maybe_response) |response| {
+                    var owned = response;
+                    defer owned.deinit(allocator);
+                }
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            }
+        }
+    }
+}
+
+fn publishAgentResultCase(server: *AgentProtocolServer, sid: agent_types.SessionId) !void {
+    try server.publishAgentResult(sid, "{\"messages\":[]}");
+}
+
+fn publishAgentErrorCase(server: *AgentProtocolServer, sid: agent_types.SessionId) !void {
+    try server.publishAgentError(sid, .internal_error, "fixture failure");
+}
+
+// #210 gap 5: the outgoing-sequence counter update must not be swallowed —
+// a failed counter write returning a number anyway would hand the SAME
+// sequence to the next frame.
+test "AgentProtocolServer nextOutgoingSequence propagates counter-write failure" {
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var server = AgentProtocolServer.init(failing.allocator());
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    try std.testing.expectError(error.OutOfMemory, server.nextOutgoingSequence(sid));
 }
 
 // ============================================================================
