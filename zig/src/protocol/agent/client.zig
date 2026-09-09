@@ -165,6 +165,15 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
+
+        // Build the fallible payload BEFORE any tracker mutation (see
+        // sendAgentMessageWithSequence).
+        var payload = agent_types.Payload{ .agent_start = .{ .config_json = try self.allocator.dupe(u8, config_json), .session_id = sid } };
+        defer payload.deinit(self.allocator);
+        if (system_prompt) |sp| {
+            payload.agent_start.system_prompt = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, sp));
+        }
+
         const seq = try self.advanceSequence(sid);
         self.recordPendingSend(sid, msg_id, seq, .start) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
@@ -172,12 +181,6 @@ pub const AgentProtocolClient = struct {
             self.next_sequence_by_session.put(sid, seq) catch {};
             return err;
         };
-
-        var payload = agent_types.Payload{ .agent_start = .{ .config_json = try self.allocator.dupe(u8, config_json), .session_id = sid } };
-        defer payload.deinit(self.allocator);
-        if (system_prompt) |sp| {
-            payload.agent_start.system_prompt = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, sp));
-        }
 
         try self.sendEnvelope(.{
             .session_id = sid,
@@ -202,6 +205,18 @@ pub const AgentProtocolClient = struct {
     /// a corrected retry reuses the same sequence (§13.1).
     pub fn sendAgentMessageWithSequence(self: *Self, session_id: agent_types.SessionId, message_json: []const u8, options_json: ?[]const u8, sequence: u64) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
+
+        // Build the fallible payload BEFORE any tracker mutation: an
+        // allocation failure here leaves the client state untouched, so a
+        // retry reuses the same sequence instead of running ahead of the
+        // server (#210 gap 7).
+        var payload = agent_types.Payload{ .agent_message = .{
+            .session_id = session_id,
+            .message_json = try self.allocator.dupe(u8, message_json),
+        } };
+        defer payload.deinit(self.allocator);
+        if (options_json) |opts| payload.agent_message.options_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, opts));
+
         try self.next_sequence_by_session.put(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
         self.recordPendingSend(session_id, msg_id, sequence, .message) catch |err| {
@@ -211,13 +226,6 @@ pub const AgentProtocolClient = struct {
             self.next_sequence_by_session.put(session_id, sequence) catch {};
             return err;
         };
-
-        var payload = agent_types.Payload{ .agent_message = .{
-            .session_id = session_id,
-            .message_json = try self.allocator.dupe(u8, message_json),
-        } };
-        defer payload.deinit(self.allocator);
-        if (options_json) |opts| payload.agent_message.options_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, opts));
 
         try self.sendEnvelope(.{
             .session_id = session_id,
@@ -283,16 +291,19 @@ pub const AgentProtocolClient = struct {
     pub fn sendAgentStopProbing(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !?agent_types.Ulid {
         if (self.admitted_by_session.get(session_id) != true) return null;
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
-        var last_message_sequence: ?u64 = null;
-        var i = list.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (list.items[i].kind == .message) {
-                last_message_sequence = list.items[i].sequence;
+        // The OLDEST unresolved message brackets the server's counter: within
+        // §13.2.4-legal states every LATER pipelined send was rejected (never
+        // accepted), so the counter sits at the oldest's own sequence (if it
+        // too was rejected) or one past it (if accepted) — exactly the two
+        // candidates probed. The newest send's pair could overshoot both.
+        var oldest_message_sequence: ?u64 = null;
+        for (list.items) |pending| {
+            if (pending.kind == .message) {
+                oldest_message_sequence = pending.sequence;
                 break;
             }
         }
-        const pre_send = last_message_sequence orelse return null;
+        const pre_send = oldest_message_sequence orelse return null;
 
         // A probe is already in flight for this session: return ITS stop id
         // instead of superseding it. Two stops at the same candidate sequence
@@ -390,11 +401,10 @@ pub const AgentProtocolClient = struct {
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
                 try self.setSessionResult(env.session_id, json);
-                // A settlement resolves EVERY outstanding send of the session
-                // (each was accepted and settled, or rejected long ago):
-                // retire them all so long-lived multi-message sessions do not
-                // accumulate resolved records (#210 gap 7).
-                self.retireAllPendingSends(env.session_id);
+                // A settlement resolves every send recorded before the
+                // settled run; the newest pending send may be a later,
+                // still-unresolved one and is retained (#210 gap 7).
+                self.retireSettledPendingSends(env.session_id);
             },
             .agent_error => |e| {
                 // Probe-control replies are consumed BEFORE terminal
@@ -409,9 +419,9 @@ pub const AgentProtocolClient = struct {
                     try self.setSessionError(env.session_id, e.message);
                     if (env.in_reply_to == null) {
                         // An UNCORRELATED agent_error is a settlement
-                        // (§13.4.2): like agent_result, it resolves every
-                        // outstanding send of the session.
-                        self.retireAllPendingSends(env.session_id);
+                        // (§13.4.2): like agent_result, it resolves the
+                        // sends recorded before the settled run.
+                        self.retireSettledPendingSends(env.session_id);
                     }
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
                 }
@@ -517,14 +527,20 @@ pub const AgentProtocolClient = struct {
         }
     }
 
-    /// Retires every pending-send record of a session — used when a
-    /// settlement (`agent_result`, or the uncorrelated settlement
-    /// `agent_error`) resolves all outstanding sends at once.
-    fn retireAllPendingSends(self: *Self, session_id: agent_types.SessionId) void {
-        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-            var list = entry.value;
-            list.deinit(self.allocator);
-        }
+    /// Retires the pending-send records a settlement resolves. A settlement
+    /// (`agent_result`, or the uncorrelated settlement `agent_error`) proves
+    /// every send RECORDED BEFORE the settled run resolved — but a newer send
+    /// may already be in flight (recorded after the server committed the
+    /// result, before this client processed it), and its unknown outcome is
+    /// exactly what a later probe reconciles. So all-but-the-NEWEST entries
+    /// retire; the newest is retained as the possibly-unresolved send, which
+    /// also bounds growth to a small constant across turns.
+    fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        if (list.items.len <= 1) return;
+        const keep = list.items[list.items.len - 1];
+        list.clearRetainingCapacity();
+        list.append(self.allocator, keep) catch return;
     }
 
     /// Applies #210 gap 7's client sequence-control rules to a correlated
@@ -1176,9 +1192,9 @@ test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)
     try client.processEnvelope(started_env);
     _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
 
-    // The run settles: every outstanding send of the session resolved — the
-    // pending records are retired (no growth across turns) and a later probe
-    // (whose message outcome is now resolved) sends nothing.
+    // The run settles: every send recorded BEFORE the settled run resolved
+    // and is retired; the NEWEST pending send may be a later, still-
+    // unresolved one and is retained (growth stays bounded across turns).
     var result_env = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
@@ -1190,10 +1206,56 @@ test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)
     defer result_env.deinit(allocator);
     try client.processEnvelope(result_env);
 
-    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
-    const probe = try client.sendAgentStopProbing(sid, "timeout");
-    try std.testing.expect(probe == null);
-    try std.testing.expectEqual(@as(usize, 2), harness.writes.items.len); // start + message — no probe stop
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only the newest send retained
+}
+
+test "AgentProtocolClient probing stop derives its candidates from the OLDEST unresolved message (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null); // seq 4 — all outcomes lost
+
+    // The server accepted message 2 (counter 3) and rejected 3 and 4. The
+    // oldest unresolved message (2) brackets the counter: stop(2) is
+    // rejected, stop(3) is accepted — the NEWEST send's pair (4, 5) would
+    // have missed both and leaked the session.
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+    var first_stop = try harness.envelopeAt(4);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first_stop.sequence); // OLDEST message's sequence
+
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection.deinit(allocator);
+    try client.processEnvelope(rejection);
+    var second_stop = try harness.envelopeAt(5);
+    defer second_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), second_stop.sequence); // oldest + 1 — accepted
 }
 
 test "AgentProtocolClient probing stop retries on a nack invalid_sequence rejection (#210 gap 7)" {

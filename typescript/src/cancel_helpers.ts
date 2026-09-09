@@ -273,14 +273,16 @@ export async function stopAgentWithSequenceProbe(
 /**
  * Extracts the rejection code from a request-correlated reply frame — the
  * real server rejects with an `agent_error` (`payload.code`); peers and test
- * fixtures may use the `nack` shape (`payload.error_code`).
+ * fixtures may use the `nack` shape (`payload.error_code`). The shared
+ * protocol's `invalid_sequence` spelling is normalized to `invalid_request`:
+ * both mean the wrong-counter rejection that drives the probe's retry.
  */
 function correlatedRejectionCode(frame: { type?: unknown; payload?: unknown }): string | undefined {
   if (frame.type !== "agent_error" && frame.type !== "nack") return undefined;
   const payload = frame.payload;
   if (payload === undefined || typeof payload !== "object" || payload === null) return undefined;
   const record = payload as Record<string, unknown>;
-  if (typeof record.code === "string") return record.code;
-  if (typeof record.error_code === "string") return record.error_code;
-  return undefined;
+  const code = typeof record.code === "string" ? record.code : typeof record.error_code === "string" ? record.error_code : undefined;
+  if (code === "invalid_sequence") return "invalid_request";
+  return code;
 }

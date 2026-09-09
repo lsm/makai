@@ -2932,7 +2932,8 @@ test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and 
     assert.deepEqual(sentStops, [2]);
   }
 
-  // The nack rejection shape (peers/fixtures) also triggers the one retry.
+  // The nack rejection shape (peers/fixtures) also triggers the one retry —
+  // including the shared protocol's invalid_sequence spelling.
   {
     const replies: StdioFrame[] = [];
     const sentStops: number[] = [];
@@ -2941,7 +2942,7 @@ test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and 
         if (frame.type !== "agent_stop") return;
         sentStops.push(frame.sequence as number);
         if (sentStops.length === 1) {
-          replies.push({ type: "nack", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { error_code: "invalid_request", reason: "invalid sequence" } });
+          replies.push({ type: "nack", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { error_code: "invalid_sequence", reason: "invalid sequence" } });
         } else {
           replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
         }
