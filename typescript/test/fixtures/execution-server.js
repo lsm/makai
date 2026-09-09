@@ -297,7 +297,12 @@ rl.on("line", (line) => {
       emit(asyncFrame(env, "agent_event", { event_json: JSON.stringify({ type: "error", code: agentFailurePair.code, message: agentFailurePair.message }) }, 3));
       emit(asyncFrame(env, "agent_error", { code: agentFailurePair.code, message: agentFailurePair.message }, 4));
     } else if (agentError) {
-      emit(frame(env, "agent_error", agentError, 3));
+      // Real-server settlement shape (§13.4.2): an agent-level failure
+      // settles through an UNCORRELATED agent_error on the session route —
+      // request-validation rejections are correlated, settlements are async
+      // output. (Correlating it here made the SDK's gap-7 rollback mistake
+      // the settlement for a message rejection.)
+      emit(asyncFrame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
       emit(frame(env, "agent_result", { result_json: JSON.stringify(agentResult) }, 3));
       if (trackAgentSessions) {
