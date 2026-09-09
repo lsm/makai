@@ -707,7 +707,7 @@ test "AgentProtocolClient rolls the tracker back on a correlated rejection so a 
         .sequence = 0,
         .in_reply_to = msg_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
@@ -775,7 +775,7 @@ test "AgentProtocolClient probing stop tries pre-send first, then post-send on c
         .sequence = 0,
         .in_reply_to = probe_stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
@@ -862,7 +862,7 @@ test "AgentProtocolClient probing stop is bounded: no retry on a non-invalid_req
         .sequence = 0,
         .in_reply_to = probe_stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
@@ -922,7 +922,7 @@ test "AgentProtocolClient probing stop consumes the retry's own rejection and ma
         .sequence = 0,
         .in_reply_to = probe_stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
     };
     defer first_rejection.deinit(allocator);
     try client.processEnvelope(first_rejection);
@@ -944,7 +944,7 @@ test "AgentProtocolClient probing stop consumes the retry's own rejection and ma
         .sequence = 0,
         .in_reply_to = second_stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
     };
     defer second_rejection.deinit(allocator);
     try client.processEnvelope(second_rejection);
@@ -976,7 +976,7 @@ test "AgentProtocolClient correlated agent_not_found on a plain stop clears the 
         .sequence = 0,
         .in_reply_to = stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
@@ -1011,7 +1011,7 @@ test "AgentProtocolClient stop sends never advance the tracker (#210 gap 7)" {
         .sequence = 0,
         .in_reply_to = stop_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
@@ -1048,7 +1048,7 @@ test "AgentProtocolClient explicit-sequence sends carry the given value and roll
         .sequence = 0,
         .in_reply_to = msg_id,
         .timestamp = compat.time.nowMillis(),
-        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = "invalid sequence" } },
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
     };
     defer rejection.deinit(allocator);
     try client.processEnvelope(rejection);
