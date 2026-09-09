@@ -210,7 +210,11 @@ export async function drainSessionFramesUntilQuiescent(
  *
  * Uncorrelated frames read during the wait are dropped: the probe runs only
  * on a dead attempt's teardown, and the late run output it may consume was
- * already lost to the caller's timeout.
+ * already lost to the caller's timeout. Each read is CORRELATED to the
+ * outstanding stop (§13.3.1), so its replies reach the probe promptly even
+ * while queued behind a transport read lock an abandoned run/stream read may
+ * still hold — without the correlation the probe's budget can expire behind
+ * that lock before the rejection arrives, and the retry never goes out.
  *
  * @returns The sequence at which the stop was accepted, or `undefined` when
  * the probe ended unresolved (no reply, session already gone, or both
@@ -232,7 +236,14 @@ export async function stopAgentWithSequenceProbe(
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
     const controller = new AbortController();
-    const read = transport.nextFrameForSession(sessionId, waitMs, { signal: controller.signal }).catch(() => null);
+    // Correlate each read to the outstanding stop (§13.3.1): the stop's
+    // replies carry `in_reply_to` naming it, and a correlated wait is
+    // delivered its replies promptly EVEN while queued behind the transport
+    // read lock — which an abandoned run/stream read can still hold after an
+    // abort. An uncorrelated probe read would burn its whole budget waiting
+    // for that lock, sending only the pre-send stop whose rejection (the
+    // accepted-message case) then never triggers the retry.
+    const read = transport.nextFrameForSession(sessionId, waitMs, { correlate: outstanding.messageId, signal: controller.signal }).catch(() => null);
     let budgetTimer: NodeJS.Timeout | undefined;
     const budget = new Promise<null>((resolve) => {
       budgetTimer = setTimeout(() => {

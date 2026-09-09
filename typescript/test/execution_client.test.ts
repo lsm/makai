@@ -2876,6 +2876,7 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
   const sessionId = "testNanoIdSess1234567";
   const sentStops: Array<{ sequence: number; messageId: string }> = [];
   const replies: StdioFrame[] = [];
+  const waitCorrelates: Array<string | undefined> = [];
   const transport = {
     send: (frame: StdioFrame) => {
       if (frame.type !== "agent_stop") return;
@@ -2887,7 +2888,11 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
         replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: messageId, payload: {} });
       }
     },
-    nextFrameForSession: async (sid: string, timeoutMs?: number) => {
+    nextFrameForSession: async (sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
+      // Each probe read MUST be correlated to the outstanding stop (§13.3.1
+      // / #210 gap 7): replies reach the probe promptly even while it is
+      // queued behind a transport read lock an abandoned read still holds.
+      waitCorrelates.push(wait?.correlate);
       const frame = replies.shift();
       if (!frame) throw new Error(`timed out waiting for frame for session ${sid} after ${timeoutMs ?? 1000}ms`);
       return frame;
@@ -2897,6 +2902,10 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
   const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
   assert.equal(acceptedAt, 3);
   assert.deepEqual(sentStops.map((stop) => stop.sequence), [2, 3]);
+  // The first read is correlated to the first stop; after the retry, the
+  // next read is correlated to the SECOND stop's message id.
+  assert.equal(waitCorrelates[0], sentStops[0]?.messageId);
+  assert.ok(waitCorrelates.slice(1).includes(sentStops[1]?.messageId));
 });
 
 test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and recognizes the nack rejection shape (#210 gap 7)", async () => {
