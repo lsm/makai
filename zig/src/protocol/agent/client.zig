@@ -132,6 +132,15 @@ pub const AgentProtocolClient = struct {
         self.sender = sender;
     }
 
+    /// Whether a bounded stop probe is still in flight for the session
+    /// (either phase). Teardown paths that started a probe pump incoming
+    /// frames until this clears — the post-send retry is emitted from
+    /// `processEnvelope` when the first stop's correlated rejection arrives
+    /// (#210 gap 7).
+    pub fn hasActiveStopProbe(self: *Self, session_id: agent_types.SessionId) bool {
+        return self.stop_probes_by_session.contains(session_id);
+    }
+
     /// The next sequence the server is expected to accept for the session: 1
     /// before any send, the sent value + 1 after each counter-advancing send
     /// (optimistic — a correlated rejection rolls it back, §13.1).
@@ -443,9 +452,15 @@ pub const AgentProtocolClient = struct {
             .nack => |n| {
                 // A correlated nack is a request rejection like a correlated
                 // agent_error (the fixture server and older peers use this
-                // shape); probe replies are consumed first, then the rollback
-                // applies to any remaining correlated nack.
+                // shape): probe replies are consumed first, and a non-probe
+                // nack surfaces through the same session-error bookkeeping —
+                // without it, a peer that rejects an ordinary agent_message
+                // by nack would leave the TUI treating the submit as
+                // accepted with no settlement ever coming (#210 gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) {
+                    self.last_error.deinit(self.allocator);
+                    self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, n.reason.slice()));
+                    try self.setSessionError(env.session_id, n.reason.slice());
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
                 }
             },

@@ -742,6 +742,7 @@ pub const TuiRuntime = struct {
                 if (client.sendAgentStopProbing(sid, "client disconnect") catch null) |_| {} else {
                     _ = client.sendAgentStop(sid, "client disconnect") catch {};
                 }
+                self.driveRemoteStopProbe(client, sid);
                 client.removeSessionState(sid);
             }
             // Cancel and join the WebSocket reader before closing the sender so
@@ -1105,6 +1106,7 @@ pub const TuiRuntime = struct {
                     _ = client.sendAgentStop(sid, "cancelled") catch {};
                 }
                 self.pumpRemoteIncoming() catch {};
+                self.driveRemoteStopProbe(client, sid);
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);
                 self.remote_session_id = null;
@@ -1430,6 +1432,23 @@ pub const TuiRuntime = struct {
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
         return out;
+    }
+
+    /// Drives an in-flight stop probe through its asynchronous second phase
+    /// (#210 gap 7, §13.4.1): the post-send retry is emitted from the
+    /// client's `processEnvelope` once the first stop's correlated rejection
+    /// arrives, so pump (bounded) until the probe settles or the budget
+    /// expires — a reply not already buffered must still get the chance to
+    /// trigger the retry before the caller drops the session state.
+    fn driveRemoteStopProbe(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient, sid: agent_protocol_types.SessionId) void {
+        const budget_ms: i64 = 150;
+        const deadline = compat.time.nowMillis() + budget_ms;
+        while (client.hasActiveStopProbe(sid)) {
+            self.pumpRemoteIncoming() catch {};
+            if (!client.hasActiveStopProbe(sid)) break;
+            if (compat.time.nowMillis() >= deadline) break;
+            compat.time.sleepNs(5 * std.time.ns_per_ms);
+        }
     }
 
     fn pumpRemoteIncoming(self: *TuiRuntime) !void {
