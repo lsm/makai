@@ -2894,17 +2894,6 @@ fn fixtureToolUseStreamSimple(
     return fixtureToolUseStream(model, context, null, allocator);
 }
 
-/// File-scope backing for `fixtureDistributedToolStream`'s completed result:
-/// the stream borrows its content and the consuming run thread drains only
-/// after the fixture returns, so the content must outlive the call.
-const fixture_distributed_tool_content = [_]ai_types.AssistantContent{.{
-    .tool_call = .{
-        .id = "dist-call-1",
-        .name = "lookup",
-        .arguments_json = "{}",
-    },
-}};
-
 fn fixtureDistributedToolStream(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -2916,13 +2905,32 @@ fn fixtureDistributedToolStream(
     _ = options;
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.owns_events = true;
     s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    // Content-block strings of a completed result are freed UNCONDITIONALLY
+    // at stream deinit (AssistantMessage.deinit's ownership contract), so
+    // the fixture must hand over allocator-owned strings — no literals.
+    const owned_id = try allocator.dupe(u8, "dist-call-1");
+    errdefer allocator.free(owned_id);
+    const owned_name = try allocator.dupe(u8, "lookup");
+    errdefer allocator.free(owned_name);
+    const owned_args = try allocator.dupe(u8, "{}");
+    errdefer allocator.free(owned_args);
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .tool_call = .{
+        .id = owned_id,
+        .name = owned_name,
+        .arguments_json = owned_args,
+    } };
+
     // Every turn emits one distributed tool call, so a run driven by this
     // fixture parks in `executeStdioToolViaAgentProtocol`'s wait.
     s.complete(.{
-        .content = &fixture_distributed_tool_content,
+        .content = content,
         .api = "fixture-dist-api",
         .provider = "fixture",
         .model = "fixture-model",
@@ -4101,10 +4109,12 @@ test "stale tool_result for a reused tool_call_id is rejected by in_reply_to cor
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     clearOwnedLines(allocator, &outbound);
 
-    // First execution of the reused id: published, answered, consumed.
+    // First execution of the reused id: published, answered, consumed. The
+    // publish only enqueues the frame into the server outbox — a background
+    // pump must move it to the pipe before the drain can observe it.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
-    _ = try stdio_loop.drainOutbound(&outbound);
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     var first_env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
     defer first_env.deinit(allocator);
     const first_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", first_env.message_id, "first");
@@ -4118,7 +4128,7 @@ test "stale tool_result for a reused tool_call_id is rejected by in_reply_to cor
     // execution must not settle the second wait (#210 gap 6).
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
-    _ = try stdio_loop.drainOutbound(&outbound);
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     var second_env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[1], allocator);
     defer second_env.deinit(allocator);
     try std.testing.expect(!std.mem.eql(u8, &first_env.message_id, &second_env.message_id));
@@ -4157,12 +4167,10 @@ test "distributed tool wait fails promptly on the disconnect latch" {
         .disconnect_failed = &disconnect_flag,
     };
 
-    try bridge.enqueueRequest(allocator, session_id, 0, "call-1", "lookup", "{}");
-
-    // Stdin EOF latched before the wait polls: it fails on the first
-    // iteration with the typed error, flags the run disconnect-failed,
-    // and marks the run cancelled so the loop stops issuing turns
-    // (#210 gap 4). No sleep-spin, no hang.
+    // Stdin EOF latched before the wait runs: it enqueues its request, then
+    // fails on the first poll iteration with the typed error, flags the run
+    // disconnect-failed, and marks the run cancelled so the loop stops
+    // issuing turns (#210 gap 4). No sleep-spin, no hang.
     bridge.markDisconnected();
     try std.testing.expectError(
         error.ClientDisconnected,
@@ -4170,8 +4178,8 @@ test "distributed tool wait fails promptly on the disconnect latch" {
     );
     try std.testing.expect(disconnect_flag.load(.acquire));
     try std.testing.expect(cancel_flag.load(.acquire));
-    // The unpublished request is dropped by the publisher (latch-checked
-    // there); its bridge entry is freed at deinit.
+    // The wait's own request stays unpublished (the publisher drops it on
+    // the latch); its bridge entry is freed at deinit.
     try std.testing.expectEqual(@as(usize, 1), bridge.requests.items.len);
 }
 
