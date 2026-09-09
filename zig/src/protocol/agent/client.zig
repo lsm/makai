@@ -934,8 +934,20 @@ test "AgentProtocolClient probing stop is bounded: no retry on a non-invalid_req
     const client = &harness.client;
 
     const sid = agent_types.generateSessionId();
-    _ = try client.sendAgentStartWithSession(sid, "{}", null);
-    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    // Admission evidence (§6.1, #210 gap 7): the probe reconciles a message
+    // send only against a registration whose agent_started this observed.
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
 
     const probe_stop_id = try client.sendAgentStopProbing(sid, "timeout");
 
