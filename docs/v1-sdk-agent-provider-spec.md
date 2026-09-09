@@ -980,9 +980,12 @@ Rules:
   mirror the server's counter optimistically — the tracker advances at SEND, before
   the outcome is known — and reconcile on evidence. A CORRELATED rejection (an
   `agent_error`/`nack` whose `in_reply_to` names the client's own send) rolls the
-  tracker back to the rejected send's own sequence, so a corrected retry reuses it;
-  the Zig client drops the per-session counter state instead when the correlated
-  rejection is `agent_not_found` (the session is gone, its counter meaningless).
+  tracker back to the rejected send's own sequence, so a corrected retry reuses it
+  (the Zig client tracks every outstanding send and rolls back MONOTONICALLY to
+  the minimum — an older unresolved send's floor is never lost to a younger
+  send's rejection); the Zig client drops the per-session counter state instead
+  when the correlated rejection is `agent_not_found` (the session is gone, its
+  counter meaningless).
   Stop sends never advance the tracker in either client: an accepted stop consumes
   the counter with the session, and a rejected stop leaves the expected value in
   place for its retry. An UNCORRELATED outcome (timeout, lost output) reconciles
@@ -993,11 +996,13 @@ Rules:
   is emitted from `processEnvelope` when the first stop's correlated
   `invalid_request` reply arrives, and BOTH stops' replies — including the
   retry's own rejection — are consumed as cleanup mechanics rather than session
-  errors; probing is a MESSAGE-send recovery and REQUIRES a recorded
-  `agent_message` send: with none, it sends nothing at all, since a start-only
-  unknown outcome carries no ownership evidence and even a single stop at the
-  tracker's value would validate against a foreign owner's freshly started
-  session — §6.1's leak-over-destroy rule) — so recovery paths are not forced
+  errors; probing is an ADMITTED-message-send recovery and requires BOTH a
+  recorded `agent_message` send AND an observed `agent_started` for the
+  registration: without either it sends nothing at all, since a message sent
+  without admission evidence may have been accepted by a foreign caller's fresh
+  session on the same id, and even a single stop at the tracker's value would
+  validate against that session — §6.1's leak-over-destroy rule) — so recovery
+  paths are not forced
   to guess a counter state.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
