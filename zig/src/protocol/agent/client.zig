@@ -1201,12 +1201,14 @@ test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)
     const client = &harness.client;
 
     const sid = agent_types.generateSessionId();
-    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
     var started_env = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .in_reply_to = null,
+        // The real agent_started is request-correlated — that is what retires
+        // the start's own pending record here.
+        .in_reply_to = start_id,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_started = .{ .session_id = sid } },
     };
