@@ -1002,10 +1002,12 @@ Rules:
   the counter to 0 (overwriting any numbers the id consumed for `models_request`s
   issued before the start), and an id re-registered after a stop restarts it, so
   sequence values may repeat across registrations of the same id. Consumers MUST
-  treat the outbound counter as per-registration. `[current exception]` the
-  counter update itself ignores allocation failure (`nextOutgoingSequence`'s map
-  put is `catch {}`), so under memory pressure two frames can receive the same
-  sequence — monotonic allocation holds absent allocation failure (#204). Echo
+  treat the outbound counter as per-registration. `[current — #210 gap 5]` a
+  failed counter update now propagates instead of being swallowed: the frame
+  whose publication failed is not built, so allocated sequences remain
+  monotonic (a retried publication may burn the already-recorded value and
+  leave a GAP — gaps are already possible across allocated frames and MUST
+  NOT be treated as loss). Echo
   replies (`session_info`, `pong`, `tool_list_response`) copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
@@ -1307,7 +1309,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
          `agent_result` publication keeps the run queued and propagates, the
          next pump retries the frame, and the trailing `agent_end` projection
          publishes ONLY after the frame commits — a failed result publication
-         can no longer produce a false-success projection.
+         can no longer produce a false-success projection. A run whose
+         settlement frame committed no longer occupies the session's
+         one-active-run slot while it retries the trailing projection: the
+         next `agent_message` is admitted (the late trailing `agent_end` is
+         the §13.4.3 stale-`agent_end` interleave consumers drain per §6.1).
        - the failure pair: the leading error-event projection and the
          settlement envelope each record their commitment; a failure before
          the projection retries the pair whole; a failure BETWEEN them (the

@@ -1148,9 +1148,18 @@ const StdioProtocolLoop = struct {
     /// session — the generation-scoped form of the one-active-run-per-session
     /// check (§13.2.4 read through §13.4.5, #204). Runs of older
     /// registrations never match: they are cancelled and their publications
-    /// discarded by the pump, so they do not make the session busy.
+    /// discarded by the pump, so they do not make the session busy. Neither
+    /// do runs whose settlement frame already committed (#210 gap 5,
+    /// review): such a run is a publication straggler — at most retrying
+    /// its trailing `agent_end` projection — while its session is already
+    /// `.ready` (`publishAgentResult` flipped it). Counting it busy would
+    /// turn a newly ACCEPTED `agent_message` into an `AgentBusy`
+    /// internal-error settlement on the next pump instead of letting it
+    /// run; the straggler's late trailing projection is the §13.4.3
+    /// stale-`agent_end` case consumers already drain per §6.1.
     fn hasActiveRunForGeneration(self: *Self, session_id: AgentProtocolTypes.SessionId, generation: u64) bool {
         for (self.active_agent_runs.items) |run| {
+            if (run.settlement_frame_published) continue;
             if (run.generation == generation and std.mem.eql(u8, run.session_id[0..], session_id[0..])) return true;
         }
         return false;
@@ -1334,8 +1343,12 @@ const StdioProtocolLoop = struct {
         // the pop would drop an already-delivered frame (and leak it). With
         // the slot reserved up front the append cannot fail; a failure
         // earlier in the iteration leaves the frame in the pipe for the
-        // next drain to deliver.
+        // next drain to deliver. An empty pipe reserves nothing at all —
+        // draining must not be able to fail when there is nothing pending
+        // (the host's error path would otherwise strand frames already
+        // buffered for the pipes drained before this one).
         while (true) {
+            if (receiver.read_pos_ptr.* >= receiver.buffer.items.len) break;
             try lines.ensureUnusedCapacity(self.allocator, 1);
             const line = (try receiver.readLine(self.allocator)) orelse break;
             lines.appendAssumeCapacity(line);
@@ -2598,6 +2611,14 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
 
         const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
             try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
+            // Frames buffered before the failure still reach stdout (#210
+            // gap 5, review): the pipe may deliver nothing further (EOF),
+            // and gating the flush on the recovered drain count would
+            // strand them forever.
+            if (outbound_lines.items.len > 0) {
+                try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
+                did_work = true;
+            }
             break :blk 0;
         };
         if (drained > 0) {
@@ -2635,6 +2656,11 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
     };
     const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
         try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
+        // Same flush-on-error as the main loop (#210 gap 5, review): the
+        // shutdown drain must not strand frames buffered before a failure.
+        if (outbound_lines.items.len > 0) {
+            try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
+        }
         break :blk 0;
     };
     if (drained > 0) {
@@ -5308,6 +5334,69 @@ test "stdio drain never drops a delivered frame on failure" {
 
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.drainOutbound(&outbound));
     try std.testing.expect(std.mem.find(u8, outbound.items[0], "agent_result") != null);
+
+    // An empty pipe reserves nothing at all: draining with nothing pending
+    // cannot fail, so a drain error can never strand frames buffered for
+    // earlier pipes (review finding on #210 gap 5).
+    clearOwnedLines(allocator, &outbound);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqual(@as(usize, 0), try stdio_loop.drainOutbound(&outbound));
+    failing.fail_index = std.math.maxInt(usize);
+}
+
+test "a settled run retrying its trailing projection does not make the session busy" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-error-api",
+        .stream = fixtureErrorStream,
+        .stream_simple = fixtureErrorStreamSimple,
+    }, "test-fixtures");
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-error-api@fixture-model";
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    // A publication STRAGGLER (review finding on #210 gap 5): the run's
+    // `agent_result` committed (the session is `.ready`) but its trailing
+    // `agent_end` projection is still pending a retry — the exact state a
+    // trailing-publication OOM leaves.
+    const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
+    completeManualRunWithResult(run);
+    run.terminal_event_json = try serializeAgentLoopEvent(allocator, session_id, .{ .agent_end = .{} });
+    run.settlement_frame_published = true;
+
+    // A new message arrives before the retry: it must be ADMITTED — the
+    // straggler is not active work — not turned into an `AgentBusy`
+    // internal-error settlement on the next pump.
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        if (!stdio_loop.hasActiveAgentRuns()) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    // Both runs drained: the straggler's only removal path publishes its
+    // trailing projection first, and the new run ran to its own settlement.
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "AgentBusy") == null);
+    }
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {
