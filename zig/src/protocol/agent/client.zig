@@ -248,7 +248,7 @@ pub const AgentProtocolClient = struct {
             return self.sendAgentStop(session_id, reason);
         }
         const msg_id = try self.sendAgentStopWithSequence(session_id, reason, last.sequence);
-        const owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
+        var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
         errdefer owned_reason.deinit(self.allocator);
         if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
             var superseded = entry.value;
