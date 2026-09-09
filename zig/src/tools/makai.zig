@@ -269,8 +269,14 @@ const StdioToolBridge = struct {
         // stop whose reply publication failed before the bridge discard
         // (§13.4.4) — must not shadow the current execution's request, or
         // it would both accept a stale reply and reject the current
-        // execution's own correctly-correlated reply.
+        // execution's own correctly-correlated reply. A queued result that
+        // already passed the OLD key's correlation survives the same leak
+        // and must be purged with it: the pop matches by (session,
+        // tool_call_id) only, so it would hand the stale result to the new
+        // execution while the duplicate-result check rejects the new
+        // execution's own reply.
         self.removeInFlightLocked(allocator, session_id, tool_call_id);
+        self.removeResultsLocked(allocator, session_id, tool_call_id);
         try self.in_flight.append(allocator, .{
             .session_id = session_id,
             .tool_call_id = owned_tool_call_id,
@@ -364,6 +370,23 @@ const StdioToolBridge = struct {
         while (idx < self.in_flight.items.len) {
             if (std.mem.eql(u8, &self.in_flight.items[idx].session_id, &session_id) and std.mem.eql(u8, self.in_flight.items[idx].tool_call_id, tool_call_id)) {
                 var removed = self.in_flight.orderedRemove(idx);
+                removed.deinit(allocator);
+                continue;
+            }
+            idx += 1;
+        }
+    }
+
+    /// Removes every queued result for the (session, tool_call_id) pair —
+    /// the results-queue half of `markInFlight`'s supersession (#210 gap 6):
+    /// a result that passed the OLD request's correlation and survived a
+    /// §13.4.4 bridge-discard leak must not be handed to the new execution
+    /// by the key-only pop. Caller must hold the mutex.
+    fn removeResultsLocked(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) void {
+        var idx: usize = 0;
+        while (idx < self.results.items.len) {
+            if (std.mem.eql(u8, &self.results.items[idx].session_id, &session_id) and std.mem.eql(u8, self.results.items[idx].tool_call_id, tool_call_id)) {
+                var removed = self.results.orderedRemove(idx);
                 removed.deinit(allocator);
                 continue;
             }
@@ -4311,8 +4334,24 @@ test "a new execution supersedes a leaked in-flight key for the same tool_call_i
     // reused the tool_call_id: the new execution's key must supersede the
     // stale one — first-match correlation must never see the leak.
     try bridge.markInFlight(allocator, session_id, "dup-call", stale_request_id);
+    // A reply to the stale request that already passed its correlation and
+    // queued before the leak: it must be purged together with the key, or
+    // the key-only pop would hand it to the new execution while the
+    // duplicate-result check rejects the new execution's own reply.
+    const stale_queued_result = StdioToolResult{
+        .session_id = session_id,
+        .tool_call_id = try allocator.dupe(u8, "dup-call"),
+        .in_reply_to = stale_request_id,
+        .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"stale queued\"}]"),
+        .details_json = try allocator.dupe(u8, ""),
+        .is_error = false,
+    };
+    try std.testing.expect(try bridge.enqueueResult(allocator, stale_queued_result));
+    try std.testing.expectEqual(@as(usize, 1), bridge.results.items.len);
+
     try bridge.markInFlight(allocator, session_id, "dup-call", current_request_id);
     try std.testing.expectEqual(@as(usize, 1), bridge.in_flight.items.len);
+    try std.testing.expectEqual(@as(usize, 0), bridge.results.items.len);
 
     var stale_result = StdioToolResult{
         .session_id = session_id,
