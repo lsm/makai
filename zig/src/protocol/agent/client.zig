@@ -365,7 +365,7 @@ pub const AgentProtocolClient = struct {
                 _ = self.stop_probes_by_session.remove(session_id);
                 defer reason.deinit(self.allocator);
                 if (retry) {
-                    self.sendAgentStopWithSequence(session_id, reason.slice(), second_sequence) catch {};
+                    _ = self.sendAgentStopWithSequence(session_id, reason.slice(), second_sequence) catch {};
                 }
                 return;
             }
