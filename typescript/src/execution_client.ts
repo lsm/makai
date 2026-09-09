@@ -455,7 +455,7 @@ class StdioAgentApi implements MakaiAgentApi {
    * to the session and would consume the frames of an immediate follow-up
    * attempt, leaving it to time out.
    */
-  private stopAgentSession(
+  private async stopAgentSession(
     session: ActiveAgentSession | undefined,
     sessionId: string | undefined,
     sequence: number,
