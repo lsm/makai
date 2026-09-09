@@ -1394,8 +1394,10 @@ server eviction (rule 6), and holds no transcript and no persistence.
    further client input: if the in-flight provider turn returns
    `stop_reason = tool_use` after EOF AND the call reaches the distributed
    executor (a configured tool with schema-valid arguments whose approval path
-   permits execution), the run transitions into the tool-waiting case below and
-   produces no terminal; an unknown tool, schema-invalid arguments, or an
+   permits execution), the run transitions into the tool-waiting case below,
+   which the disconnect latch then fails (see the next sentence — it settles
+   through the failure pair, not silence); an unknown tool, schema-invalid
+   arguments, or an
    approval-required call (the stdio host locally rejects those without a
    reachable approver) synthesizes a local error tool-result instead, the loop
    continues, and the run can still settle on stdout. A run waiting on a distributed
