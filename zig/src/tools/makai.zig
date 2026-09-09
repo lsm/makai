@@ -4476,6 +4476,9 @@ test "stopped session's late run publications are discarded after id re-registra
     const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
     defer allocator.free(stop_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
+    // The stop cancelled the still-listed run (asserted here: the pump's
+    // removal below destroys the run's objects, cancel_flag included).
+    try std.testing.expect(cancel_flag.load(.acquire));
 
     const restart_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
     defer allocator.free(restart_req);
@@ -4485,10 +4488,10 @@ test "stopped session's late run publications are discarded after id re-registra
 
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
-    // The stale run was drained and removed, and it was cancelled by the
-    // stop.
+    // The stale run was drained and removed (its cancellation by the stop
+    // was asserted above; the pump's orderedRemove destroys the run's
+    // objects, so cancel_flag is no longer readable here).
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
-    try std.testing.expect(cancel_flag.load(.acquire));
 
     // But it published nothing into the re-created registration: no run
     // events, no settlement error, and the fresh container was never marked
