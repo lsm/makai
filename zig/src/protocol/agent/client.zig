@@ -18,16 +18,21 @@ pub const QueuedEvent = struct {
     }
 };
 
-/// Every counter-advancing send (`agent_start`/`agent_message`) for a session
-/// whose outcome is still unresolved, so a correlated rejection can roll the
-/// per-session counter back to the rejected send's own sequence (§13.1: a
-/// rejected request never advances the server's expected counter, so a
-/// corrected retry reuses the sequence; #210 gap 7, slice 1 of the client
-/// sequence-control series). All outstanding sends are tracked (not just the
-/// latest): a reply may name ANY of them, and the rollback takes the minimum —
-/// an older unresolved send's floor must never be lost to a younger send's
-/// rejection.
-const PendingSendKind = enum { start, message };
+/// Every tracked request send for a session whose outcome is still
+/// unresolved, so a correlated reply can be tied to this client's own
+/// request (§13.1: a rejected counter-advancing request never advances the
+/// server's expected counter, so a corrected retry reuses the sequence;
+/// #210 gap 7, slice 1 of the client sequence-control series).
+/// Counter-advancing sends (`agent_start`/`agent_message`) are the rollback
+/// targets — all outstanding sends are tracked (not just the latest), and
+/// the rollback takes the minimum so an older unresolved send's floor is
+/// never lost to a younger send's rejection. Ordinary stops never advance
+/// the counter, so their records exist purely so their OWN replies — a
+/// session-gone answer discovering the eviction through the stop, or a
+/// rejection — reach the handling above instead of being ignored (their
+/// rejection rollback is naturally a no-op: a stop carries the tracker's
+/// own value).
+const PendingSendKind = enum { start, message, stop };
 
 const PendingSend = struct {
     msg_id: agent_types.Ulid,
@@ -108,10 +113,10 @@ pub const AgentProtocolClient = struct {
         return self.next_sequence_by_session.get(session_id) orelse 1;
     }
 
-    /// Records a counter-advancing send BEFORE it is written to the wire, so
-    /// the post-send bookkeeping is infallible: an allocation failure here
-    /// errors out with nothing on the wire, never after the server may have
-    /// accepted the send (#210 gap 7).
+    /// Records a send BEFORE it is written to the wire, so the post-send
+    /// bookkeeping is infallible: an allocation failure here errors out with
+    /// nothing on the wire, never after the server may have accepted the
+    /// send (#210 gap 7).
     fn recordPendingSend(self: *Self, session_id: agent_types.SessionId, msg_id: agent_types.Ulid, sequence: u64, kind: PendingSendKind) !void {
         const gop = try self.pending_sends_by_session.getOrPut(session_id);
         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(PendingSend).empty;
@@ -208,14 +213,24 @@ pub const AgentProtocolClient = struct {
         defer payload.deinit(self.allocator);
         if (reason) |r| payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r));
 
+        const sequence = self.peekNextSequence(session_id);
         const json = try self.serializeEnvelopeForSend(.{
             .session_id = session_id,
             .message_id = msg_id,
-            .sequence = self.peekNextSequence(session_id),
+            .sequence = sequence,
             .timestamp = compat.time.nowMillis(),
             .payload = payload,
         });
         defer self.allocator.free(json);
+        // The stop is tracked like any other own request — a stop never
+        // advances the counter, so the record exists purely so its OWN
+        // replies reach the handling: a session-gone answer naming the stop
+        // (an eviction discovered through the teardown) drops the session's
+        // counter state, instead of leaving a stale value that a
+        // re-registration of the same id would send and have rejected
+        // (#210 gap 7). Recorded BEFORE the wire so a record failure leaves
+        // nothing sent.
+        try self.recordPendingSend(session_id, msg_id, sequence, .stop);
         try self.writeEnvelopeJson(json);
         return msg_id;
     }
@@ -290,6 +305,14 @@ pub const AgentProtocolClient = struct {
                 });
             },
             .agent_result => |json| {
+                // Reconcile the CONSUMED frame BEFORE the fallible
+                // bookkeeping: a settlement resolves the settled run's own
+                // message send, so its record retires even when the result
+                // copy or the session-scoped diagnostics cannot be allocated
+                // — a stale entry would otherwise floor a LATER rejection
+                // too low and grow without bound over a long-lived session
+                // (#210 gap 7).
+                self.retireSettledPendingSends(env.session_id);
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
                 try self.setSessionResult(env.session_id, json);
@@ -310,6 +333,12 @@ pub const AgentProtocolClient = struct {
                     if (std.mem.eql(u8, sid[0..], p.session_id[0..])) self.session_id = null;
                 }
                 _ = self.next_sequence_by_session.remove(p.session_id);
+                // The session is gone with its counter — the tracked
+                // requests (the accepted stop included) are meaningless.
+                if (self.pending_sends_by_session.fetchRemove(p.session_id)) |entry| {
+                    var list = entry.value;
+                    list.deinit(self.allocator);
+                }
                 try self.session_complete_flags.put(p.session_id, true);
             },
             else => {},
@@ -323,6 +352,23 @@ pub const AgentProtocolClient = struct {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
         for (list.items, 0..) |pending, index| {
             if (!std.mem.eql(u8, &reply_to, &pending.msg_id)) continue;
+            _ = list.orderedRemove(index);
+            return;
+        }
+    }
+
+    /// Retires the pending-send record a settlement resolves: the settled
+    /// run's own message. That message is the OLDEST pending message-kind
+    /// send — it was admitted (hence sent) before any later pipelined send
+    /// could be attempted against the one-active-run rule (§13.2.4) — so
+    /// exactly the oldest message entry retires and every LATER unresolved
+    /// send is kept for its own reply. Serial use degenerates to retiring
+    /// the sole message, so a long-lived session's records stay bounded by
+    /// its unresolved sends, not its history (#210 gap 7).
+    fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        for (list.items, 0..) |pending, index| {
+            if (pending.kind != .message) continue;
             _ = list.orderedRemove(index);
             return;
         }
@@ -756,4 +802,97 @@ test "AgentProtocolClient stop sends never advance the tracker (#210 gap 7)" {
     defer stop_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), stop_env.sequence);
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    // The accepted stop consumes the tracked requests with the session.
+    var stopped_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 4,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid } },
+    };
+    defer stopped_env.deinit(allocator);
+    try client.processEnvelope(stopped_env);
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+}
+
+test "AgentProtocolClient session-gone answer to a stop drops the counter for re-registration (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+    const stop_id = try client.sendAgentStop(sid, "teardown"); // stop@3, tracked
+
+    // An idle-TTL eviction discovered through the stop: the correlated
+    // agent_not_found names the client's own stop, and the session-gone
+    // handling must run — without tracking the stop, the stale counter would
+    // survive and a re-registration of the same id would send it and be
+    // rejected by the fresh session.
+    var gone = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer gone.deinit(allocator);
+    try client.processEnvelope(gone);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // re-registration restarts at 1
+    var restarted = try harness.envelopeAt(3);
+    defer restarted.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), restarted.sequence);
+}
+
+test "AgentProtocolClient settlement retires the settled run's own message record (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env); // retires the start's record
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    // The run settles: the settled run's own message retires, so a
+    // long-lived session's records stay bounded by its unresolved sends —
+    // without retirement every completed turn would leave a record behind.
+    var result_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer result_env.deinit(allocator);
+    try client.processEnvelope(result_env);
+
+    const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining);
+
+    // The tracker itself is untouched by the settlement.
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null);
+    var next_env = try harness.envelopeAt(2); // start, m1, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), next_env.sequence);
 }

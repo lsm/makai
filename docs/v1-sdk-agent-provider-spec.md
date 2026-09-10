@@ -988,7 +988,12 @@ Rules:
   drops the counter state instead, since the session is gone server-side.
   Stop sends never advance the tracker: an accepted stop consumes the
   counter with the session, and a rejected stop leaves the expected value
-  in place for its retry. Slices to follow in the series: explicit-sequence
+  in place for its retry; stops are tracked requests too, so a
+  session-gone answer discovered through a stop drops the counter state
+  for the re-registration. A settlement retires the settled run's own
+  message record (the oldest pending message), keeping a long-lived
+  session's records bounded by its unresolved sends rather than its
+  history. Slices to follow in the series: explicit-sequence
   sends with duplicate-evidence handling, the pending-record lifecycle and
   stale-reply guards, the bounded stop probe for unknown outcomes, and the
   TUI teardown integration (`[in progress — #210 gap 7 re-sliced from
