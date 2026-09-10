@@ -581,15 +581,16 @@ pub const AgentProtocolClient = struct {
                             // ambiguous even though the recorded bit predates
                             // it (#210 gap 7).
                             if (entry.resend_of_pending and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
-                            // The retired duplicate was possibly a COMPETING
-                            // payload at its sequence: its removal can
-                            // re-qualify other payloads' retries for the
-                            // silent path (their recorded bit was false only
-                            // because this competitor existed). Records of
-                            // the RETIRED payload keep their recorded bits —
-                            // the retired record was proven consumed, and its
-                            // chain's justifications stand (#210 gap 7).
-                            self.requalifyProvenanceAfterCompetitorRetirement(env.session_id, entry.sequence, entry.payload_hash);
+                            // The retired record was itself
+                            // rejected-as-duplicate — it never ran — so its
+                            // same-payload descendants' silent justification
+                            // dies with it, AND its removal can re-qualify
+                            // other payloads' retries for the silent path
+                            // (their recorded bit was false only because
+                            // this competitor existed). Re-derive everything
+                            // at the sequence against the current records
+                            // (#210 gap 7).
+                            self.rederiveProvenanceAt(env.session_id, entry.sequence);
                             // The proven step is already recorded; fall
                             // through to surface the failure.
                         } else if (entry.kind == .stop) {
@@ -766,25 +767,37 @@ pub const AgentProtocolClient = struct {
         return false;
     }
 
-    /// Re-derives the retry provenance of same-sequence records of OTHER
-    /// payloads after a COMPETING record retired through its own duplicate
-    /// answer: with the competitor gone (and proven consumed — its chain's
-    /// justifications stand, so records of the retired payload keep their
-    /// recorded bits), a same-payload retry's duplicate legitimately
-    /// confirms the still-pending original (#210 gap 7).
-    fn requalifyProvenanceAfterCompetitorRetirement(self: *Self, session_id: agent_types.SessionId, sequence: u64, retired_hash: u64) void {
+    /// Re-derives the retry provenance of every same-sequence message
+    /// record against the CURRENT record set (#210 gap 7). Used after a
+    /// rejection removes a record AND after a NON-RETRY duplicate retires
+    /// one: a duplicate answer means the retired record was itself
+    /// rejected-as-duplicate — the sequence was consumed by an EARLIER
+    /// envelope, so the retired record never ran and its same-payload
+    /// descendants' silent justification dies with it (only a SETTLED
+    /// source, whose run completed, leaves its descendants' recorded bits
+    /// standing). Provenance stays DIRECTIONAL (an earlier intact source)
+    /// and COMPETING-PAYLOAD-GATED; a bit that loses its source marks the
+    /// chain broken so later records cannot re-derive through it.
+    fn rederiveProvenanceAt(self: *Self, session_id: agent_types.SessionId, sequence: u64) void {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
         for (list.items, 0..) |*pending, i| {
             if (pending.kind != .message or pending.sequence != sequence) continue;
-            if (pending.payload_hash == retired_hash) continue;
-            if (self.hasCompetingPayload(session_id, sequence, pending.payload_hash)) continue;
-            for (list.items[0..i]) |earlier| {
-                if (earlier.kind != .message or earlier.sequence != sequence) continue;
-                if (earlier.payload_hash != pending.payload_hash) continue;
-                if (earlier.provenance_broken) continue;
-                pending.resend_of_pending = true;
-                break;
+            var viable_source = false;
+            var has_competing_payload = false;
+            for (list.items) |other| {
+                if (other.kind != .message or other.sequence != sequence) continue;
+                if (other.payload_hash != pending.payload_hash) has_competing_payload = true;
             }
+            if (!has_competing_payload) {
+                for (list.items[0..i]) |earlier| {
+                    if (earlier.kind != .message or earlier.sequence != sequence) continue;
+                    if (earlier.payload_hash != pending.payload_hash) continue;
+                    if (earlier.provenance_broken) continue;
+                    viable_source = true;
+                }
+            }
+            if (pending.resend_of_pending and !viable_source) pending.provenance_broken = true;
+            pending.resend_of_pending = viable_source;
         }
     }
 
@@ -850,40 +863,11 @@ pub const AgentProtocolClient = struct {
         // A rejected MESSAGE may have been the SOURCE of other records'
         // retry provenance (`resend_of_pending` was recorded when the
         // rejected send was still pending): with the source now PROVEN
-        // never-admitted, a remaining same-sequence record is no longer a
-        // retry of an unresolved original — its duplicate answer must
-        // surface, not retire silently as though the rejected payload had
-        // run (#210 gap 7). Provenance is DIRECTIONAL and TRANSITIVE: a
-        // record derives only from an earlier same-sequence same-payload
-        // record whose own source chain is intact (`provenance_broken`
-        // marks records whose source died), so rejecting a source clears
-        // the whole chain below it — without the direction, two retries of
-        // a rejected payload would treat each other as unresolved sources
-        // and keep suppressing their duplicate answers.
+        // never-admitted, the chain below it must re-derive — see
+        // `rederiveProvenanceAt` for the directional, transitive, and
+        // competing-payload-gated rules (#210 gap 7).
         if (rejected.kind == .message) {
-            for (list.items, 0..) |*pending, i| {
-                if (pending.kind != .message or pending.sequence != rejected.sequence) continue;
-                var viable_source = false;
-                // The same competing-payload rule as record time: a
-                // different-payload record at the sequence explains a
-                // duplicate answer without the same-payload source having
-                // run, so the silent path is disqualified (#210 gap 7).
-                var has_competing_payload = false;
-                for (list.items) |other| {
-                    if (other.kind != .message or other.sequence != rejected.sequence) continue;
-                    if (other.payload_hash != pending.payload_hash) has_competing_payload = true;
-                }
-                if (!has_competing_payload) {
-                    for (list.items[0..i]) |earlier| {
-                        if (earlier.kind != .message or earlier.sequence != rejected.sequence) continue;
-                        if (earlier.payload_hash != pending.payload_hash) continue;
-                        if (earlier.provenance_broken) continue;
-                        viable_source = true;
-                    }
-                }
-                if (pending.resend_of_pending and !viable_source) pending.provenance_broken = true;
-                pending.resend_of_pending = viable_source;
-            }
+            self.rederiveProvenanceAt(session_id, rejected.sequence);
         }
         // A rejected STOP never floors the tracker below proven bounds —
         // stops never advance the counter (§13.1), so the rejection itself
@@ -3458,4 +3442,85 @@ test "AgentProtocolClient a retired competing duplicate requalifies other payloa
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the A original remains for its own settlement
+}
+
+test "AgentProtocolClient a non-retry duplicate retirement invalidates same-payload retries (#210 gap 7)" {
+    // Sequence 2 was consumed by an earlier, SETTLED payload; a fresh
+    // payload A at 2 and its retry both receive duplicate_sequence.
+    // A's answer retires A and surfaces (A never executed), but the
+    // retry's recorded bit — derived from A while A was pending — must be
+    // re-derived: the duplicate proves only that SOME EARLIER envelope
+    // consumed 2, never that A ran, so the retry's answer SURFACES too
+    // instead of silently confirming a payload that never executed.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":settled}", null); // seq 2 — settles below
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled); // sequence 2 consumed by the settled payload
+
+    const stale_a_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // non-retry at the consumed sequence
+    const retry_a_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // retry of the pending A
+
+    var stale_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stale_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = stale_a_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer stale_duplicate.deinit(allocator);
+    try client.processEnvelope(stale_duplicate);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null); // A never executed — surfaced
+    client.clearSessionTerminalState(sid);
+
+    var retry_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_a_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer retry_duplicate.deinit(allocator);
+    try client.processEnvelope(retry_duplicate);
+
+    // The retry's silent justification died with A: its duplicate
+    // SURFACES instead of confirming a payload that never ran.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining); // both resolved
 }
