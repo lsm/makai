@@ -3,8 +3,8 @@
 // regex/template regression corpus, and ratchet behavior. Run with
 // `node --test scripts/check-no-comments.test.mjs`.
 
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -168,6 +168,13 @@ test("ts: comment trailing a block before a closing brace is stripped", () => {
   );
 });
 
+test("ts: removing a block comment between identifier characters keeps the tokens separated", () => {
+  assert.equal(stripComments("return/* note */value\n", "x.ts"), "return value\n");
+  assert.equal(stripComments("const/*c*/x = 1\n", "x.ts"), "const x = 1\n");
+  assert.equal(stripComments("return/* multi\nline */value\n", "x.ts"), "return value\n");
+  assert.equal(stripComments("const a = 1 /* c */ + 2\n", "x.ts"), "const a = 1 + 2\n");
+});
+
 test("ts: unclosed block comment refuses to lex", () => {
   assert.throws(() => stripComments("const a = 1 /* oops\nkeep()\n", "x.ts"), /never closed/);
 });
@@ -193,6 +200,8 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   }
   assert.equal(tsCount("// ts is a language\nconst a = 1\n"), 1);
   assert.equal(tsCount("// @ts-team notes\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// eslint is used by downstream consumers\nconst a = 1\n"), 1);
+  assert.equal(tsCount("/* eslint enables linting */\nconst a = 1\n"), 1);
 });
 
 let workDir;
@@ -234,6 +243,53 @@ test("ratchet: allowlisted file that is clean or untracked is stale", () => {
   const result = checkFiles([dirtyZig, cleanZig], new Set([dirtyZig, cleanZig, staleEntry]));
   assert.deepEqual(result.offending, []);
   assert.deepEqual(result.stale.sort(), [cleanZig, staleEntry].sort());
+});
+
+function gitRepo(name) {
+  const repo = join(workDir, name);
+  mkdirSync(repo);
+  execSync("git init -q", { cwd: repo });
+  return repo;
+}
+
+function gitCommit(repo) {
+  execSync("git -c user.name=test -c user.email=test@test add -A", { cwd: repo });
+  execSync("git -c user.name=test -c user.email=test@test commit -qm ratchet", { cwd: repo });
+}
+
+test("ratchet: an allowlist new in this change seeds freely (base revision lacks it)", () => {
+  const repo = gitRepo("seed-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "dirty.ts"), "// sdk\nconst a = 1;\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\ndirty.ts\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig", "dirty.ts"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 0, run.stdout);
+  assert.ok(run.stdout.includes("(2 ratcheted)"));
+});
+
+test("ratchet: allowlist entries absent from the base revision are rejected additions", () => {
+  const repo = gitRepo("additions-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.ts"), "// sdk\nconst a = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\ndirty.ts\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig", "dirty.ts"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("allowlist addition not permitted"));
+  assert.ok(run.stdout.includes("dirty.ts"));
+  assert.ok(run.stdout.includes("added entries: 1"));
 });
 
 function loadAllowlistFrom(paths) {

@@ -76,8 +76,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      # Depth 2 so the ratchet can diff the allowlist against HEAD^1 — the
+      # base branch tip on a pull_request merge ref (the previous commit on
+      # main for push builds) — and reject newly added entries.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Setup Node
         uses: actions/setup-node@v4

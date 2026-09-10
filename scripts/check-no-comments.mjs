@@ -13,11 +13,14 @@
 // mode (default, or `--write`: strip + tidy orphaned blank lines).
 // `--check` is ratcheted by scripts/no-comments-allowlist.txt: files
 // seeded there pass while the gap-7 series lands; entries whose file is
-// clean or untracked are stale and fail, so the list only shrinks.
+// clean or untracked are stale and fail, and entries absent from the
+// base revision (HEAD^1 — the seed itself excepted) are additions and
+// fail, so the list only shrinks.
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
 const TS_KEEP_PATTERNS = [
@@ -25,7 +28,7 @@ const TS_KEEP_PATTERNS = [
   /^\/\/\/\s*</,
   /@ts-(ignore|expect-error|nocheck|check)\b/,
   /biome-ignore/,
-  /\beslint\b/,
+  /^(?:\/\/|\/\*+)\s*eslint-/,
   /oxlint-(disable|enable)/,
   /@public\b/,
   /(v8|istanbul|c8) ignore/,
@@ -34,7 +37,7 @@ const TS_KEEP_PATTERNS = [
 
 const ZIG_KEEP_PATTERNS = [/^\/\/ zig fmt: (off|on)[ \t\r]*$/];
 
-const DEFAULT_ALLOWLIST = new URL("no-comments-allowlist.txt", import.meta.url).pathname;
+const DEFAULT_ALLOWLIST = fileURLToPath(new URL("no-comments-allowlist.txt", import.meta.url));
 
 // ---------------------------------------------------------------------------
 // TypeScript: literal spans from the parser, then any `//` or `/*` outside
@@ -227,6 +230,9 @@ export function stripComments(text, fileName = "x.ts") {
   let cursor = 0;
   for (const { start, end } of removals) {
     out += text.slice(cursor, start);
+    // Removing a block comment that separates two identifier characters
+    // (e.g. `return/* c */value`) must leave a space, or the tokens join.
+    if (/\w$/.test(out) && /^\w/.test(text.slice(end))) out += " ";
     cursor = end;
   }
   out += text.slice(cursor);
@@ -237,10 +243,9 @@ export function stripComments(text, fileName = "x.ts") {
 // Ratchet + CLI
 // ---------------------------------------------------------------------------
 
-export function loadAllowlist(path) {
+function parseAllowlist(text) {
   const entries = new Set();
-  if (!existsSync(path)) return entries;
-  for (const line of readFileSync(path, "utf8").split("\n")) {
+  for (const line of text.split("\n")) {
     const t = line.trim();
     if (!t || t.startsWith("#")) continue;
     entries.add(t);
@@ -248,7 +253,35 @@ export function loadAllowlist(path) {
   return entries;
 }
 
-export function checkFiles(files, allowlist) {
+export function loadAllowlist(path) {
+  if (!existsSync(path)) return new Set();
+  return parseAllowlist(readFileSync(path, "utf8"));
+}
+
+// Entries of the allowlist as committed in the base revision (HEAD^1: the
+// base branch tip on a PR merge ref, the previous commit on main), or null
+// when no base, file, or repository is determinable — the seed case, where
+// the allowlist is new in this change and every entry is taken as given.
+export function baseAllowlistEntries(allowlistPath, cwd) {
+  let root;
+  let base;
+  let rel;
+  try {
+    root = execSync("git rev-parse --show-toplevel", { encoding: "utf8", cwd }).trim();
+    base = execSync("git rev-parse --verify HEAD^1", { encoding: "utf8", cwd }).trim();
+    rel = relative(root, resolve(cwd, allowlistPath));
+  } catch {
+    return null;
+  }
+  if (rel.startsWith("..")) return null;
+  try {
+    return parseAllowlist(execSync(`git show ${base}:${rel}`, { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "pipe"] }));
+  } catch {
+    return null;
+  }
+}
+
+export function checkFiles(files, allowlist, baseEntries = null) {
   const offending = [];
   const ratcheted = [];
   const stats = [];
@@ -266,7 +299,8 @@ export function checkFiles(files, allowlist) {
     }
   }
   const stale = [...allowlist].filter((p) => !dirty.has(p)).sort();
-  return { offending, ratcheted, stale, stats, dirtyCount: dirty.size, commentTotal: stats.reduce((a, s) => a + s.count, 0) };
+  const additions = baseEntries === null ? [] : [...allowlist].filter((p) => !baseEntries.has(p)).sort();
+  return { offending, ratcheted, stale, additions, stats, dirtyCount: dirty.size, commentTotal: stats.reduce((a, s) => a + s.count, 0) };
 }
 
 function listFiles(args) {
@@ -292,16 +326,22 @@ function main() {
   const allowlist = loadAllowlist(allowlistPath);
 
   if (check) {
-    const result = checkFiles(files, allowlist);
+    const result = checkFiles(files, allowlist, baseAllowlistEntries(allowlistPath, process.cwd()));
     for (const file of result.offending) process.stdout.write(`comments remain: ${file}\n`);
     for (const path of result.stale) {
       process.stdout.write(`stale allowlist entry (clean or untracked): ${path}\n`);
     }
+    for (const path of result.additions) {
+      process.stdout.write(`allowlist addition not permitted (the ratchet may only shrink): ${path}\n`);
+    }
     process.stdout.write(
       `files with comments: ${result.dirtyCount} (${result.ratcheted.length} ratcheted), ` +
-        `offending: ${result.offending.length}, stale entries: ${result.stale.length}\n`,
+        `offending: ${result.offending.length}, stale entries: ${result.stale.length}` +
+        `, added entries: ${result.additions.length}\n`,
     );
-    if (result.offending.length > 0 || result.stale.length > 0) process.exit(1);
+    if (result.offending.length > 0 || result.stale.length > 0 || result.additions.length > 0) {
+      process.exit(1);
+    }
     return;
   }
 
