@@ -160,9 +160,10 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    `agent_not_found` clearing the tracked sequence state and marking the
    session complete; probe replies are consumed as cleanup mechanics, never
    session errors — and probing requires BOTH a recorded `agent_message`
-   send AND an observed `agent_started` for the registration, else it sends
-   NOTHING: without admission evidence a stop at the tracker's value would
-   destroy a foreign owner's fresh session, §6.1). The TS SDK's tracker
+   send AND an observed `agent_started` REPLY-CORRELATED to the client's own
+   tracked start (an uncorrelated or foreign started never arms it), else it
+   sends NOTHING: without admission evidence a stop at the tracker's value
+   would destroy a foreign owner's fresh session, §6.1). The TS SDK's tracker
    (`ActiveAgentSession`; pending #215) marks the `agent_message` send
    unresolved at send,
    rolls back to the pre-send sequence on a correlated rejection, confirms

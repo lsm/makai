@@ -998,8 +998,11 @@ Rules:
   `invalid_request` reply arrives, and BOTH stops' replies — including the
   retry's own rejection — are consumed as cleanup mechanics rather than session
   errors; probing is an ADMITTED-message-send recovery and requires BOTH a
-  recorded `agent_message` send AND an observed `agent_started` for the
-  registration: without either it sends nothing at all, since a message sent
+  recorded `agent_message` send AND an observed `agent_started` REPLY-
+  CORRELATED to the client's own tracked start (the server ties the reply
+  to the start's message id; a delayed, unsolicited, or foreign started
+  carries no ownership proof and never arms the probe): without either it
+  sends nothing at all, since a message sent
   without admission evidence may have been accepted by a foreign caller's fresh
   session on the same id, and even a single stop at the tracker's value would
   validate against that session — §6.1's leak-over-destroy rule. Residual,
