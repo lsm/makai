@@ -998,17 +998,22 @@ Rules:
   step — the server's counter is past the sent sequence, never that it
   reached any optimistic value derived from unresolved sends: a RETRY of
   a still-unresolved message (same sequence AND payload digest, via
-  `sendAgentMessageWithSequence`) retires silently with the tracker set to
-  EXACTLY the proven step — optimistic mirrors from sends interleaved
-  before the reply are not evidence either (a higher true counter is
-  reached one silent step per round trip), while a mismatched payload, a
-  non-retry send, or a START falls through to the ordinary rejection path
-  and surfaces.
+  `sendAgentMessageWithSequence`) retires silently, with the tracker
+  restored to the HIGHEST PROVEN bound — the duplicated sequence + 1,
+  plus resolved-outcome progress (the current and pre-send tracker), each
+  capped at the lowest still-pending message sequence so unresolved
+  mirrors never leak in and settled progress is never discarded (for a
+  retry the cap collapses the bound to the proven step; a higher true
+  counter is reached one silent step per round trip), while a mismatched
+  payload, a non-retry send, or a START falls through to the ordinary
+  rejection path and surfaces.
   Explicit-sequence sends (`sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
   tracker mirrors it optimistically but restores its PRE-SEND state when
   the pre-wire bookkeeping fails (nothing reached the wire), and
-  `maxInt(u64)` is rejected before any mutation. Stop sends never advance
+  `maxInt(u64)` is rejected before any mutation. An explicit STOP RESYNCS
+  the tracker to the given value without advancing past it, and its
+  correlated rejection undoes the resync when the tracker still holds it. Stop sends never advance
   the tracker: an accepted stop consumes the counter with the session, a
   rejected stop leaves the expected value in place for its retry, and
   stops are tracked requests too, so a session-gone answer discovered
