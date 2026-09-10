@@ -357,7 +357,10 @@ pub const AgentProtocolClient = struct {
         const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
         if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
-            _ = self.pending_sends_by_session.remove(session_id);
+            if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
+                var list = entry.value;
+                list.deinit(self.allocator);
+            }
             return;
         }
 
