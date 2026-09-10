@@ -1310,7 +1310,10 @@ server eviction (rule 6), and holds no transcript and no persistence.
    send; a correlated rejection rolls it back (§13.1) so the ordinary teardown
    stop carries the pre-send sequence, and while the outcome is unresolved the
    teardown stop IS the probe — the FLOOR state first (the minimum of the
-   oldest unresolved send's sequence and the tracker's rolled-back value),
+   tracker, the unresolved sends' sequences, and their pre-send trackers —
+   a lone forward explicit send records a pre-send state far below its
+   optimistic value, and that state is the one the server holds when the
+   send was rejected),
    advancing on each correlated wrong-counter rejection — `invalid_request`,
    or the shared `nack` sequencing vocabulary `invalid_sequence` and
    `duplicate_sequence` (a candidate the server already consumed, so its
@@ -1332,10 +1335,18 @@ server eviction (rule 6), and holds no transcript and no persistence.
    anything, so an explicit resend at an older sequence must not leave its
    regressed tracker behind; the §13.1 rollback is reserved for rejections
    that prove the counter did NOT advance. The duplicate shape is
-   recognized by either signal: the shared vocabulary's `duplicate_sequence`
-   nack, or a generic `invalid_request` naming a resend whose sequence
-   another still-pending record carries (the agent surface spells every
-   sequence mismatch `invalid_request`, the already-consumed case included).
+   recognized ONLY by the shared vocabulary's explicit `duplicate_sequence`
+   nack, and only when the rejected send is a RETRY of a still-unresolved
+   original (its record notes at send time that another message already
+   carried the sequence): the original's run may still settle, so the
+   record retires with the high-water and no session error. A duplicate
+   answer on a NON-retry send preserves the high-water but SURFACES the
+   rejection — no run of the envelope will settle. A generic
+   `invalid_request` stays AMBIGUOUS — the agent surface collapses
+   already-consumed and never-accepted mismatches into one code, and a
+   same-sequence pending record proves only that the original's outcome is
+   unresolved — so it takes the ordinary rollback and the unknown side
+   reconciles through the teardown probe's candidate bracket.
    The TypeScript SDK's single-message tracker spans exactly the two classic
    states (floor, floor+1); the Zig client, which tracks pipelined sends,
    sweeps every state in between — a second send accepted after the server

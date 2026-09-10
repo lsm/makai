@@ -150,8 +150,8 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    paths need: `peekNextSequence`, `sendAgentMessageWithSequence`,
    `sendAgentStopWithSequence`, and `sendAgentStopProbing` — a bounded
    candidate sweep over the DISCRETE reachable server states (stop at the
-   FLOOR — the minimum unresolved message send's sequence capped by the
-   tracker's rolled-back value; each correlated `invalid_request` reply
+   FLOOR — the minimum of the tracker, the unresolved message sends'
+   sequences, and their pre-send trackers; each correlated `invalid_request` reply
    processed through `processEnvelope` advances to the next candidate in
    the ascending set of one-past each pending message send, every record's
    pre-send high-water, and the tracker — never a dense floor-to-ceiling
