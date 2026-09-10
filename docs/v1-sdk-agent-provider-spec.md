@@ -976,7 +976,7 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-1 of the
+  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-2 of the
   client sequence-control series]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
@@ -1022,11 +1022,32 @@ Rules:
   sequence, or a non-retry MESSAGE keeps the proven step (`sequence + 1`)
   and SURFACES through the error bookkeeping — nothing of that envelope
   will ever settle; a START or STOP duplicate runs the ordinary rejection
-  rollback instead and surfaces likewise. A higher true counter than the restore is reached one
+  rollback instead and surfaces likewise. The silent path's retry
+  provenance is a lattice over the pending records, not the send-time bit
+  alone: a record's retry bit derives from an EARLIER same-sequence
+  same-payload record whose own source chain is intact, and every
+  reconciliation that removes a record re-derives the sequence's records
+  against the current set — DIRECTIONALLY (two retries of the same payload
+  cannot vouch for each other; only an earlier record is a source),
+  TRANSITIVELY (rejecting a source breaks its whole same-payload chain,
+  masked ancestry included — a record whose retry bit a then-present
+  competitor masked to false still carries its ancestry, and the chain
+  breaks when that ancestry dies), and COMPETING-PAYLOAD-GATED (a
+  different-payload record still pending at the sequence disqualifies the
+  silent path and blocks re-qualification; the retirement of such a
+  competitor RE-QUALIFIES the other payloads' retries it had masked). A
+  non-retry duplicate retirement breaks its same-payload descendants the
+  same way — the retired envelope never ran either. A SETTLED source is
+  the opposite pole: the run demonstrably executed the payload, so the
+  remaining same-sequence same-payload records' retry bits are set TRUE —
+  overriding an earlier competitor mask (the answer-time competing check
+  still gates while the competitor remains) and superseding an earlier
+  broken marker — and stand through later re-derivations: a settled
+  chain never breaks. A higher true counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
   silently). Slices to follow in the series:
-  the proven-floor reconciliation for restored progress, the
+  the proven-floor and stop-undo reconciliation for restored progress, the
   pending-record lifecycle and stale-reply guards, the bounded stop probe
   for unknown outcomes, and the TUI teardown integration
   (`[in progress — #210 gap 7 re-sliced from #213]`).
