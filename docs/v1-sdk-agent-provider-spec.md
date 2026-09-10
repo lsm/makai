@@ -1045,7 +1045,9 @@ Rules:
   proven consumed when it was recorded (a send below the then-proven
   floor could never have been admitted, so no same-payload source could
   run or settle — the duplicate must surface however the retry bit
-  reads) keeps the proven step (`sequence + 1`)
+  reads, unless a SETTLED source demonstrably ran the payload there,
+  which outranks the floor heuristic) keeps the proven step
+  (`sequence + 1`)
   and SURFACES through the error bookkeeping — nothing of that envelope
   will ever settle; a START duplicate runs the ordinary rejection
   rollback instead and surfaces likewise, while a STOP duplicate still

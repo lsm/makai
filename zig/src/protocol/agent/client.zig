@@ -627,9 +627,15 @@ pub const AgentProtocolClient = struct {
                             // consumed when the send was recorded: a send
                             // below the then-proven floor could never be
                             // admitted, so no same-payload source could run
-                            // or settle and the duplicate must surface
-                            // (#210 gap 7).
-                            if (entry.resend_of_pending and entry.proven_floor_at_send <= entry.sequence and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
+                            // or settle and the duplicate must surface. A
+                            // SETTLED source is exempt from the below-floor
+                            // disqualification: the settlement demonstrably
+                            // ran this payload at this sequence, directly
+                            // contradicting the rule's nothing-could-have-run
+                            // premise — the settled fact outranks the floor
+                            // heuristic exactly as it outranks the
+                            // competitor mask (#210 gap 7).
+                            if (entry.resend_of_pending and (entry.source_settled or entry.proven_floor_at_send <= entry.sequence) and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
                             // The retired record was itself
                             // rejected-as-duplicate — it never ran — so its
                             // same-payload descendants' silent justification
