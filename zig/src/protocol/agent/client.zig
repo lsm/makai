@@ -2724,5 +2724,8 @@ test "AgentProtocolClient duplicate_sequence nack on a start falls through to th
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid)); // rolled back
     try std.testing.expect(client.getLastErrorForSession(sid) != null); // surfaced, not swallowed
     try std.testing.expect(client.isSessionComplete(sid));
-    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    // The ordinary rejection path retires the entry from the list (the empty
+    // list itself stays mapped until the session's control state clears).
+    const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining);
 }
