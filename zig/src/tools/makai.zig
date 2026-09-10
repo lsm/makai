@@ -1125,9 +1125,10 @@ const StdioProtocolLoop = struct {
         }
         // The authoritative envelope is retried until it commits — never
         // abandoned after the projection: the Zig client settles only on
-        // `agent_error`/`agent_result` (`processEnvelope` merely queues an
-        // `agent_event`), so a projection-only delivery would strand its
-        // session-complete tracking (#210 gap 5, review).
+        // `agent_error`/`agent_result`/a correlated `nack`
+        // (`processEnvelope` merely queues an `agent_event`), so a
+        // projection-only delivery would strand its session-complete
+        // tracking (#210 gap 5, review).
         self.agent_server.publishAgentError(run.session_id, code, message) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {},
