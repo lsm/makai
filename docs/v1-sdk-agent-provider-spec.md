@@ -1019,9 +1019,10 @@ Rules:
   identically to absence — the wire treats them the same) retires
   silently with the tracker restored to `sequence + 1`, while a
   mismatched payload, a competing different-payload record at the
-  sequence, a non-retry send, or a START/STOP falls through to the
-  ordinary rejection path and surfaces (nothing of that envelope will
-  ever settle). A higher true counter than the restore is reached one
+  sequence, or a non-retry MESSAGE keeps the proven step (`sequence + 1`)
+  and SURFACES through the error bookkeeping — nothing of that envelope
+  will ever settle; a START or STOP duplicate runs the ordinary rejection
+  rollback instead and surfaces likewise. A higher true counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
   silently). Slices to follow in the series:
