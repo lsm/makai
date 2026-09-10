@@ -976,13 +976,23 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  `[current deviation]` the built-in `AgentProtocolClient` does not honor this yet:
-  it advances its per-session counter eagerly on every send and does not restore it
-  when the send is rejected (`client.zig` `nextSequence`), and it offers no
-  sequence control surface (no rollback, no explicit-sequence send), so
-  same-sequence retries through that client are unsupported — callers needing that
-  discipline must drive the transport directly until sequence control is exposed
-  (`[planned — #210 gap 7]`).
+  Zig client sequence discipline `[current — #210 gap 7, slice 1 of the
+  client sequence-control series]`: the `AgentProtocolClient` mirrors the
+  server's counter optimistically — the tracker advances at SEND, before the
+  outcome is known — and reconciles on evidence. A CORRELATED rejection (an
+  `agent_error` whose `in_reply_to` names the client's own send) rolls the
+  tracker back to the rejected send's own sequence, so a corrected retry
+  reuses it (every outstanding send is tracked and the rollback takes the
+  MINIMUM — an older unresolved send's floor is never lost to a younger
+  send's rejection); a correlated `agent_not_found` (or `session_expired`)
+  drops the counter state instead, since the session is gone server-side.
+  Stop sends never advance the tracker: an accepted stop consumes the
+  counter with the session, and a rejected stop leaves the expected value
+  in place for its retry. Slices to follow in the series: explicit-sequence
+  sends with duplicate-evidence handling, the pending-record lifecycle and
+  stale-reply guards, the bounded stop probe for unknown outcomes, and the
+  TUI teardown integration (`[in progress — #210 gap 7 re-sliced from
+  #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
