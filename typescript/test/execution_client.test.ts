@@ -3096,45 +3096,39 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
   // The probe's accepted stop removed the old registration, so a concurrent
   // caller may already be re-registering the id; its uncorrelated run output
   // routes by session id (immune to correlation) and must not be eaten by a
-  // drain that LINGERS. idleMs 0 makes the drain backlog-only: it takes
-  // whatever is parked and returns on the first empty immediate dequeue.
+  // drain that LINGERS. idleMs 0 makes the drain backlog-only: every
+  // uncorrelated read is an IMMEDIATE dequeue attempt (timeout 0) and the
+  // first empty one ends the drain. The contract is asserted on the
+  // requested timeouts — deterministic, no wall-clock race: a waiting read
+  // (the old 50ms idle window) is exactly what could consume a
+  // re-registered run's frames.
   const sessionId = "testNanoIdSess1234567";
   const queue: StdioFrame[] = [];
   const sentStops: number[] = [];
+  const uncorrelatedTimeouts: number[] = [];
   const transport = {
     send: (frame: StdioFrame) => {
       if (frame.type !== "agent_stop") return;
       sentStops.push(frame.sequence as number);
       queue.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
     },
-    // Honors the timeout: a 0ms uncorrelated read is an immediate dequeue
-    // attempt over what is parked RIGHT NOW — no waiting for late arrivals.
     nextFrameForSession: async (_sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
       const correlate = wait?.correlate;
+      if (correlate === undefined) uncorrelatedTimeouts.push(timeoutMs ?? 0);
       const matches = correlate !== undefined
         ? (entry: StdioFrame) => entry.in_reply_to === correlate
         : (entry: StdioFrame) => entry.in_reply_to === undefined;
       const immediate = queue.findIndex(matches);
       if (immediate >= 0) return queue.splice(immediate, 1)[0];
-      if ((timeoutMs ?? 0) === 0) throw new Error("timed out");
-      await new Promise((resolve) => setTimeout(resolve, timeoutMs));
-      const late = queue.findIndex(matches);
-      if (late < 0) throw new Error("timed out");
-      return queue.splice(late, 1)[0];
+      throw new Error("timed out");
     },
   };
   // Parked late output from the unresolved run, ahead of the stop's reply.
   queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-parked", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
-  // A re-registered caller's first frame lands 25ms later — INSIDE the old
-  // 50ms idle window (which would have eaten it), outside the backlog-only
-  // drain.
-  const later = { type: "agent_event", session_id: sessionId, message_id: "m-new-run", sequence: 9, timestamp: 1, version: 1, payload: { event_json: "{\"type\":\"agent_start\"}" } } as StdioFrame;
-  setTimeout(() => queue.push(later), 25);
 
   const api = createMakaiAgentApi(transport as never, {}) as unknown as {
     stopAgentSession(session: unknown, sessionId: string, sequence: number, reason: string, options?: { drain?: "quiescent" | "background" | "none" }): Promise<void>;
   };
-  const started = Date.now();
   await api.stopAgentSession(
     { nextSequence: 3, unresolvedMessageSequence: 2, startReplyObserved: true, idClientGenerated: false, stopped: false, sessionId },
     sessionId,
@@ -3144,9 +3138,10 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
   );
 
   // The probe settled at the pre-send value, the parked frame drained, and
-  // the re-registered run's frame survived — without the drain lingering
-  // for an idle window.
+  // every uncorrelated drain read was an immediate dequeue — no idle window
+  // in which a re-registered caller's frames could be consumed.
   assert.deepEqual(sentStops, [2]);
-  assert.ok(queue.includes(later));
-  assert.ok(Date.now() - started < 25, "the backlog-only drain must not wait out an idle window");
+  assert.equal(queue.length, 0);
+  assert.ok(uncorrelatedTimeouts.length >= 1);
+  assert.ok(uncorrelatedTimeouts.every((timeout) => timeout === 0), "the post-probe drain must request only immediate (0ms) dequeues");
 });
