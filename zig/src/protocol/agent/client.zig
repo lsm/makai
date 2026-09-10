@@ -1921,7 +1921,7 @@ test "AgentProtocolClient correlated agent_not_found clears state only for a req
 
     const sid = agent_types.generateSessionId();
     _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
-    var started_env = agent_types.Envelope{
+    var first_started_env = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
@@ -1929,8 +1929,8 @@ test "AgentProtocolClient correlated agent_not_found clears state only for a req
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_started = .{ .session_id = sid } },
     };
-    defer started_env.deinit(allocator);
-    try client.processEnvelope(started_env);
+    defer first_started_env.deinit(allocator);
+    try client.processEnvelope(first_started_env);
     try std.testing.expect(client.session_id != null);
     const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
 
