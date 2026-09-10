@@ -508,11 +508,16 @@ class StdioAgentApi implements MakaiAgentApi {
       // successful probe therefore does not prove the route clean: queued
       // output from the unresolved run would be claimed by an immediate
       // same-id follow-up after its start is accepted, returning the
-      // previous run's result or failure. The drain is bounded and AWAITED —
-      // it settles before the completion or error surfaces, so it cannot
-      // race a follow-up — and carries no stopReplyTo: the probe already
-      // consumed the stop's reply, so the drain runs to quiescence.
-      await drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250);
+      // previous run's result or failure. The drain drains the ALREADY-QUEUED
+      // backlog only (idleMs 0 — no idle window): an accepted probe removed
+      // the old registration, so a concurrently re-registered caller on the
+      // same id may already be streaming; a waiting drain would eat its
+      // uncorrelated run output (routed by session id, not correlation) and
+      // time its run out. Still bounded and AWAITED, and no stopReplyTo: the
+      // probe already consumed the stop's reply. Frames in flight but not
+      // yet parked when the backlog empties escape this drain — the same
+      // downstream-buffer residual class recorded in §13.4.3/§6.1.
+      await drainSessionFramesUntilQuiescent(this.transport, sessionId, 0, 250);
       return;
     }
     const stopMessageId = bestEffortStopAgent(this.transport, sessionId, sequence, reason);
@@ -647,12 +652,18 @@ class StdioAgentApi implements MakaiAgentApi {
           if (activeSession) activeSession.startReplyObserved = true;
           if (messageSent && frame.in_reply_to === messageMessageId) {
             this.rollbackUnresolvedMessage(activeSession);
-          } else if (activeSession?.unresolvedMessageSequence !== undefined) {
-            // An UNCORRELATED agent_error after the message was sent is run
-            // output (the failure pair's settlement, §13.4.2): acceptance is
-            // proven and the advanced counter is confirmed (#210 gap 7).
-            activeSession.unresolvedMessageSequence = undefined;
           }
+          // An UNCORRELATED agent_error after the message was sent must NOT
+          // confirm the advanced counter (#210 gap 7, §13.4.1): the frame is
+          // either the settlement of an admitted run (§13.4.2's failure pair)
+          // OR an admission failure's unscoped runtime error — the server
+          // rolled the counter back and never admitted the run — and the two
+          // are indistinguishable on the wire. Leaving the marker unresolved
+          // routes the teardown through the sequence probe, which settles
+          // either case (admitted: the pre-send stop is rejected and the
+          // post-send retry succeeds; rolled back: the pre-send stop
+          // succeeds); clearing it here would send only the advanced value,
+          // whose rejection in the rolled-back case leaks the session.
           const error = streamErrorFrameToError(frame);
           if (!startAccepted && error.code === "agent_busy") {
             // The id belongs to another live run; stopping would tear that
@@ -964,11 +975,17 @@ class StdioAgentApi implements MakaiAgentApi {
           // teardown stop uses the pre-send sequence.
           this.rollbackUnresolvedMessage(activeSession);
         } else if (messageSent && activeSession?.unresolvedMessageSequence !== undefined
-          && frame.type !== "agent_started" && frame.type !== "ack" && frame.type !== "agent_stopped") {
+          && frame.type !== "agent_started" && frame.type !== "ack" && frame.type !== "agent_stopped"
+          && frame.type !== "agent_error") {
           // Any other post-message frame is run output consumed by THIS
           // attempt's waits — the strongest acceptance tie the wire affords
           // (see the matching clear in runOnce; the stale-trailing-frame
-          // caveat is the documented §13.4.3/§6.1 residual).
+          // caveat is the documented §13.4.3/§6.1 residual). An UNCORRELATED
+          // agent_error is excluded: it is either a settlement of an admitted
+          // run (§13.4.2) or an admission failure's unscoped runtime error
+          // with the counter rolled back (§13.4.1) — indistinguishable on the
+          // wire, so it must not confirm the advanced counter; the teardown
+          // probe reconciles both (#210 gap 7).
           activeSession.unresolvedMessageSequence = undefined;
         }
         if (frame.type === "agent_started" && !messageSent) {
@@ -1000,8 +1017,10 @@ class StdioAgentApi implements MakaiAgentApi {
           continue;
         }
         const events = normalizeAgentFrame(frame, toolBuffers);
-        if (events.length > 0 && activeSession?.unresolvedMessageSequence !== undefined) {
-          // Recognized run output proves the message was accepted (#210 gap 7).
+        if (events.length > 0 && activeSession?.unresolvedMessageSequence !== undefined && frame.type !== "agent_error") {
+          // Recognized run output proves the message was accepted (#210 gap
+          // 7) — except an agent_error frame, which normalizes to an error
+          // event but proves nothing either way (see the exclusion above).
           activeSession.unresolvedMessageSequence = undefined;
         }
         for (const rawEvent of events) {

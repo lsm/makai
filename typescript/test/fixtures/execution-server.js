@@ -162,6 +162,12 @@ const agentMessageRejectionsDone = new Set();
 // session flow normally so a same-id retry can succeed once the probe's stop
 // removed the session.
 const agentMessageSuppressionsDone = new Set();
+// Sessions whose first agent_message failed admission with an uncorrelated
+// runtime agent_error (one-shot per session): MAKAI_TEST_ADMISSION_RUNTIME_ERROR
+// mirrors §13.4.1's server-side acceptance-path failure — the expected counter
+// does NOT advance and nothing is admitted, but the frame on the wire is
+// identical to §13.4.2's settlement of an admitted run.
+const admissionRuntimeErrorsDone = new Set();
 
 function loadAuthState() {
   if (!authStatePath || !fs.existsSync(authStatePath)) return;
@@ -264,6 +270,17 @@ rl.on("line", (line) => {
     if (process.env.MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE && !agentMessageRejectionsDone.has(env.session_id)) {
       agentMessageRejectionsDone.add(env.session_id);
       emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
+      return;
+    }
+    if (process.env.MAKAI_TEST_ADMISSION_RUNTIME_ERROR && !admissionRuntimeErrorsDone.has(env.session_id)) {
+      // §13.4.1 admission-path failure: UNCORRELATED runtime agent_error,
+      // counter not advanced, nothing admitted — the wire twin of the
+      // §13.4.2 settlement the MAKAI_TEST_AGENT_ERROR_PATH knob emits. A
+      // client must not read either shape as proof of acceptance (#210
+      // gap 7); placed BEFORE the tracking advance so the expected counter
+      // stays at the pre-send value.
+      admissionRuntimeErrorsDone.add(env.session_id);
+      emit(asyncFrame(env, "agent_error", { code: "internal_error", message: "admission allocation failure" }, 3));
       return;
     }
     if (trackAgentSessions) {

@@ -2280,28 +2280,60 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
     );
 
-    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2);
     const stops = logged.filter((entry) => entry.type === "agent_stop");
-    assert.equal(stops.length, 1);
+    // The settlement agent_error is UNCORRELATED, so it cannot confirm the
+    // message's admission (it is wire-identical to an admission failure's
+    // unscoped runtime error, §13.4.1): the teardown probes both counter
+    // states — stop@2 rejected correlated invalid_request (the message WAS
+    // admitted, counter at 3), stop@3 accepted.
+    assert.equal(stops.length, 2);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
-    assert.equal(stops[0]?.sequence, 3);
-    assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
+    assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
+    assert.equal((stops.at(-1)?.payload as Record<string, unknown>).reason, "completed");
 
-    // The stop took effect server-side: an immediate retry with the same id
-    // starts a fresh session (the fixture's agent_error replays for it — it
-    // is NOT rejected with agent_busy, and the stale stop-reply frames are
-    // skipped rather than consumed as the retry's own frames).
+    // The probe's second stop took effect server-side: an immediate retry
+    // with the same id starts a fresh session (the fixture's agent_error
+    // replays for it — it is NOT rejected with agent_busy, and the stale
+    // stop-reply frames are skipped rather than consumed as the retry's own
+    // frames).
     await assert.rejects(
       () => agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
     );
-    const stopsAfterRetry = (await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2))
+    const stopsAfterRetry = (await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 4))
       .filter((entry) => entry.type === "agent_stop");
-    assert.equal(stopsAfterRetry.length, 2);
-    assert.equal(stopsAfterRetry[1]?.sequence, 3);
+    assert.equal(stopsAfterRetry.length, 4);
+    assert.deepEqual(stopsAfterRetry.slice(2).map((entry) => entry.sequence), [2, 3]);
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run probes both counter states when an uncorrelated runtime error may be an admission failure (#210 gap 7)", async () => {
+  // §13.4.1: an allocation failure in the server's message-acceptance path
+  // surfaces as an UNCORRELATED runtime agent_error with the counter rolled
+  // back and nothing admitted — wire-identical to §13.4.2's settlement of an
+  // admitted run. Consuming the frame must not confirm the advanced counter:
+  // the teardown probes, and the PRE-send stop succeeds immediately because
+  // the counter never advanced (a plain stop at 3 would be rejected and the
+  // owned session would leak).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_ADMISSION_RUNTIME_ERROR: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "admission allocation failure",
+    );
+
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.sequence, 2); // pre-send — accepted, the counter never advanced
+    assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
+  } finally {
+    await harness.cleanup();
   }
 });
 
@@ -3058,4 +3090,63 @@ test("stopAgentSession drains queued session output after a successful sequence 
   // the route empty for an immediate same-id follow-up.
   assert.deepEqual(drainedFrameIds, ["m-stale-output"]);
   assert.equal(queue.length, 0);
+});
+
+test("the post-probe drain consumes only already-queued output, not a re-registered session's frames (#210 gap 7)", async () => {
+  // The probe's accepted stop removed the old registration, so a concurrent
+  // caller may already be re-registering the id; its uncorrelated run output
+  // routes by session id (immune to correlation) and must not be eaten by a
+  // drain that LINGERS. idleMs 0 makes the drain backlog-only: it takes
+  // whatever is parked and returns on the first empty immediate dequeue.
+  const sessionId = "testNanoIdSess1234567";
+  const queue: StdioFrame[] = [];
+  const sentStops: number[] = [];
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      sentStops.push(frame.sequence as number);
+      queue.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+    },
+    // Honors the timeout: a 0ms uncorrelated read is an immediate dequeue
+    // attempt over what is parked RIGHT NOW — no waiting for late arrivals.
+    nextFrameForSession: async (_sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
+      const correlate = wait?.correlate;
+      const matches = correlate !== undefined
+        ? (entry: StdioFrame) => entry.in_reply_to === correlate
+        : (entry: StdioFrame) => entry.in_reply_to === undefined;
+      const immediate = queue.findIndex(matches);
+      if (immediate >= 0) return queue.splice(immediate, 1)[0];
+      if ((timeoutMs ?? 0) === 0) throw new Error("timed out");
+      await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+      const late = queue.findIndex(matches);
+      if (late < 0) throw new Error("timed out");
+      return queue.splice(late, 1)[0];
+    },
+  };
+  // Parked late output from the unresolved run, ahead of the stop's reply.
+  queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-parked", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
+  // A re-registered caller's first frame lands 25ms later — INSIDE the old
+  // 50ms idle window (which would have eaten it), outside the backlog-only
+  // drain.
+  const later = { type: "agent_event", session_id: sessionId, message_id: "m-new-run", sequence: 9, timestamp: 1, version: 1, payload: { event_json: "{\"type\":\"agent_start\"}" } } as StdioFrame;
+  setTimeout(() => queue.push(later), 25);
+
+  const api = createMakaiAgentApi(transport as never, {}) as unknown as {
+    stopAgentSession(session: unknown, sessionId: string, sequence: number, reason: string, options?: { drain?: "quiescent" | "background" | "none" }): Promise<void>;
+  };
+  const started = Date.now();
+  await api.stopAgentSession(
+    { nextSequence: 3, unresolvedMessageSequence: 2, startReplyObserved: true, idClientGenerated: false, stopped: false, sessionId },
+    sessionId,
+    3,
+    "timeout",
+    { drain: "quiescent" },
+  );
+
+  // The probe settled at the pre-send value, the parked frame drained, and
+  // the re-registered run's frame survived — without the drain lingering
+  // for an idle window.
+  assert.deepEqual(sentStops, [2]);
+  assert.ok(queue.includes(later));
+  assert.ok(Date.now() - started < 25, "the backlog-only drain must not wait out an idle window");
 });

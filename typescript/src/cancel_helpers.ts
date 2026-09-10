@@ -132,6 +132,12 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * poison a later run reusing the id — or when an idle window passes with no
  * frame.
  *
+ * `idleMs: 0` degenerates the drain to the ALREADY-QUEUED backlog: every
+ * iteration attempts an immediate dequeue and the first empty one ends the
+ * drain, so no window remains in which frames belonging to a caller that
+ * CONCURRENTLY re-registered the id (its uncorrelated run output routes by
+ * session id, immune to correlation) are consumed.
+ *
  * Only a reply correlated to the current stop ends the drain early. Terminal-
  * SHAPED frames that do not name it are stale or belong to the just-failed
  * run: the failure pair's uncorrelated settlement `agent_error` (§13.4.2)
