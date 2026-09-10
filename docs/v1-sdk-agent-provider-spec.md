@@ -976,11 +976,12 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slice 1 of the
+  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-1 of the
   client sequence-control series]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
-  `agent_error` whose `in_reply_to` names the client's own send) rolls the
+  `agent_error` OR `nack` whose `in_reply_to` names the client's own send)
+  rolls the
   tracker back to the rejected send's own sequence, so a corrected retry
   reuses it (every outstanding send is tracked and the rollback takes the
   MINIMUM — an older unresolved send's floor is never lost to a younger
@@ -1006,8 +1007,25 @@ Rules:
   `agent_busy`: the server validates the sequence before the processing
   state, so a busy answer proves the sequence MATCHED and the tracker
   rests at exactly the rejected sequence (a busy-rejected explicit send
-  retries its own sequence, never the stale pre-send tracker). Slices to follow in the series:
-  duplicate-evidence handling for `duplicate_sequence` answers, the
+  retries its own sequence, never the stale pre-send tracker).
+  A correlated nack rejects a request exactly like a correlated
+  `agent_error`, while nacks for NON-run requests (models, tool_list,
+  ping, status) stay request-scoped and are dropped. A
+  `duplicate_sequence` answer is duplicate evidence proving exactly ONE
+  step — the server's counter is past the sent sequence, never that it
+  reached any optimistic value derived from unresolved sends: a RETRY of
+  a still-unresolved message (same sequence AND payload digest, via
+  `sendAgentMessageWithSequence`; an empty `options_json` digests
+  identically to absence — the wire treats them the same) retires
+  silently with the tracker restored to `sequence + 1`, while a
+  mismatched payload, a competing different-payload record at the
+  sequence, a non-retry send, or a START/STOP falls through to the
+  ordinary rejection path and surfaces (nothing of that envelope will
+  ever settle). A higher true counter than the restore is reached one
+  step per round trip (the next send at the restored value is answered
+  `duplicate_sequence` in turn, and as a same-payload retry it retires
+  silently). Slices to follow in the series:
+  the proven-floor reconciliation for restored progress, the
   pending-record lifecycle and stale-reply guards, the bounded stop probe
   for unknown outcomes, and the TUI teardown integration
   (`[in progress — #210 gap 7 re-sliced from #213]`).
