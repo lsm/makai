@@ -320,12 +320,24 @@ pub const AgentProtocolClient = struct {
         }
         const pre_send = oldest_message_sequence orelse return null;
 
-        // Register the probe BEFORE the stop reaches the wire so the
-        // post-send bookkeeping is infallible; a failed write unregisters it.
-        // The reason buffer has exactly one owner at every point: the local
-        // variable until the map insert succeeds, the map entry after — the
-        // guard flag keeps the two errdefers from double-freeing it.
+        // Pre-wire phase — every failure here happens with NOTHING on the
+        // wire, so nothing is registered and the caller sees a clean error:
+        // build the stop payload and serialize it before touching the probe
+        // map. The reason buffer has exactly one owner at every point (the
+        // local variable until the map insert succeeds, the entry after).
         const msg_id = agent_types.generateUlid();
+        var payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
+        defer payload.deinit(self.allocator);
+        if (reason) |r| payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r));
+        const stop_json = try self.serializeEnvelopeForSend(.{
+            .session_id = session_id,
+            .message_id = msg_id,
+            .sequence = pre_send,
+            .timestamp = compat.time.nowMillis(),
+            .payload = payload,
+        });
+        defer self.allocator.free(stop_json);
+
         var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
         var reason_owned_by_map = false;
         errdefer if (!reason_owned_by_map) owned_reason.deinit(self.allocator);
@@ -335,13 +347,14 @@ pub const AgentProtocolClient = struct {
             .reason = owned_reason,
         });
         reason_owned_by_map = true;
-        errdefer {
-            if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
-                var probe = entry.value;
-                probe.reason.deinit(self.allocator);
-            }
-        }
-        try self.sendStopEnvelope(session_id, msg_id, reason, pre_send);
+
+        // Wire phase — a write/flush failure here is AMBIGUOUS (the stop may
+        // already have reached the peer), so the probe stays registered: the
+        // correlated rejection of a delivered pre-send stop must still
+        // trigger the post-send retry, and a teardown driver still sees an
+        // active probe to pump. The write error itself is swallowed — the
+        // probe's bounded lifecycle owns the outcome now (#210 gap 7).
+        self.writeEnvelopeJson(stop_json) catch {};
         return msg_id;
     }
 
@@ -417,12 +430,14 @@ pub const AgentProtocolClient = struct {
                     .session_id = env.session_id,
                     .json = owned_json,
                 });
-                // Run output proves the session's SOLE pending message was
-                // accepted (the TS tracker clears its unresolved marker on
-                // output the same way): retire it so a later cancellation
-                // stops directly at the advanced counter instead of probing
-                // the stale pre-send sequence (#210 gap 7).
-                self.retireSolePendingMessage(env.session_id);
+                // Deliberately NO pending-send retirement on run output: an
+                // event cannot be tied to the run that produced it (a reused
+                // id's previous run may still emit its trailing agent_end
+                // after the next message was admitted, §13.4.3), so retiring
+                // the sole pending send on an event can delete the NEW run's
+                // record on a stale frame. The bounded probe — not
+                // retirement — reconciles an unknown outcome, and its retry
+                // round-trip is the price of that ambiguity (#210 gap 7).
             },
             .agent_result => |json| {
                 self.last_result_json.deinit(self.allocator);
@@ -555,17 +570,6 @@ pub const AgentProtocolClient = struct {
         return true;
     }
 
-    /// Retires the session's pending record when it is exactly one message
-    /// send — used when run output arrives: the output proves that message
-    /// was accepted. With more than one pending send the accepting message
-    /// cannot be identified, so nothing is retired.
-    fn retireSolePendingMessage(self: *Self, session_id: agent_types.SessionId) void {
-        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
-        if (list.items.len != 1) return;
-        if (list.items[0].kind != .message) return;
-        _ = list.orderedRemove(0);
-    }
-
     /// Retires the pending-send record whose request a reply names (e.g. the
     /// `agent_started` replying to an `agent_start`) — its outcome resolved.
     fn retirePendingSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid) void {
@@ -578,28 +582,24 @@ pub const AgentProtocolClient = struct {
         }
     }
 
-    /// Retires the pending-send records a settlement resolves. A settlement
-    /// (`agent_result`, or the uncorrelated settlement `agent_error`) proves
-    /// the settled run's own send and everything recorded before it resolved.
-    /// With exactly ONE pending send, that send IS the settled run's own
-    /// message (serial use) — retire it, so the next turn starts from an
-    /// empty list and a later lost-output probe is not bracketed by the
-    /// settled record's stale sequence. With TWO OR MORE pending sends, the
-    /// settled run's message is among the OLDER entries and the NEWEST
-    /// genuinely postdates it (a send recorded after the server committed,
-    /// before this client processed the settlement) — its unknown outcome is
-    /// exactly what a later probe reconciles, so only it is retained. Either
-    /// way growth stays bounded across turns.
+    /// Retires the pending-send record a settlement resolves: the settled
+    /// run's own message. That message is the OLDEST pending message-kind
+    /// send — it was admitted (hence sent) before any later pipelined send
+    /// could be attempted against the one-active-run rule (§13.2.4) — so
+    /// exactly the oldest message entry retires and every LATER unresolved
+    /// send is kept: the earliest of those still brackets the server's
+    /// counter for a later probe (sends 2/3/4 with 2 settled and 3/4
+    /// rejected leave the server expecting 3 — the probe must try 3, not
+    /// 4/5). Serial use degenerates to retiring the sole message, so the
+    /// next turn starts from an empty list and its lost-output probe cannot
+    /// be bracketed by the settled record's stale sequence.
     fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
-        if (list.items.len == 0) return;
-        if (list.items.len == 1) {
-            _ = list.orderedRemove(0);
+        for (list.items, 0..) |pending, index| {
+            if (pending.kind != .message) continue;
+            _ = list.orderedRemove(index);
             return;
         }
-        const keep = list.items[list.items.len - 1];
-        list.clearRetainingCapacity();
-        list.append(self.allocator, keep) catch return;
     }
 
     /// Applies #210 gap 7's client sequence-control rules to a correlated
@@ -844,6 +844,9 @@ test "AgentProtocolClient maintains per-session sequence continuity across stop 
 /// in its final location — the mock sender's context points back at it.
 const Gap7Harness = struct {
     writes: std.ArrayList([]u8) = std.ArrayList([]u8).empty,
+    /// When set, the mock sender fails every write — simulating a transport
+    /// failure after a send's bookkeeping is in place.
+    fail_writes: bool = false,
     client: AgentProtocolClient,
 
     fn init() Gap7Harness {
@@ -867,6 +870,7 @@ const Gap7Harness = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *Gap7Harness = @ptrCast(@alignCast(ctx));
+        if (self.fail_writes) return error.WriteFailed;
         try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
     }
 
@@ -1479,6 +1483,86 @@ test "AgentProtocolClient correlated agent_not_found on a plain stop clears the 
 
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+}
+
+test "AgentProtocolClient settlement retires the settled run's own send, keeping later unresolved ones (#210 gap 7)" {
+    // Sends 2/3/4 pipelined; the server accepts 2 (it settles) and rejects
+    // 3 and 4 while processing, leaving its counter at 3. The settlement
+    // retires ONLY the settled run's own send (the oldest message), so the
+    // probe's candidates come from the oldest UNRESOLVED message — 3 — not
+    // 4/5, which could not stop the session.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, settles
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3 — rejected busy
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null); // seq 4 — rejected invalid
+
+    var result_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 5,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer result_env.deinit(allocator);
+    try client.processEnvelope(result_env);
+
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 2), pending.items.len); // 3 and 4 remain unresolved
+
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(probe_result != null);
+    var first_stop = try harness.envelopeAt(4);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), first_stop.sequence); // the oldest UNRESOLVED message's pair — [3, 4]
+}
+
+test "AgentProtocolClient probing stop survives an ambiguous write failure (#210 gap 7)" {
+    // A write/flush failure after the probe's stop may have reached the peer
+    // is ambiguous: the probe must stay registered so a delivered pre-send
+    // stop's correlated rejection still triggers the post-send retry, and a
+    // teardown driver still sees an active probe to pump.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    harness.fail_writes = true;
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(probe_result != null);
+    try std.testing.expect(client.hasActiveStopProbe(sid)); // the probe outlives the ambiguous write failure
 }
 
 test "AgentProtocolClient stop sends never advance the tracker (#210 gap 7)" {
