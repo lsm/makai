@@ -71,6 +71,28 @@ jobs:
       - name: Run ${{ matrix.group }} unit tests
         run: zig build test-unit-${{ matrix.group }}
 
+  no-comments:
+    name: Zero-Comments Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run checker self-tests
+        run: node --test scripts/check-no-comments.test.mjs
+
+      - name: Check zero-comments policy
+        run: node scripts/check-no-comments.mjs --check
+
   ts-sdk-e2e:
     name: TS SDK E2E
     needs: [unit-tests]
