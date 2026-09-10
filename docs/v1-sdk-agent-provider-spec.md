@@ -1009,11 +1009,15 @@ Rules:
   source breaks the whole chain — since a rejected send never ran). The
   client keeps a monotone PROVEN FLOOR per session: every reconciliation
   that establishes a sound lower bound — a busy answer's exact parity,
-  an all-rejected floor, a duplicate answer's proven step, a
-  settlement's minimum-candidate step, a stop-undo's capped restore —
+  an all-rejected floor, a duplicate answer's proven step (for a message
+  OR a tracked stop), a settlement's minimum-candidate step, a
+  stop-undo's capped restore, an accepted start's consumed sequence —
   maxes it, and every later floor or restore maxes with it (the counter
   never moves backward, so a bound once proven stays proven; optimistic
-  mirrors from unresolved sends never participate). A higher true
+  mirrors from unresolved sends never participate — an unresolved stop's
+  resync is caller-asserted, and message-rejection floors carry the
+  stop's PRE-RESEND prior so the caller's value cannot be laundered
+  into the floor through later snapshots). A higher true
   counter than the restore is reached one silent step per round trip
   (the next send at the restored value is answered `duplicate_sequence`
   in turn, and as a same-payload retry it retires silently).
