@@ -447,6 +447,20 @@ pub const AgentProtocolClient = struct {
 
         const rejected = list.items[index];
         _ = list.orderedRemove(index);
+        // A correlated `agent_busy` proves the server's counter EQUALS the
+        // rejected sequence: the server validates the inbound sequence
+        // BEFORE the processing state (handleMessage), so a busy answer
+        // means the sequence MATCHED — every lower sequence was consumed —
+        // and busy never advances the counter (§13.1). This matters most
+        // for an EXPLICIT recovery send: rolling it back to its pre-send
+        // tracker (a stale 1 against a server at 7) would have the retry
+        // replay the stale value instead of the busy-proven sequence
+        // (#210 gap 7).
+        const busy = if (code) |c| c == .agent_busy else false;
+        if (busy) {
+            try self.next_sequence_by_session.put(session_id, rejected.sequence);
+            return;
+        }
         // The rollback restores the counter the server RETAINED — the
         // record's pre-send tracker — rather than min'ing the send's own
         // optimistic mirror unconditionally: a BACKWARD explicit send
@@ -456,9 +470,13 @@ pub const AgentProtocolClient = struct {
         // 999-mirror has the same shape). The CURRENT map value participates
         // as the floor when something OTHER than this send's own mirror
         // produced it (§13.1 — a rejected request never advances the
-        // server's expected counter; #210 gap 7).
+        // server's expected counter; #210 gap 7). The successor comparison
+        // is overflow-safe: an explicit maxInt-1 message leaves the tracker
+        // at maxInt and an immediately queued stop can be recorded there,
+        // so `sequence + 1` must never be evaluated for the maximum.
         const current = self.peekNextSequence(session_id);
-        const base = if (current == rejected.sequence + 1) rejected.prior_tracker else current;
+        const mirror_is_own = rejected.sequence != std.math.maxInt(u64) and current == rejected.sequence + 1;
+        const base = if (mirror_is_own) rejected.prior_tracker else current;
         const floor = @min(base, rejected.prior_tracker);
         try self.next_sequence_by_session.put(session_id, floor);
     }
@@ -1036,4 +1054,38 @@ test "AgentProtocolClient rejects an un-advanceable explicit sequence before any
     try std.testing.expectError(error.InvalidSequence, client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // untouched
     try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len); // the start only — nothing sent
+}
+
+test "AgentProtocolClient agent_busy rejection of an explicit send preserves the busy-proven sequence (#210 gap 7)" {
+    // A busy answer proves the sequence MATCHED the server's counter (the
+    // server validates the sequence before the processing state), so an
+    // explicit recovery send answered busy must leave the tracker AT that
+    // sequence: rolling it back to the (stale) pre-send tracker would have
+    // the retry replay the stale value instead of the busy-proven one.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const msg_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 7); // stale local tracker 1, server at 7
+
+    var busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already processing a message") } },
+    };
+    defer busy.deinit(allocator);
+    try client.processEnvelope(busy);
+    try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid)); // the busy-proven sequence, not the stale prior 1
+
+    // The retry carries the busy-proven sequence.
+    _ = try client.sendAgentMessage(sid, "{\"m\":1-retry}", null);
+    var retried = try harness.envelopeAt(1);
+    defer retried.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 7), retried.sequence);
 }
