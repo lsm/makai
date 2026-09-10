@@ -118,6 +118,12 @@ pub const AgentProtocolClient = struct {
     /// Monotone memory of every sound lower bound established for a
     /// session's counter (#210 gap 7) — see `noteProvenFloor`.
     proven_floor_by_session: std.AutoHashMap(agent_types.SessionId, u64),
+    /// The MINIMUM pre-resync prior over a session's REJECTED explicit
+    /// stops (#210 gap 7): a rejected stop's resync is refuted, so any
+    /// snapshot taken while it was live reverts to at most its prior —
+    /// including snapshots of LATER stops resynced on top of it, whose own
+    /// rejections arrive after this stop's record is gone.
+    stop_revert_bound_by_session: std.AutoHashMap(agent_types.SessionId, u64),
 
     const Self = @This();
 
@@ -131,6 +137,7 @@ pub const AgentProtocolClient = struct {
             .session_last_results = std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)).init(allocator),
             .pending_sends_by_session = std.AutoHashMap(agent_types.SessionId, std.ArrayList(PendingSend)).init(allocator),
             .proven_floor_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
+            .stop_revert_bound_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
         };
     }
 
@@ -160,6 +167,7 @@ pub const AgentProtocolClient = struct {
         }
         self.pending_sends_by_session.deinit();
         self.proven_floor_by_session.deinit();
+        self.stop_revert_bound_by_session.deinit();
 
         self.* = undefined;
     }
@@ -183,9 +191,23 @@ pub const AgentProtocolClient = struct {
         const gop = try self.pending_sends_by_session.getOrPut(session_id);
         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(PendingSend).empty;
         var resend_of_pending = false;
+        var has_competing_payload = false;
         for (gop.value_ptr.items) |pending| {
-            if (pending.kind == .message and pending.sequence == sequence and pending.payload_hash == payload_hash and !pending.provenance_broken) resend_of_pending = true;
+            if (pending.kind != .message or pending.sequence != sequence) continue;
+            if (pending.payload_hash == payload_hash) {
+                if (!pending.provenance_broken) resend_of_pending = true;
+            } else {
+                has_competing_payload = true;
+            }
         }
+        // A COMPETING different-payload record at the same sequence
+        // disqualifies the silent path: a later duplicate_sequence answer
+        // proves only that SOMEONE consumed the sequence — the competing
+        // payload explains it without this send's source ever having run
+        // (an ambiguously-failed send's record may linger while another
+        // payload was admitted at the sequence), so the rejection must
+        // surface instead of retiring silently (#210 gap 7).
+        if (has_competing_payload) resend_of_pending = false;
         try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending });
     }
 
@@ -427,7 +449,17 @@ pub const AgentProtocolClient = struct {
                 if (self.pendingSendFor(p.session_id, env.in_reply_to)) |start| {
                     if (start.kind == .start) self.noteProvenFloor(p.session_id, start.sequence + 1);
                 } else {
+                    // An ADOPTED start (uncorrelated — a generated-id
+                    // response or a restored client receiving the reply)
+                    // still proves the registration consumed sequence 1.
                     self.noteProvenFloor(p.session_id, 2);
+                }
+                // The adopted-start world may hold the live tracker at its
+                // fresh value while the server already expects 2: raise the
+                // tracker to the proven floor so the first ordinary message
+                // is not rejected on a consumed sequence (#210 gap 7).
+                if (self.peekNextSequence(p.session_id) < self.provenFloor(p.session_id)) {
+                    self.next_sequence_by_session.put(p.session_id, self.provenFloor(p.session_id)) catch {};
                 }
                 // The start's outcome resolved (accepted): retire its pending
                 // record so long-lived sessions do not accumulate resolved
@@ -458,6 +490,15 @@ pub const AgentProtocolClient = struct {
                 // rejection's all-rejected floor) is raised — best-effort,
                 // since duplicate evidence lifts a tracker left low by an
                 // allocation failure here.
+                //
+                // Deliberately agent_result-ONLY: an UNCORRELATED
+                // agent_error is wire-identical between a run settlement
+                // (§13.4.2) and an admission failure's unscoped runtime
+                // error (§13.4.1), and retiring on the admission-failure
+                // side would disarm the bounded stop probe (slice 4) that
+                // exists to bracket exactly that ambiguity — the
+                // error-settlement retirement is deferred to the lifecycle
+                // slice with the probe's context (#210 gap 7).
                 if (self.retireSettledPendingSends(env.session_id)) |min_candidate_sequence| {
                     self.noteProvenFloor(env.session_id, min_candidate_sequence + 1);
                     const target = self.provenFloor(env.session_id);
@@ -567,6 +608,7 @@ pub const AgentProtocolClient = struct {
                 }
                 _ = self.next_sequence_by_session.remove(p.session_id);
                 _ = self.proven_floor_by_session.remove(p.session_id);
+                _ = self.stop_revert_bound_by_session.remove(p.session_id);
                 // The session is gone with its counter — the tracked
                 // requests (the accepted stop included) are meaningless.
                 if (self.pending_sends_by_session.fetchRemove(p.session_id)) |entry| {
@@ -748,6 +790,7 @@ pub const AgentProtocolClient = struct {
         if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.proven_floor_by_session.remove(session_id);
+            _ = self.stop_revert_bound_by_session.remove(session_id);
             if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
                 var pending_list = entry.value;
                 pending_list.deinit(self.allocator);
@@ -774,11 +817,22 @@ pub const AgentProtocolClient = struct {
             for (list.items, 0..) |*pending, i| {
                 if (pending.kind != .message or pending.sequence != rejected.sequence) continue;
                 var viable_source = false;
-                for (list.items[0..i]) |earlier| {
-                    if (earlier.kind != .message or earlier.sequence != rejected.sequence) continue;
-                    if (earlier.payload_hash != pending.payload_hash) continue;
-                    if (earlier.provenance_broken) continue;
-                    viable_source = true;
+                // The same competing-payload rule as record time: a
+                // different-payload record at the sequence explains a
+                // duplicate answer without the same-payload source having
+                // run, so the silent path is disqualified (#210 gap 7).
+                var has_competing_payload = false;
+                for (list.items) |other| {
+                    if (other.kind != .message or other.sequence != rejected.sequence) continue;
+                    if (other.payload_hash != pending.payload_hash) has_competing_payload = true;
+                }
+                if (!has_competing_payload) {
+                    for (list.items[0..i]) |earlier| {
+                        if (earlier.kind != .message or earlier.sequence != rejected.sequence) continue;
+                        if (earlier.payload_hash != pending.payload_hash) continue;
+                        if (earlier.provenance_broken) continue;
+                        viable_source = true;
+                    }
                 }
                 if (pending.resend_of_pending and !viable_source) pending.provenance_broken = true;
                 pending.resend_of_pending = viable_source;
@@ -798,8 +852,20 @@ pub const AgentProtocolClient = struct {
         // stop's resync was a no-op (it carried the tracker's own value),
         // so nothing changes for it beyond proven-floor retention.
         if (rejected.kind == .stop) {
+            // The pre-resync prior is the world-if-this-stop-rejected: any
+            // snapshot taken while this resync was live — including a LATER
+            // stop's own prior, resynced on top of it — reverts to at most
+            // it. It joins the session's revert bound even when the live
+            // undo below is skipped (a newer resync moved the tracker);
+            // without that, the newer stop's rejection would restore a
+            // value this stop's refuted resync had contaminated (#210
+            // gap 7).
+            const prior_bound = rejected.prior_tracker;
+            const existing_revert = self.stop_revert_bound_by_session.get(session_id);
+            const revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
+            self.stop_revert_bound_by_session.put(session_id, revert_bound) catch {};
             if (self.peekNextSequence(session_id) == rejected.sequence) {
-                var pending_floor: u64 = std.math.maxInt(u64);
+                var pending_floor: u64 = revert_bound;
                 for (list.items) |pending| {
                     if (pending.kind == .message) {
                         pending_floor = @min(pending_floor, @min(pending.sequence, pending.prior_tracker));
@@ -810,7 +876,7 @@ pub const AgentProtocolClient = struct {
                         pending_floor = @min(pending_floor, pending.prior_tracker);
                     }
                 }
-                var undo = @min(rejected.prior_tracker, pending_floor);
+                var undo = pending_floor;
                 undo = @max(undo, self.provenFloor(session_id));
                 self.noteProvenFloor(session_id, undo);
                 try self.next_sequence_by_session.put(session_id, undo);
@@ -865,6 +931,12 @@ pub const AgentProtocolClient = struct {
                 floor = @min(floor, pending.prior_tracker);
             }
         }
+        // A REJECTED stop's pre-resync prior bounds the same world — its
+        // record is gone, but snapshots taken during its refuted resync
+        // still revert to at most that prior (#210 gap 7).
+        if (self.stop_revert_bound_by_session.get(session_id)) |revert_bound| {
+            floor = @min(floor, revert_bound);
+        }
         // The all-rejected floor and every previously proven bound are
         // both sound lower bounds on the counter — the sound floor is
         // their MAX. Without this, a generic backward rejection
@@ -916,6 +988,7 @@ pub const AgentProtocolClient = struct {
         _ = self.next_sequence_by_session.remove(session_id);
         _ = self.session_complete_flags.remove(session_id);
         _ = self.proven_floor_by_session.remove(session_id);
+        _ = self.stop_revert_bound_by_session.remove(session_id);
         if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
             var list = entry.value;
             list.deinit(self.allocator);
@@ -3129,4 +3202,142 @@ test "AgentProtocolClient generic invalid_request on a resend stays ambiguous �
     try std.testing.expect(client.isSessionComplete(sid));
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the resend retired, the original remains
+}
+
+test "AgentProtocolClient a competing payload at the sequence disqualifies the silent retry (#210 gap 7)" {
+    // Payload A at 2 fails ambiguously (its record lingers); payload B at
+    // 2 is admitted; the A-retry is recorded while BOTH are pending. Its
+    // duplicate_sequence proves only that SOMEONE consumed 2 — B explains
+    // it without A ever having run — so the rejection surfaces instead of
+    // retiring silently as though A had executed.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — ambiguous write, outcome unknown
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // admitted at the same sequence
+    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // the A-retry
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // The competing B explains the duplicate without A having run: the
+    // rejection SURFACES, and both original records remain pending.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 2), pending.items.len); // A and B remain
+}
+
+test "AgentProtocolClient chained explicit stop rejections revert through every refuted resync (#210 gap 7)" {
+    // The server expects 2; stop A resyncs to 7 (prior 2), stop B to 8
+    // (prior 7 — snapshotted on A's resync). A's rejection cannot undo
+    // live (B moved the tracker); B's rejection must still revert THROUGH
+    // A's refuted resync to 2 — restoring B's own prior (7) would wedge
+    // the tracker above the server permanently via the proven floor.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, server expects 2
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const stop_a_id = try client.sendAgentStopWithSequence(sid, "first", 7); // prior 2, tracker 7
+    const stop_b_id = try client.sendAgentStopWithSequence(sid, "second", 8); // prior 7, tracker 8
+
+    var rejected_a = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejected_a.deinit(allocator);
+    try client.processEnvelope(rejected_a); // guard fails (tracker is 8); A's prior 2 joins the revert bound
+
+    var rejected_b = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_b_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejected_b.deinit(allocator);
+    try client.processEnvelope(rejected_b); // reverts through BOTH refuted resyncs
+
+    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // never B's contaminated 7
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    var next_env = try harness.envelopeAt(3); // start, stop A, stop B, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), next_env.sequence);
+}
+
+test "AgentProtocolClient an adopted uncorrelated start raises the live tracker to the proven floor (#210 gap 7)" {
+    // A generated-id response (or a restored client) delivers the started
+    // reply without correlation: the registration consumed sequence 1, so
+    // the floor is 2 — and the LIVE tracker must follow it, or the first
+    // ordinary message would carry the consumed 1 and be rejected.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // tracker follows the proof
+
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    var first = try harness.envelopeAt(0);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first.sequence);
 }
