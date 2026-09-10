@@ -999,38 +999,50 @@ Rules:
   reached any optimistic value derived from unresolved sends: a RETRY of
   a still-unresolved message (same sequence AND payload digest, via
   `sendAgentMessageWithSequence`) retires silently, with the tracker
-  restored to the HIGHEST PROVEN bound — the duplicated sequence + 1,
-  plus resolved-outcome progress from every available snapshot (the
-  current tracker, the entry's pre-send value, and each remaining
-  record's own prior), each capped at the sends that were unresolved
-  when its snapshot was taken (the still-pending message records
-  preceding it in insertion order) so unresolved mirrors never leak in
-  and settled progress is never discarded (for a retry the caps collapse
-  the bound to the proven step; a higher true counter is reached one
-  silent step per round trip), while a mismatched payload, a non-retry
-  send, or a START falls through to the ordinary rejection path and
-  surfaces (an empty `options_json` digests identically to absence — the
-  wire treats them the same; a rejected message re-derives the retry
-  provenance of remaining same-sequence records, since a rejected send
-  never ran).
+  restored to `sequence + 1` MAX the session's proven floor (see below),
+  while a mismatched payload, a non-retry send, or a START falls through
+  to the ordinary rejection path and surfaces (an empty `options_json`
+  digests identically to absence — the wire treats them the same; a
+  rejected message re-derives the retry provenance of remaining
+  same-sequence records DIRECTIONALLY — a retry derives only from an
+  earlier record whose own source chain is intact, and rejecting a
+  source breaks the whole chain — since a rejected send never ran). The
+  client keeps a monotone PROVEN FLOOR per session: every reconciliation
+  that establishes a sound lower bound — a busy answer's exact parity,
+  an all-rejected floor, a duplicate answer's proven step, a
+  settlement's minimum-candidate step, a stop-undo's capped restore —
+  maxes it, and every later floor or restore maxes with it (the counter
+  never moves backward, so a bound once proven stays proven; optimistic
+  mirrors from unresolved sends never participate). A higher true
+  counter than the restore is reached one silent step per round trip
+  (the next send at the restored value is answered `duplicate_sequence`
+  in turn, and as a same-payload retry it retires silently).
   Explicit-sequence sends (`sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
   tracker mirrors it optimistically but restores its PRE-SEND state when
   the pre-wire bookkeeping fails (nothing reached the wire), and
-  `maxInt(u64)` is rejected before any mutation. An explicit STOP RESYNCS
-  the tracker to the given value without advancing past it, and its
-  correlated rejection undoes the resync when the tracker still holds it. Stop sends never advance
+  `maxInt(u64)` is rejected before any mutation (both variants). An
+  explicit STOP RESYNCS the tracker to the given value without advancing
+  past it, and its correlated rejection undoes the resync — when the
+  tracker still holds the stop's value — to the pre-resync tracker
+  CAPPED by the still-pending messages' floor (the pre-resync value may
+  itself be an unresolved send's optimistic mirror), max the proven
+  floor. Stop sends never advance
   the tracker: an accepted stop consumes the counter with the session, a
   rejected stop leaves the expected value in place for its retry, and
   stops are tracked requests too, so a session-gone answer discovered
   through a stop drops the counter state for the re-registration. A
   settlement retires the settled run's own message record (the oldest
   pending message), keeping a long-lived session's records bounded by its
-  unresolved sends rather than its history; the retirement also RAISES
-  the tracker to at least that record's sequence + 1 — the settlement
-  proves the counter advanced past it, restoring progress a stale rewind
-  (a delayed busy answer's parity floor for a retry that was actually
-  accepted) had pulled below. Slices to follow in the
+  unresolved sends rather than its history; the settlement also raises
+  the proven floor to the MINIMUM pending-message sequence + 1 — the
+  settled run is only KNOWN to be one of the pending messages (the
+  insertion-order attribution is a heuristic; agent_result carries no
+  run identity, §13.3.2), so the heuristically retired record's own
+  sequence proves nothing — and the tracker follows the floor,
+  restoring progress a stale rewind (a delayed busy answer's parity
+  floor for a retry that was actually accepted) had pulled below.
+  Slices to follow in the
   series: the pending-record lifecycle and stale-reply guards, the bounded
   stop probe for unknown outcomes, and the TUI teardown integration
   (`[in progress — #210 gap 7 re-sliced from #213]`).
