@@ -426,7 +426,7 @@ pub const AgentProtocolClient = struct {
         var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
         var reason_owned_by_map = false;
         errdefer if (!reason_owned_by_map) owned_reason.deinit(self.allocator);
-        var owned_candidates = try candidates.toOwnedSlice(self.allocator);
+        const owned_candidates = try candidates.toOwnedSlice(self.allocator);
         var candidates_owned_by_map = false;
         errdefer if (!candidates_owned_by_map) self.allocator.free(owned_candidates);
         try self.stop_probes_by_session.put(session_id, .{
@@ -782,10 +782,9 @@ pub const AgentProtocolClient = struct {
         var reason = probe.reason;
         _ = self.stop_probes_by_session.remove(session_id);
         var candidates_owned_here = true;
-        var reason_owned_here = true;
         defer {
             if (candidates_owned_here) self.allocator.free(candidates);
-            if (reason_owned_here) reason.deinit(self.allocator);
+            reason.deinit(self.allocator);
         }
         if (retry) {
             // Pre-wire phase for the next candidate (mirrors the first
