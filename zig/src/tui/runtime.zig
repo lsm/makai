@@ -1592,22 +1592,36 @@ pub const TuiRuntime = struct {
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
 
-        var reconnected_once = false;
-        while (true) {
-            const result = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
-                const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
-                if (self.remote_config_websocket_owned and reconnectable and !reconnected_once) {
-                    reconnected_once = true;
-                    try self.ensureRemoteWebSocketConnection(true);
-                    try self.ensureRemoteSession();
-                    sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
-                    continue;
-                }
-                return err;
-            };
-            _ = result;
-            break;
-        }
+        // §13.4.6: a failed message write is AMBIGUOUS — the envelope may
+        // already have reached the server and its run may be executing (tool
+        // side effects included). Auto-reconnecting and RESENDING on a fresh
+        // session would run the turn twice and leave the old registration
+        // unstopped, so a reconnectable write failure instead restores the
+        // socket, RECONCILES the old registration with the bounded stop
+        // probe (its output is lost either way — the turn fails and the
+        // caller retries explicitly), and never resends (#210 gap 7).
+        _ = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
+            const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
+            if (self.remote_config_websocket_owned and reconnectable) {
+                const old_sid = sid;
+                // Reconnect WITHOUT the session-state clear the normal
+                // recovery performs: the probe below needs the old
+                // registration's pending-send evidence intact.
+                self.clearWebSocketRemote();
+                try self.reconnectWebSocketRemote();
+                client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
+                if (client.sendAgentStopProbing(old_sid, "send failed")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(old_sid, "send failed") catch {};
+                    }
+                } else |_| {}
+                self.driveRemoteStopProbe(client, old_sid);
+                client.removeSessionState(old_sid);
+                self.remote_session_id = null;
+                self.remote_pending_session_id = null;
+            }
+            return err;
+        };
 
         if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {

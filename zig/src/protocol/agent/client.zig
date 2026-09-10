@@ -507,6 +507,14 @@ pub const AgentProtocolClient = struct {
                 // isSessionComplete/getLastErrorForSession callers (#210
                 // gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, e.code)) {
+                    // A CORRELATED reply naming a request this client does not
+                    // track is a delayed rejection from an OLDER registration
+                    // on a reused id: request-scoped, not a failure of the
+                    // current session — recording it would mark the healthy
+                    // current turn complete+failed and abort it in the TUI
+                    // (#210 gap 7). Uncorrelated frames still settle below
+                    // (§13.4.2's settlement shape).
+                    if (env.in_reply_to != null and !self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                     // Roll the tracker back BEFORE the fallible error
                     // bookkeeping: the rejection envelope is already
                     // consumed, so an allocation failure in the diagnostics
@@ -750,7 +758,14 @@ pub const AgentProtocolClient = struct {
             // A tracked request answered agent_not_found: the session is
             // gone server-side, so its tracked sequence state is meaningless.
             // Drop it — a re-registration of the id must start at sequence
-            // 1, not the stale optimistic counter.
+            // 1, not the stale optimistic counter. The ACTIVE IDENTITY
+            // clears too (mirroring the agent_stopped arm): with it left
+            // set, the TUI's session sync keeps the vanished registration
+            // as the live one and every later turn skips agent_start in
+            // favor of messages into the void (#210 gap 7).
+            if (self.session_id) |active| {
+                if (std.mem.eql(u8, active[0..], session_id[0..])) self.session_id = null;
+            }
             _ = self.next_sequence_by_session.remove(session_id);
             self.clearSessionControlState(session_id);
             return;
@@ -1906,10 +1921,23 @@ test "AgentProtocolClient correlated agent_not_found clears state only for a req
 
     const sid = agent_types.generateSessionId();
     _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expect(client.session_id != null);
     const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
 
     // Tracked request answered agent_not_found: the session is gone, drop
-    // the sequence and control state.
+    // the sequence, control state, AND the active identity — with the
+    // identity left set, the TUI's session sync keeps the vanished
+    // registration as the live one and later turns never re-start.
     var tracked_rejection = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
@@ -1923,6 +1951,7 @@ test "AgentProtocolClient correlated agent_not_found clears state only for a req
 
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id == null);
 
     // The id is re-registered (start + started + message): the CURRENT
     // registration's state is live again...
@@ -2008,6 +2037,62 @@ test "AgentProtocolClient unrelated nack does not fail the live session (#210 ga
     };
     defer message_nack.deinit(allocator);
     try client.processEnvelope(message_nack);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient stale correlated agent_error does not fail the live session (#210 gap 7)" {
+    // A delayed correlated agent_error replying to an OLDER registration's
+    // request (reused id, reply arrives during the new run): the
+    // counter/control mutation was already gated on current-request
+    // ownership — the TERMINAL bookkeeping must be too, or the healthy
+    // current turn is marked complete+failed and the TUI aborts it.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, unresolved
+
+    // Stale rejection naming an untracked request: request-scoped, dropped.
+    var stale = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "stale rejection") } },
+    };
+    defer stale.deinit(allocator);
+    try client.processEnvelope(stale);
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    // A rejection naming the PENDING message still fails the session.
+    var ours = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer ours.deinit(allocator);
+    try client.processEnvelope(ours);
     try std.testing.expect(client.getLastErrorForSession(sid) != null);
     try std.testing.expect(client.isSessionComplete(sid));
 }
