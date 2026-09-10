@@ -575,11 +575,23 @@ pub const AgentProtocolClient = struct {
                     if (self.pendingSendFor(env.session_id, env.in_reply_to)) |entry| {
                         if (entry.kind == .message) {
                             try self.retireDuplicateAdmittedSend(env.session_id, env.in_reply_to, entry);
-                            if (entry.resend_of_pending) return;
-                            // The high-water is already preserved; skip the
-                            // rollback (the entry is retired, so the
-                            // correlated rejection below finds no match) and
-                            // fall through to record the failure.
+                            // The silent path requires no COMPETING payload
+                            // at the sequence NOW — a competitor recorded
+                            // after this send makes the duplicate answer
+                            // ambiguous even though the recorded bit predates
+                            // it (#210 gap 7).
+                            if (entry.resend_of_pending and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
+                            // The retired duplicate was possibly a COMPETING
+                            // payload at its sequence: its removal can
+                            // re-qualify other payloads' retries for the
+                            // silent path (their recorded bit was false only
+                            // because this competitor existed). Records of
+                            // the RETIRED payload keep their recorded bits —
+                            // the retired record was proven consumed, and its
+                            // chain's justifications stand (#210 gap 7).
+                            self.requalifyProvenanceAfterCompetitorRetirement(env.session_id, entry.sequence, entry.payload_hash);
+                            // The proven step is already recorded; fall
+                            // through to surface the failure.
                         } else if (entry.kind == .stop) {
                             // A duplicate_sequence answer for a STOP proves
                             // the counter is past the stop's sequence too
@@ -739,6 +751,41 @@ pub const AgentProtocolClient = struct {
 
     fn provenFloor(self: *Self, session_id: agent_types.SessionId) u64 {
         return self.proven_floor_by_session.get(session_id) orelse 0;
+    }
+
+    /// Whether a DIFFERENT-payload message record is still pending at the
+    /// sequence — a competing payload explains a duplicate answer without
+    /// the same-payload source having run, disqualifying the silent path
+    /// (#210 gap 7).
+    fn hasCompetingPayload(self: *Self, session_id: agent_types.SessionId, sequence: u64, payload_hash: u64) bool {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return false;
+        for (list.items) |pending| {
+            if (pending.kind != .message or pending.sequence != sequence) continue;
+            if (pending.payload_hash != payload_hash) return true;
+        }
+        return false;
+    }
+
+    /// Re-derives the retry provenance of same-sequence records of OTHER
+    /// payloads after a COMPETING record retired through its own duplicate
+    /// answer: with the competitor gone (and proven consumed — its chain's
+    /// justifications stand, so records of the retired payload keep their
+    /// recorded bits), a same-payload retry's duplicate legitimately
+    /// confirms the still-pending original (#210 gap 7).
+    fn requalifyProvenanceAfterCompetitorRetirement(self: *Self, session_id: agent_types.SessionId, sequence: u64, retired_hash: u64) void {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        for (list.items, 0..) |*pending, i| {
+            if (pending.kind != .message or pending.sequence != sequence) continue;
+            if (pending.payload_hash == retired_hash) continue;
+            if (self.hasCompetingPayload(session_id, sequence, pending.payload_hash)) continue;
+            for (list.items[0..i]) |earlier| {
+                if (earlier.kind != .message or earlier.sequence != sequence) continue;
+                if (earlier.payload_hash != pending.payload_hash) continue;
+                if (earlier.provenance_broken) continue;
+                pending.resend_of_pending = true;
+                break;
+            }
+        }
     }
 
     /// Retires a send proven duplicate-admitted by a `duplicate_sequence`
@@ -3340,4 +3387,75 @@ test "AgentProtocolClient an adopted uncorrelated start raises the live tracker 
     var first = try harness.envelopeAt(0);
     defer first.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), first.sequence);
+}
+
+test "AgentProtocolClient a retired competing duplicate requalifies other payloads' retries (#210 gap 7)" {
+    // Payload A and competing payload B are pending at 2; the A-retry is
+    // correctly non-silent while B remains. BOTH are answered
+    // duplicate_sequence with B's reply processed FIRST: B retires (and
+    // legitimately surfaces), which removes the only competitor — the
+    // A-retry's later duplicate now legitimately confirms the
+    // still-pending A original and retires SILENTLY instead of raising a
+    // false terminal error.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — the original, outcome unknown
+    const competing_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // the competitor
+    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // non-silent while B remains
+
+    var competing_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = competing_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = competing_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer competing_duplicate.deinit(allocator);
+    try client.processEnvelope(competing_duplicate);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null); // B's rejection surfaces
+    client.clearSessionTerminalState(sid); // the caller consumes B's legitimate failure
+
+    var retry_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer retry_duplicate.deinit(allocator);
+    try client.processEnvelope(retry_duplicate);
+
+    // With the competitor proven consumed and gone, the A-retry's
+    // duplicate confirms the pending A original: silent, no false error.
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the A original remains for its own settlement
 }
