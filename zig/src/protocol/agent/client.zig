@@ -229,7 +229,10 @@ pub const AgentProtocolClient = struct {
         // counter state, instead of leaving a stale value that a
         // re-registration of the same id would send and have rejected
         // (#210 gap 7). Recorded BEFORE the wire so a record failure leaves
-        // nothing sent.
+        // nothing sent. The deprecated compatibility mirror reflects the
+        // emitted value like the start/message paths, without advancing the
+        // per-session tracker.
+        self.sequence = sequence; // compatibility mirror
         try self.recordPendingSend(session_id, msg_id, sequence, .stop);
         try self.writeEnvelopeJson(json);
         return msg_id;
@@ -796,12 +799,14 @@ test "AgentProtocolClient stop sends never advance the tracker (#210 gap 7)" {
 
     // A stop consumes the counter with the session when accepted and never
     // advances it when rejected — the stop carries the tracker's current
-    // expected value and the tracker is unchanged by the send.
+    // expected value and the tracker is unchanged by the send. The
+    // deprecated compatibility mirror reflects the emitted value.
     _ = try client.sendAgentStop(sid, "completed");
     var stop_env = try harness.envelopeAt(2);
     defer stop_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), stop_env.sequence);
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.sequence);
 
     // The accepted stop consumes the tracked requests with the session.
     var stopped_env = agent_types.Envelope{
