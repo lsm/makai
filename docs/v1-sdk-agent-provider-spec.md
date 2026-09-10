@@ -981,7 +981,9 @@ Rules:
   mirror the server's counter optimistically — the tracker advances at SEND, before
   the outcome is known — and reconcile on evidence. A CORRELATED rejection (an
   `agent_error`/`nack` whose `in_reply_to` names the client's own send) rolls the
-  tracker back to the rejected send's own sequence, so a corrected retry reuses it
+  tracker back to the counter the server RETAINED — the rejected record's
+  pre-send tracker, identical to the send's own sequence for ordinary sends —
+  so a corrected retry reuses it
   (the Zig client tracks every outstanding send and rolls back MONOTONICALLY to
   the minimum — an older unresolved send's floor is never lost to a younger
   send's rejection; ordinary `agent_stop`s are tracked requests too, so their

@@ -143,7 +143,8 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    `AgentProtocolClient`
    rolls its per-session counter back when a correlated `agent_error`/`nack`
    names the send (`processEnvelope` matches `in_reply_to` against the session's
-   outstanding counter-advancing sends and rolls back to the minimum; a
+   outstanding counter-advancing sends and rolls back to the minimum of the
+   retained pre-send trackers; a
    correlated `agent_not_found` drops the counter state instead), never
    advances the counter on stop sends (a rejected stop leaves the expected
    value in place for its retry), and exposes the control surface recovery
