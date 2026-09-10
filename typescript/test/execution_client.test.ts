@@ -2999,3 +2999,63 @@ test("stopAgentWithSequenceProbe is bounded: no reply and a non-invalid_request 
     assert.deepEqual(sentStops, [2]);
   }
 });
+
+test("stopAgentSession drains queued session output after a successful sequence probe (#210 gap 7)", async () => {
+  // The probe's reads are correlated to its stop, and the transport serves a
+  // correlated wait from its reply queue AHEAD of the session queue: the
+  // `agent_stopped` that resolves the probe can be delivered while the
+  // timed-out attempt's late run output is still parked on the session
+  // route. A successful probe must therefore still drain before the id is
+  // reusable — otherwise an immediate same-id follow-up claims the previous
+  // run's output as its own result after its start is accepted.
+  const sessionId = "testNanoIdSess1234567";
+  const queue: StdioFrame[] = [];
+  // Late output from the timed-out run, parked BEFORE the stop's reply —
+  // exactly the ordering a concurrent read-lock holder produces.
+  queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-stale-output", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
+  const sentStops: number[] = [];
+  const waitCorrelates: Array<string | undefined> = [];
+  const drainedFrameIds: string[] = [];
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      sentStops.push(frame.sequence as number);
+      queue.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+    },
+    nextFrameForSession: async (_sid: string, _timeoutMs?: number, wait?: { correlate?: string }) => {
+      // Mirrors the real transport's dequeueOwnFrame priority: a correlated
+      // wait claims its reply regardless of queue position, while an
+      // uncorrelated wait (the drain) takes parked output in order.
+      const correlate = wait?.correlate;
+      waitCorrelates.push(correlate);
+      const frame = correlate !== undefined
+        ? queue.find((entry) => entry.in_reply_to === correlate)
+        : queue.find((entry) => entry.in_reply_to === undefined);
+      if (!frame) throw new Error("timed out");
+      queue.splice(queue.indexOf(frame), 1);
+      if (correlate === undefined) drainedFrameIds.push(String(frame.message_id));
+      return frame;
+    },
+  };
+  const api = createMakaiAgentApi(transport as never, {}) as unknown as {
+    stopAgentSession(session: unknown, sessionId: string, sequence: number, reason: string, options?: { drain?: "quiescent" | "background" | "none" }): Promise<void>;
+  };
+
+  await api.stopAgentSession(
+    { nextSequence: 3, unresolvedMessageSequence: 2, startReplyObserved: true, idClientGenerated: false, stopped: false, sessionId },
+    sessionId,
+    3,
+    "timeout",
+    { drain: "quiescent" },
+  );
+
+  // The probe settled at the pre-send value (one stop, no retry) — its own
+  // reads correlated to the stop, the drain's reads uncorrelated ...
+  assert.deepEqual(sentStops, [2]);
+  assert.ok(waitCorrelates[0] !== undefined);
+  assert.ok(waitCorrelates.includes(undefined));
+  // ... and the post-probe drain consumed the parked late output, leaving
+  // the route empty for an immediate same-id follow-up.
+  assert.deepEqual(drainedFrameIds, ["m-stale-output"]);
+  assert.equal(queue.length, 0);
+});

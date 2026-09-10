@@ -308,6 +308,16 @@ pub const TuiRuntime = struct {
     remote_pending_session_id: ?agent_protocol_types.SessionId = null,
     remote_error_emitted: bool = false,
     remote_reconnect_attempted: bool = false,
+    /// Set when a teardown pump (cancel/stop) observes the receive stream
+    /// disconnect: teardown must not reconnect (the recovery path registers a
+    /// replacement session the teardown never stops), so the reconnect is
+    /// deferred to the next `ensureRemoteSession`, which restores the SSE
+    /// receive stream BEFORE any `agent_start` — an SSE send side still works
+    /// after its stream dies, so a start sent first registers a session whose
+    /// reply is lost on the dead stream, and `handleRemoteDisconnect`'s
+    /// recovery then registers a SECOND session, leaking the first
+    /// server-side until eviction (#210 gap 7).
+    remote_sse_reconnect_needed: bool = false,
     remote_session_timeout_ms: u64 = 5_000,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
@@ -675,6 +685,10 @@ pub const TuiRuntime = struct {
                 self.started = true;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
+                // A deferred teardown disconnect (if any) is satisfied here:
+                // start() itself restored the receive stream above, so the
+                // next ensureRemoteSession must not reconnect it again.
+                self.remote_sse_reconnect_needed = false;
                 self.pumpRemoteIncoming() catch |err| {
                     // Cancel the WebSocket reader before closing the sender so the
                     // close path cannot clear buffers while receive() is using them.
@@ -1473,7 +1487,10 @@ pub const TuiRuntime = struct {
     /// invocation, so the probe driver's deadline is enforced between
     /// frames: a continuously readable receiver with a large backlog
     /// cannot stall the teardown past its budget. All failures simply end
-    /// the pump.
+    /// the pump. A disconnect is terminal for the teardown but must not be
+    /// forgotten: it flags `remote_sse_reconnect_needed` so the next
+    /// `ensureRemoteSession` restores the receive stream BEFORE registering
+    /// a session on it.
     fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) void {
         var receiver = &(self.remote_receiver orelse return);
         const client = &(self.remote_client orelse return);
@@ -1488,7 +1505,9 @@ pub const TuiRuntime = struct {
                 self.drainRemoteClientEvents(client) catch return;
             },
             .pending => {},
-            .disconnected => {},
+            .disconnected => {
+                self.remote_sse_reconnect_needed = true;
+            },
         }
     }
 
@@ -1679,6 +1698,21 @@ pub const TuiRuntime = struct {
     }
 
     fn ensureRemoteSession(self: *TuiRuntime) !void {
+        if (self.remote_sse_reconnect_needed) {
+            // A teardown pump deferred a receive-stream disconnect here
+            // (#210 gap 7): reconnect BEFORE registering a session. The SSE
+            // send side outlives its receive stream, so a start sent first
+            // would register a server-side session whose reply is lost on
+            // the dead stream — handleRemoteDisconnect's recovery then
+            // registers a second session and the first leaks until
+            // eviction. A failed reconnect fails the turn here, registering
+            // nothing; the flag stays set so the next turn retries the
+            // reconnect-first order.
+            if (self.remote_config_sse_client) |sse_client| {
+                try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+            }
+            self.remote_sse_reconnect_needed = false;
+        }
         if (self.remote_session_id != null) return;
         if (self.remote_pending_session_id == null) {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
@@ -5634,6 +5668,63 @@ test "remote disconnect attempts reconnect then emits terminal error" {
         if (ev == .agent_end and ev.agent_end.reason == .@"error") saw_error_end = true;
     }
     try std.testing.expect(saw_error_end);
+}
+
+test "cancel after receive disconnect defers SSE reconnect to before the next session registration" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    try runtime.ensureRemoteSession();
+    try std.testing.expect(!runtime.remote_sse_reconnect_needed);
+
+    mock.disconnected = true;
+    runtime.cancel();
+    // The teardown treated the dead receive stream as terminal (reconnecting
+    // would register an unstopped replacement session) but flagged it: the
+    // next turn must reconnect BEFORE its agent_start, or the start — the
+    // SSE send side outlives the receive stream — registers a session whose
+    // reply is lost on the dead stream, and the disconnect recovery then
+    // registers a second one, leaking the first server-side (#210 gap 7).
+    try std.testing.expect(runtime.remote_sse_reconnect_needed);
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+    try std.testing.expect(runtime.started);
+
+    // A never-reconnected SSE client (the empty endpoint fails fast,
+    // deterministically) makes the deferred reconnect fail BEFORE anything
+    // is registered: no agent_start is written and the flag survives so the
+    // next turn retries the reconnect-first order.
+    mock.disconnected = false;
+    const sse_client = try std.testing.allocator.create(sse_transport.SseHttpClient);
+    sse_client.* = sse_transport.SseHttpClient.init(std.testing.allocator);
+    runtime.remote_config_sse_client = sse_client;
+    const writes_before = mock.writes.items.len;
+    try std.testing.expectError(error.InvalidUrl, runtime.ensureRemoteSession());
+    try std.testing.expectEqual(writes_before, mock.writes.items.len);
+    try std.testing.expect(runtime.remote_sse_reconnect_needed);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+
+    // Without an SSE client to reconnect (websocket/stdio configs handle
+    // their own liveness), the flag is consumed and registration proceeds
+    // exactly once — here straight into the start timeout.
+    runtime.remote_config_sse_client = null;
+    sse_client.deinit();
+    std.testing.allocator.destroy(sse_client);
+    runtime.remote_session_timeout_ms = 1;
+    try std.testing.expectError(error.RemoteAgentStartFailed, runtime.ensureRemoteSession());
+    try std.testing.expect(!runtime.remote_sse_reconnect_needed);
+    try std.testing.expectEqual(writes_before + 1, mock.writes.items.len);
 }
 
 test "remote submit pump failure completes stream" {

@@ -491,18 +491,28 @@ class StdioAgentApi implements MakaiAgentApi {
       // advanced value: without the probe, the rolled-back case rejects the
       // stop and the owned session leaks indefinitely. The probe is bounded
       // (one stop, at most one correlated-invalid_request retry) and consumes
-      // its own replies, so nothing it reads poisons a later same-id attempt.
+      // its own replies.
       const preSend = session.unresolvedMessageSequence;
       session.unresolvedMessageSequence = undefined;
-      const acceptedAt = await stopAgentWithSequenceProbe(this.transport, sessionId, { preSend, postSend: sequence }, reason);
-      if (acceptedAt === undefined && options.drain === "quiescent") {
-        // Unresolved probe (no reply, or both candidate states rejected):
-        // still drain before the id is reused.
-        await drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250);
-      }
+      await stopAgentWithSequenceProbe(this.transport, sessionId, { preSend, postSend: sequence }, reason);
       if (options.drain === "background") {
         drainSessionFrames(this.transport, sessionId);
+        return;
       }
+      // Drain on EVERY probe outcome, resolved or not (§13.3.1): the probe's
+      // reads are correlated to its stop, and the transport serves a
+      // correlated wait from its reply queue AHEAD of the session queue — so
+      // the `agent_stopped` that resolves the probe can be delivered while
+      // the attempt's late run output is still parked on the session route
+      // (and an unresolved probe leaves whatever parked during it). A
+      // successful probe therefore does not prove the route clean: queued
+      // output from the unresolved run would be claimed by an immediate
+      // same-id follow-up after its start is accepted, returning the
+      // previous run's result or failure. The drain is bounded and AWAITED —
+      // it settles before the completion or error surfaces, so it cannot
+      // race a follow-up — and carries no stopReplyTo: the probe already
+      // consumed the stop's reply, so the drain runs to quiescence.
+      await drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250);
       return;
     }
     const stopMessageId = bestEffortStopAgent(this.transport, sessionId, sequence, reason);

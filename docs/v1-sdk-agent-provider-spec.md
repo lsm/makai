@@ -1298,7 +1298,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
    stop carries the pre-send sequence, and while the outcome is unresolved the
    teardown stop IS the probe — pre-send first, at most one
    correlated-`invalid_request` retry at the post-send value, bounded, consuming
-   its own replies so nothing it reads poisons a later same-id attempt (the
+   its own replies. Because a correlated wait is served ahead of the session
+   queue (§13.3.1), the reply that resolves the probe can overtake the
+   attempt's late output still parked on the session route, so after the probe
+   settles — at either outcome — the teardown drains queued session output
+   before the id is reused; the probe alone must not be read as leaving the
+   route clean (the
    earlier behavior — advance before the outcome is known, send only the
    advanced value, cleanup stop fails in the rolled-back case, owned session
    leaks indefinitely — is closed). The Zig client exposes the same probe

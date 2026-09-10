@@ -169,6 +169,16 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    plain tracked stop as the ineligible fallback (its ids are
    client-generated and exclusive, §6.1 — the fallback's optimistic
    sequence is the correct one exactly when the probe is ineligible).
+   Review-hardened in the same slice: the TS teardown drains queued
+   session output after the probe settles at EITHER outcome — correlated
+   reads are served ahead of the session queue, so the reply resolving
+   the probe can overtake still-parked late output, which an immediate
+   same-id follow-up would otherwise claim as its own (§13.3.1); and the
+   TUI defers a teardown-observed SSE receive disconnect to a pre-start
+   reconnect on the next session (`remote_sse_reconnect_needed`), so the
+   still-working SSE send side can no longer register a session whose
+   reply dies on the dead stream while the disconnect recovery registers
+   a second one, leaking the first until eviction.
    Residual, documented
    (§13.1): the admission gate cannot prove CURRENT-registration ownership of
    a caller-supplied id after a silent TTL eviction — eviction emits no

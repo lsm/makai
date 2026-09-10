@@ -216,6 +216,13 @@ export async function drainSessionFramesUntilQuiescent(
  * still hold — without the correlation the probe's budget can expire behind
  * that lock before the rejection arrives, and the retry never goes out.
  *
+ * Correlation cuts the other way too: a correlated wait is served from its
+ * reply queue AHEAD of the session queue, so the `agent_stopped` that
+ * resolves this probe can be delivered while the attempt's late run output
+ * is still parked on the session route. A resolved probe does NOT leave the
+ * route clean — callers must still drain queued session output before
+ * reusing the id (see `stopAgentSession`'s post-probe drain).
+ *
  * @returns The sequence at which the stop was accepted, or `undefined` when
  * the probe ended unresolved (no reply, session already gone, or both
  * candidate states rejected).
