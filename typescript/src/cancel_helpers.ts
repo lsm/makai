@@ -162,9 +162,14 @@ export async function drainSessionFramesUntilQuiescent(
   maxMs = 250,
   opts: { stopReplyTo?: string } = {},
 ): Promise<void> {
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
+  // Monotonic clock (mirrors stopAgentWithSequenceProbe): a backward
+  // wall-clock step (NTP, snapshot restore) with frames continuously
+  // available would otherwise extend this drain past its documented bound —
+  // and failed-run teardowns now AWAIT it after every probe outcome, so the
+  // bound guards error-propagation latency too.
+  const deadline = performance.now() + maxMs;
+  while (performance.now() < deadline) {
+    const remaining = deadline - performance.now();
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
     const controller = new AbortController();

@@ -284,7 +284,10 @@ pub const AgentProtocolClient = struct {
     /// at the post-send value (the message may have been accepted with its
     /// output lost or delayed); the retry's own replies are consumed the
     /// same way. Acceptance at either value settles cleanup; no other reply
-    /// retries.
+    /// retries. The first candidate is the MINIMUM of the oldest unresolved
+    /// message send's sequence and the tracker's rolled-back floor — a
+    /// rejection processed before an older send's settlement can leave the
+    /// entry's optimistic value above the server's expected counter.
     ///
     /// Probing requires OWNERSHIP EVIDENCE (§6.1): a recorded `agent_message`
     /// send AND an observed `agent_started` for this session's registration.
@@ -311,6 +314,14 @@ pub const AgentProtocolClient = struct {
         // accepted), so the counter sits at the oldest's own sequence (if it
         // too was rejected) or one past it (if accepted) — exactly the two
         // candidates probed. The newest send's pair could overshoot both.
+        // The tracker's rolled-back floor caps the entry's OPTIMISTIC value:
+        // when a rejection is processed BEFORE an older send's settlement
+        // (sends 2/3/4 pipelined, 3 rejected while 2's settlement is in
+        // flight, then 2 settles and 4's reply is lost), the surviving entry
+        // holds its optimistic 4 while the server expects 3 — the floor the
+        // rollback already recorded. min() brackets {floor, floor+1}, the
+        // two states the wire can still occupy; the entry's {4, 5} pair
+        // overshoots both and leaks the session (#210 gap 7).
         var oldest_message_sequence: ?u64 = null;
         for (list.items) |pending| {
             if (pending.kind == .message) {
@@ -318,7 +329,8 @@ pub const AgentProtocolClient = struct {
                 break;
             }
         }
-        const pre_send = oldest_message_sequence orelse return null;
+        const entry_sequence = oldest_message_sequence orelse return null;
+        const pre_send = @min(entry_sequence, self.peekNextSequence(session_id));
 
         // Pre-wire phase — every failure here happens with NOTHING on the
         // wire, so nothing is registered and the caller sees a clean error:
@@ -377,21 +389,30 @@ pub const AgentProtocolClient = struct {
     }
 
     fn setSessionError(self: *Self, session_id: agent_types.SessionId, msg: []const u8) !void {
+        // Allocate the replacement BEFORE releasing the existing value
+        // (mirrors the last_error arms): a failed dupe after the deinit would
+        // leave the map slot holding a deinit'd slice that a later update,
+        // clear, or deinit would double-free (#210 gap 7).
+        var owned = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
         if (self.session_last_errors.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
-            existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
+            existing.* = owned;
         } else {
-            try self.session_last_errors.put(session_id, OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg)));
+            errdefer owned.deinit(self.allocator);
+            try self.session_last_errors.put(session_id, owned);
         }
         try self.session_complete_flags.put(session_id, true);
     }
 
     fn setSessionResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
+        // Same allocate-before-release ordering as setSessionError.
+        var owned = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, result_json));
         if (self.session_last_results.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
-            existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, result_json));
+            existing.* = owned;
         } else {
-            try self.session_last_results.put(session_id, OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, result_json)));
+            errdefer owned.deinit(self.allocator);
+            try self.session_last_results.put(session_id, owned);
         }
         try self.session_complete_flags.put(session_id, true);
     }
@@ -440,8 +461,12 @@ pub const AgentProtocolClient = struct {
                 // round-trip is the price of that ambiguity (#210 gap 7).
             },
             .agent_result => |json| {
+                // Allocate the replacement BEFORE releasing the previous
+                // value (same ordering rule as the error arms): a failed
+                // dupe must not leave last_result_json undefined.
+                const result_copy = try self.allocator.dupe(u8, json);
                 self.last_result_json.deinit(self.allocator);
-                self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
+                self.last_result_json = OwnedSlice(u8).initOwned(result_copy);
                 try self.setSessionResult(env.session_id, json);
                 // A settlement resolves every send recorded before the
                 // settled run; the newest pending send may be a later,
@@ -606,12 +631,15 @@ pub const AgentProtocolClient = struct {
     /// send — it was admitted (hence sent) before any later pipelined send
     /// could be attempted against the one-active-run rule (§13.2.4) — so
     /// exactly the oldest message entry retires and every LATER unresolved
-    /// send is kept: the earliest of those still brackets the server's
-    /// counter for a later probe (sends 2/3/4 with 2 settled and 3/4
-    /// rejected leave the server expecting 3 — the probe must try 3, not
-    /// 4/5). Serial use degenerates to retiring the sole message, so the
-    /// next turn starts from an empty list and its lost-output probe cannot
-    /// be bracketed by the settled record's stale sequence.
+    /// send is kept. The earliest remaining entry alone brackets the
+    /// server's counter only when no rollback floor sits below it (sends
+    /// 2/3/4 with 2 settled and 3/4 REJECTED leave an empty list and the
+    /// plain tracked stop at the floor 3); when a later send's reply is
+    /// merely lost, `sendAgentStopProbing` combines the surviving entry
+    /// with the rolled-back floor for its bracket. Serial use degenerates
+    /// to retiring the sole message, so the next turn starts from an empty
+    /// list and its lost-output probe cannot be bracketed by the settled
+    /// record's stale sequence.
     fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
         for (list.items, 0..) |pending, index| {
@@ -1359,6 +1387,123 @@ test "AgentProtocolClient probing stop derives its candidates from the OLDEST un
     var second_stop = try harness.envelopeAt(5);
     defer second_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), second_stop.sequence); // oldest + 1 — accepted
+}
+
+test "AgentProtocolClient probing stop honors the rolled-back floor when a rejection precedes an older settlement (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 2
+    const msg3 = try client.sendAgentMessage(sid, "{\"m\":3}", null); // seq 3
+    _ = try client.sendAgentMessage(sid, "{\"m\":4}", null); // seq 4 — reply lost
+
+    // The server accepted 2 (expected 3) and rejected 3 on its payload (no
+    // advance). The client processes 3's rejection BEFORE 2's settlement:
+    // the rollback floors the tracker at 3, and the settlement then retires
+    // the OLDEST message (2), leaving only the optimistic entry 4 — whose
+    // naive {4, 5} pair would overshoot the server's expected 3 entirely.
+    var rejection3 = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg3,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "payload rejected") } },
+    };
+    defer rejection3.deinit(allocator);
+    try client.processEnvelope(rejection3);
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    var settled2 = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 9,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled2.deinit(allocator);
+    try client.processEnvelope(settled2);
+
+    // The probe's first stop must carry the rolled-back FLOOR — min(entry 4,
+    // tracker 3) — so the two candidates bracket {3, 4}, the states the wire
+    // can still occupy; the pre-fix entry pair {4, 5} missed 3 and the
+    // session leaked.
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+    var first_stop = try harness.envelopeAt(4);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), first_stop.sequence);
+
+    // The floor stop's correlated rejection (the entry-4-accepted case still
+    // live) retries at exactly one past the floor.
+    var stop_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer stop_rejection.deinit(allocator);
+    try client.processEnvelope(stop_rejection);
+    var second_stop = try harness.envelopeAt(5);
+    defer second_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), second_stop.sequence); // floor + 1
+}
+
+test "AgentProtocolClient session terminal-state updates keep the previous value when the replacement allocation fails (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    const client = &harness.client;
+    const sid = agent_types.generateSessionId();
+
+    try client.setSessionError(sid, "first failure");
+    try client.setSessionResult(sid, "{\"first\":true}");
+    try std.testing.expectEqualStrings("first failure", client.getLastErrorForSession(sid).?);
+    try std.testing.expectEqualStrings("{\"first\":true}", client.getLastResultJsonForSession(sid).?);
+
+    // Fail the NEXT allocation (the replacement dupe): the update errors, but
+    // the map slots must still hold their previous values — a slot the failed
+    // path had left holding a deinit'd slice would double-free on the next
+    // update or at deinit.
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        client.allocator = failing.allocator();
+        defer client.allocator = allocator;
+        try std.testing.expectError(error.OutOfMemory, client.setSessionError(sid, "second failure"));
+    }
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        client.allocator = failing.allocator();
+        defer client.allocator = allocator;
+        try std.testing.expectError(error.OutOfMemory, client.setSessionResult(sid, "{\"second\":true}"));
+    }
+    try std.testing.expectEqualStrings("first failure", client.getLastErrorForSession(sid).?);
+    try std.testing.expectEqualStrings("{\"first\":true}", client.getLastResultJsonForSession(sid).?);
+
+    // The SURVIVING values are then replaced cleanly — this deinit path
+    // double-frees if the failed update left the slot undefined.
+    try client.setSessionError(sid, "third failure");
+    try client.setSessionResult(sid, "{\"third\":true}");
+    try std.testing.expectEqualStrings("third failure", client.getLastErrorForSession(sid).?);
+    try std.testing.expectEqualStrings("{\"third\":true}", client.getLastResultJsonForSession(sid).?);
 }
 
 test "AgentProtocolClient probing stop retries on a nack invalid_sequence rejection (#210 gap 7)" {
