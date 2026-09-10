@@ -998,11 +998,12 @@ Rules:
   step — the server's counter is past the sent sequence, never that it
   reached any optimistic value derived from unresolved sends: a RETRY of
   a still-unresolved message (same sequence AND payload digest, via
-  `sendAgentMessageWithSequence`) retires silently with the tracker
-  advanced only the proven step (a higher true counter is reached one
-  silent step per round trip), while a mismatched payload, a non-retry
-  send, or a START falls through to the ordinary rejection path and
-  surfaces.
+  `sendAgentMessageWithSequence`) retires silently with the tracker set to
+  EXACTLY the proven step — optimistic mirrors from sends interleaved
+  before the reply are not evidence either (a higher true counter is
+  reached one silent step per round trip), while a mismatched payload, a
+  non-retry send, or a START falls through to the ordinary rejection path
+  and surfaces.
   Explicit-sequence sends (`sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
   tracker mirrors it optimistically but restores its PRE-SEND state when
