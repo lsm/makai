@@ -404,27 +404,37 @@ pub const AgentProtocolClient = struct {
         // Allocate the replacement BEFORE releasing the existing value
         // (mirrors the last_error arms): a failed dupe after the deinit would
         // leave the map slot holding a deinit'd slice that a later update,
-        // clear, or deinit would double-free (#210 gap 7).
+        // clear, or deinit would double-free (#210 gap 7). The flag DISARMS
+        // the cleanup the moment the map takes ownership, so a later failure
+        // in this function (the complete-flags put) cannot free the stored
+        // slice.
         var owned = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
+        var owned_by_map = false;
+        errdefer if (!owned_by_map) owned.deinit(self.allocator);
         if (self.session_last_errors.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = owned;
+            owned_by_map = true;
         } else {
-            errdefer owned.deinit(self.allocator);
             try self.session_last_errors.put(session_id, owned);
+            owned_by_map = true;
         }
         try self.session_complete_flags.put(session_id, true);
     }
 
     fn setSessionResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
-        // Same allocate-before-release ordering as setSessionError.
+        // Same allocate-before-release, disarm-on-transfer ordering as
+        // setSessionError.
         var owned = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, result_json));
+        var owned_by_map = false;
+        errdefer if (!owned_by_map) owned.deinit(self.allocator);
         if (self.session_last_results.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = owned;
+            owned_by_map = true;
         } else {
-            errdefer owned.deinit(self.allocator);
             try self.session_last_results.put(session_id, owned);
+            owned_by_map = true;
         }
         try self.session_complete_flags.put(session_id, true);
     }
@@ -503,12 +513,17 @@ pub const AgentProtocolClient = struct {
                     // must not leave the optimistic counter and pending
                     // record in place against a server that rejected them.
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
-                    if (env.in_reply_to == null) {
-                        // An UNCORRELATED agent_error is a settlement
-                        // (§13.4.2): like agent_result, it resolves the
-                        // sends recorded before the settled run.
-                        self.retireSettledPendingSends(env.session_id);
-                    }
+                    // An UNCORRELATED agent_error no longer retires the
+                    // pending send (§13.4.1): it is either the settlement of
+                    // an admitted run (§13.4.2) or an admission failure's
+                    // unscoped runtime error with the counter rolled back —
+                    // wire-identical. Retiring on the admission-failure side
+                    // disarms the teardown probe (no unresolved send left),
+                    // and the fallback plain stop at the optimistic value is
+                    // rejected while the server still expects the pre-send
+                    // value, leaking the session. Keeping the send pending
+                    // lets the probe bracket both states; a real settlement
+                    // pays one extra stop envelope (#210 gap 7).
                     // Allocate the replacement BEFORE releasing the previous
                     // value: a failed dupe must not leave last_error
                     // undefined (a later update or deinit would double-free).
@@ -521,12 +536,20 @@ pub const AgentProtocolClient = struct {
             .nack => |n| {
                 // A correlated nack is a request rejection like a correlated
                 // agent_error (the fixture server and older peers use this
-                // shape): probe replies are consumed first, and a non-probe
-                // nack surfaces through the same session-error bookkeeping —
-                // without it, a peer that rejects an ordinary agent_message
-                // by nack would leave the TUI treating the submit as
-                // accepted with no settlement ever coming (#210 gap 7).
+                // shape): probe replies are consumed first, and a nack
+                // surfaces through the session-error bookkeeping ONLY when
+                // it rejects one of this client's own start/message requests
+                // — without it, a peer that rejects an ordinary
+                // agent_message by nack would leave the TUI treating the
+                // submit as accepted with no settlement ever coming. A nack
+                // for a NON-run request (models, tool_list, ping, status —
+                // e.g. a not_implemented capability answer) shares the
+                // transport and can arrive mid-run: recording it as a
+                // terminal session error makes the TUI abort a healthy
+                // turn. Unrelated nacks stay request-scoped and are dropped
+                // (#210 gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) {
+                    if (!self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                     // Rollback first, then fallible bookkeeping (see the
                     // agent_error arm).
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
@@ -681,6 +704,19 @@ pub const AgentProtocolClient = struct {
         }
     }
 
+    /// Whether `in_reply_to` names one of the session's tracked pending
+    /// sends — i.e. the reply belongs to a request of the CURRENT
+    /// registration (a start or message this client sent and has not yet
+    /// resolved).
+    fn replyNamesPendingSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid) bool {
+        const reply_to = in_reply_to orelse return false;
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return false;
+        for (list.items) |pending| {
+            if (std.mem.eql(u8, &reply_to, &pending.msg_id)) return true;
+        }
+        return false;
+    }
+
     /// Applies #210 gap 7's client sequence-control rules to a correlated
     /// rejection (an `agent_error`/`nack` whose `in_reply_to` names this
     /// client's own send): a rejected counter-advancing send rolls the tracker
@@ -689,31 +725,40 @@ pub const AgentProtocolClient = struct {
     /// sends are matched (a pipelined send's reply may arrive after a later
     /// send was recorded), and the rollback takes the MINIMUM of the tracker
     /// and the rejected send's sequence: an older unresolved send's floor
-    /// must never be lost to a younger send's rejection.
+    /// must never be lost to a younger send's rejection. The reply must name
+    /// a request tracked for the CURRENT registration: on a quickly reused
+    /// id, a delayed correlated `agent_not_found` (or rejection) from an
+    /// older registration's message or stop must not clear the new
+    /// registration's sequence, pending-send, and admission state — the next
+    /// message would start again at sequence 1 against the live server
+    /// session (#210 gap 7).
     fn handleCorrelatedRejection(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !void {
         const reply_to = in_reply_to orelse return;
 
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        var matched: ?usize = null;
+        for (list.items, 0..) |pending, index| {
+            if (std.mem.eql(u8, &reply_to, &pending.msg_id)) {
+                matched = index;
+                break;
+            }
+        }
+        const index = matched orelse return;
+
         const session_gone = if (code) |c| c == .agent_not_found else false;
         if (session_gone) {
-            // A correlated agent_not_found — whether it names a
-            // counter-advancing send or a plain stop (whose id the client
-            // does not track): the session does not exist server-side, so
-            // its tracked sequence state is meaningless. Drop it — a
-            // re-registration of the id must start at sequence 1, not the
-            // stale optimistic counter.
+            // A tracked request answered agent_not_found: the session is
+            // gone server-side, so its tracked sequence state is meaningless.
+            // Drop it — a re-registration of the id must start at sequence
+            // 1, not the stale optimistic counter.
             _ = self.next_sequence_by_session.remove(session_id);
             self.clearSessionControlState(session_id);
             return;
         }
 
-        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
-        for (list.items, 0..) |pending, index| {
-            if (!std.mem.eql(u8, &reply_to, &pending.msg_id)) continue;
-            const floor = @min(self.peekNextSequence(session_id), pending.sequence);
-            try self.next_sequence_by_session.put(session_id, floor);
-            _ = list.orderedRemove(index);
-            return;
-        }
+        const floor = @min(self.peekNextSequence(session_id), list.items[index].sequence);
+        try self.next_sequence_by_session.put(session_id, floor);
+        _ = list.orderedRemove(index);
     }
 
     pub fn popEvent(self: *Self) ?QueuedEvent {
@@ -1845,11 +1890,14 @@ test "AgentProtocolClient probing stop consumes the retry's own rejection and ma
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
 }
 
-test "AgentProtocolClient correlated agent_not_found on a plain stop clears the tracked sequence state (#210 gap 7)" {
-    // The reply names the STOP's message id, which the client does not track
-    // in its pending sends — the not-found cleanup must not depend on
-    // matching a counter-advancing send, or the stale counter would make a
-    // re-registration of the id start at sequence 2/3 and fail its start.
+test "AgentProtocolClient correlated agent_not_found clears state only for a request of the current registration (#210 gap 7)" {
+    // The rejection must name a request this client tracks for the CURRENT
+    // registration. A tracked send's not_found clears the stale counter (a
+    // re-registration of the id must start at sequence 1); a DELAYED
+    // not_found from an older registration's stop — whose id the client
+    // never tracked, arriving after the reused id's new agent_started —
+    // must leave the new registration's state alone, or its next message
+    // would start at sequence 1 against the live server session.
     const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
@@ -1858,21 +1906,161 @@ test "AgentProtocolClient correlated agent_not_found on a plain stop clears the 
 
     const sid = agent_types.generateSessionId();
     _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
-    const stop_id = try client.sendAgentStop(sid, "completed"); // sequence 2
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
 
-    var rejection = agent_types.Envelope{
+    // Tracked request answered agent_not_found: the session is gone, drop
+    // the sequence and control state.
+    var tracked_rejection = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 0,
-        .in_reply_to = stop_id,
+        .in_reply_to = msg_id,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
     };
-    defer rejection.deinit(allocator);
-    try client.processEnvelope(rejection);
+    defer tracked_rejection.deinit(allocator);
+    try client.processEnvelope(tracked_rejection);
 
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+
+    // The id is re-registered (start + started + message): the CURRENT
+    // registration's state is live again...
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 2, tracker 3
+
+    // ...so a delayed not_found replying to the OLD registration's
+    // untracked stop id must NOT wipe it.
+    const stale_stop_id = agent_types.generateUlid();
+    var stale_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stale_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer stale_rejection.deinit(allocator);
+    try client.processEnvelope(stale_rejection);
+
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.pending_sends_by_session.contains(sid));
+}
+
+test "AgentProtocolClient unrelated nack does not fail the live session (#210 gap 7)" {
+    // Non-run requests (models, tool_list, ping, status) share the transport
+    // and can be nacked mid-run — e.g. a not_implemented capability answer.
+    // The nack is request-scoped: only a nack rejecting one of this client's
+    // own start/message requests may surface as a terminal session error.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, unresolved
+
+    // An unrelated capability nack: the session's turn state survives.
+    var models_nack = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{ .rejected_id = agent_types.generateUlid(), .error_code = .not_implemented, .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "not implemented")) } },
+    };
+    defer models_nack.deinit(allocator);
+    try client.processEnvelope(models_nack);
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    // A nack rejecting the PENDING message still fails the session.
+    var message_nack = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{ .rejected_id = msg_id, .error_code = .invalid_sequence, .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "invalid sequence")) } },
+    };
+    defer message_nack.deinit(allocator);
+    try client.processEnvelope(message_nack);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient uncorrelated agent_error keeps the pending send for the teardown probe (#210 gap 7)" {
+    // §13.4.1: an uncorrelated runtime agent_error may be an admission
+    // failure — the server rolled the counter back and admitted nothing —
+    // or the §13.4.2 settlement of an admitted run; the two are
+    // wire-identical. Retiring the pending send on it would disarm the
+    // teardown probe (the fallback plain stop at the optimistic value is
+    // rejected in the rolled-back case and the session leaks), so the send
+    // stays unresolved and the probe brackets both states.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, unresolved
+
+    var uncorrelated = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .internal_error, .message = try allocator.dupe(u8, "admission allocation failure") } },
+    };
+    defer uncorrelated.deinit(allocator);
+    try client.processEnvelope(uncorrelated);
+
+    // The send is retained: the teardown probe is eligible and brackets the
+    // pre-send state (2) — in the admission-failure world the server still
+    // expects it, and the probe's FIRST stop succeeds.
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len);
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(probe_result != null);
+    var first_stop = try harness.envelopeAt(3); // start, message, floor stop
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first_stop.sequence);
 }
 
 test "AgentProtocolClient settlement retires the settled run's own send, keeping later unresolved ones (#210 gap 7)" {

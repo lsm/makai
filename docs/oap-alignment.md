@@ -175,13 +175,15 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    correlated-`invalid_request` retry at the post-send value with
    correlated reads, acceptance at either settles; both `run()` and
    `stream()`, awaited on error paths so the probe's reads cannot race a
-   same-id follow-up). Same-sequence retries and unknown-outcome cleanup
-   are supported in both clients (§13.1/§13.4.1); the TUI's remote
+   same-id follow-up; TS behaviors pending #215). Same-sequence retries
+   and unknown-outcome cleanup are supported in the zig client today, in
+   the TS SDK once #215 lands (§13.1/§13.4.1); the TUI's remote
    disconnect/cancel teardown routes through the probe first, with the
    plain tracked stop as the ineligible fallback (its ids are
    client-generated and exclusive, §6.1 — the fallback's optimistic
    sequence is the correct one exactly when the probe is ineligible).
-   Review-hardened in the same slice: the TS teardown drains queued
+   Review-hardened in the same slice (TS behaviors pending #215): the TS
+   teardown drains queued
    session output after the probe settles at EITHER outcome — correlated
    reads are served ahead of the session queue, so the reply resolving
    the probe can overtake still-parked late output, which an immediate
