@@ -1037,13 +1037,24 @@ Rules:
   silent path and blocks re-qualification; the retirement of such a
   competitor RE-QUALIFIES the other payloads' retries it had masked). A
   non-retry duplicate retirement breaks its same-payload descendants the
-  same way — the retired envelope never ran either. A SETTLED source is
-  the opposite pole: the run demonstrably executed the payload, so the
-  remaining same-sequence same-payload records' retry bits are set TRUE —
-  overriding an earlier competitor mask (the answer-time competing check
-  still gates while the competitor remains) and superseding an earlier
-  broken marker — and stand through later re-derivations: a settled
-  chain never breaks. A higher true counter than the restore is reached one
+  same way — the retired envelope never ran either. A settlement
+  reconciles its sequence's provenance in two asymmetric moves (the
+  oldest-record attribution is a heuristic — `agent_result` carries no run
+  identity, §13.3.2): a GRANTED settled justification, only when
+  UNAMBIGUOUS — every pending message record shares the retired record's
+  sequence and payload, so whichever record the run belonged to, it
+  demonstrably ran THAT payload at THAT sequence — sets the remaining
+  same-pair records' retry bits TRUE (overriding a competitor mask,
+  superseding an earlier broken marker, standing through later
+  re-derivations, and propagating to later same-payload records recorded
+  while a settled-flagged record remains pending; the answer-time
+  competing check still gates while the competitor remains); and an
+  attribution-trusting BREAK marks the remaining different-payload records
+  at the settled sequence provenance-broken — the settled run consumed the
+  sequence, so those payloads never ran there (under a mis-attribution
+  the break errs toward a surfaced duplicate, the self-correcting
+  direction, where a mis-granted settled bit would silently swallow a
+  failure). A higher true counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
   silently). Slices to follow in the series:

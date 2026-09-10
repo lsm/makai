@@ -77,14 +77,17 @@ const PendingSend = struct {
     /// copy), instead of mistaking the masked record for a fresh intact
     /// source once the competitor is gone (#210 gap 7).
     had_same_payload_ancestry: bool = false,
-    /// Sticky: a same-sequence same-payload source SETTLED — its run
-    /// demonstrably executed the payload, the strongest silent-path
-    /// justification there is. Set when a settlement retires the settled
-    /// record, overriding any competitor mask (and an earlier broken
-    /// marker), and makes the record immune to re-derivation: the settled
-    /// source's own record is gone, so a scan of the pending records
-    /// alone would find no earlier source and falsely break the chain
-    /// (#210 gap 7).
+    /// Sticky: a same-sequence same-payload source SETTLED — a completed
+    /// run demonstrably executed this payload at this sequence, the
+    /// strongest silent-path justification there is. Granted only when
+    /// UNAMBIGUOUS (every pending message record shares the retired
+    /// record's sequence and payload — whichever record the run belonged
+    /// to, it ran THIS payload at THIS sequence), inherited by later
+    /// same-payload records at record time while a settled-flagged record
+    /// remains pending, and immune to re-derivation: the settled source's
+    /// own record is retired by the settlement, so a scan of the pending
+    /// records alone would find no earlier source and falsely break the
+    /// chain (#210 gap 7).
     source_settled: bool = false,
 };
 
@@ -197,11 +200,13 @@ pub const AgentProtocolClient = struct {
         var resend_of_pending = false;
         var has_competing_payload = false;
         var had_same_payload_ancestry = false;
+        var inherits_settled_source = false;
         for (gop.value_ptr.items) |pending| {
             if (pending.kind != .message or pending.sequence != sequence) continue;
             if (pending.payload_hash == payload_hash) {
                 had_same_payload_ancestry = true;
                 if (!pending.provenance_broken) resend_of_pending = true;
+                if (pending.source_settled) inherits_settled_source = true;
             } else {
                 has_competing_payload = true;
             }
@@ -221,7 +226,16 @@ pub const AgentProtocolClient = struct {
         // (the ancestry marker is still recorded for the re-derivation;
         // see `had_same_payload_ancestry`).
         if (has_competing_payload) resend_of_pending = false;
-        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending, .had_same_payload_ancestry = had_same_payload_ancestry });
+        // Settled provenance outranks the competitor mask: a completed run
+        // demonstrably executed this payload at this sequence, so the
+        // send's duplicate answer is silently justified however the
+        // pending set reads now — the fact must survive the mask, or a
+        // later re-derivation (which never touches settled records) would
+        // leave a settled record pinned at a masked-false bit forever
+        // (#210 gap 7). The answer-time competing check still gates while
+        // the competitor remains.
+        if (inherits_settled_source) resend_of_pending = true;
+        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending, .had_same_payload_ancestry = had_same_payload_ancestry, .source_settled = inherits_settled_source });
     }
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
@@ -590,27 +604,51 @@ pub const AgentProtocolClient = struct {
     /// the sole message, so a long-lived session's records stay bounded by
     /// its unresolved sends, not its history (#210 gap 7).
     ///
-    /// The settled run DEMONSTRABLY executed its payload at the sequence,
-    /// so the remaining same-sequence same-payload records carry the
-    /// strongest silent-path justification there is: their retry bits are
-    /// set TRUE — overriding a competitor mask recorded at send time (the
-    /// answer-time competing check still gates while the competitor
-    /// remains) and superseding an earlier broken marker (a later settled
-    /// run of the same payload outranks the death of an earlier chain).
-    /// Without the sticky settled flag the re-derivation would later find
-    /// no earlier record — the settled source's own record retires here —
-    /// and break the chain, surfacing a false terminal error for a
-    /// payload that ran (#210 gap 7).
+    /// The settlement also reconciles the sequence's provenance, in two
+    /// asymmetric moves (the attribution above is a heuristic — agent_result
+    /// carries no run identity, §13.3.2 — so the two moves differ in how
+    /// much of it they trust):
+    ///
+    /// GRANT (settled justification), only when UNAMBIGUOUS — every
+    /// pending message record shares the retired record's sequence and
+    /// payload: whichever record the run belonged to, it demonstrably ran
+    /// THIS payload at THIS sequence, so the remaining same-pair records'
+    /// retry bits are set TRUE and made immune to re-derivation (the
+    /// settled source's own record retires here, and a pending-only scan
+    /// would later find no earlier source and falsely break the chain).
+    /// Granting on the attribution alone would bless the wrong payload
+    /// when the oldest record is a rejected send whose reply was lost —
+    /// a false SILENT, the unrecoverable direction.
+    ///
+    /// BREAK (negative evidence), attribution-trusting: the remaining
+    /// DIFFERENT-payload records at the retired record's sequence are
+    /// marked broken — the settled run consumed that sequence, so those
+    /// payloads never ran there and cannot requalify for the silent path
+    /// through a later re-derivation. If the attribution was wrong (the
+    /// oldest record was a stale rejected send), the break is a false
+    /// SURFACE — the payload actually ran, its settlement already
+    /// delivered the outcome, and the surfaced duplicate self-corrects —
+    /// the safe direction (#210 gap 7).
     fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
         for (list.items, 0..) |pending, index| {
             if (pending.kind != .message) continue;
+            var unambiguous = true;
+            for (list.items) |candidate| {
+                if (candidate.kind != .message) continue;
+                if (candidate.sequence != pending.sequence or candidate.payload_hash != pending.payload_hash) unambiguous = false;
+            }
             for (list.items) |*other| {
                 if (other.kind != .message or other.sequence != pending.sequence) continue;
-                if (other.payload_hash != pending.payload_hash) continue;
-                other.source_settled = true;
-                other.provenance_broken = false;
-                other.resend_of_pending = true;
+                if (other.payload_hash == pending.payload_hash) {
+                    if (!unambiguous) continue;
+                    other.source_settled = true;
+                    other.provenance_broken = false;
+                    other.resend_of_pending = true;
+                } else {
+                    other.provenance_broken = true;
+                    other.resend_of_pending = false;
+                }
             }
             _ = list.orderedRemove(index);
             return;
@@ -2410,14 +2448,15 @@ test "AgentProtocolClient masked same-payload ancestry breaks with its source (#
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only A copy 2 remains
 }
 
-test "AgentProtocolClient a settled source requalifies masked same-payload ancestry (#210 gap 7)" {
-    // Payload A is ACCEPTED at 2; competing payload B and an A-retry both
-    // remain pending at 2, B masking the retry's bit to false. A's result
-    // arrives FIRST: the settlement retires the accepted source AND marks
-    // the retry's justification SETTLED — so when B's delayed rejection
-    // later runs the re-derivation (which finds no earlier record — the
-    // settled source's own record is retired), the retry's bit STANDS,
-    // and its duplicate answer silently confirms the settled A instead of
+test "AgentProtocolClient a settled source preserves same-payload retry provenance (#210 gap 7)" {
+    // Payload A is ACCEPTED at 2 with its retry recorded while A is the
+    // only same-sequence record. A's result arrives: every pending message
+    // is the same payload at the same sequence, so the settling run is
+    // UNAMBIGUOUSLY an A-at-2 run — the retry's justification is marked
+    // SETTLED. When a later competitor's rejection runs the re-derivation
+    // (which finds no earlier record — the settled source's own record
+    // retired with the settlement), the retry's bit STANDS, and its
+    // duplicate answer silently confirms the settled A instead of
     // surfacing a false terminal error for a payload that demonstrably
     // ran.
     const allocator = std.testing.allocator;
@@ -2439,8 +2478,7 @@ test "AgentProtocolClient a settled source requalifies masked same-payload ances
     defer started_env.deinit(allocator);
     try client.processEnvelope(started_env);
     _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — ACCEPTED, result below
-    const competing_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // the competitor, rejection delayed
-    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // masked retry of the accepted A
+    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // retry of the pending A
 
     var settled = agent_types.Envelope{
         .session_id = sid,
@@ -2451,8 +2489,12 @@ test "AgentProtocolClient a settled source requalifies masked same-payload ances
         .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
     };
     defer settled.deinit(allocator);
-    try client.processEnvelope(settled); // A's run completed — the retry's justification is settled fact
+    try client.processEnvelope(settled); // A's run completed — unambiguous, so the retry's justification is settled fact
 
+    // A competitor recorded AFTER the settlement, rejected before the
+    // retry's answer: its removal is the re-derivation trigger that would
+    // break an unprotected chain.
+    const competing_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2);
     var competing_rejected = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
@@ -2483,6 +2525,242 @@ test "AgentProtocolClient a settled source requalifies masked same-payload ances
 
     // The settled source outranks the missing pending record: silent, no
     // false failure, and the retry's record is gone with its answer.
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
+    const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining); // all records resolved
+}
+
+test "AgentProtocolClient a settled source does not bless the payload of a stale oldest record (#210 gap 7)" {
+    // The oldest pending record can be a REJECTED send whose reply was
+    // lost, while a later different-payload send at the same sequence was
+    // admitted and settles: the FIFO attribution retires the stale record,
+    // but the mixed pending set makes the settling run's payload
+    // AMBIGUOUS — a settled grant here would bless the rejected payload's
+    // retries and silently suppress their duplicate answers for a payload
+    // that never executed. No grant is given, and the retry's duplicate
+    // SURFACES.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — REJECTED with the reply lost, record lingers as the oldest
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // ADMITTED at 2 — its run settles below
+    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // masked retry of the stale A
+
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled); // attributed to the stale A record; the run was B's
+
+    var retry_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer retry_duplicate.deinit(allocator);
+    try client.processEnvelope(retry_duplicate);
+
+    // A never ran — its retry's duplicate SURFACES instead of being
+    // silently swallowed by a grant the attribution cannot justify.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // B's record remains for its own resolution
+}
+
+test "AgentProtocolClient a settlement breaks different-payload chains at the sequence (#210 gap 7)" {
+    // Payload A settles at 2 while competing payloads B, B-retry, and C
+    // remain pending there. A's settlement proves the sequence was
+    // consumed by A's payload — no other payload at 2 ever ran — so their
+    // chains are marked BROKEN: C's later removal re-derives sequence 2,
+    // and without the break it would treat B as an intact source and
+    // re-qualify the B-retry for the silent path — silently confirming a
+    // payload the settlement excluded. The B-retry's duplicate SURFACES.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — settles below
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // the excluded competitor
+    const b_retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // its retry (bit derived from B)
+    const other_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":C}", null, 2); // a third payload whose removal triggers re-derivation
+
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled); // A's run consumed 2 — every other payload at 2 is proven never-admitted
+
+    var other_rejected = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = other_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer other_rejected.deinit(allocator);
+    try client.processEnvelope(other_rejected); // C's removal re-derives sequence 2 — B's chain must stay broken
+    client.clearSessionTerminalState(sid); // the caller consumes C's legitimate failure
+
+    var b_retry_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = b_retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = b_retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer b_retry_duplicate.deinit(allocator);
+    try client.processEnvelope(b_retry_duplicate);
+
+    // A's settlement excluded B: the B-retry's duplicate SURFACES instead
+    // of silently treating B as an intact source.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only B's own record remains
+}
+
+test "AgentProtocolClient settled provenance propagates to retries recorded after the settlement (#210 gap 7)" {
+    // A retry recorded while a SETTLED-flagged same-payload record is
+    // pending inherits the settled justification: the flag survives the
+    // intermediary's own silent retirement and a later re-derivation
+    // (triggered by a competitor's rejection), so the new retry's
+    // duplicate retires silently too — the payload demonstrably ran. An
+    // inheritance limited to the retry bit would lose the fact with the
+    // intermediary's record and surface a false terminal error.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — ACCEPTED
+    const first_retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // retry while A is pending
+
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled); // unambiguous (A and the retry, same payload at 2) — the retry's justification is settled
+
+    const second_retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // recorded AFTER the settlement — inherits it
+    var first_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = first_retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = first_retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer first_duplicate.deinit(allocator);
+    try client.processEnvelope(first_duplicate); // the settled intermediary retires silently
+
+    const competing_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2);
+    var competing_rejected = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = competing_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer competing_rejected.deinit(allocator);
+    try client.processEnvelope(competing_rejected); // the re-derivation trigger — the inherited flag must survive it
+    client.clearSessionTerminalState(sid); // the caller consumes B's legitimate failure
+
+    var second_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = second_retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = second_retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer second_duplicate.deinit(allocator);
+    try client.processEnvelope(second_duplicate);
+
+    // The settled fact propagated: silent, no false failure.
     try std.testing.expect(client.getLastErrorForSession(sid) == null);
     try std.testing.expect(!client.isSessionComplete(sid));
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
