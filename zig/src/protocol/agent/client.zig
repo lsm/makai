@@ -38,18 +38,25 @@ const PendingSend = struct {
 };
 
 /// An in-flight bounded stop probe (#210 gap 7): after an uncorrelated
-/// `agent_message` outcome the cleanup stop first tries the PRE-send counter
-/// state; a correlated `invalid_request` rejection naming the probe's first
-/// stop triggers exactly one retry at the post-send value. `final` marks the
-/// second phase — the retry is in flight and its OWN replies are consumed
-/// without any further retry (a session that vanished between the two stops
-/// answers `agent_not_found`; both candidates missing answers
-/// `invalid_request`) so cleanup mechanics never surface as run errors.
+/// `agent_message` outcome the cleanup stop sweeps the REACHABLE server
+/// counter states, lowest candidate first — a correlated `invalid_request`
+/// rejection naming the probe's current stop advances to `next_sequence`,
+/// up to `ceiling` inclusive. Serial use spans exactly two states (the
+/// floor and one past it); pipelined sends whose settlements this client
+/// has not yet consumed can leave the server at ANY value in between, so
+/// the sweep is bounded by the pending-send count, not fixed at two. A
+/// session that vanished mid-sweep answers `agent_not_found`; exhausting
+/// the ceiling retires the probe — either way the replies are consumed as
+/// cleanup mechanics, never surfaced as run errors.
 const StopProbe = struct {
     first_msg_id: agent_types.Ulid,
-    second_sequence: u64,
+    /// The candidate for the NEXT retry (the current stop carries
+    /// `next_sequence - 1` at registration).
+    next_sequence: u64,
+    /// The last candidate, inclusive — max(tracker, newest pending message
+    /// send + 1): every server state the unresolved sends can occupy.
+    ceiling: u64,
     reason: OwnedSlice(u8),
-    final: bool = false,
 };
 
 pub const AgentProtocolClient = struct {
@@ -276,18 +283,19 @@ pub const AgentProtocolClient = struct {
         try self.writeEnvelopeJson(json);
     }
 
-    /// Bounded two-state stop probe for an UNCORRELATED `agent_message`
-    /// outcome (#210 gap 7, §13.4.1): the cleanup stop first tries the
-    /// PRE-send counter state (the message may have been rejected with the
-    /// counter rolled back), and a correlated `invalid_request` rejection
-    /// processed later through `processEnvelope` triggers exactly one retry
-    /// at the post-send value (the message may have been accepted with its
-    /// output lost or delayed); the retry's own replies are consumed the
-    /// same way. Acceptance at either value settles cleanup; no other reply
-    /// retries. The first candidate is the MINIMUM of the oldest unresolved
-    /// message send's sequence and the tracker's rolled-back floor — a
-    /// rejection processed before an older send's settlement can leave the
-    /// entry's optimistic value above the server's expected counter.
+    /// Bounded stop-probe sweep for an UNCORRELATED `agent_message` outcome
+    /// (#210 gap 7, §13.4.1): the cleanup stop first tries the FLOOR counter
+    /// state (the minimum of the oldest unresolved message send's sequence
+    /// and the tracker's rolled-back value — the message may have been
+    /// rejected with the counter rolled back), and each correlated
+    /// `invalid_request` rejection processed through `processEnvelope`
+    /// advances the sweep to the next candidate, at most up to the ceiling
+    /// (max of the tracker and one past the newest pending send — pipelined
+    /// sends whose settlements this client has not yet consumed can leave
+    /// the server anywhere in between). The retry's own replies are consumed
+    /// the same way; acceptance at any candidate settles cleanup, and no
+    /// other reply retries. Serial use spans exactly the classic two states
+    /// (floor, floor+1).
     ///
     /// Probing requires OWNERSHIP EVIDENCE (§6.1): a recorded `agent_message`
     /// send AND an observed `agent_started` for this session's registration.
@@ -309,28 +317,31 @@ pub const AgentProtocolClient = struct {
         }
         if (self.admitted_by_session.get(session_id) != true) return null;
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
-        // The OLDEST unresolved message brackets the server's counter: within
-        // §13.2.4-legal states every LATER pipelined send was rejected (never
-        // accepted), so the counter sits at the oldest's own sequence (if it
-        // too was rejected) or one past it (if accepted) — exactly the two
-        // candidates probed. The newest send's pair could overshoot both.
-        // The tracker's rolled-back floor caps the entry's OPTIMISTIC value:
-        // when a rejection is processed BEFORE an older send's settlement
-        // (sends 2/3/4 pipelined, 3 rejected while 2's settlement is in
-        // flight, then 2 settles and 4's reply is lost), the surviving entry
-        // holds its optimistic 4 while the server expects 3 — the floor the
-        // rollback already recorded. min() brackets {floor, floor+1}, the
-        // two states the wire can still occupy; the entry's {4, 5} pair
-        // overshoots both and leaks the session (#210 gap 7).
+        // The sweep spans every server state the unresolved sends can still
+        // occupy. Its FLOOR is the oldest unresolved message's sequence,
+        // capped by the tracker's rolled-back value: when a rejection is
+        // processed BEFORE an older send's settlement (sends 2/3/4
+        // pipelined, 3 rejected while 2's settlement is in flight, then 2
+        // settles and 4's reply is lost), the surviving entry holds its
+        // optimistic 4 while the server expects 3 — the floor the rollback
+        // already recorded; the entry's naive 4/5 pair would overshoot both.
+        // Its CEILING is max(tracker, newest entry + 1): a second message
+        // sent after the server settled the first (§13.2.3 returns it to
+        // ready) but before this client consumed that settlement can be
+        // accepted sequentially, leaving the server at a value BETWEEN the
+        // floor and one-past-the-newest — a fixed two-state probe would miss
+        // it and leak the session. The sweep adds at most one stop per
+        // pending send above the floor (#210 gap 7).
         var oldest_message_sequence: ?u64 = null;
+        var newest_message_sequence: u64 = 0;
         for (list.items) |pending| {
-            if (pending.kind == .message) {
-                oldest_message_sequence = pending.sequence;
-                break;
-            }
+            if (pending.kind != .message) continue;
+            if (oldest_message_sequence == null) oldest_message_sequence = pending.sequence;
+            newest_message_sequence = @max(newest_message_sequence, pending.sequence);
         }
         const entry_sequence = oldest_message_sequence orelse return null;
         const pre_send = @min(entry_sequence, self.peekNextSequence(session_id));
+        const ceiling = @max(self.peekNextSequence(session_id), newest_message_sequence + 1);
 
         // Pre-wire phase — every failure here happens with NOTHING on the
         // wire, so nothing is registered and the caller sees a clean error:
@@ -355,7 +366,8 @@ pub const AgentProtocolClient = struct {
         errdefer if (!reason_owned_by_map) owned_reason.deinit(self.allocator);
         try self.stop_probes_by_session.put(session_id, .{
             .first_msg_id = msg_id,
-            .second_sequence = pre_send + 1,
+            .next_sequence = pre_send + 1,
+            .ceiling = ceiling,
             .reason = owned_reason,
         });
         reason_owned_by_map = true;
@@ -525,6 +537,21 @@ pub const AgentProtocolClient = struct {
                 }
             },
             .agent_stopped => |p| {
+                // A delayed agent_stopped can reply to an OLDER registration's
+                // stop after the reused id has already started a new probe
+                // whose own stop is still in flight: a reply correlated to a
+                // DIFFERENT request than the active probe's current stop must
+                // not tear the session's control state down — clearing the
+                // probe would strand the CURRENT registration, whose
+                // pre-send stop's rejection would then find no probe to
+                // advance the sweep (#210 gap 7). An uncorrelated reply (a
+                // lenient peer may omit in_reply_to for the probe's own
+                // stop) still completes the probe.
+                if (self.stop_probes_by_session.get(p.session_id)) |probe| {
+                    if (env.in_reply_to) |reply_to| {
+                        if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return;
+                    }
+                }
                 if (self.session_id) |sid| {
                     if (std.mem.eql(u8, sid[0..], p.session_id[0..])) self.session_id = null;
                 }
@@ -563,28 +590,29 @@ pub const AgentProtocolClient = struct {
     /// Handles a reply correlated to an active stop probe. Returns true when
     /// the envelope IS a probe-control reply and has been fully consumed
     /// (callers must then skip terminal bookkeeping — the probe's replies are
-    /// cleanup mechanics, not run failures). In the first phase a correlated
-    /// `invalid_request` triggers the one bounded retry at the post-send
-    /// value and re-registers the probe in its final phase so the retry's own
-    /// replies are consumed too. In any phase, `agent_not_found` drops the
-    /// session's sequence state (the session is gone server-side — a
-    /// re-registration of the id must start from sequence 1, not the stale
-    /// optimistic counter) and marks the session complete: no `agent_stopped`
-    /// can ever follow for a nonexistent session.
+    /// cleanup mechanics, not run failures). A correlated `invalid_request`
+    /// advances the sweep to the next candidate while one remains at or below
+    /// the ceiling, re-registering the probe so the new stop's OWN replies
+    /// are consumed too. In any phase, `agent_not_found` drops the session's
+    /// sequence state (the session is gone server-side — a re-registration of
+    /// the id must start from sequence 1, not the stale optimistic counter)
+    /// and marks the session complete: no `agent_stopped` can ever follow for
+    /// a nonexistent session.
     fn handleProbeReply(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !bool {
         const reply_to = in_reply_to orelse return false;
         const probe = self.stop_probes_by_session.get(session_id) orelse return false;
         if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return false;
 
-        const retry = !probe.final and (if (code) |c| c == .invalid_request else false);
+        const retry = probe.next_sequence <= probe.ceiling and (if (code) |c| c == .invalid_request else false);
         const session_gone = if (code) |c| c == .agent_not_found else false;
-        const second_sequence = probe.second_sequence;
+        const next_sequence = probe.next_sequence;
+        const ceiling = probe.ceiling;
         var reason = probe.reason;
         _ = self.stop_probes_by_session.remove(session_id);
         defer reason.deinit(self.allocator);
         if (retry) {
-            // Pre-wire phase for the retry (mirrors the first stop): build
-            // and serialize BEFORE the final-phase registration, so a
+            // Pre-wire phase for the next candidate (mirrors the first
+            // stop): build and serialize BEFORE the re-registration, so a
             // pre-wire failure leaves the probe simply retired — nothing
             // reached the wire.
             const second_msg_id = agent_types.generateUlid();
@@ -594,20 +622,20 @@ pub const AgentProtocolClient = struct {
             const second_json = try self.serializeEnvelopeForSend(.{
                 .session_id = session_id,
                 .message_id = second_msg_id,
-                .sequence = second_sequence,
+                .sequence = next_sequence,
                 .timestamp = compat.time.nowMillis(),
                 .payload = retry_payload,
             });
             defer self.allocator.free(second_json);
-            // Final phase: consume the retry's own replies. Registered
-            // BEFORE the write so an AMBIGUOUS write failure keeps it — the
-            // rejection of a delivered retry must still be consumed as probe
-            // control, and teardown drivers keep an active probe to pump.
+            // Consume the new stop's own replies. Registered BEFORE the
+            // write so an AMBIGUOUS write failure keeps it — the rejection
+            // of a delivered stop must still be consumed as probe control,
+            // and teardown drivers keep an active probe to pump.
             try self.stop_probes_by_session.put(session_id, .{
                 .first_msg_id = second_msg_id,
-                .second_sequence = 0,
+                .next_sequence = next_sequence + 1,
+                .ceiling = ceiling,
                 .reason = OwnedSlice(u8).initBorrowed(""),
-                .final = true,
             });
             self.writeEnvelopeJson(second_json) catch {};
         } else if (session_gone) {
@@ -1520,6 +1548,149 @@ test "AgentProtocolClient settlement retires the pending send even when the resu
     var first_stop = try harness.envelopeAt(3); // start, m1, m2, stop
     defer first_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), first_stop.sequence);
+}
+
+test "AgentProtocolClient probing stop sweeps every reachable counter state across sequentially accepted sends (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+
+    // m1@2 is accepted and settled SERVER-side, but this client has not
+    // consumed the settlement when it sends m2@3 — §13.2.3 already returned
+    // the server to ready, so m2 is accepted too and the server expects 4.
+    // A fixed two-state probe (2/3) would miss 4 and leak the session; the
+    // sweep spans floor 2 to ceiling max(tracker 4, newest+1 4) = 4.
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3
+    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid));
+
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+    var stop1 = try harness.envelopeAt(3); // start, m1, m2, floor stop
+    defer stop1.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), stop1.sequence);
+
+    // Each correlated invalid_request advances the sweep: 2 → 3 → 4, where
+    // the server actually sits.
+    var rejection1 = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection1.deinit(allocator);
+    try client.processEnvelope(rejection1);
+    var stop2 = try harness.envelopeAt(4);
+    defer stop2.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), stop2.sequence);
+
+    var rejection2 = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop2.message_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection2.deinit(allocator);
+    try client.processEnvelope(rejection2);
+    var stop3 = try harness.envelopeAt(5);
+    defer stop3.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), stop3.sequence);
+
+    // The ceiling bounds the sweep: stop3 carries the ceiling value, so its
+    // rejection retires the probe — no fourth stop is written.
+    var rejection3 = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop3.message_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection3.deinit(allocator);
+    try client.processEnvelope(rejection3);
+    try std.testing.expectEqual(@as(usize, 6), harness.writes.items.len);
+    try std.testing.expect(!client.stop_probes_by_session.contains(sid));
+}
+
+test "AgentProtocolClient delayed agent_stopped replying to an older stop preserves an active probe (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — reply lost
+
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+    var stop1 = try harness.envelopeAt(2); // start, message, floor stop
+    defer stop1.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), stop1.sequence);
+
+    // A delayed agent_stopped replying to an OLDER registration's stop (a
+    // message id the probe does not own) arrives while the probe is in
+    // flight: it must not tear the session's control state down — the
+    // current probe would be cleared and the CURRENT registration stranded
+    // when its own stop's rejection finds no sweep to advance.
+    var stale_stopped = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid } },
+    };
+    defer stale_stopped.deinit(allocator);
+    try client.processEnvelope(stale_stopped);
+    try std.testing.expect(client.stop_probes_by_session.contains(sid));
+    try std.testing.expect(!client.isSessionComplete(sid));
+
+    // The probe's own rejection still advances the sweep.
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection.deinit(allocator);
+    try client.processEnvelope(rejection);
+    var stop2 = try harness.envelopeAt(3);
+    defer stop2.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), stop2.sequence);
+    try std.testing.expect(client.stop_probes_by_session.contains(sid));
 }
 
 test "AgentProtocolClient session terminal-state updates keep the previous value when the replacement allocation fails (#210 gap 7)" {

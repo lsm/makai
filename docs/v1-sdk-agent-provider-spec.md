@@ -1296,9 +1296,18 @@ server eviction (rule 6), and holds no transcript and no persistence.
    `[current — #210 gap 7]`: the tracker marks the message send unresolved at
    send; a correlated rejection rolls it back (§13.1) so the ordinary teardown
    stop carries the pre-send sequence, and while the outcome is unresolved the
-   teardown stop IS the probe — pre-send first, at most one
-   correlated-`invalid_request` retry at the post-send value, bounded, consuming
-   its own replies. Because a correlated wait is served ahead of the session
+   teardown stop IS the probe — the FLOOR state first (the minimum of the
+   oldest unresolved send's sequence and the tracker's rolled-back value),
+   advancing on each correlated `invalid_request` rejection toward the
+   CEILING (the maximum of the tracker and one past the newest pending send).
+   The TypeScript SDK's single-message tracker spans exactly the two classic
+   states (floor, floor+1); the Zig client, which tracks pipelined sends,
+   sweeps every state in between — a second send accepted after the server
+   settled the first (§13.2.3 returns it to ready independently of when the
+   client consumes that settlement) can leave the server BETWEEN the floor
+   and one-past-the-newest, which a fixed two-state probe would miss. Each
+   client's sweep is bounded by its pending-send count and consumes its own
+   replies. Because a correlated wait is served ahead of the session
    queue (§13.3.1), the reply that resolves the probe can overtake the
    attempt's late output still parked on the session route, so after the probe
    settles — at either outcome — the teardown drains queued session output
