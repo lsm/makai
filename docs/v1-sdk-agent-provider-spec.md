@@ -1030,7 +1030,9 @@ Rules:
   caller-supplied counter value (recovery paths that know the server's
   state are not forced to guess);
   the tracker mirrors it optimistically but restores its PRE-SEND state
-  when the pre-wire bookkeeping fails (nothing reached the wire),
+  when the pre-wire bookkeeping fails (nothing reached the wire — the
+  value AND its write epoch, so a still-pending mirror's ownership
+  survives the rollback),
   `maxInt(u64)` is rejected before any mutation for the MESSAGE variant
   (a start against a tracker already at the maximum is rejected the same
   way; a STOP may carry the maximum itself — a stop never computes

@@ -321,12 +321,13 @@ pub const AgentProtocolClient = struct {
             .payload = payload,
         });
         defer self.allocator.free(start_json);
+        const prior_epoch = self.trackerEpoch(sid);
         try self.setTrackerValue(sid, seq + 1);
         self.sequence = seq; // compatibility mirror
         self.recordPendingSend(sid, msg_id, seq, .start, seq, 0) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
             // start reuses `seq` instead of running ahead of the server.
-            self.setTrackerValue(sid, seq) catch {};
+            self.restoreTrackerState(sid, seq, prior_epoch);
             return err;
         };
 
@@ -381,13 +382,14 @@ pub const AgentProtocolClient = struct {
         // counter (#210 gap 7).
         const prior_sequence = self.peekNextSequence(session_id);
         const prior_mirror = self.sequence;
+        const prior_epoch = self.trackerEpoch(session_id);
         try self.setTrackerValue(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
         self.recordPendingSend(session_id, msg_id, sequence, .message, prior_sequence, messagePayloadHash(message_json, options_json)) catch |err| {
             // Nothing reached the wire: restore the PRE-SEND state so the
             // client is exactly as it was before the failed attempt (#210
             // gap 7).
-            self.setTrackerValue(session_id, prior_sequence) catch {};
+            self.restoreTrackerState(session_id, prior_sequence, prior_epoch);
             self.sequence = prior_mirror;
             return err;
         };
@@ -455,15 +457,17 @@ pub const AgentProtocolClient = struct {
         // no-op: it carries the tracker's own value.
         const prior = self.peekNextSequence(session_id);
         const prior_mirror = self.sequence;
+        const prior_epoch = self.trackerEpoch(session_id);
         self.sequence = sequence; // compatibility mirror
         self.setTrackerValue(session_id, sequence) catch |err| {
+            self.restoreTrackerState(session_id, prior, prior_epoch);
             self.sequence = prior_mirror;
             return err;
         };
         self.recordPendingSend(session_id, msg_id, sequence, .stop, prior, 0) catch |err| {
             // Nothing reached the wire: restore the pre-send state, the
             // compatibility mirror included (#210 gap 7).
-            self.setTrackerValue(session_id, prior) catch {};
+            self.restoreTrackerState(session_id, prior, prior_epoch);
             self.sequence = prior_mirror;
             return err;
         };
@@ -924,10 +928,26 @@ pub const AgentProtocolClient = struct {
     /// expected sequence.
     fn setTrackerValue(self: *Self, session_id: agent_types.SessionId, value: u64) !void {
         const epoch_gop = try self.tracker_epoch_by_session.getOrPut(session_id);
-        const tracker_gop = try self.next_sequence_by_session.getOrPut(session_id);
+        // Zeroed the moment the entry exists: a failure in the second
+        // reservation must not leave an undefined epoch readable (zero is
+        // indistinguishable from absent, so the half-reserved state is
+        // unobservable).
         if (!epoch_gop.found_existing) epoch_gop.value_ptr.* = 0;
+        const tracker_gop = try self.next_sequence_by_session.getOrPut(session_id);
         tracker_gop.value_ptr.* = value;
         epoch_gop.value_ptr.* += 1;
+    }
+
+    /// Rolls the tracker back to a captured PRE-SEND state — the value
+    /// AND the epoch: a pre-wire failure left nothing on the wire, so the
+    /// client must be exactly as before the attempt. A plain
+    /// `setTrackerValue` would bump the epoch again, silently
+    /// invalidating the optimistic mirror of a still-pending send that
+    /// owned the restored value — its ownership would die to a send that
+    /// never happened (#210 gap 7).
+    fn restoreTrackerState(self: *Self, session_id: agent_types.SessionId, value: u64, epoch: u64) void {
+        self.next_sequence_by_session.put(session_id, value) catch {};
+        self.tracker_epoch_by_session.put(session_id, epoch) catch {};
     }
 
     /// Whether a DIFFERENT-payload message record is still pending at the
@@ -1049,6 +1069,20 @@ pub const AgentProtocolClient = struct {
         }
 
         const rejected = list.items[index];
+        // A rejected RESYNCING stop's pre-resync prior joins the session's
+        // revert bound BEFORE the record leaves the list: the store is
+        // fallible, and a failure after the removal would strand the
+        // reconciliation — a retry of the envelope no longer matches a
+        // pending send, while the refuted resync still holds the tracker
+        // (#210 gap 7).
+        const stop_resync = rejected.kind == .stop and rejected.prior_tracker != rejected.sequence;
+        var revert_bound: u64 = 0;
+        if (stop_resync) {
+            const prior_bound = rejected.prior_tracker;
+            const existing_revert = self.stop_revert_bound_by_session.get(session_id);
+            revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
+            try self.stop_revert_bound_by_session.put(session_id, revert_bound);
+        }
         _ = list.orderedRemove(index);
         // A rejected MESSAGE may have been the SOURCE of other records'
         // retry provenance (`resend_of_pending` was recorded when the
@@ -1074,7 +1108,7 @@ pub const AgentProtocolClient = struct {
         // by an unresolved send's optimistic mirror) and MAXED with the
         // session's proven floor (#210 gap 7).
         if (rejected.kind == .stop) {
-            if (rejected.prior_tracker == rejected.sequence) {
+            if (!stop_resync) {
                 // No resync happened — retain the current value, subject
                 // to the proven floor (a stop's own duplicate_sequence
                 // step included) (#210 gap 7).
@@ -1083,22 +1117,14 @@ pub const AgentProtocolClient = struct {
                 }
                 return;
             }
-            // The pre-resync prior is the world-if-this-stop-rejected: any
-            // snapshot taken while this resync was live — including a LATER
-            // stop's own prior, resynced on top of it — reverts to at most
-            // it. It joins the session's revert bound even when the live
-            // undo below is skipped (a newer resync moved the tracker);
-            // without that, the newer stop's rejection would restore a
-            // value this stop's refuted resync had contaminated (#210
-            // gap 7).
-            const prior_bound = rejected.prior_tracker;
-            const existing_revert = self.stop_revert_bound_by_session.get(session_id);
-            const revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
-            // Stored under `try`: a dropped bound would let a LATER stop's
-            // rejection restore a prior this refuted resync had
-            // contaminated — the failure must surface, not vanish (#210
-            // gap 7).
-            try self.stop_revert_bound_by_session.put(session_id, revert_bound);
+            // The pre-resync prior stored above is the
+            // world-if-this-stop-rejected: any snapshot taken while this
+            // resync was live — including a LATER stop's own prior,
+            // resynced on top of it — reverts to at most it, even when
+            // the live undo below is skipped (a newer resync moved the
+            // tracker); without that, the newer stop's rejection would
+            // restore a value this stop's refuted resync had contaminated
+            // (#210 gap 7).
             // The undo guard is OWNERSHIP, not value equality: a later
             // send's optimistic mirror can coincidentally equal the stop's
             // resync value (a message accepted at 6 mirrors the tracker to
@@ -4201,4 +4227,63 @@ test "AgentProtocolClient an accepted start invalidates pre-reply sequence-1 mes
     var next_env = try harness.envelopeAt(3); // start, A, retry, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), next_env.sequence);
+}
+test "AgentProtocolClient a pre-wire send failure preserves a live mirror's ownership (#210 gap 7)" {
+    // An explicit stop at 7 resyncs the tracker; a message at 6 is then
+    // sent — its mirror of 7 is the last write, so it OWNS the value. A
+    // third send that fails before the wire (the pending record cannot
+    // be allocated) must leave the client exactly as before: restoring
+    // the tracker value through a fresh write would bump the epoch and
+    // silently kill that ownership, and the stop's later rejection
+    // would rewind past the accepted message's mirror. The rollback
+    // restores the epoch with the value.
+    const allocator = std.testing.allocator;
+    const sid = agent_types.generateSessionId();
+    var exercised_failure = false;
+    for (0..8) |fail_index| {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+        const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = start_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentStopWithSequence(sid, "caller-known", 7); // resync: tracker 7
+        _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":at-six}", null, 6); // LIVE mirror 7 — the last write
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        client.allocator = failing.allocator();
+        const sent = client.sendAgentMessageWithSequence(sid, "{\"m\":doomed}", null, 7);
+        client.allocator = allocator;
+        const failed = if (sent) |_| false else |_| true;
+        if (!failed) continue; // this index missed the send path's allocations
+        exercised_failure = true;
+        try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid)); // the value restored
+        const pending = client.pending_sends_by_session.getPtr(sid).?;
+        const owner = pending.items[1]; // [stop@7, at-six] — the doomed record was never appended
+        try std.testing.expectEqual(client.trackerEpoch(sid), owner.send_epoch); // ownership intact
+
+        // The stop's rejection then finds the mirror still owning the 7 — no rewind.
+        const stop_record = pending.items[0];
+        var stop_rejected = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = stop_record.msg_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+        };
+        defer stop_rejected.deinit(allocator);
+        try client.processEnvelope(stop_rejected);
+        try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid)); // the live mirror's value survives
+    }
+    try std.testing.expect(exercised_failure); // the sweep actually hit the failure paths
 }
