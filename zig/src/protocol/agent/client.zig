@@ -38,20 +38,39 @@ const PendingSend = struct {
     msg_id: agent_types.Ulid,
     sequence: u64,
     kind: PendingSendKind,
-    /// The tracker's value BEFORE this send's optimistic mirror: an explicit
-    /// resend at an older sequence REGRESSES the tracker to sequence+1, and
-    /// a duplicate_sequence answer to that resend (evidence the server is
-    /// only ever PAST the sent value) must restore this high-water instead
-    /// of preserving the regression (#210 gap 7).
+    /// The tracker's value BEFORE this send's optimistic mirror: a rejected
+    /// send's rollback restores it (rather than min'ing the send's own
+    /// optimistic regression) when the tracker still holds only this send's
+    /// mirror — an explicit resend at an older sequence regresses the
+    /// tracker to sequence+1, and min'ing that regression against the
+    /// pre-send value would pin the client below the server's counter
+    /// forever (#210 gap 7).
     prior_tracker: u64,
-    /// Whether another unresolved MESSAGE record already carried this
-    /// sequence when the send was recorded — the send is a RETRY of a
-    /// still-unresolved original, so a later duplicate_sequence answer to
-    /// it is duplicate evidence (an earlier copy was admitted; the server
-    /// is past the sequence) even if the original settles first and removes
-    /// its own record (#210 gap 7).
+    /// A 64-bit digest of a MESSAGE send's logical payload (`message_json` +
+    /// `options_json`): duplicate-evidence retry matching is sequence AND
+    /// payload identity — the same sequence carrying a DIFFERENT payload is
+    /// not a retry of the pending original (a `duplicate_sequence` answer
+    /// proves only that the EARLIER payload was admitted; the new one was
+    /// never executed and must surface instead of retiring silently)
+    /// (#210 gap 7). Unused (0) for start/stop records.
+    payload_hash: u64 = 0,
+    /// Whether another unresolved MESSAGE record with the SAME sequence and
+    /// payload digest existed when the send was recorded — the send is a
+    /// RETRY of a still-unresolved original, so a later duplicate_sequence
+    /// answer to it is duplicate evidence (an earlier copy was admitted;
+    /// the server is past the sequence) even if the original settles first
+    /// and removes its own record (#210 gap 7).
     resend_of_pending: bool = false,
 };
+
+/// Computes a pending MESSAGE record's payload digest (see
+/// `PendingSend.payload_hash`).
+fn messagePayloadHash(message_json: []const u8, options_json: ?[]const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(message_json);
+    if (options_json) |opts| hasher.update(opts);
+    return hasher.final();
+}
 
 pub const AgentProtocolClient = struct {
     allocator: std.mem.Allocator,
@@ -130,14 +149,14 @@ pub const AgentProtocolClient = struct {
     /// bookkeeping is infallible: an allocation failure here errors out with
     /// nothing on the wire, never after the server may have accepted the
     /// send (#210 gap 7).
-    fn recordPendingSend(self: *Self, session_id: agent_types.SessionId, msg_id: agent_types.Ulid, sequence: u64, kind: PendingSendKind, prior_tracker: u64) !void {
+    fn recordPendingSend(self: *Self, session_id: agent_types.SessionId, msg_id: agent_types.Ulid, sequence: u64, kind: PendingSendKind, prior_tracker: u64, payload_hash: u64) !void {
         const gop = try self.pending_sends_by_session.getOrPut(session_id);
         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(PendingSend).empty;
         var resend_of_pending = false;
         for (gop.value_ptr.items) |pending| {
-            if (pending.kind == .message and pending.sequence == sequence) resend_of_pending = true;
+            if (pending.kind == .message and pending.sequence == sequence and pending.payload_hash == payload_hash) resend_of_pending = true;
         }
-        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .resend_of_pending = resend_of_pending });
+        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending });
     }
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
@@ -169,7 +188,7 @@ pub const AgentProtocolClient = struct {
         defer self.allocator.free(start_json);
         try self.next_sequence_by_session.put(sid, seq + 1);
         self.sequence = seq; // compatibility mirror
-        self.recordPendingSend(sid, msg_id, seq, .start, seq) catch |err| {
+        self.recordPendingSend(sid, msg_id, seq, .start, seq, 0) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
             // start reuses `seq` instead of running ahead of the server.
             self.next_sequence_by_session.put(sid, seq) catch {};
@@ -229,7 +248,7 @@ pub const AgentProtocolClient = struct {
         const prior_mirror = self.sequence;
         try self.next_sequence_by_session.put(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
-        self.recordPendingSend(session_id, msg_id, sequence, .message, prior_sequence) catch |err| {
+        self.recordPendingSend(session_id, msg_id, sequence, .message, prior_sequence, messagePayloadHash(message_json, options_json)) catch |err| {
             // Nothing reached the wire: restore the PRE-SEND state so the
             // client is exactly as it was before the failed attempt (#210
             // gap 7).
@@ -285,7 +304,7 @@ pub const AgentProtocolClient = struct {
         // emitted value like the start/message paths, without advancing the
         // per-session tracker.
         self.sequence = sequence; // compatibility mirror
-        try self.recordPendingSend(session_id, msg_id, sequence, .stop, self.peekNextSequence(session_id));
+        try self.recordPendingSend(session_id, msg_id, sequence, .stop, self.peekNextSequence(session_id), 0);
         try self.writeEnvelopeJson(json);
     }
 
@@ -418,8 +437,8 @@ pub const AgentProtocolClient = struct {
                     // a still-unresolved original (resend_of_pending): an
                     // earlier copy of the sequence was admitted, the code
                     // proves the server is past it, and the ORIGINAL's run
-                    // may still settle — so the record retires with the
-                    // pre-resend high-water and no session error. A duplicate
+                    // may still settle — so the record retires with only the
+                    // PROVEN step and no session error. A duplicate
                     // answer on a NON-retry send admits nothing of this
                     // caller's own state: no run of the envelope will produce
                     // a settlement, so the high-water is preserved but the
@@ -545,21 +564,23 @@ pub const AgentProtocolClient = struct {
     }
 
     /// Retires a send proven duplicate-admitted by a `duplicate_sequence`
-    /// answer and restores the tracker to the HIGH-WATER — the maximum of
-    /// the tracker and every remaining record's pre-send value: the answer
-    /// proves the server is PAST the sent sequence, never that it dropped
-    /// below any value this client had already reached, and overlapping
-    /// explicit resends chain-regress their prior snapshots (the true
-    /// high-water survives in the OLDEST resend's record) (#210 gap 7).
+    /// answer and advances the tracker ONLY the one step the answer proves:
+    /// the server's counter is PAST the sent sequence. Anything higher this
+    /// client optimistically reached — the resend's pre-send tracker, or a
+    /// remaining record's — is UNPROVEN (the sends it came from are still
+    /// unresolved; a pipelined send rejected busy with its reply lost leaves
+    /// the server below the optimistic bound), and restoring it jumps the
+    /// tracker past the server so the next ordinary send is rejected as a
+    /// mismatch (#210 gap 7). The CURRENT tracker participates only through
+    /// the max — a duplicate answer never lowers it. If the server's
+    /// counter is higher still, the next send at the restored value is
+    /// answered `duplicate_sequence` in turn — and as a retry of a
+    /// still-pending message it retires silently, advancing one PROVEN step
+    /// per round trip until the true counter is reached.
     fn retireDuplicateAdmittedSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, entry: PendingSend) !void {
         self.retirePendingSend(session_id, in_reply_to);
-        var high_water = @max(self.peekNextSequence(session_id), entry.prior_tracker);
-        if (self.pending_sends_by_session.getPtr(session_id)) |list| {
-            for (list.items) |pending| {
-                high_water = @max(high_water, pending.prior_tracker);
-            }
-        }
-        try self.next_sequence_by_session.put(session_id, high_water);
+        const restore = @max(self.peekNextSequence(session_id), entry.sequence + 1);
+        try self.next_sequence_by_session.put(session_id, restore);
     }
 
     /// Applies #210 gap 7's client sequence-control rules to a correlated
@@ -612,6 +633,18 @@ pub const AgentProtocolClient = struct {
         // client below the server's known counter forever (a forward
         // explicit send's 999-mirror has the same shape) (#210 gap 7).
         if (rejected.kind != .stop) {
+            // A correlated `agent_busy` proves the server's counter EQUALS
+            // the rejected sequence: the server validates the inbound
+            // sequence BEFORE the processing state (handleMessage), so a
+            // busy answer means the sequence MATCHED — every lower sequence
+            // was already consumed — and busy never advances the counter
+            // (§13.1). The all-rejected floor below would replay an
+            // already-consumed sequence and be rejected again (#210 gap 7).
+            const busy = if (code) |c| c == .agent_busy else false;
+            if (busy) {
+                try self.next_sequence_by_session.put(session_id, rejected.sequence);
+                return;
+            }
             const current = self.peekNextSequence(session_id);
             const base = if (current == rejected.sequence + 1) rejected.prior_tracker else current;
             var floor = @min(base, rejected.prior_tracker);
@@ -929,7 +962,10 @@ test "AgentProtocolClient pipelined sends roll back monotonically to the oldest 
     const second_id = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3, tracker 4
 
     // The first message is rejected busy (no advance): the reply still finds
-    // ITS pending send even though a later send was recorded.
+    // ITS pending send even though a later send was recorded. A busy answer
+    // proves the server's counter EQUALS the rejected sequence (the server
+    // validates the sequence before the processing state), so the tracker
+    // floors to exactly 2.
     var busy = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
@@ -940,7 +976,7 @@ test "AgentProtocolClient pipelined sends roll back monotonically to the oldest 
     };
     defer busy.deinit(allocator);
     try client.processEnvelope(busy);
-    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // min(4, 2)
+    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // busy proves the counter is 2
 
     // The second is rejected invalid_sequence (the server still expects 2):
     // the rollback may not raise the floor the older rejection established.
@@ -1516,13 +1552,16 @@ test "AgentProtocolClient duplicate_sequence nack on a start falls through to th
     try std.testing.expectEqual(@as(usize, 0), remaining);
 }
 
-test "AgentProtocolClient duplicate_sequence nack restores the pre-resend high-water (#210 gap 7)" {
-    // Sends at 2 and 3 were accepted (tracker 4, server expects 4); a
-    // recovery resend at the older 2 regresses the tracker to 3, and its
-    // duplicate_sequence answer must restore the PRE-RESEND high-water —
-    // the answer proves the server is past 2, never that it dropped below
-    // the 4 this client had already reached. Preserving the regression
-    // would pin every later ordinary send on the consumed 3.
+test "AgentProtocolClient duplicate_sequence nack restores only the PROVEN step — the optimistic bound waits for its own evidence (#210 gap 7)" {
+    // Sends at 2 and 3 were accepted with their replies outstanding
+    // (tracker 4; the server is at 4 in this world); a recovery resend at
+    // the older 2 regresses the tracker to 3, and its duplicate_sequence
+    // answer proves exactly ONE step — the server is past 2 — never that
+    // it reached the optimistic 4 (in the world where 3 was busy-rejected
+    // with the reply lost, the server still expects 3, and restoring 4
+    // would make the next ordinary send a terminal mismatch). The restore
+    // is the proven 3; each further duplicate answer for a matching retry
+    // of a still-pending message advances one more proven step, silently.
     const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
@@ -1541,9 +1580,9 @@ test "AgentProtocolClient duplicate_sequence nack restores the pre-resend high-w
     };
     defer started_env.deinit(allocator);
     try client.processEnvelope(started_env);
-    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted
-    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3 — accepted, tracker 4
-    const resend_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // tracker regressed to 3
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, reply outstanding
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3 — accepted, reply outstanding, tracker 4
+    const resend_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // same payload — the retry
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
 
     var duplicate = agent_types.Envelope{
@@ -1561,26 +1600,49 @@ test "AgentProtocolClient duplicate_sequence nack restores the pre-resend high-w
     defer duplicate.deinit(allocator);
     try client.processEnvelope(duplicate);
 
-    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid)); // high-water restored
+    // Only the PROVEN step (past 2), never the optimistic 4; no false
+    // failure; the resend's record retired while the originals stay.
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
     try std.testing.expect(client.getLastErrorForSession(sid) == null);
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 2), pending.items.len); // m1 and m2 remain; the resend retired
 
-    // The next ordinary send continues past the consumed sequences instead
-    // of replaying 3.
+    // The server is past 3 as well (this world): the next ordinary send at
+    // the restored 3 is m2's retry (same sequence AND payload), so its
+    // duplicate answer retires SILENTLY and advances one more proven step.
+    const ladder_id = try client.sendAgentMessage(sid, "{\"m\":2}", null); // @3, retry of pending m2
+    var ladder_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = ladder_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = ladder_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer ladder_duplicate.deinit(allocator);
+    try client.processEnvelope(ladder_duplicate);
+    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+
+    // The next NEW message continues past the consumed sequences.
     _ = try client.sendAgentMessage(sid, "{\"m\":3}", null);
-    var next_env = try harness.envelopeAt(4); // start, m1, m2, resend, next
+    var next_env = try harness.envelopeAt(5); // start, m1, m2, resend, ladder, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
 }
 
-test "AgentProtocolClient duplicate_sequence nack restores the high-water across overlapping resends (#210 gap 7)" {
+test "AgentProtocolClient duplicate_sequence nack ignores chain-regressed resend priors (#210 gap 7)" {
     // Overlapping explicit resends chain-regress their prior snapshots:
     // with the client and server at 4, a resend at 2 records prior 4 and
     // lowers the tracker to 3; a second resend then records the
-    // ALREADY-lowered 3 as its prior. Its duplicate answer must still
-    // restore 4 — the true high-water survives in the first resend's
-    // still-pending record.
+    // ALREADY-lowered 3 as its prior. Its duplicate answer proves only one
+    // step (past 2): the restore is 3 — neither the second resend's
+    // regressed prior nor the first resend's prior 4 is evidence, and
+    // restoring an unproven value would jump the tracker past the server.
     const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
@@ -1619,14 +1681,113 @@ test "AgentProtocolClient duplicate_sequence nack restores the high-water across
     defer duplicate.deinit(allocator);
     try client.processEnvelope(duplicate);
 
-    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid)); // the FIRST resend's prior carries the high-water
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // the PROVEN step, not any unproven prior
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 3), pending.items.len); // m1, m2, and the first resend remain
 
     _ = try client.sendAgentMessage(sid, "{\"m\":3}", null);
     var next_env = try harness.envelopeAt(5); // start, m1, m2, resend, resend2, next
     defer next_env.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
+    try std.testing.expectEqual(@as(u64, 3), next_env.sequence);
+}
+
+test "AgentProtocolClient agent_busy rejection floors to the rejected sequence — every lower one was consumed (#210 gap 7)" {
+    // Sequence 2 was accepted with its reply outstanding; sequence 3 is
+    // sent while that run is still processing and answered agent_busy. The
+    // server validates the inbound sequence BEFORE the processing state,
+    // so the busy answer PROVES the server expects exactly 3 — the
+    // all-rejected floor (the still-pending sequence-2 record's 2) would
+    // replay the consumed 2 and be rejected again.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, reply outstanding
+    const second_id = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3, tracker 4
+
+    var busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = second_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already processing a message") } },
+    };
+    defer busy.deinit(allocator);
+    try client.processEnvelope(busy);
+
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // NOT the pending m1's 2
+
+    // The corrected retry carries the busy-proven sequence 3.
+    _ = try client.sendAgentMessage(sid, "{\"m\":2-retry}", null);
+    var retried = try harness.envelopeAt(3); // start, m1, m2, retry
+    defer retried.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), retried.sequence);
+}
+
+test "AgentProtocolClient duplicate_sequence nack on a mismatched payload at a pending sequence is not a retry (#210 gap 7)" {
+    // The retry match is sequence AND payload identity: a DIFFERENT
+    // payload sent at a still-pending sequence is a new logical request.
+    // A duplicate_sequence answer for it proves only that the EARLIER
+    // payload was admitted — the new one was never executed, nothing will
+    // settle it, so the rejection surfaces instead of retiring silently.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, reply outstanding
+    const other_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":OTHER}", null, 2); // DIFFERENT payload at the pending sequence
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = other_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = other_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // The proven step is kept (the server is past 2) but the failure
+    // SURFACES — the other payload was never run.
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the ORIGINAL m1 remains; the mismatched send retired
 }
 
 test "AgentProtocolClient duplicate_sequence nack on a non-retry send preserves the high-water and surfaces (#210 gap 7)" {

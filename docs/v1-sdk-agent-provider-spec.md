@@ -986,16 +986,23 @@ Rules:
   still-unresolved MESSAGE record's pre-send tracker and sequence — the
   counter the server holds in the all-rejected world; a pending START's
   floor is never taken, since a non-session-gone rejection proves the
-  counter is past it); a correlated `agent_not_found` (or
+  counter is past it — while a correlated `agent_busy` floors to EXACTLY
+  the rejected sequence instead: the server validates the inbound sequence
+  before the processing state, so a busy answer proves every lower
+  sequence was consumed); a correlated `agent_not_found` (or
   `session_expired`) drops the counter state instead, since the session is
   gone server-side. A correlated nack rejects a request exactly like a
   correlated `agent_error`, while nacks for NON-run requests (models,
   tool_list, ping, status) stay request-scoped and are dropped. A
-  `duplicate_sequence` answer is duplicate evidence — the server's counter
-  is PROVEN past the sent sequence: a RETRY of a still-unresolved message
-  (`sendAgentMessageWithSequence` at a pending sequence) retires silently
-  with the pre-resend HIGH-WATER restored, while a non-retry send or a
-  START falls through to the ordinary rejection path and surfaces.
+  `duplicate_sequence` answer is duplicate evidence proving exactly ONE
+  step — the server's counter is past the sent sequence, never that it
+  reached any optimistic value derived from unresolved sends: a RETRY of
+  a still-unresolved message (same sequence AND payload digest, via
+  `sendAgentMessageWithSequence`) retires silently with the tracker
+  advanced only the proven step (a higher true counter is reached one
+  silent step per round trip), while a mismatched payload, a non-retry
+  send, or a START falls through to the ordinary rejection path and
+  surfaces.
   Explicit-sequence sends (`sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
   tracker mirrors it optimistically but restores its PRE-SEND state when
