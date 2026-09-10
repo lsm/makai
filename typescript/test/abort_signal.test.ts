@@ -270,6 +270,121 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
   await flushMicrotasks();
 });
 
+test("agent.run abort completes the sequence probe before the abort surfaces, so an immediate same-id retry is not agent_busy (#210 gap 7)", async () => {
+  // The message was ACCEPTED (server counter at 3) but its output never
+  // arrived, so the abort teardown is a two-state probe: stop@2 rejected
+  // correlated invalid_request, stop@3 accepted. Awaiting the teardown means
+  // the post-send stop is on the wire BEFORE the abort error reaches the
+  // caller — a fire-and-forget probe would let an immediate same-id retry's
+  // agent_start hit the still-registered session as agent_busy.
+  const queue: StdioFrame[] = [];
+  const sent: StdioFrame[] = [];
+  const transport = {
+    send(frame: StdioFrame): void {
+      sent.push(frame);
+      if (frame.type === "agent_start") {
+        queue.push({ type: "agent_started", session_id: frame.session_id, message_id: "m-started", sequence: 1, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { session_id: frame.session_id } });
+      }
+      if (frame.type === "agent_stop") {
+        // Real-server validation shape: the message was accepted, so the
+        // PRE-send stop is rejected correlated invalid_request and the
+        // post-send stop is accepted.
+        if ((frame.sequence as number) < 3) {
+          queue.push({ type: "agent_error", session_id: frame.session_id, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "invalid_request", message: "invalid sequence" } });
+        } else {
+          queue.push({ type: "agent_stopped", session_id: frame.session_id, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+        }
+      }
+    },
+    async nextFrameForSession(_sessionId: string, timeoutMs?: number, wait?: { correlate?: string }): Promise<StdioFrame> {
+      const correlate = wait?.correlate;
+      const index = correlate !== undefined
+        ? queue.findIndex((entry) => entry.in_reply_to === correlate)
+        : queue.findIndex((entry) => entry.in_reply_to === undefined);
+      if (index >= 0) return queue.splice(index, 1)[0];
+      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs ?? 50, 50)));
+      throw new Error("timed out");
+    },
+  };
+  const agent = createMakaiAgentApi(transport as never);
+  const controller = new AbortController();
+
+  const runPromise = agent.run({ ...REQUEST, options: { signal: controller.signal } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+
+  await assert.rejects(
+    () => runPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+  // Serialization proof: by the time the abort surfaces, the probe has run
+  // to completion — BOTH stops (the rejected pre-send 2 and the accepted
+  // post-send 3) are on the wire, so a same-id retry's agent_start cannot
+  // hit the still-registered session.
+  assert.deepEqual(
+    sent.map((frame) => `${frame.type}:${frame.sequence}`),
+    ["agent_start:1", "agent_message:2", "agent_stop:2", "agent_stop:3"],
+  );
+  await new Promise((resolve) => setTimeout(resolve, 260));
+});
+
+test("agent.run abort cancels the abandoned session read instead of leaving it pending (#210 gap 7)", async () => {
+  // raceWithAbort rejecting is not enough: the abandoned transport read (a
+  // repliesOnly:false wait on the session route) must be ABORTED with the
+  // caller's signal — a read left pending for the response timeout could
+  // consume an immediate same-id retry's uncorrelated result or events.
+  // The fake holds each undeliverable read until its signal aborts or its
+  // timeout fires, mirroring the real transport; the assertion is that no
+  // read remains pending once the abort has surfaced.
+  const queue: StdioFrame[] = [];
+  let pendingReads = 0;
+  const transport = {
+    send(frame: StdioFrame): void {
+      if (frame.type === "agent_start") {
+        queue.push({ type: "agent_started", session_id: frame.session_id, message_id: "m-started", sequence: 1, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { session_id: frame.session_id } });
+      }
+      if (frame.type === "agent_stop") {
+        if ((frame.sequence as number) < 3) {
+          queue.push({ type: "agent_error", session_id: frame.session_id, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "invalid_request", message: "invalid sequence" } });
+        } else {
+          queue.push({ type: "agent_stopped", session_id: frame.session_id, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+        }
+      }
+    },
+    nextFrameForSession(_sessionId: string, timeoutMs: number | undefined, wait?: { correlate?: string; signal?: AbortSignal }): Promise<StdioFrame> {
+      const correlate = wait?.correlate;
+      const index = correlate !== undefined ? queue.findIndex((entry) => entry.in_reply_to === correlate) : -1;
+      if (index >= 0) return Promise.resolve(queue.splice(index, 1)[0]);
+      pendingReads += 1;
+      return new Promise<StdioFrame>((_resolve, reject) => {
+        const settle = () => {
+          pendingReads -= 1;
+          reject(new Error("timed out"));
+        };
+        const timer = setTimeout(settle, timeoutMs ?? 1000);
+        wait?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          pendingReads -= 1;
+          reject(new Error("aborted"));
+        }, { once: true });
+      });
+    },
+  };
+  const agent = createMakaiAgentApi(transport as never, { responseTimeoutMs: 5000 });
+  const controller = new AbortController();
+
+  const runPromise = agent.run({ ...REQUEST, options: { signal: controller.signal } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+
+  await assert.rejects(
+    () => runPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(pendingReads, 0, "the abandoned session read must be aborted with the caller's signal");
+});
+
 // ---------------------------------------------------------------------------
 // agent.stream abort tests
 // ---------------------------------------------------------------------------

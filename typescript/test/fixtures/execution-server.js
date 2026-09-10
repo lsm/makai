@@ -152,6 +152,22 @@ const authFlows = new Map();
 // Without this env the fixture stays a stateless line responder.
 const trackAgentSessions = Boolean(process.env.MAKAI_TEST_TRACK_AGENT_SESSIONS);
 const agentSessions = new Map();
+// Sessions whose first agent_message was rejected by the
+// MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE knob (one-shot per session).
+const agentMessageRejectionsDone = new Set();
+// Sessions whose first agent_message output was suppressed by
+// MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE (one-shot per session): the
+// message is ACCEPTED (counter advanced) but no run output follows — the
+// unknown-outcome scenario of §13.4.1/#210 gap 7. Later messages on the same
+// session flow normally so a same-id retry can succeed once the probe's stop
+// removed the session.
+const agentMessageSuppressionsDone = new Set();
+// Sessions whose first agent_message failed admission with an uncorrelated
+// runtime agent_error (one-shot per session): MAKAI_TEST_ADMISSION_RUNTIME_ERROR
+// mirrors §13.4.1's server-side acceptance-path failure — the expected counter
+// does NOT advance and nothing is admitted, but the frame on the wire is
+// identical to §13.4.2's settlement of an admitted run.
+const admissionRuntimeErrorsDone = new Set();
 
 function loadAuthState() {
   if (!authStatePath || !fs.existsSync(authStatePath)) return;
@@ -247,11 +263,42 @@ rl.on("line", (line) => {
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
+    // One-shot correlated rejection knob (#210 gap 7): the FIRST message on a
+    // session is rejected exactly like a real-server validation failure
+    // (request-correlated agent_error, sequence 0) and admits nothing — the
+    // expected counter does not advance.
+    if (process.env.MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE && !agentMessageRejectionsDone.has(env.session_id)) {
+      agentMessageRejectionsDone.add(env.session_id);
+      emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
+      return;
+    }
+    if (process.env.MAKAI_TEST_ADMISSION_RUNTIME_ERROR && !admissionRuntimeErrorsDone.has(env.session_id)) {
+      // §13.4.1 admission-path failure: UNCORRELATED runtime agent_error,
+      // counter not advanced, nothing admitted — the wire twin of the
+      // §13.4.2 settlement the MAKAI_TEST_AGENT_ERROR_PATH knob emits. A
+      // client must not read either shape as proof of acceptance (#210
+      // gap 7); placed BEFORE the tracking advance so the expected counter
+      // stays at the pre-send value.
+      admissionRuntimeErrorsDone.add(env.session_id);
+      emit(asyncFrame(env, "agent_error", { code: "internal_error", message: "admission allocation failure" }, 3));
+      return;
+    }
     if (trackAgentSessions) {
+      // Real-server validation (§13.1): an out-of-sequence message is
+      // rejected with a request-correlated agent_error (sequence 0) and the
+      // expected counter does not advance. A true duplicate sequence is
+      // rejected here.
       const expected = agentSessions.get(env.session_id) ?? 1;
+      if (env.sequence !== expected) {
+        emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
+        return;
+      }
       agentSessions.set(env.session_id, expected + 1);
     }
-    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE) return;
+    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE && !agentMessageSuppressionsDone.has(env.session_id)) {
+      agentMessageSuppressionsDone.add(env.session_id);
+      return;
+    }
     if (process.env.MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON) {
       emit(frame(env, "agent_result", { result_json: "not-json" }, 3));
     } else if (process.env.MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON) {
@@ -267,7 +314,12 @@ rl.on("line", (line) => {
       emit(asyncFrame(env, "agent_event", { event_json: JSON.stringify({ type: "error", code: agentFailurePair.code, message: agentFailurePair.message }) }, 3));
       emit(asyncFrame(env, "agent_error", { code: agentFailurePair.code, message: agentFailurePair.message }, 4));
     } else if (agentError) {
-      emit(frame(env, "agent_error", agentError, 3));
+      // Real-server settlement shape (§13.4.2): an agent-level failure
+      // settles through an UNCORRELATED agent_error on the session route —
+      // request-validation rejections are correlated, settlements are async
+      // output. (Correlating it here made the SDK's gap-7 rollback mistake
+      // the settlement for a message rejection.)
+      emit(asyncFrame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
       emit(frame(env, "agent_result", { result_json: JSON.stringify(agentResult) }, 3));
       if (trackAgentSessions) {
@@ -285,7 +337,10 @@ rl.on("line", (line) => {
     if (trackAgentSessions) {
       const expected = agentSessions.get(env.session_id) ?? 1;
       if (env.sequence !== expected) {
-        emit(frame(env, "nack", { error_code: "invalid_request", reason: "invalid sequence" }, 3));
+        // Real-server validation shape (§13.1): a request-correlated
+        // agent_error carrying sequence 0 — the two-state stop probe (#210
+        // gap 7) keys its retry on this rejection.
+        emit(frame(env, "agent_error", { code: "invalid_request", message: "invalid sequence" }, 0));
         return;
       }
       agentSessions.delete(env.session_id);
