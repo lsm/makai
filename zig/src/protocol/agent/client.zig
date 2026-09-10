@@ -456,6 +456,18 @@ pub const AgentProtocolClient = struct {
                 // isSessionComplete/getLastErrorForSession callers (#210
                 // gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, e.code)) {
+                    // Roll the tracker back BEFORE the fallible error
+                    // bookkeeping: the rejection envelope is already
+                    // consumed, so an allocation failure in the diagnostics
+                    // must not leave the optimistic counter and pending
+                    // record in place against a server that rejected them.
+                    try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
+                    if (env.in_reply_to == null) {
+                        // An UNCORRELATED agent_error is a settlement
+                        // (§13.4.2): like agent_result, it resolves the
+                        // sends recorded before the settled run.
+                        self.retireSettledPendingSends(env.session_id);
+                    }
                     // Allocate the replacement BEFORE releasing the previous
                     // value: a failed dupe must not leave last_error
                     // undefined (a later update or deinit would double-free).
@@ -463,13 +475,6 @@ pub const AgentProtocolClient = struct {
                     self.last_error.deinit(self.allocator);
                     self.last_error = OwnedSlice(u8).initOwned(error_copy);
                     try self.setSessionError(env.session_id, e.message);
-                    if (env.in_reply_to == null) {
-                        // An UNCORRELATED agent_error is a settlement
-                        // (§13.4.2): like agent_result, it resolves the
-                        // sends recorded before the settled run.
-                        self.retireSettledPendingSends(env.session_id);
-                    }
-                    try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
                 }
             },
             .nack => |n| {
@@ -481,13 +486,13 @@ pub const AgentProtocolClient = struct {
                 // by nack would leave the TUI treating the submit as
                 // accepted with no settlement ever coming (#210 gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) {
-                    // Allocate the replacement BEFORE releasing the previous
-                    // value (see the agent_error arm).
+                    // Rollback first, then fallible bookkeeping (see the
+                    // agent_error arm).
+                    try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
                     const reason_copy = try self.allocator.dupe(u8, n.reason.slice());
                     self.last_error.deinit(self.allocator);
                     self.last_error = OwnedSlice(u8).initOwned(reason_copy);
                     try self.setSessionError(env.session_id, n.reason.slice());
-                    try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
                 }
             },
             .agent_stopped => |p| {
@@ -549,19 +554,33 @@ pub const AgentProtocolClient = struct {
         _ = self.stop_probes_by_session.remove(session_id);
         defer reason.deinit(self.allocator);
         if (retry) {
-            const second_msg_id = self.sendAgentStopWithSequence(session_id, reason.slice(), second_sequence) catch {
-                // The retry never reached the wire — no reply will name it,
-                // so there is nothing to register for consumption.
-                return true;
-            };
-            // Final phase: consume the retry's own replies. The reason is not
-            // used for another send, so a borrowed empty slice suffices.
+            // Pre-wire phase for the retry (mirrors the first stop): build
+            // and serialize BEFORE the final-phase registration, so a
+            // pre-wire failure leaves the probe simply retired — nothing
+            // reached the wire.
+            const second_msg_id = agent_types.generateUlid();
+            var retry_payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
+            defer retry_payload.deinit(self.allocator);
+            retry_payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason.slice()));
+            const second_json = try self.serializeEnvelopeForSend(.{
+                .session_id = session_id,
+                .message_id = second_msg_id,
+                .sequence = second_sequence,
+                .timestamp = compat.time.nowMillis(),
+                .payload = retry_payload,
+            });
+            defer self.allocator.free(second_json);
+            // Final phase: consume the retry's own replies. Registered
+            // BEFORE the write so an AMBIGUOUS write failure keeps it — the
+            // rejection of a delivered retry must still be consumed as probe
+            // control, and teardown drivers keep an active probe to pump.
             try self.stop_probes_by_session.put(session_id, .{
                 .first_msg_id = second_msg_id,
                 .second_sequence = 0,
                 .reason = OwnedSlice(u8).initBorrowed(""),
                 .final = true,
             });
+            self.writeEnvelopeJson(second_json) catch {};
         } else if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
             self.clearSessionControlState(session_id);

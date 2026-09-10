@@ -1451,12 +1451,15 @@ pub const TuiRuntime = struct {
     /// normal reconnect path would register a fresh session that nothing
     /// ever stops.
     fn driveRemoteStopProbe(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient, sid: agent_protocol_types.SessionId) void {
-        const budget_ms: i64 = 150;
-        const deadline = compat.time.nowMillis() + budget_ms;
+        // Monotonic clock: a backward wall-clock step (NTP, snapshot restore)
+        // would otherwise extend the budget far past 150ms while cancel()
+        // or stop() keeps polling.
+        const deadline_ns = (compat.time.monotonicNanos() catch return) + 150 * std.time.ns_per_ms;
         while (client.hasActiveStopProbe(sid)) {
             self.pumpRemoteIncomingForTeardown();
             if (!client.hasActiveStopProbe(sid)) break;
-            if (compat.time.nowMillis() >= deadline) break;
+            const now_ns = compat.time.monotonicNanos() catch break;
+            if (now_ns >= deadline_ns) break;
             compat.time.sleepNs(5 * std.time.ns_per_ms);
         }
     }
