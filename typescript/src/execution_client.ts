@@ -423,8 +423,14 @@ class StdioAgentApi implements MakaiAgentApi {
           };
           retryIdClientGenerated = true;
         },
-        onAbort: () => {
-          this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted", { drain: "background" });
+        onAbort: async () => {
+          // AWAITED: with an unresolved message outcome the teardown is a
+          // bounded two-state probe (#210 gap 7, §13.4.1) whose post-send
+          // retry must land before the abort surfaces — a fire-and-forget
+          // probe lets an immediate same-id retry's agent_start hit the
+          // still-registered session as agent_busy. The background drain
+          // stays fire-and-forget.
+          await this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted", { drain: "background" });
         },
       },
     );
@@ -760,7 +766,15 @@ class StdioAgentApi implements MakaiAgentApi {
       }
     } catch (error) {
       if (isAbortError(error)) {
-        teardownSession("client aborted", "background");
+        // AWAITED for the same reason as the error path below: with an
+        // unresolved message outcome the teardown is a bounded two-state
+        // probe whose post-send retry must land before the abort surfaces,
+        // or an immediate same-id retry's agent_start is rejected
+        // agent_busy against the still-registered session (#210 gap 7).
+        // The background drain itself stays fire-and-forget — only the
+        // probe serializes; the abort error is delayed by at most the
+        // probe's bound.
+        await teardownSession("client aborted", "background");
       } else {
         // Failed runs must tear their session down too: the server keeps it
         // registered (and its id permanently agent_busy) until an agent_stop.
@@ -856,7 +870,12 @@ class StdioAgentApi implements MakaiAgentApi {
       }
     } catch (error) {
       if (isAbortError(error)) {
-        this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted", { drain: "background" });
+        // AWAITED: with an unresolved message outcome the teardown is a
+        // bounded two-state probe whose post-send retry must land before
+        // the abort surfaces, or an immediate same-id retry's agent_start
+        // is rejected agent_busy against the still-registered session
+        // (#210 gap 7). The background drain stays fire-and-forget.
+        await this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted", { drain: "background" });
       }
       throw error;
     } finally {
@@ -2020,8 +2039,8 @@ async function withAuthRetry<T>(
     beforeRetry?: () => void;
     signal?: AbortSignal;
     logger?: MakaiLogger;
-    /** Called when abort fires during auth retry to cancel the abandoned stream/session. */
-    onAbort?: () => void;
+    /** Called when abort fires during auth retry to cancel the abandoned stream/session. Awaited, so an async teardown (e.g. an agent sequence probe) settles before the abort error surfaces. */
+    onAbort?: () => void | Promise<void>;
   },
 ): Promise<T> {
   try {
@@ -2042,11 +2061,11 @@ async function withAuthRetry<T>(
         );
       } catch (loginError) {
         if (isAbortError(loginError)) {
-          options.onAbort?.();
+          await options.onAbort?.();
           throw loginError;
         }
         if (loginError instanceof MakaiAuthError && loginError.kind === "cancelled" && options.signal?.aborted) {
-          options.onAbort?.();
+          await options.onAbort?.();
           const abortError = new Error("operation aborted during auth retry");
           abortError.name = "AbortError";
           throw abortError;
