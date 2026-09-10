@@ -984,9 +984,12 @@ Rules:
   tracker back to the rejected send's own sequence, so a corrected retry reuses it
   (the Zig client tracks every outstanding send and rolls back MONOTONICALLY to
   the minimum — an older unresolved send's floor is never lost to a younger
-  send's rejection); the Zig client drops the per-session counter state instead
-  when the correlated rejection is `agent_not_found` (the session is gone, its
-  counter meaningless).
+  send's rejection; ordinary `agent_stop`s are tracked requests too, so their
+  own replies — `agent_not_found`, `session_expired`, a rejection — reach the
+  session-gone and rejection handling rather than being dropped as a foreign
+  registration's stale frame); the Zig client drops the per-session counter
+  state instead when the correlated rejection is `agent_not_found` (the session
+  is gone, its counter meaningless).
   Stop sends never advance the tracker in either client: an accepted stop consumes
   the counter with the session, and a rejected stop leaves the expected value in
   place for its retry. An UNCORRELATED outcome (timeout, lost output) reconciles
@@ -1312,10 +1315,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
    `duplicate_sequence` (a candidate the server already consumed, so its
    expected counter is higher; `sequence_gap`, the candidate too high, stays
    terminal because the ascending sweep cannot recover from too-high) —
-   toward the CEILING (the maximum of the tracker, one past the newest
-   pending send, and the pre-resend high-water the pending records carry —
-   an explicit resend at an older sequence leaves the pre-resend value a
-   reachable server state). For an ordinary tracked send answered `duplicate_sequence`
+   through the DISCRETE reachable candidate set — the floor, one-past each
+   pending message send, and every record's pre-send high-water plus the
+   tracker (an explicit resend at an older sequence leaves the pre-resend
+   value reachable while the intervening integers were deterministically
+   consumed) — never a dense interval, which long-lived settled traffic
+   could stretch past any bounded teardown driver. For an ordinary tracked send answered `duplicate_sequence`
    — not a probe stop — the evidence is the opposite of a rejection: an
    earlier copy of that sequence was already admitted and the server's
    counter is past it, so the send's record retires as resolved while the
@@ -1325,7 +1330,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
    proves the counter is past the sent value, never that it dropped below
    anything, so an explicit resend at an older sequence must not leave its
    regressed tracker behind; the §13.1 rollback is reserved for rejections
-   that prove the counter did NOT advance.
+   that prove the counter did NOT advance. The duplicate shape is
+   recognized by either signal: the shared vocabulary's `duplicate_sequence`
+   nack, or a generic `invalid_request` naming a resend whose sequence
+   another still-pending record carries (the agent surface spells every
+   sequence mismatch `invalid_request`, the already-consumed case included).
    The TypeScript SDK's single-message tracker spans exactly the two classic
    states (floor, floor+1); the Zig client, which tracks pipelined sends,
    sweeps every state in between — a second send accepted after the server
