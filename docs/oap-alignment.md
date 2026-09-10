@@ -149,13 +149,14 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    value in place for its retry), and exposes the control surface recovery
    paths need: `peekNextSequence`, `sendAgentMessageWithSequence`,
    `sendAgentStopWithSequence`, and `sendAgentStopProbing` — a bounded
-   candidate sweep (stop at the FLOOR — the minimum of the oldest unresolved
-   message send's sequence and the tracker's rolled-back value; each
-   correlated `invalid_request` reply processed through `processEnvelope`
-   advances to the next candidate, up to the CEILING of max(tracker, newest
-   pending send + 1), because a second send accepted after the server
-   settled the first (§13.2.3) but before the client consumed that
-   settlement can leave the server between the two; any other reply retires
+   candidate sweep over the DISCRETE reachable server states (stop at the
+   FLOOR — the minimum unresolved message send's sequence capped by the
+   tracker's rolled-back value; each correlated `invalid_request` reply
+   processed through `processEnvelope` advances to the next candidate in
+   the ascending set of one-past each pending message send, every record's
+   pre-send high-water, and the tracker — never a dense floor-to-ceiling
+   interval, which long-lived settled traffic could stretch past any
+   bounded teardown driver; any other reply retires
    the probe, with
    `agent_not_found` clearing the tracked sequence state and marking the
    session complete; probe replies are consumed as cleanup mechanics, never

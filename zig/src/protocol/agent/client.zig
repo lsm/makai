@@ -47,6 +47,13 @@ const PendingSend = struct {
     /// only ever PAST the sent value) must restore this high-water instead
     /// of preserving the regression (#210 gap 7).
     prior_tracker: u64,
+    /// Whether another unresolved MESSAGE record already carried this
+    /// sequence when the send was recorded — the send is a RETRY of a
+    /// still-unresolved original, so a later generic invalid_request
+    /// rejection of it is duplicate evidence (an earlier copy was admitted;
+    /// the server is past the sequence) even if the original settles first
+    /// and removes its own record (#210 gap 7).
+    resend_of_pending: bool = false,
 };
 
 /// An in-flight bounded stop probe (#210 gap 7): after an uncorrelated
@@ -183,7 +190,11 @@ pub const AgentProtocolClient = struct {
     fn recordPendingSend(self: *Self, session_id: agent_types.SessionId, msg_id: agent_types.Ulid, sequence: u64, kind: PendingSendKind, prior_tracker: u64) !void {
         const gop = try self.pending_sends_by_session.getOrPut(session_id);
         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(PendingSend).empty;
-        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker });
+        var resend_of_pending = false;
+        for (gop.value_ptr.items) |pending| {
+            if (pending.kind == .message and pending.sequence == sequence) resend_of_pending = true;
+        }
+        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .resend_of_pending = resend_of_pending });
     }
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
@@ -378,7 +389,12 @@ pub const AgentProtocolClient = struct {
         var oldest_message_sequence: ?u64 = null;
         for (list.items) |pending| {
             if (pending.kind != .message) continue;
-            if (oldest_message_sequence == null) oldest_message_sequence = pending.sequence;
+            // The MINIMUM message sequence, not the first recorded: explicit
+            // resends can be recorded out of order (a 999 before a 2), and
+            // the floor must bracket the lowest reachable state — if both
+            // admissions failed before advancing the server, every stop
+            // above the minimum is too high (#210 gap 7).
+            oldest_message_sequence = @min(oldest_message_sequence orelse pending.sequence, pending.sequence);
         }
         const entry_sequence = oldest_message_sequence orelse return null;
         const tracker_value = self.peekNextSequence(session_id);
@@ -606,7 +622,7 @@ pub const AgentProtocolClient = struct {
                     // gap 7).
                     if (e.code == .invalid_request) {
                         if (self.pendingSendFor(env.session_id, env.in_reply_to)) |entry| {
-                            if (entry.kind == .message and self.pendingSendCarriesSequence(env.session_id, entry.sequence, entry.msg_id)) {
+                            if (entry.kind == .message and entry.resend_of_pending) {
                                 try self.retireDuplicateAdmittedSend(env.session_id, env.in_reply_to, entry);
                                 return;
                             }
@@ -782,9 +798,10 @@ pub const AgentProtocolClient = struct {
         var reason = probe.reason;
         _ = self.stop_probes_by_session.remove(session_id);
         var candidates_owned_here = true;
+        var reason_owned_here = true;
         defer {
             if (candidates_owned_here) self.allocator.free(candidates);
-            reason.deinit(self.allocator);
+            if (reason_owned_here) reason.deinit(self.allocator);
         }
         if (retry) {
             // Pre-wire phase for the next candidate (mirrors the first
@@ -807,15 +824,18 @@ pub const AgentProtocolClient = struct {
             // write so an AMBIGUOUS write failure keeps it — the rejection
             // of a delivered stop must still be consumed as probe control,
             // and teardown drivers keep an active probe to pump. The
-            // REMAINING candidate slice transfers to the re-registered
-            // probe (same allocation, index advanced) — no per-retry copy.
+            // REMAINING candidate slice AND the owned reason transfer to
+            // the re-registered probe (same allocations, index advanced) —
+            // no per-retry copies, and a later retry re-sends the caller's
+            // reason rather than an empty one (#210 gap 7).
             try self.stop_probes_by_session.put(session_id, .{
                 .first_msg_id = second_msg_id,
                 .candidates = candidates,
                 .next_index = next_index + 1,
-                .reason = OwnedSlice(u8).initBorrowed(""),
+                .reason = reason,
             });
             candidates_owned_here = false;
+            reason_owned_here = false;
             self.writeEnvelopeJson(second_json) catch {};
         } else if (session_gone) {
             // Mirror the correlated-rejection not_found branch: the ACTIVE
@@ -849,19 +869,6 @@ pub const AgentProtocolClient = struct {
             }
         }
         try self.next_sequence_by_session.put(session_id, high_water);
-    }
-
-    /// Whether a pending record OTHER than `excluding` carries the sequence —
-    /// evidence that a rejected send duplicates a still-pending original (the
-    /// agent surface spells every sequence mismatch invalid_request, the
-    /// already-consumed case included, so the code alone cannot distinguish).
-    fn pendingSendCarriesSequence(self: *Self, session_id: agent_types.SessionId, sequence: u64, excluding: agent_types.Ulid) bool {
-        const list = self.pending_sends_by_session.getPtr(session_id) orelse return false;
-        for (list.items) |pending| {
-            if (std.mem.eql(u8, &excluding, &pending.msg_id)) continue;
-            if (pending.sequence == sequence) return true;
-        }
-        return false;
     }
 
     /// Retires the pending-send record whose request a reply names (e.g. the
@@ -977,9 +984,17 @@ pub const AgentProtocolClient = struct {
             return;
         }
 
-        const floor = @min(self.peekNextSequence(session_id), list.items[index].sequence);
-        try self.next_sequence_by_session.put(session_id, floor);
+        const rejected = list.items[index];
         _ = list.orderedRemove(index);
+        // A rejected STOP never rolls the tracker back: stops never advance
+        // the counter (§13.1), so a stale explicit stop sequence carries no
+        // counter evidence — lowering the tracker to it would pin every
+        // later ordinary send on an invalid value. Start/message rejections
+        // keep the §13.1 rollback to the rejected send's own sequence.
+        if (rejected.kind != .stop) {
+            const floor = @min(self.peekNextSequence(session_id), rejected.sequence);
+            try self.next_sequence_by_session.put(session_id, floor);
+        }
     }
 
     pub fn popEvent(self: *Self) ?QueuedEvent {
@@ -3266,5 +3281,157 @@ test "AgentProtocolClient plain stop replies reach the session-gone and rejectio
         try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // unchanged: a stop never advances the counter
         try std.testing.expect(client.getLastErrorForSession(sid) != null); // observable
         try std.testing.expect(client.isSessionComplete(sid));
+    }
+}
+
+test "AgentProtocolClient rejected stop never rolls the tracker back (#210 gap 7)" {
+    // A stop never advances the counter, so its rejection carries no
+    // counter evidence: a stale explicit stop sequence (2 against a tracker
+    // and server at 4) must leave the tracker untouched — rolling it back
+    // would pin every later ordinary send on an invalid value.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3, tracker 4
+    const stop_id = try client.sendAgentStopWithSequence(sid, "stale", 2);
+
+    var rejected = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejected.deinit(allocator);
+    try client.processEnvelope(rejected);
+
+    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid)); // unchanged
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null);
+    var next_env = try harness.envelopeAt(4); // start, m1, m2, stop, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
+}
+
+test "AgentProtocolClient resend provenance survives the original's settlement (#210 gap 7)" {
+    // The duplicate evidence for a generic invalid_request on a resend is
+    // recorded ON THE RESEND (another unresolved message already carried the
+    // sequence when it was sent), so the original's settlement processing —
+    // which retires the original's record — does not erase it: the delayed
+    // rejection still resolves as duplicate-admitted instead of rolling the
+    // tracker back to the consumed sequence with a false terminal error.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, output lost
+    const resend_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // retry of the pending original
+
+    // The original settles FIRST (its result arrives before the resend's
+    // delayed rejection), retiring the oldest message record.
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled);
+
+    var mismatch = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = resend_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer mismatch.deinit(allocator);
+    try client.processEnvelope(mismatch);
+
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // high-water kept
+    try std.testing.expect(client.getLastErrorForSession(sid) == null); // no false failure
+    try std.testing.expect(!client.isSessionComplete(sid));
+    const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining); // both records resolved
+}
+
+test "AgentProtocolClient probe retries carry the caller's reason (#210 gap 7)" {
+    // The owned reason transfers to each re-registered probe, so every
+    // retry stop — not just the first — reports why the session is being
+    // torn down.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":high}", null, 999); // prior 2, tracker 1000
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // prior 1000, tracker 3
+
+    const probe_result = try client.sendAgentStopProbing(sid, "cancelled");
+    var current_stop_id = probe_result.?;
+    const expected = [_]u64{ 2, 3, 1000 };
+    for (expected, 0..) |_, index| {
+        var rejection = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = current_stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+        };
+        defer rejection.deinit(allocator);
+        try client.processEnvelope(rejection);
+        if (index + 1 == expected.len) break;
+        var stop = try harness.envelopeAt(3 + index + 1); // the retry this rejection produced
+        defer stop.deinit(allocator);
+        try std.testing.expectEqual(expected[index + 1], stop.sequence);
+        try std.testing.expectEqualStrings("cancelled", stop.payload.agent_stop.reason.slice());
+        current_stop_id = stop.message_id;
     }
 }
