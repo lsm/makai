@@ -230,9 +230,12 @@ export async function stopAgentWithSequenceProbe(
 ): Promise<number | undefined> {
   let outstanding = { messageId: bestEffortStopAgent(transport, sessionId, sequences.preSend, reason), sequence: sequences.preSend };
   let retried = false;
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
+  // Monotonic clock: a backward wall-clock step (NTP, snapshot restore)
+  // would otherwise extend the budget past its documented bound — and
+  // failed run/stream teardown paths await this helper.
+  const deadline = performance.now() + maxMs;
+  while (performance.now() < deadline) {
+    const remaining = deadline - performance.now();
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
     const controller = new AbortController();

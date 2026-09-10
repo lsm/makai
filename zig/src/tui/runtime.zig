@@ -1104,15 +1104,16 @@ pub const TuiRuntime = struct {
         if (self.remote_client) |*client| {
             if (self.remote_session_id orelse self.remote_pending_session_id) |sid| {
                 // Same probe-first teardown as the disconnect path (#210 gap
-                // 7): the pump below processes the stop's replies, driving
-                // the probe's post-send retry when the first was rejected;
+                // 7): the pumps below are teardown context — disconnect is
+                // terminal (the reconnect path would register a replacement
+                // session this cancellation then clears without stopping);
                 // a probe ERROR sends no fallback (see the disconnect path).
                 if (client.sendAgentStopProbing(sid, "cancelled")) |probe_id| {
                     if (probe_id == null) {
                         _ = client.sendAgentStop(sid, "cancelled") catch {};
                     }
                 } else |_| {}
-                self.pumpRemoteIncoming() catch {};
+                self.pumpRemoteIncomingForTeardown();
                 self.driveRemoteStopProbe(client, sid);
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);
@@ -1468,24 +1469,26 @@ pub const TuiRuntime = struct {
     /// processing, but a disconnect is TERMINAL — reconnecting during
     /// stop/cancel would create a new pending session that the ongoing
     /// teardown then clears without stopping, leaking it server-side until
-    /// eviction (#210 gap 7). All failures simply end the pump.
+    /// eviction (#210 gap 7) — and at most ONE frame is processed per
+    /// invocation, so the probe driver's deadline is enforced between
+    /// frames: a continuously readable receiver with a large backlog
+    /// cannot stall the teardown past its budget. All failures simply end
+    /// the pump.
     fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) void {
         var receiver = &(self.remote_receiver orelse return);
         const client = &(self.remote_client orelse return);
-        while (true) {
-            switch (receiver.read(self.allocator) catch return) {
-                .line => |line| {
-                    defer self.allocator.free(line);
-                    var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return;
-                    defer env.deinit(self.allocator);
-                    if (env.version != 1) return;
-                    client.processEnvelope(env) catch return;
-                    self.syncRemoteSessionFromClient(client) catch return;
-                    self.drainRemoteClientEvents(client) catch return;
-                },
-                .pending => return,
-                .disconnected => return,
-            }
+        switch (receiver.read(self.allocator) catch return) {
+            .line => |line| {
+                defer self.allocator.free(line);
+                var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return;
+                defer env.deinit(self.allocator);
+                if (env.version != 1) return;
+                client.processEnvelope(env) catch return;
+                self.syncRemoteSessionFromClient(client) catch return;
+                self.drainRemoteClientEvents(client) catch return;
+            },
+            .pending => {},
+            .disconnected => {},
         }
     }
 
