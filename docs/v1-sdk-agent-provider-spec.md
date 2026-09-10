@@ -1000,13 +1000,19 @@ Rules:
   a still-unresolved message (same sequence AND payload digest, via
   `sendAgentMessageWithSequence`) retires silently, with the tracker
   restored to the HIGHEST PROVEN bound — the duplicated sequence + 1,
-  plus resolved-outcome progress (the current and pre-send tracker), each
-  capped at the lowest still-pending message sequence so unresolved
-  mirrors never leak in and settled progress is never discarded (for a
-  retry the cap collapses the bound to the proven step; a higher true
-  counter is reached one silent step per round trip), while a mismatched
-  payload, a non-retry send, or a START falls through to the ordinary
-  rejection path and surfaces.
+  plus resolved-outcome progress from every available snapshot (the
+  current tracker, the entry's pre-send value, and each remaining
+  record's own prior), each capped at the sends that were unresolved
+  when its snapshot was taken (the still-pending message records
+  preceding it in insertion order) so unresolved mirrors never leak in
+  and settled progress is never discarded (for a retry the caps collapse
+  the bound to the proven step; a higher true counter is reached one
+  silent step per round trip), while a mismatched payload, a non-retry
+  send, or a START falls through to the ordinary rejection path and
+  surfaces (an empty `options_json` digests identically to absence — the
+  wire treats them the same; a rejected message re-derives the retry
+  provenance of remaining same-sequence records, since a rejected send
+  never ran).
   Explicit-sequence sends (`sendAgentMessageWithSequence`,
   `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
   tracker mirrors it optimistically but restores its PRE-SEND state when
@@ -1020,7 +1026,11 @@ Rules:
   through a stop drops the counter state for the re-registration. A
   settlement retires the settled run's own message record (the oldest
   pending message), keeping a long-lived session's records bounded by its
-  unresolved sends rather than its history. Slices to follow in the
+  unresolved sends rather than its history; the retirement also RAISES
+  the tracker to at least that record's sequence + 1 — the settlement
+  proves the counter advanced past it, restoring progress a stale rewind
+  (a delayed busy answer's parity floor for a retry that was actually
+  accepted) had pulled below. Slices to follow in the
   series: the pending-record lifecycle and stale-reply guards, the bounded
   stop probe for unknown outcomes, and the TUI teardown integration
   (`[in progress — #210 gap 7 re-sliced from #213]`).

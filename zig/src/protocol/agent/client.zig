@@ -66,11 +66,16 @@ const PendingSend = struct {
 /// Computes a pending MESSAGE record's payload digest (see
 /// `PendingSend.payload_hash`). Each component is tagged, presence-marked,
 /// and length-delimited before hashing — plain concatenation would identify
-/// distinct payload pairs such as ("1","23") and ("12","3") (#210 gap 7).
+/// distinct payload pairs such as ("1","23") and ("12","3"). An EMPTY
+/// `options_json` is canonicalized to absence first: the request surface
+/// (`AgentMessageRequest.getOptionsJson`) and the serializer treat "" and
+/// null identically on the wire, so the same wire request must digest the
+/// same however the caller spells its options (#210 gap 7).
 fn messagePayloadHash(message_json: []const u8, options_json: ?[]const u8) u64 {
+    const canonical_options: ?[]const u8 = if (options_json) |opts| (if (opts.len == 0) null else opts) else null;
     var hasher = std.hash.Wyhash.init(0);
     payloadDigestField(&hasher, 0xE1, message_json);
-    payloadDigestField(&hasher, 0xD1, options_json);
+    payloadDigestField(&hasher, 0xD1, canonical_options);
     return hasher.final();
 }
 
@@ -285,8 +290,12 @@ pub const AgentProtocolClient = struct {
     /// Sends an `agent_stop` carrying an EXPLICIT inbound sequence (#210
     /// gap 7) — a caller with positive ownership evidence for an
     /// unknown-outcome start may stop explicitly at the counter state it
-    /// knows (§13.2.6). Like `sendAgentStop`, the tracker is not advanced.
+    /// knows (§13.2.6). Like `sendAgentStop`, the tracker is not advanced
+    /// past the given value; `maxInt(u64)` is rejected before any mutation
+    /// (the resync below would install it, and a later start's `seq + 1`
+    /// would overflow the tracker).
     pub fn sendAgentStopWithSequence(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8, sequence: u64) !agent_types.Ulid {
+        if (sequence == std.math.maxInt(u64)) return error.InvalidSequence;
         const msg_id = agent_types.generateUlid();
         try self.sendStopEnvelope(session_id, msg_id, reason, sequence);
         return msg_id;
@@ -409,8 +418,20 @@ pub const AgentProtocolClient = struct {
                 // copy or the session-scoped diagnostics cannot be allocated
                 // — a stale entry would otherwise floor a LATER rejection
                 // too low and grow without bound over a long-lived session
-                // (#210 gap 7).
-                self.retireSettledPendingSends(env.session_id);
+                // (#210 gap 7). The retirement also RESTORES progress a
+                // stale rewind had pulled below it: the settlement proves
+                // the counter advanced past the retired record's sequence,
+                // so a tracker below sequence + 1 (a DELAYED busy answer's
+                // parity floor for a retry that was actually accepted, or a
+                // rejection's all-rejected floor) is raised — best-effort,
+                // since duplicate evidence lifts a tracker left low by an
+                // allocation failure here.
+                if (self.retireSettledPendingSends(env.session_id)) |settled_sequence| {
+                    const proven = settled_sequence + 1;
+                    if (self.peekNextSequence(env.session_id) < proven) {
+                        self.next_sequence_by_session.put(env.session_id, proven) catch {};
+                    }
+                }
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
                 try self.setSessionResult(env.session_id, json);
@@ -477,10 +498,10 @@ pub const AgentProtocolClient = struct {
                     // registration on duplicate evidence alone would also
                     // claim a FOREIGN caller's registration on a reused
                     // caller-supplied id).
-                    if (self.pendingSendFor(env.session_id, env.in_reply_to)) |entry| {
-                        if (entry.kind == .message) {
-                            try self.retireDuplicateAdmittedSend(env.session_id, env.in_reply_to, entry);
-                            if (entry.resend_of_pending) return;
+                    if (self.pendingSendWithIndexFor(env.session_id, env.in_reply_to)) |found| {
+                        if (found.entry.kind == .message) {
+                            try self.retireDuplicateAdmittedSend(env.session_id, env.in_reply_to, found.entry, found.index);
+                            if (found.entry.resend_of_pending) return;
                             // The high-water is already preserved; skip the
                             // rollback (the entry is retired, so the
                             // correlated rejection below finds no match) and
@@ -548,13 +569,21 @@ pub const AgentProtocolClient = struct {
     /// and the list stays bounded by unresolved sends; the full fix needs
     /// run identity on the settlement frame, which the wire cannot observe
     /// today (#210 gap 7 — documented series residual, see #213).
-    fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
-        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+    ///
+    /// Returns the retired record's sequence: the settlement PROVES the
+    /// session's counter advanced past it (the run was admitted and
+    /// completed), so the caller raises the tracker to at least sequence +
+    /// 1 — restoring progress a stale rewind had pulled below it (a delayed
+    /// busy answer's parity floor for a retry that was actually accepted,
+    /// or a rejection's all-rejected floor) (#210 gap 7).
+    fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) ?u64 {
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
         for (list.items, 0..) |pending, index| {
             if (pending.kind != .message) continue;
             _ = list.orderedRemove(index);
-            return;
+            return pending.sequence;
         }
+        return null;
     }
 
     /// Whether `in_reply_to` names one of the session's tracked pending
@@ -583,6 +612,19 @@ pub const AgentProtocolClient = struct {
         return null;
     }
 
+    /// A copy of the pending send a reply names PLUS its insertion index
+    /// (records are in insertion order — duplicate-evidence provenance
+    /// needs to know which records preceded a snapshot), or null when the
+    /// reply matches no tracked send.
+    fn pendingSendWithIndexFor(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid) ?struct { entry: PendingSend, index: usize } {
+        const reply_to = in_reply_to orelse return null;
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
+        for (list.items, 0..) |pending, index| {
+            if (std.mem.eql(u8, &reply_to, &pending.msg_id)) return .{ .entry = pending, .index = index };
+        }
+        return null;
+    }
+
     /// Maps a protocol nack error code onto the agent error code carrying
     /// the same evidence for the sequence rules. The shared protocol's
     /// wrong-counter rejections — invalid_sequence, and duplicate_sequence
@@ -605,41 +647,57 @@ pub const AgentProtocolClient = struct {
     /// answer and restores the tracker to the HIGHEST PROVEN bound. The
     /// answer itself proves one step: the server's counter is past the sent
     /// sequence (`entry.sequence + 1`). Independently established progress
-    /// — the current tracker and the entry's pre-send snapshot, each of
-    /// which summarizes the session's RESOLVED outcomes (accepted mirrors
-    /// stay, rejections rolled back) — is proven too, but only up to the
-    /// LOWEST still-pending message sequence: mirrors of unresolved sends
-    /// (a pipelined send rejected busy with its reply lost, or an
-    /// optimistic send interleaved before this reply arrived) may have
-    /// inflated any value above it (#210 gap 7). Restoring an unproven
-    /// value jumps the tracker past the server (the next ordinary send is
-    /// gap-rejected); discarding proven progress replays consumed
-    /// sequences, each surfacing a false terminal error. For a RETRY the
-    /// original is still pending, the cap is at most the sent sequence,
-    /// and the bound collapses to the proven step — a higher true counter
-    /// is then reached one silent step per round trip (the next send at
-    /// the restored value is itself answered `duplicate_sequence`, and as
-    /// a same-payload retry it retires silently).
-    fn retireDuplicateAdmittedSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, entry: PendingSend) !void {
-        self.retirePendingSend(session_id, in_reply_to);
-        // The lowest still-pending message sequence caps every tracker
-        // snapshot: all sequences below it have resolved, so their
-        // contribution to a snapshot is real; anything above it may be an
-        // unresolved send's optimistic mirror.
-        var lowest_pending = std.math.maxInt(u64);
+    /// is proven too — the CURRENT tracker, the entry's pre-send snapshot,
+    /// and every remaining record's own pre-send snapshot each summarize
+    /// the session's RESOLVED outcomes (accepted mirrors stay, rejections
+    /// rolled back) — but each snapshot only up to the sends that were
+    /// UNRESOLVED when it was taken: a mirror of a send that was pending
+    /// at snapshot time and is still pending now may have inflated it
+    /// above that send's sequence. Pending records are in insertion order,
+    /// so a snapshot's contaminators are exactly the still-pending message
+    /// records recorded BEFORE the snapshot's own record — the caps below
+    /// (#210 gap 7). Restoring an unproven value jumps the tracker past
+    /// the server (the next ordinary send is gap-rejected); discarding
+    /// proven progress replays consumed sequences, each surfacing a false
+    /// terminal error. For a RETRY a still-pending original caps every
+    /// source at the sent sequence and the bound collapses to the proven
+    /// step — a higher true counter is then reached one silent step per
+    /// round trip (the next send at the restored value is itself answered
+    /// `duplicate_sequence`, and as a same-payload retry it retires
+    /// silently).
+    fn retireDuplicateAdmittedSend(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, entry: PendingSend, entry_index: usize) !void {
+        var restore: u64 = entry.sequence + 1;
         if (self.pending_sends_by_session.getPtr(session_id)) |list| {
-            for (list.items) |pending| {
+            // The current tracker is a snapshot taken NOW: every
+            // still-pending message record may contaminate it.
+            var cap_tracker: u64 = std.math.maxInt(u64);
+            // The entry's pre-send snapshot: contaminated by the records
+            // that preceded it (the entry itself is resolving here — the
+            // duplicate answer consumed its sequence).
+            var cap_entry_prior: u64 = std.math.maxInt(u64);
+            // Each remaining record's own pre-send snapshot is a proven
+            // bound up to the still-pending message records recorded before
+            // IT (this is what recovers, e.g., a backward explicit send's
+            // clean pre-regression prior).
+            var best_remaining_prior: u64 = 0;
+            for (list.items, 0..) |pending, i| {
                 if (pending.kind != .message) continue;
-                lowest_pending = @min(lowest_pending, pending.sequence);
+                if (i == entry_index) continue; // the retiring entry
+                cap_tracker = @min(cap_tracker, pending.sequence);
+                if (i < entry_index) cap_entry_prior = @min(cap_entry_prior, pending.sequence);
+                var cap_prior: u64 = std.math.maxInt(u64);
+                for (list.items[0..i], 0..) |earlier, j| {
+                    if (earlier.kind != .message) continue;
+                    if (j == entry_index) continue; // resolving now, not a contaminator
+                    cap_prior = @min(cap_prior, earlier.sequence);
+                }
+                best_remaining_prior = @max(best_remaining_prior, @min(pending.prior_tracker, cap_prior));
             }
+            restore = @max(restore, @min(self.peekNextSequence(session_id), cap_tracker));
+            restore = @max(restore, @min(entry.prior_tracker, cap_entry_prior));
+            restore = @max(restore, best_remaining_prior);
         }
-        const restore = @max(
-            entry.sequence + 1,
-            @max(
-                @min(self.peekNextSequence(session_id), lowest_pending),
-                @min(entry.prior_tracker, lowest_pending),
-            ),
-        );
+        self.retirePendingSend(session_id, in_reply_to);
         try self.next_sequence_by_session.put(session_id, restore);
     }
 
@@ -680,6 +738,26 @@ pub const AgentProtocolClient = struct {
 
         const rejected = list.items[index];
         _ = list.orderedRemove(index);
+        // A rejected MESSAGE may have been the SOURCE of another record's
+        // retry provenance (`resend_of_pending` was recorded when the
+        // rejected send was still pending): with the source now PROVEN
+        // never-admitted, a remaining same-sequence record is no longer a
+        // retry of an unresolved original — its duplicate answer must
+        // surface, not retire silently as though the rejected payload had
+        // run (#210 gap 7). Re-derive the bit for the remaining
+        // same-sequence message records.
+        if (rejected.kind == .message) {
+            for (list.items) |*pending| {
+                if (pending.kind != .message or pending.sequence != rejected.sequence) continue;
+                var has_unresolved_source = false;
+                for (list.items) |other| {
+                    if (other.kind != .message or other.sequence != rejected.sequence) continue;
+                    if (std.mem.eql(u8, &other.msg_id, &pending.msg_id)) continue;
+                    if (other.payload_hash == pending.payload_hash) has_unresolved_source = true;
+                }
+                pending.resend_of_pending = has_unresolved_source;
+            }
+        }
         // A rejected STOP never floors the tracker — stops never advance
         // the counter (§13.1), so the rejection itself carries no counter
         // evidence. But an EXPLICIT stop RESYNCED the tracker to its
@@ -2048,6 +2126,267 @@ test "AgentProtocolClient duplicate_sequence nack on a mismatched payload at a p
     try std.testing.expect(client.isSessionComplete(sid));
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the ORIGINAL m1 remains; the mismatched send retired
+}
+
+test "AgentProtocolClient settlement restores progress a delayed busy answer rewound (#210 gap 7)" {
+    // An attempt at sequence 2 is answered agent_busy with the reply
+    // DELAYED; an explicit retry at 2 is accepted (the server advances to
+    // 3). When the delayed busy finally arrives, its parity floor rewinds
+    // the tracker to 2 — correct as of the ANSWER, stale as of NOW. The
+    // retry's settlement then proves the counter advanced past 2 and
+    // restores 3, so the next ordinary send does not replay the consumed
+    // sequence.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const first_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — busy, reply delayed
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // the retry — ACCEPTED, tracker 3
+
+    var delayed_busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = first_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already processing a message") } },
+    };
+    defer delayed_busy.deinit(allocator);
+    try client.processEnvelope(delayed_busy);
+    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // the stale parity floor
+
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled);
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // the settlement's proof restored
+
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null);
+    var next_env = try harness.envelopeAt(3); // start, first, retry, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), next_env.sequence);
+}
+
+test "AgentProtocolClient duplicate restore retains clean priors of backward pending sends (#210 gap 7)" {
+    // Settled turns establish the server at 5; backward explicit sends at
+    // 3 (prior 5 — clean, nothing was pending when it was recorded) and
+    // then 2 (prior 4 — regressed). When the sequence-2 duplicate arrives
+    // FIRST, a universal cap at the lowest pending sequence (3) would
+    // restore only 3; but the sequence-3 record's own prior is proven up
+    // to ITS contaminators (none), so the settled 5 survives. With the
+    // sequence-3 reply lost, the next ordinary send continues at 5 instead
+    // of replaying consumed sequences as surfaced rejections.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — settled below
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3 — settled below
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null); // seq 4 — settled below
+    for (0..3) |_| {
+        var settled = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 5,
+            .in_reply_to = null,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+        };
+        defer settled.deinit(allocator);
+        try client.processEnvelope(settled);
+    }
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":back-3}", null, 3); // prior 5, clean
+    const back_two_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":back-2}", null, 2); // prior 4, regressed
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = back_two_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = back_two_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // The sequence-3 record's clean prior 5 survives the restore.
+    try std.testing.expectEqual(@as(u64, 5), client.peekNextSequence(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the backward-3 record remains for its own reply
+    _ = try client.sendAgentMessage(sid, "{\"m\":4}", null);
+    var next_env = try harness.envelopeAt(6); // start, m1..m3, back-3, back-2, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 5), next_env.sequence);
+}
+
+test "AgentProtocolClient rejected source clears stale retry provenance (#210 gap 7)" {
+    // While sequence 2 is busy: payload A is sent at 2, then payload B at
+    // 2 after the server goes idle (B is ADMITTED), then a retry of A at
+    // 2. A's delayed agent_busy finally arrives — A never ran. The retry's
+    // recorded provenance (A was pending when it was recorded) is now
+    // stale: re-derived against the REMAINING records, it is not a retry
+    // of any unresolved same-payload original, so its duplicate answer
+    // SURFACES instead of retiring silently as though A had executed.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const first_a_id = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — busy, reply delayed
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // ADMITTED after the run went idle
+    const retry_a_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // retry of the pending A
+
+    var delayed_busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = first_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already processing a message") } },
+    };
+    defer delayed_busy.deinit(allocator);
+    try client.processEnvelope(delayed_busy);
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_a_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // Only B ran; the A-retry never executed — its duplicate answer
+    // surfaces, and B's record remains pending for its own settlement.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len);
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // past the consumed 2
+}
+
+test "AgentProtocolClient rejects an un-advanceable explicit stop sequence (#210 gap 7)" {
+    // maxInt(u64) would be installed into the tracker by the explicit
+    // stop's resync, and a later start's seq + 1 would overflow (trap in
+    // safety-checked builds) — rejected before any mutation, like the
+    // message variant.
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+
+    try std.testing.expectError(error.InvalidSequence, client.sendAgentStopWithSequence(sid, "never", std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // untouched
+    try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len); // the start only
+}
+
+test "AgentProtocolClient retry identity canonicalizes empty options to absence (#210 gap 7)" {
+    // The request surface and the serializer treat options_json = "" and
+    // null identically on the wire; the retry digest must too, or the same
+    // wire request spelled the other way is misclassified as a non-retry
+    // and its duplicate answer becomes a false terminal error.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — reply lost
+    const retried_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", "", 2); // same wire request, empty-spelled options
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retried_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retried_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // Same wire request → retry → silent retire, no false failure.
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    // The digest itself canonicalizes.
+    try std.testing.expectEqual(messagePayloadHash("{\"m\":1}", null), messagePayloadHash("{\"m\":1}", ""));
 }
 
 test "AgentProtocolClient duplicate_sequence nack on a non-retry send preserves the high-water and surfaces (#210 gap 7)" {
