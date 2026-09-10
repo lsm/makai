@@ -1014,8 +1014,14 @@ Rules:
   requires a client-visible registration generation — a future wire revision.
   Until then an exclusive client-generated id remains the only sufficient
   ownership evidence, and a stop probe already in flight is idempotent (a
-  second probe returns the in-flight stop's id instead of superseding it)) —
-  so recovery paths are not forced
+  second probe returns the in-flight stop's id instead of superseding it).
+  The TS tracker likewise clears its unresolved marker on run output
+  consumed by the attempt's own correlated, post-acceptance waits — the
+  strongest acceptance tie the wire affords and the basis of the SDK's
+  encoded teardown semantics (abort and failure-pair paths stop at the
+  advanced counter); a stale trailing frame from a prior run on a quickly
+  reused id slipping into those waits is the same documented residual
+  class)) — so recovery paths are not forced
   to guess a counter state.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a

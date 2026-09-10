@@ -701,15 +701,15 @@ class StdioAgentApi implements MakaiAgentApi {
         if (normalized.length === 0) {
           throw new MakaiStreamError(`unexpected frame type while awaiting agent result: ${String(frame.type)}`, { kind: "transport_error" });
         }
-        // Deliberately NO marker clear on ordinary event frames: an
-        // agent_event cannot be tied to the current attempt (a quickly
-        // reused id's previous run may emit its trailing agent_end after the
-        // new message was sent, §13.4.3), and clearing on it would let
-        // teardown skip the probe on a message whose outcome is still
-        // unknown. The marker clears only on frames that settle or actively
-        // belong to this attempt (agent_result and its fallbacks,
-        // tool_execute, the TERMINAL agent_end this attempt consumes as its
-        // own completion) or on a correlated rejection.
+        // Consumed run output clears the unresolved marker: frames that
+        // reached THIS attempt's correlated, post-acceptance waits are the
+        // strongest acceptance tie the wire affords, and the repo's teardown
+        // semantics build on it (abort and failure-pair paths stop at the
+        // advanced counter). A stale trailing frame from a previous run
+        // slipping in is the documented §13.4.3/§6.1 downstream-buffer
+        // residual — the same wire-unobservable class recorded for the
+        // probe's admission gate (#210 gap 7).
+        if (activeSession) activeSession.unresolvedMessageSequence = undefined;
         for (const event of normalized) {
           if (event.type === "error") {
             // Loop-internal failure pair (spec §13.4.2, #205): this error
@@ -731,12 +731,6 @@ class StdioAgentApi implements MakaiAgentApi {
           if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolsExecuted = true;
           events.push(event);
           if (event.type === "agent_end") {
-            // The TERMINAL event of this attempt's stream — the response is
-            // built from it, so acceptance is proven (a terminal frame
-            // consumed here ends the attempt; stale-terminal misattribution
-            // is the pre-existing §13.4.3/§6.1 class, unchanged by the
-            // marker).
-            if (activeSession) activeSession.unresolvedMessageSequence = undefined;
             const response = responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
             await teardownSession("completed", "quiescent");
             return response;
@@ -959,14 +953,12 @@ class StdioAgentApi implements MakaiAgentApi {
           // the failure, but the tracker must roll back first (§13.1) so the
           // teardown stop uses the pre-send sequence.
           this.rollbackUnresolvedMessage(activeSession);
-        } else if (messageSent && frame.type === "agent_error" && activeSession?.unresolvedMessageSequence !== undefined) {
-          // An UNCORRELATED agent_error (the correlated one took the branch
-          // above) is the settlement: the marker clears ONLY on frames that
-          // settle or actively belong to this attempt (settlement,
-          // tool_execute) — never on agent_event frames, which cannot be
-          // tied to the current attempt (§13.4.3: a quickly reused id's
-          // previous run may emit its trailing agent_end after the new
-          // message was sent).
+        } else if (messageSent && activeSession?.unresolvedMessageSequence !== undefined
+          && frame.type !== "agent_started" && frame.type !== "ack" && frame.type !== "agent_stopped") {
+          // Any other post-message frame is run output consumed by THIS
+          // attempt's waits — the strongest acceptance tie the wire affords
+          // (see the matching clear in runOnce; the stale-trailing-frame
+          // caveat is the documented §13.4.3/§6.1 residual).
           activeSession.unresolvedMessageSequence = undefined;
         }
         if (frame.type === "agent_started" && !messageSent) {
@@ -998,8 +990,10 @@ class StdioAgentApi implements MakaiAgentApi {
           continue;
         }
         const events = normalizeAgentFrame(frame, toolBuffers);
-        // No marker clear on event frames here either — see the branch above
-        // (events cannot be tied to the current attempt, §13.4.3).
+        if (events.length > 0 && activeSession?.unresolvedMessageSequence !== undefined) {
+          // Recognized run output proves the message was accepted (#210 gap 7).
+          activeSession.unresolvedMessageSequence = undefined;
+        }
         for (const rawEvent of events) {
           let event = rawEvent;
           if (event.type === "error" && event.code === "auth_required") {
@@ -1020,10 +1014,6 @@ class StdioAgentApi implements MakaiAgentApi {
             event = usage ? { ...event, usage } : { ...event };
             if (!usage) delete event.usage;
             terminal = true;
-            // The TERMINAL event of this attempt's stream — see the matching
-            // clear in runOnce (acceptance proven by the frame this attempt
-            // consumes as its own completion).
-            if (activeSession) activeSession.unresolvedMessageSequence = undefined;
             // Provider auth failures surfaced via the agent event stream keep
             // the typed retryable path: mirror the provider stream convention
             // (error events with code auth_required throw instead of ending
