@@ -3145,3 +3145,89 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
   assert.ok(uncorrelatedTimeouts.length >= 1);
   assert.ok(uncorrelatedTimeouts.every((timeout) => timeout === 0), "the post-probe drain must request only immediate (0ms) dequeues");
 });
+
+test("the abort-path background drain is backlog-only, not a lingering route reader (#210 gap 7)", async () => {
+  // The abort teardowns await the probe but leave the drain running in the
+  // background: a deadline-based drain keeps polling the uncorrelated
+  // session route for its full window even when empty and can consume a
+  // re-registered session's output. The background drain must request only
+  // immediate (0ms) dequeues, like the quiescent one.
+  const sessionId = "testNanoIdSess1234567";
+  const queue: StdioFrame[] = [];
+  const sentStops: number[] = [];
+  const uncorrelatedTimeouts: number[] = [];
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      sentStops.push(frame.sequence as number);
+      queue.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+    },
+    nextFrameForSession: async (_sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
+      const correlate = wait?.correlate;
+      if (correlate === undefined) uncorrelatedTimeouts.push(timeoutMs ?? 0);
+      const matches = correlate !== undefined
+        ? (entry: StdioFrame) => entry.in_reply_to === correlate
+        : (entry: StdioFrame) => entry.in_reply_to === undefined;
+      const immediate = queue.findIndex(matches);
+      if (immediate >= 0) return queue.splice(immediate, 1)[0];
+      throw new Error("timed out");
+    },
+  };
+  queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-parked", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
+
+  const api = createMakaiAgentApi(transport as never, {}) as unknown as {
+    stopAgentSession(session: unknown, sessionId: string, sequence: number, reason: string, options?: { drain?: "quiescent" | "background" | "none" }): Promise<void>;
+  };
+  await api.stopAgentSession(
+    { nextSequence: 3, unresolvedMessageSequence: 2, startReplyObserved: true, idClientGenerated: false, stopped: false, sessionId },
+    sessionId,
+    3,
+    "client aborted",
+    { drain: "background" },
+  );
+  // The fire-and-forget drain starts within the call's microtasks; give it a
+  // tick to issue its reads, then verify they were all immediate dequeues.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(sentStops, [2]);
+  assert.equal(queue.length, 0);
+  assert.ok(uncorrelatedTimeouts.length >= 1);
+  assert.ok(uncorrelatedTimeouts.every((timeout) => timeout === 0), "the background post-probe drain must request only immediate (0ms) dequeues");
+});
+
+test("stopAgentWithSequenceProbe waits through idle windows for a delayed rejection before retrying (#210 gap 7)", async () => {
+  // The pre-send stop's correlated rejection lands AFTER one idle window
+  // (a briefly loaded child process or host event loop): the probe must keep
+  // waiting within its budget and still issue the post-send retry — treating
+  // the first silent window as settled would leave an accepted message's
+  // session registered and same-id starts agent_busy.
+  const sessionId = "testNanoIdSess1234567";
+  const sentStops: number[] = [];
+  const replies: StdioFrame[] = [];
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      sentStops.push(frame.sequence as number);
+      if (sentStops.length === 1) {
+        setTimeout(() => {
+          replies.push({ type: "agent_error", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "invalid_request", message: "invalid sequence" } });
+        }, 120);
+      } else {
+        replies.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
+      }
+    },
+    nextFrameForSession: async (_sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
+      const correlate = wait?.correlate;
+      const match = correlate !== undefined ? replies.find((entry) => entry.in_reply_to === correlate) : undefined;
+      if (match) {
+        replies.splice(replies.indexOf(match), 1);
+        return match;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs ?? 50, 50)));
+      throw new Error("timed out");
+    },
+  };
+
+  const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 50, 400);
+  assert.equal(acceptedAt, 3);
+  assert.deepEqual(sentStops, [2, 3]);
+});

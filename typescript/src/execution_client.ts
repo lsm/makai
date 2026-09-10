@@ -6,7 +6,6 @@ import {
   bestEffortCancelStream,
   bestEffortStopAgent,
   drainStreamFrames,
-  drainSessionFrames,
   drainSessionFramesUntilQuiescent,
   stopAgentWithSequenceProbe,
 } from "./cancel_helpers";
@@ -502,7 +501,14 @@ class StdioAgentApi implements MakaiAgentApi {
       session.unresolvedMessageSequence = undefined;
       await stopAgentWithSequenceProbe(this.transport, sessionId, { preSend, postSend: sequence }, reason);
       if (options.drain === "background") {
-        drainSessionFrames(this.transport, sessionId);
+        // Backlog-only, still fire-and-forget: a deadline-based background
+        // drain keeps polling the uncorrelated session route for its full
+        // window even when empty, and the abort paths leave it running
+        // after the AWAITED probe — an immediate same-id retry could
+        // register and then have its uncorrelated output consumed by that
+        // lingering reader (#210 gap 7). The immediate-dequeue drain takes
+        // the parked backlog and stops at the first empty read.
+        drainSessionFramesUntilQuiescent(this.transport, sessionId, 0, 250);
         return;
       }
       // Drain on EVERY probe outcome, resolved or not (§13.3.1): the probe's
@@ -535,7 +541,11 @@ class StdioAgentApi implements MakaiAgentApi {
       return drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250, { stopReplyTo: stopMessageId });
     }
     if (options.drain === "background") {
-      drainSessionFrames(this.transport, sessionId);
+      // Backlog-only fire-and-forget, matching the probe branch: the abort
+      // paths leave this drain running, so a deadline-based reader that
+      // keeps polling the uncorrelated route could consume a re-registered
+      // session's output (#210 gap 7).
+      drainSessionFramesUntilQuiescent(this.transport, sessionId, 0, 250);
     }
     return Promise.resolve();
   }
@@ -620,7 +630,12 @@ class StdioAgentApi implements MakaiAgentApi {
         // message id: the transport then delivers replies to that request to
         // this attempt even when a concurrent call shares the session id
         // (spec §13.3.1, #201), instead of both competing on one route.
-        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, { correlate: correlateId, repliesOnly: !startAccepted }), signal, "agent.run aborted");
+        // The caller's signal is wired INTO the transport read too: on abort
+        // the read is aborted via its signal, which re-routes any frame it
+        // had dequeued — an abandoned, repliesOnly:false read left pending
+        // for the response timeout could otherwise consume an immediate
+        // same-id retry's uncorrelated result or events (#210 gap 7).
+        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, { correlate: correlateId, repliesOnly: !startAccepted, signal }), signal, "agent.run aborted");
         if (frame.type === "ack" || frame.type === "agent_stopped") continue;
         if (!startAccepted && frame.type !== "agent_started" && frame.type !== "nack" && frame.type !== "agent_error") {
           // Stale tail of a prior attempt on this session id (its cancelled
@@ -947,7 +962,10 @@ class StdioAgentApi implements MakaiAgentApi {
         // message id: the transport then delivers replies to that request to
         // this attempt even when a concurrent call shares the session id
         // (spec §13.3.1, #201), instead of both competing on one route.
-        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, { correlate: correlateId, repliesOnly: !startAccepted }), signal, "agent.stream aborted");
+        // Signal wired into the transport read for the same reason as
+        // runOnce's: an abandoned inner read must not outlive the abort and
+        // consume a same-id retry's uncorrelated output (#210 gap 7).
+        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, { correlate: correlateId, repliesOnly: !startAccepted, signal }), signal, "agent.stream aborted");
         if (frame.type === "ack" || frame.type === "agent_stopped") continue;
         if (!startAccepted && frame.type !== "agent_started" && frame.type !== "nack" && frame.type !== "agent_error") {
           // Stale tail of a prior attempt on this session id (its cancelled
@@ -1463,7 +1481,7 @@ async function nextAgentFrame(
   transport: MakaiStdioClient,
   sessionId: string,
   context: TimeoutDiagnosticContext,
-  wait?: { correlate: string; repliesOnly?: boolean },
+  wait?: { correlate: string; repliesOnly?: boolean; signal?: AbortSignal },
 ): Promise<StdioFrame> {
   try {
     return await transport.nextFrameForSession(sessionId, context.timeout_ms, wait);

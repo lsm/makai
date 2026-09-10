@@ -274,7 +274,17 @@ export async function stopAgentWithSequenceProbe(
     });
     const frame = await Promise.race([read, budget]);
     if (budgetTimer !== undefined) clearTimeout(budgetTimer);
-    if (!frame) break;
+    if (!frame) {
+      // An empty per-read window is NOT a settled outcome: the outstanding
+      // stop's correlated rejection can take longer than one idle window to
+      // arrive (a briefly loaded child process or host event loop), and
+      // giving up after the FIRST silent window would skip the mandatory
+      // post-send retry — the accepted-message case then leaks the session
+      // and same-id starts fail agent_busy. Keep waiting within the
+      // remaining probe budget; only the budget itself bounds the probe
+      // (#210 gap 7).
+      continue;
+    }
     if (frame.in_reply_to !== outstanding.messageId) continue;
     if (frame.type === "agent_stopped") return outstanding.sequence;
     const code = correlatedRejectionCode(frame);
