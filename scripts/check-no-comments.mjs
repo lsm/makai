@@ -32,7 +32,7 @@ function git(args, cwd) {
 
 const TS_KEEP_PATTERNS = [
   /^#!/,
-  /^\/\/\/\s*</,
+  /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)\b/,
   /^(?:\/\/|\/\*+)[\s*]*@ts-(ignore|expect-error|nocheck|check)\b/,
   /^(?:\/\/|\/\*+)[\s*]*biome-ignore\b/,
   /^(?:\/\/|\/\*+)\s*eslint-/,
@@ -48,8 +48,12 @@ const DEFAULT_ALLOWLIST = fileURLToPath(new URL("no-comments-allowlist.txt", imp
 
 // ---------------------------------------------------------------------------
 // TypeScript: literal spans from the parser, then any `//` or `/*` outside
-// them is unambiguously a comment.
+// them is unambiguously a comment. Line comments end at any ECMAScript
+// line terminator (LF, CR, LS, PS) — a lone CR or LS terminates a comment
+// just like a newline, or write mode would eat the next line's code.
 // ---------------------------------------------------------------------------
+
+const TS_LINE_TERMINATOR = /[\n\r\u2028\u2029]/;
 
 function parse(text, fileName) {
   return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -93,7 +97,7 @@ function collectTsCommentRanges(text, fileName) {
     }
     if (text[i] === "/" && text[i + 1] === "/") {
       let j = i + 2;
-      while (j < n && text[j] !== "\n") j++;
+      while (j < n && !TS_LINE_TERMINATOR.test(text[j])) j++;
       if (!TS_KEEP_PATTERNS.some((p) => p.test(text.slice(i, j)))) ranges.push({ start: i, end: j });
       i = j;
       continue;
@@ -279,21 +283,33 @@ export function loadAllowlist(path) {
 // is new in this change and every entry is taken as given. The comparison
 // commit is the merge-base of HEAD and the --base revision (the PR base sha
 // or a push's pre-update sha, so additions anywhere in a multi-commit range
-// are caught), or HEAD^1 when --base is not given.
+// are caught). An --base that cannot resolve (force-pushed away, zero sha)
+// falls back to HEAD^1 rather than disabling the ratchet; only when no
+// comparison commit resolves at all is the result null.
 export function baseAllowlistEntries(allowlistPath, cwd, baseRev = null) {
   let root;
-  let base;
-  let rel;
   try {
     root = git(["rev-parse", "--show-toplevel"], cwd).trim();
-    base = baseRev
-      ? git(["merge-base", "HEAD", baseRev], cwd).trim()
-      : git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
-    rel = relative(root, resolve(cwd, allowlistPath));
   } catch {
     return null;
   }
+  const rel = relative(root, resolve(cwd, allowlistPath));
   if (rel.startsWith("..")) return null;
+  let base = null;
+  if (baseRev) {
+    try {
+      base = git(["merge-base", "HEAD", baseRev], cwd).trim();
+    } catch {
+      base = null;
+    }
+  }
+  if (!base) {
+    try {
+      base = git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
+    } catch {
+      return null;
+    }
+  }
   try {
     return parseAllowlist(git(["show", `${base}:${rel}`], cwd));
   } catch {

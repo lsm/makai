@@ -184,6 +184,17 @@ test("ts: a block comment spanning lines preserves a line terminator (ASI)", () 
   assert.equal(stripComments("foo(/*\n*/x)\n", "x.ts"), "foo(\nx)\n");
 });
 
+test("ts: line comments end at every ECMAScript line terminator, not just LF", () => {
+  const cr = "const a=1;//c\rconst b=2;\n";
+  assert.equal(tsCount(cr), 1);
+  const crOut = stripComments(cr, "x.ts");
+  assert.ok(crOut.includes("const b=2;"), crOut);
+  const ls = "const a=1;//c\u2028const b=2;\n";
+  assert.equal(tsCount(ls), 1);
+  const lsOut = stripComments(ls, "x.ts");
+  assert.ok(lsOut.includes("const b=2;"), lsOut);
+});
+
 test("ts: unclosed block comment refuses to lex", () => {
   assert.throws(() => stripComments("const a = 1 /* oops\nkeep()\n", "x.ts"), /never closed/);
 });
@@ -215,6 +226,7 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("// consider biome-ignore later\nconst a = 1\n"), 1);
   assert.equal(tsCount("// coverage uses v8 ignore below\nconst a = 1\n"), 1);
   assert.equal(tsCount("// we removed knip-ignore usage\nconst a = 1\n"), 1);
+  assert.equal(tsCount("/// <summary>documentation</summary>\nconst a = 1\n"), 1);
 });
 
 let workDir;
@@ -333,6 +345,34 @@ test("ratchet: --base catches additions hidden earlier in a multi-commit range",
   assert.equal(viaBase.status, 1, viaBase.stdout);
   assert.ok(viaBase.stdout.includes("allowlist addition not permitted"));
   assert.ok(viaBase.stdout.includes("sneaky.ts"));
+});
+
+test("ratchet: an unresolvable --base falls back to HEAD^1 instead of seeding freely", () => {
+  const repo = gitRepo("fallback-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.ts"), "// sdk\nconst a = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\ndirty.ts\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [
+      SCRIPT,
+      "--check",
+      "--base",
+      "0000000000000000000000000000000000000000",
+      "--allowlist",
+      "allowlist.txt",
+      "--files",
+      "dirty.zig",
+      "dirty.ts",
+    ],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("allowlist addition not permitted"));
+  assert.ok(run.stdout.includes("dirty.ts"));
 });
 
 function loadAllowlistFrom(paths) {
