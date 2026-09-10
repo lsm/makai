@@ -1011,13 +1011,18 @@ pub const AgentProtocolClient = struct {
         // the counter (§13.1), so a stale explicit stop sequence carries no
         // counter evidence — lowering the tracker to it would pin every
         // later ordinary send on an invalid value. Start/message rejections
-        // roll back to the counter the server RETAINED — the record's
-        // pre-send tracker, not the rejected send's own sequence: a forward
-        // explicit send (tracker 2, send at 999) leaves the server at 2
-        // when rejected, and the send's 999 would repeat the invalid
-        // counter forever (#210 gap 7).
+        // restore the counter the server RETAINED — the record's pre-send
+        // tracker, which already carries every floor established before the
+        // send. The CURRENT map value participates as a floor only when
+        // something OTHER than this send's own optimistic mirror produced
+        // it: a backward explicit send regressed the tracker to sequence+1,
+        // and min'ing that regression against the prior would pin the
+        // client below the server's known counter forever (a forward
+        // explicit send's 999-mirror has the same shape) (#210 gap 7).
         if (rejected.kind != .stop) {
-            const floor = @min(self.peekNextSequence(session_id), rejected.prior_tracker);
+            const current = self.peekNextSequence(session_id);
+            const base = if (current == rejected.sequence + 1) rejected.prior_tracker else current;
+            const floor = @min(base, rejected.prior_tracker);
             try self.next_sequence_by_session.put(session_id, floor);
         }
     }
@@ -3603,4 +3608,70 @@ test "AgentProtocolClient probe retries carry the caller's reason (#210 gap 7)" 
         try std.testing.expectEqualStrings("cancelled", stop.payload.agent_stop.reason.slice());
         current_stop_id = stop.message_id;
     }
+}
+
+test "AgentProtocolClient rejected backward explicit send restores the high-water (#210 gap 7)" {
+    // A settled session at 4; an explicit stale send at 2 regresses the
+    // tracker to 3 before the wire. Its rejection must restore the
+    // pre-send high-water: min'ing the send's own optimistic regression
+    // against the prior would pin the tracker at 3 while the server sits
+    // at 4, and every subsequent rejection would keep it there.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3, tracker 4
+    var first_settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 4,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer first_settled.deinit(allocator);
+    try client.processEnvelope(first_settled);
+    var second_settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 5,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer second_settled.deinit(allocator);
+    try client.processEnvelope(second_settled);
+    const stale_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":stale}", null, 2); // prior 4, tracker 3
+
+    var rejected = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stale_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejected.deinit(allocator);
+    try client.processEnvelope(rejected);
+
+    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid)); // high-water restored, not the regression
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null);
+    var next_env = try harness.envelopeAt(4); // start, m1, m2, stale, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
 }
