@@ -4198,7 +4198,7 @@ test "AgentProtocolClient an accepted start invalidates pre-reply sequence-1 mes
     const pending = client.pending_sends_by_session.getPtr(sid).?;
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the first A remains (broken, awaiting its own reply)
     _ = try client.sendAgentMessage(sid, "{\"m\":next}", null);
-    var next_env = try harness.envelopeAt(4); // start, A, retry, next
+    var next_env = try harness.envelopeAt(3); // start, A, retry, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), next_env.sequence);
 }
