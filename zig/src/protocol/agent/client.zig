@@ -2574,7 +2574,7 @@ test "AgentProtocolClient explicit-sequence sends carry the given value and roll
     var explicit_stop = try harness.envelopeAt(1);
     defer explicit_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), explicit_stop.sequence);
-    try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid));
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid)); // still the retained counter — stops never advance it
 }
 
 test "AgentProtocolClient explicit-sequence send failure restores the PRE-SEND tracker state (#210 gap 7)" {
