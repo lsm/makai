@@ -69,6 +69,21 @@ const PendingSend = struct {
     /// suppress duplicate answers for payloads that never executed
     /// (#210 gap 7).
     provenance_broken: bool = false,
+    /// Whether a same-sequence same-payload record was already pending
+    /// when this send was recorded — the send HAS same-payload ancestry,
+    /// even when a competing payload masked its retry bit to false. The
+    /// ancestry marker lets a later re-derivation mark the chain BROKEN
+    /// when that ancestry dies (a rejected or duplicate-retired earlier
+    /// copy), instead of mistaking the masked record for a fresh intact
+    /// source once the competitor is gone (#210 gap 7).
+    had_same_payload_ancestry: bool = false,
+    /// The session's proven floor when this send was recorded: a send at
+    /// a sequence BELOW the then-proven floor could never have been
+    /// admitted (the counter was already past it), so neither it nor any
+    /// earlier same-payload source still pending at its record time could
+    /// run or settle — the silent duplicate path is disqualified for such
+    /// records no matter what their retry bit says (#210 gap 7).
+    proven_floor_at_send: u64 = 0,
 };
 
 /// Computes a pending MESSAGE record's payload digest (see
@@ -192,9 +207,11 @@ pub const AgentProtocolClient = struct {
         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(PendingSend).empty;
         var resend_of_pending = false;
         var has_competing_payload = false;
+        var had_same_payload_ancestry = false;
         for (gop.value_ptr.items) |pending| {
             if (pending.kind != .message or pending.sequence != sequence) continue;
             if (pending.payload_hash == payload_hash) {
+                had_same_payload_ancestry = true;
                 if (!pending.provenance_broken) resend_of_pending = true;
             } else {
                 has_competing_payload = true;
@@ -208,7 +225,7 @@ pub const AgentProtocolClient = struct {
         // payload was admitted at the sequence), so the rejection must
         // surface instead of retiring silently (#210 gap 7).
         if (has_competing_payload) resend_of_pending = false;
-        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending });
+        try gop.value_ptr.append(self.allocator, .{ .msg_id = msg_id, .sequence = sequence, .kind = kind, .prior_tracker = prior_tracker, .payload_hash = payload_hash, .resend_of_pending = resend_of_pending, .had_same_payload_ancestry = had_same_payload_ancestry, .proven_floor_at_send = if (kind == .message) self.provenFloor(session_id) else 0 });
     }
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
@@ -579,8 +596,13 @@ pub const AgentProtocolClient = struct {
                             // at the sequence NOW — a competitor recorded
                             // after this send makes the duplicate answer
                             // ambiguous even though the recorded bit predates
-                            // it (#210 gap 7).
-                            if (entry.resend_of_pending and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
+                            // it — AND a sequence not already proven
+                            // consumed when the send was recorded: a send
+                            // below the then-proven floor could never be
+                            // admitted, so no same-payload source could run
+                            // or settle and the duplicate must surface
+                            // (#210 gap 7).
+                            if (entry.resend_of_pending and entry.proven_floor_at_send <= entry.sequence and !self.hasCompetingPayload(env.session_id, entry.sequence, entry.payload_hash)) return;
                             // The retired record was itself
                             // rejected-as-duplicate — it never ran — so its
                             // same-payload descendants' silent justification
@@ -796,7 +818,7 @@ pub const AgentProtocolClient = struct {
                     viable_source = true;
                 }
             }
-            if (pending.resend_of_pending and !viable_source) pending.provenance_broken = true;
+            if ((pending.resend_of_pending or pending.had_same_payload_ancestry) and !viable_source) pending.provenance_broken = true;
             pending.resend_of_pending = viable_source;
         }
     }
@@ -895,7 +917,19 @@ pub const AgentProtocolClient = struct {
             const existing_revert = self.stop_revert_bound_by_session.get(session_id);
             const revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
             self.stop_revert_bound_by_session.put(session_id, revert_bound) catch {};
-            if (self.peekNextSequence(session_id) == rejected.sequence) {
+            // The undo guard is OWNERSHIP, not value equality: a later
+            // send's optimistic mirror can coincidentally equal the stop's
+            // resync value (a message accepted at 6 mirrors the tracker to
+            // 7 just like a stop resynced to 7), and rewinding on the
+            // stop's rejection would destroy the accepted send's mirror.
+            // The resync is still ours only while NO other tracked send's
+            // mirror explains the current value (#210 gap 7).
+            var mirror_owner_pending = false;
+            for (list.items) |pending| {
+                if (pending.kind == .stop) continue;
+                if (pending.sequence + 1 == self.peekNextSequence(session_id)) mirror_owner_pending = true;
+            }
+            if (!mirror_owner_pending and self.peekNextSequence(session_id) == rejected.sequence) {
                 var pending_floor: u64 = revert_bound;
                 for (list.items) |pending| {
                     if (pending.kind == .message) {
@@ -3523,4 +3557,217 @@ test "AgentProtocolClient a non-retry duplicate retirement invalidates same-payl
     try std.testing.expect(client.isSessionComplete(sid));
     const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
     try std.testing.expectEqual(@as(usize, 0), remaining); // both resolved
+}
+
+test "AgentProtocolClient masked same-payload ancestry breaks with its source (#210 gap 7)" {
+    // At an already-consumed sequence: A, then competitor B, then two more
+    // A copies. A's duplicate retires A and surfaces; the A copies' retry
+    // bits were FALSE (the competitor masked them), so the cycle-9 rule
+    // alone would not mark them broken — and after B's duplicate retires
+    // the competitor, the first remaining copy would look like a fresh
+    // intact source for the second. The recorded ANCESTRY marker breaks
+    // both copies when A's duplicate proves the chain dead: the second
+    // copy's duplicate SURFACES — no A copy ever ran.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const first_a_id = try client.sendAgentMessage(sid, "{\"m\":A}", null); // seq 2 — consumed sequence
+    const competing_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":B}", null, 2); // the competitor
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // A copy 2 — masked
+    const third_a_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // A copy 3 — masked
+
+    var first_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = first_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = first_a_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer first_duplicate.deinit(allocator);
+    try client.processEnvelope(first_duplicate);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null); // A never executed
+    client.clearSessionTerminalState(sid);
+
+    var competing_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = competing_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = competing_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer competing_duplicate.deinit(allocator);
+    try client.processEnvelope(competing_duplicate);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null); // B never executed either
+    client.clearSessionTerminalState(sid);
+
+    var third_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = third_a_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = third_a_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer third_duplicate.deinit(allocator);
+    try client.processEnvelope(third_duplicate);
+
+    // No A copy ever ran — the third copy's duplicate SURFACES instead of
+    // silently confirming a masked "source" whose ancestry is dead.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only A copy 2 remains
+}
+
+test "AgentProtocolClient a rejected stop does not undo a later accepted send's equal-valued mirror (#210 gap 7)" {
+    // The server expects 6; an explicit stop resyncs the tracker to 7,
+    // then an explicit message AT THE CORRECT SEQUENCE 6 is accepted and
+    // mirrors the tracker to 7 — the same VALUE by a different owner.
+    // The stop's later gap rejection must not mistake that 7 for its own
+    // resync and rewind past the accepted send's mirror.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    for (0..4) |_| {
+        _ = try client.sendAgentMessage(sid, "{\"m\":fill}", null); // seqs 2..5
+        var settled = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 6,
+            .in_reply_to = null,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+        };
+        defer settled.deinit(allocator);
+        try client.processEnvelope(settled);
+    }
+    try std.testing.expectEqual(@as(u64, 6), client.peekNextSequence(sid)); // server expects 6
+
+    const stop_id = try client.sendAgentStopWithSequence(sid, "stale", 7); // resync: tracker 7, prior 6
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":at-six}", null, 6); // ACCEPTED, mirror 7
+
+    var stop_rejected = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer stop_rejected.deinit(allocator);
+    try client.processEnvelope(stop_rejected);
+
+    // The pending accepted message's mirror owns the 7 — no rewind.
+    try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid));
+
+    _ = try client.sendAgentMessage(sid, "{\"m\":next}", null);
+    var next_env = try harness.envelopeAt(7); // start, 4 fills, stop, at-six, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 7), next_env.sequence);
+}
+
+test "AgentProtocolClient retries at a sequence below the proven floor surface (#210 gap 7)" {
+    // Sequence 2 settled and established floor 3; payload A is then sent
+    // at 2 TWICE — both sends were provably never-admissible (the counter
+    // was already past 2). When the FIRST duplicate reply is lost and the
+    // retry's duplicate arrives, the recorded retry bit must not suppress
+    // it: no A send could execute, nothing will settle, and the caller
+    // must see the failure instead of waiting forever.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":settled}", null); // seq 2 — settles below
+    var settled = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settled.deinit(allocator);
+    try client.processEnvelope(settled); // floor 3: sequence 2 proven consumed
+
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // its duplicate reply is LOST
+    const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // recorded below the floor
+
+    var retry_duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = retry_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = retry_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer retry_duplicate.deinit(allocator);
+    try client.processEnvelope(retry_duplicate);
+
+    // Neither A send could have executed — the duplicate SURFACES.
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the first A send remains unresolved
 }
