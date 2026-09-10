@@ -4060,6 +4060,7 @@ test "AgentProtocolClient a retry of a source recorded before the floor keeps th
     };
     defer busy.deinit(allocator);
     try client.processEnvelope(busy); // parity 3: the floor rises past the retry's sequence
+    client.clearSessionTerminalState(sid); // the caller consumes the busy failure
 
     const retry_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":A}", null, 2); // retry — inherits the source's admissibility
     var retry_duplicate = agent_types.Envelope{
