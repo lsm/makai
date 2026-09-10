@@ -1304,8 +1304,13 @@ server eviction (rule 6), and holds no transcript and no persistence.
    stop carries the pre-send sequence, and while the outcome is unresolved the
    teardown stop IS the probe — the FLOOR state first (the minimum of the
    oldest unresolved send's sequence and the tracker's rolled-back value),
-   advancing on each correlated `invalid_request` rejection toward the
-   CEILING (the maximum of the tracker and one past the newest pending send).
+   advancing on each correlated wrong-counter rejection — `invalid_request`,
+   or the shared `nack` sequencing vocabulary `invalid_sequence` and
+   `duplicate_sequence` (a candidate the server already consumed, so its
+   expected counter is higher; `sequence_gap`, the candidate too high, stays
+   terminal because the ascending sweep cannot recover from too-high) —
+   toward the CEILING (the maximum of the tracker and one past the newest
+   pending send).
    The TypeScript SDK's single-message tracker spans exactly the two classic
    states (floor, floor+1); the Zig client, which tracks pipelined sends,
    sweeps every state in between — a second send accepted after the server

@@ -236,13 +236,23 @@ pub const AgentProtocolClient = struct {
             .payload = payload,
         });
         defer self.allocator.free(message_json_buf);
+        // The PRE-SEND tracker state, restored when the pending-send record
+        // cannot be allocated: an explicit sequence may legitimately differ
+        // from it (a recovery path that knows the server's counter), and
+        // leaving the caller-supplied value behind on a failure that reached
+        // no wire would poison the tracker — a fresh client that tried
+        // sequence 7 would send its next ordinary message at an invalid
+        // counter (#210 gap 7).
+        const prior_sequence = self.peekNextSequence(session_id);
+        const prior_mirror = self.sequence;
         try self.next_sequence_by_session.put(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
         self.recordPendingSend(session_id, msg_id, sequence, .message) catch |err| {
-            // Nothing reached the wire: restore the tracker so a retry of the
-            // same message reuses `sequence` instead of running ahead of the
-            // server (#210 gap 7).
-            self.next_sequence_by_session.put(session_id, sequence) catch {};
+            // Nothing reached the wire: restore the PRE-SEND state so the
+            // client is exactly as it was before the failed attempt (#210
+            // gap 7).
+            self.next_sequence_by_session.put(session_id, prior_sequence) catch {};
+            self.sequence = prior_mirror;
             return err;
         };
 
@@ -597,11 +607,17 @@ pub const AgentProtocolClient = struct {
     fn agentCodeFromNack(code: ?agent_types.ErrorCode) ?agent_types.AgentErrorCode {
         const c = code orelse return null;
         return switch (c) {
-            // The shared protocol's invalid_sequence is the same wrong-counter
-            // rejection the agent surface spells invalid_request — peers may
-            // answer a stop either way, so both drive the probe's retry and
-            // the tracker's rollback (#210 gap 7).
-            .invalid_request, .invalid_sequence => .invalid_request,
+            // The shared protocol's wrong-counter rejections —
+            // invalid_sequence, and duplicate_sequence (a candidate the
+            // server has already consumed, so its expected counter is
+            // HIGHER) — are the same evidence the agent surface spells
+            // invalid_request: peers may answer a stop any of these ways, and
+            // all of them drive the probe's retry and the tracker's rollback
+            // (#210 gap 7). sequence_gap is the opposite condition — the
+            // candidate is already too HIGH for the server's counter — and
+            // the ascending sweep cannot recover from it, so it stays
+            // terminal.
+            .invalid_request, .invalid_sequence, .duplicate_sequence => .invalid_request,
             else => null,
         };
     }
@@ -2315,4 +2331,129 @@ test "AgentProtocolClient explicit-sequence sends carry the given value and roll
     defer explicit_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), explicit_stop.sequence);
     try std.testing.expectEqual(@as(u64, 7), client.peekNextSequence(sid));
+}
+
+test "AgentProtocolClient explicit-sequence send failure restores the PRE-SEND tracker state (#210 gap 7)" {
+    // A recovery path may send an explicit sequence far from the tracker's
+    // value; when the pre-wire bookkeeping cannot be allocated, nothing
+    // reached the wire, so the client must end up exactly as before the
+    // attempt. Storing the CALLER-SUPPLIED value instead (the old rollback)
+    // left a fresh client's tracker at 7 while the server still expected 1 —
+    // every later ordinary send carried an invalid counter. Sweep every
+    // pre-wire allocation failure: each must leave the tracker at its
+    // pre-send state.
+    const allocator = std.testing.allocator;
+    const sid = agent_types.generateSessionId();
+    var exercised_failure = false;
+    for (0..8) |fail_index| {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        client.allocator = failing.allocator();
+        const sent = client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 7);
+        client.allocator = allocator;
+        if (sent) |_| continue else |_| {};
+        exercised_failure = true;
+        try std.testing.expectEqual(@as(usize, 0), harness.writes.items.len); // nothing on the wire
+        try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid)); // the PRE-send state
+    }
+    try std.testing.expect(exercised_failure); // the sweep actually hit the failure paths
+}
+
+test "AgentProtocolClient probing stop retries on a nack duplicate_sequence rejection and not on sequence_gap (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+
+    // duplicate_sequence: the probe candidate was already consumed, so the
+    // server's expected counter is HIGHER — the same wrong-counter evidence
+    // as invalid_sequence, and the sweep advances to the next candidate.
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = null,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+        const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+        const probe_stop_id = probe_result.?;
+
+        var nack_rejection = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = probe_stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .nack = .{
+                .rejected_id = probe_stop_id,
+                .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+                .error_code = .duplicate_sequence,
+            } },
+        };
+        defer nack_rejection.deinit(allocator);
+        try client.processEnvelope(nack_rejection);
+
+        try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len); // start, message, stop(2), stop(3)
+        var second_stop = try harness.envelopeAt(3);
+        defer second_stop.deinit(allocator);
+        try std.testing.expectEqual(@as(u64, 3), second_stop.sequence);
+    }
+
+    // sequence_gap: the candidate is already too HIGH for the server's
+    // counter — the ascending sweep cannot recover from too-high, so the
+    // probe retires without a retry.
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = null,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+        const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+        const probe_stop_id = probe_result.?;
+
+        var gap_rejection = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = probe_stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .nack = .{
+                .rejected_id = probe_stop_id,
+                .reason = OwnedSlice(u8).initBorrowed("sequence gap"),
+                .error_code = .sequence_gap,
+            } },
+        };
+        defer gap_rejection.deinit(allocator);
+        try client.processEnvelope(gap_rejection);
+
+        try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len); // no retry
+        try std.testing.expect(!client.stop_probes_by_session.contains(sid));
+    }
 }

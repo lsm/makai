@@ -1501,8 +1501,16 @@ pub const TuiRuntime = struct {
                 defer env.deinit(self.allocator);
                 if (env.version != 1) return;
                 client.processEnvelope(env) catch return;
-                self.syncRemoteSessionFromClient(client) catch return;
+                // Drain BEFORE the session sync: a terminal frame can clear
+                // the client's active identity (a correlated agent_not_found
+                // drops it with the session), and the sync then discards the
+                // session's state — including a just-recorded error — as
+                // orphaned. Surfacing the terminal state first lets the turn
+                // complete with that error while `remote_session_id` still
+                // names the session; the sync afterwards nulls the id so the
+                // next turn re-registers (#210 gap 7).
                 self.drainRemoteClientEvents(client) catch return;
+                self.syncRemoteSessionFromClient(client) catch return;
             },
             .pending => {},
             .disconnected => {
@@ -1525,8 +1533,12 @@ pub const TuiRuntime = struct {
                     defer env.deinit(self.allocator);
                     if (env.version != 1) return error.ProtocolVersionMismatch;
                     try client.processEnvelope(env);
-                    try self.syncRemoteSessionFromClient(client);
+                    // Drain before sync — same ordering as the teardown pump:
+                    // terminal state must surface while the session id still
+                    // names the session, before the sync discards state the
+                    // client identity no longer backs (#210 gap 7).
                     try self.drainRemoteClientEvents(client);
+                    try self.syncRemoteSessionFromClient(client);
                 },
                 .pending => return,
                 .disconnected => {
@@ -5120,6 +5132,51 @@ test "remote manual submit waits for terminal result after agent_end" {
     });
     _ = tui_session.streamEvents();
     try std.testing.expect(!runtime.remote_turn_in_flight);
+}
+
+test "remote correlated agent_not_found surfaces the error before the session state is dropped" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try tui_session.submitTurn("running");
+    try std.testing.expect(runtime.remote_turn_in_flight);
+
+    // The session vanishes server-side mid-turn: its rejection of the
+    // in-flight agent_message is a correlated agent_not_found, which clears
+    // the client's active identity with the session. The pump must surface
+    // the recorded error BEFORE the session sync discards the now-orphaned
+    // state — with sync first, the error was wiped before the drain could
+    // read it, the turn never completed, and every later submission reported
+    // AgentAlreadyStreaming.
+    const sid = runtime.remote_session_id.?;
+    var message_env = try agent_envelope.deserializeEnvelope(mock.writes.items[1], std.testing.allocator);
+    defer message_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = message_env.message_id,
+        .timestamp = 0,
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+    });
+    _ = tui_session.streamEvents();
+
+    try std.testing.expect(!runtime.remote_turn_in_flight);
+    try std.testing.expect(runtime.event_stream.isDone());
+    // The sync AFTER the drain drops the vanished registration so the next
+    // turn re-registers instead of messaging into the void.
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expectError(error.RemoteAgentStartFailed, tui_session.submitTurn("next"));
 }
 
 test "remote pumps terminal result without queued work" {
