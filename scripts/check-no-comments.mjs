@@ -37,7 +37,8 @@ const TS_KEEP_PATTERNS = [
   /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)\b/,
   /^(?:\/\/|\/\*+)[\s*]*@ts-(ignore|expect-error|nocheck|check)\b/,
   /^(?:\/\/|\/\*+)[\s*]*biome-ignore\b/,
-  /^(?:\/\/|\/\*+)\s*eslint-/,
+  /^(?:\/\/|\/\*+)[\s*]*eslint-(disable|enable)\b/,
+  /^\/\*+[\s*]*eslint-env\b/,
   /^(?:\/\/|\/\*+)[\s*]*oxlint-(disable|enable)\b/,
   /^(?:\/\/|\/\*+)[\s*]*@public\b/,
   /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore\b/,
@@ -87,6 +88,12 @@ function collectTsCommentRanges(text, fileName) {
   let spanIdx = 0;
   let i = 0;
   const n = text.length;
+  // The shebang line is a protected span: a `//` inside it (e.g. a Deno
+  // `--allow-net=https://…` flag) is not a comment, and keep-patterns can
+  // never see it anyway because matching starts at the `//`.
+  if (text.startsWith("#!")) {
+    while (i < n && !TS_LINE_TERMINATOR.test(text[i])) i++;
+  }
   while (i < n) {
     const span = spans[spanIdx];
     if (span && i >= span.end) {
@@ -362,13 +369,26 @@ export function ratchetViolation(allowlistPath, cwd, baseRev = null) {
   return null;
 }
 
+// A tracked file deleted from the working tree before staging (git
+// ls-files still lists it) is not dirty — skipping it lets the stale-entry
+// logic report its allowlist entry instead of crashing on ENOENT.
+function readIfExists(file) {
+  try {
+    return readFileSync(file, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
 export function checkFiles(files, allowlist, baseEntries = null) {
   const offending = [];
   const ratcheted = [];
   const stats = [];
   const dirty = new Set();
   for (const file of files) {
-    const text = readFileSync(file, "utf8");
+    const text = readIfExists(file);
+    if (text === null) continue;
     const count = findComments(text, file).length;
     if (count === 0) continue;
     dirty.add(file);
@@ -437,7 +457,8 @@ function main() {
   let removed = 0;
   let failed = false;
   for (const file of files) {
-    const text = readFileSync(file, "utf8");
+    const text = readIfExists(file);
+    if (text === null) continue;
     let out;
     try {
       out = stripComments(text, file);

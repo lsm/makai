@@ -207,11 +207,13 @@ test("ts: unclosed block comment refuses to lex", () => {
 test("ts: functional directives are exempt, lookalikes are not", () => {
   const kept = [
     "#!/usr/bin/env node\nconst a = 1\n",
+    "#!/usr/bin/env -S deno run --allow-net=https://example.com\nconst a = 1\n",
     '/// <reference types="node" />\nconst a = 1\n',
     "// @ts-expect-error malformed input\nconst a = 1\n",
     "/* @ts-ignore */\nconst a = 1\n",
     "// biome-ignore lint/suspicious/noExplicitAny: fixture\nconst a = 1\n",
     "// eslint-disable-next-line no-console\nconst a = 1\n",
+    "/* eslint-env browser, node */\nconst a = 1\n",
     "// oxlint-disable-next-line\nconst a = 1\n",
     "// @public\nconst a = 1\n",
     "// knip-ignore\nconst a = 1\n",
@@ -227,6 +229,7 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("// @ts-team notes\nconst a = 1\n"), 1);
   assert.equal(tsCount("// eslint is used by downstream consumers\nconst a = 1\n"), 1);
   assert.equal(tsCount("/* eslint enables linting */\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// eslint-plugin-react is not needed here\nconst a = 1\n"), 1);
   assert.equal(tsCount("// do not add @ts-ignore here\nconst a = 1\n"), 1);
   assert.equal(tsCount("// consider biome-ignore later\nconst a = 1\n"), 1);
   assert.equal(tsCount("// coverage uses v8 ignore below\nconst a = 1\n"), 1);
@@ -273,6 +276,19 @@ test("ratchet: allowlisted file that is clean or untracked is stale", () => {
   const result = checkFiles([dirtyZig, cleanZig], new Set([dirtyZig, cleanZig, staleEntry]));
   assert.deepEqual(result.offending, []);
   assert.deepEqual(result.stale.sort(), [cleanZig, staleEntry].sort());
+});
+
+test("ratchet: a tracked file deleted before staging is skipped, not crashed on", () => {
+  const { dirtyZig } = fixtures();
+  const deleted = join(workDir, "deleted-pending-stage.zig");
+  writeFileSync(deleted, "// carve\nconst x = 1;\n");
+  const result = checkFiles([dirtyZig, deleted], new Set([dirtyZig, deleted]));
+  rmSync(deleted);
+  const after = checkFiles([dirtyZig, deleted], new Set([dirtyZig, deleted]));
+  assert.deepEqual(result.offending, []);
+  assert.deepEqual(result.ratcheted.sort(), [deleted, dirtyZig].sort());
+  assert.deepEqual(after.offending, []);
+  assert.deepEqual(after.stale, [deleted]);
 });
 
 function gitRepo(name) {
