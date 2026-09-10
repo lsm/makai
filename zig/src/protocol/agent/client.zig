@@ -404,8 +404,8 @@ pub const AgentProtocolClient = struct {
         if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
             if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-                var list = entry.value;
-                list.deinit(self.allocator);
+                var pending_list = entry.value;
+                pending_list.deinit(self.allocator);
             }
             return;
         }
