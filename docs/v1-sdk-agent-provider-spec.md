@@ -1317,8 +1317,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
    — not a probe stop — the evidence is the opposite of a rejection: an
    earlier copy of that sequence was already admitted and the server's
    counter is past it, so the send's record retires as resolved while the
-   tracker keeps its optimistic value; the §13.1 rollback is reserved for
-   rejections that prove the counter did NOT advance.
+   tracker keeps its PRE-RESEND high-water — the duplicate answer only ever
+   proves the counter is past the sent value, never that it dropped below
+   anything, so an explicit resend at an older sequence must not leave its
+   regressed tracker behind; the §13.1 rollback is reserved for rejections
+   that prove the counter did NOT advance.
    The TypeScript SDK's single-message tracker spans exactly the two classic
    states (floor, floor+1); the Zig client, which tracks pipelined sends,
    sweeps every state in between — a second send accepted after the server
