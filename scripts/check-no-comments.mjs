@@ -14,25 +14,32 @@
 // `--check` is ratcheted by scripts/no-comments-allowlist.txt: files
 // seeded there pass while the gap-7 series lands; entries whose file is
 // clean or untracked are stale and fail, and entries absent from the
-// base revision (HEAD^1 — the seed itself excepted) are additions and
-// fail, so the list only shrinks.
+// base revision (--base's merge-base, else HEAD^1 — the seed itself
+// excepted) are additions and fail, so the list only shrinks.
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
+// All git invocations pass an argument array to execFileSync: a shell
+// never sees the pathspecs, so quoting works identically on posix and
+// Windows (cmd.exe would otherwise keep the single quotes).
+function git(args, cwd) {
+  return execFileSync("git", args, { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "pipe"] });
+}
+
 const TS_KEEP_PATTERNS = [
   /^#!/,
   /^\/\/\/\s*</,
-  /@ts-(ignore|expect-error|nocheck|check)\b/,
-  /biome-ignore/,
+  /^(?:\/\/|\/\*+)[\s*]*@ts-(ignore|expect-error|nocheck|check)\b/,
+  /^(?:\/\/|\/\*+)[\s*]*biome-ignore\b/,
   /^(?:\/\/|\/\*+)\s*eslint-/,
-  /oxlint-(disable|enable)/,
-  /@public\b/,
-  /(v8|istanbul|c8) ignore/,
-  /knip-ignore/,
+  /^(?:\/\/|\/\*+)[\s*]*oxlint-(disable|enable)\b/,
+  /^(?:\/\/|\/\*+)[\s*]*@public\b/,
+  /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore\b/,
+  /^(?:\/\/|\/\*+)[\s*]*knip-ignore\b/,
 ];
 
 const ZIG_KEEP_PATTERNS = [/^\/\/ zig fmt: (off|on)[ \t\r]*$/];
@@ -177,11 +184,11 @@ function expandRange(text, { start, end }) {
   const prefix = text.slice(lineStart, start);
   const suffix = text.slice(end, nlAfter);
   if (/^\s*$/.test(prefix) && /^\s*$/.test(suffix)) {
-    return { start: lineStart, end: Math.min(nlAfter + 1, text.length) };
+    return { start: lineStart, end: Math.min(nlAfter + 1, text.length), alone: true };
   }
   let e = end;
   while (e < text.length && (text[e] === " " || text[e] === "\t")) e++;
-  return { start, end: e };
+  return { start, end: e, alone: false };
 }
 
 function mergeRanges(ranges) {
@@ -191,6 +198,7 @@ function mergeRanges(ranges) {
     const last = merged[merged.length - 1];
     if (last && r.start <= last.end) {
       last.end = Math.max(last.end, r.end);
+      last.alone = last.alone && r.alone;
     } else {
       merged.push({ ...r });
     }
@@ -228,11 +236,19 @@ export function stripComments(text, fileName = "x.ts") {
   const removals = mergeRanges(comments.map((r) => expandRange(text, r)));
   let out = "";
   let cursor = 0;
-  for (const { start, end } of removals) {
+  for (const { start, end, alone } of removals) {
     out += text.slice(cursor, start);
-    // Removing a block comment that separates two identifier characters
-    // (e.g. `return/* c */value`) must leave a space, or the tokens join.
-    if (/\w$/.test(out) && /^\w/.test(text.slice(end))) out += " ";
+    // A removal must not change token separation. Comment-only lines are
+    // fully removed (`alone`) — surrounding newlines already separate the
+    // neighbors. Otherwise, when the removal would join two directly
+    // abutting non-whitespace characters (`return/*c*/value`,
+    // `a+/*c*/+b`), leave a space. A block comment spanning lines carries
+    // a line terminator for ASI purposes, so removing one inline leaves a
+    // newline (`return/*\n*/value` keeps `return\nvalue`).
+    if (!alone) {
+      if (text.slice(start, end).includes("\n")) out += "\n";
+      else if (/\S$/.test(out) && end < text.length && /\S/.test(text[end])) out += " ";
+    }
     cursor = end;
   }
   out += text.slice(cursor);
@@ -258,24 +274,28 @@ export function loadAllowlist(path) {
   return parseAllowlist(readFileSync(path, "utf8"));
 }
 
-// Entries of the allowlist as committed in the base revision (HEAD^1: the
-// base branch tip on a PR merge ref, the previous commit on main), or null
-// when no base, file, or repository is determinable — the seed case, where
-// the allowlist is new in this change and every entry is taken as given.
-export function baseAllowlistEntries(allowlistPath, cwd) {
+// Entries of the allowlist as committed in the base revision, or null when
+// no comparison point is determinable — the seed case, where the allowlist
+// is new in this change and every entry is taken as given. The comparison
+// commit is the merge-base of HEAD and the --base revision (the PR base sha
+// or a push's pre-update sha, so additions anywhere in a multi-commit range
+// are caught), or HEAD^1 when --base is not given.
+export function baseAllowlistEntries(allowlistPath, cwd, baseRev = null) {
   let root;
   let base;
   let rel;
   try {
-    root = execSync("git rev-parse --show-toplevel", { encoding: "utf8", cwd }).trim();
-    base = execSync("git rev-parse --verify HEAD^1", { encoding: "utf8", cwd }).trim();
+    root = git(["rev-parse", "--show-toplevel"], cwd).trim();
+    base = baseRev
+      ? git(["merge-base", "HEAD", baseRev], cwd).trim()
+      : git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
     rel = relative(root, resolve(cwd, allowlistPath));
   } catch {
     return null;
   }
   if (rel.startsWith("..")) return null;
   try {
-    return parseAllowlist(execSync(`git show ${base}:${rel}`, { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "pipe"] }));
+    return parseAllowlist(git(["show", `${base}:${rel}`], cwd));
   } catch {
     return null;
   }
@@ -310,7 +330,7 @@ function listFiles(args) {
     const end = rest.findIndex((a) => a.startsWith("--"));
     return rest.slice(0, end === -1 ? rest.length : end).filter(Boolean);
   }
-  return execSync("git ls-files '*.zig' '*.ts'", { encoding: "utf8" })
+  return git(["ls-files", "*.zig", "*.ts"])
     .split("\n")
     .map((f) => f.trim())
     .filter(Boolean);
@@ -322,11 +342,13 @@ function main() {
   const stats = args.includes("--stats");
   const allowlistIdx = args.indexOf("--allowlist");
   const allowlistPath = allowlistIdx !== -1 ? args[allowlistIdx + 1] : DEFAULT_ALLOWLIST;
+  const baseIdx = args.indexOf("--base");
+  const baseRev = baseIdx !== -1 ? args[baseIdx + 1] : null;
   const files = listFiles(args);
   const allowlist = loadAllowlist(allowlistPath);
 
   if (check) {
-    const result = checkFiles(files, allowlist, baseAllowlistEntries(allowlistPath, process.cwd()));
+    const result = checkFiles(files, allowlist, baseAllowlistEntries(allowlistPath, process.cwd(), baseRev));
     for (const file of result.offending) process.stdout.write(`comments remain: ${file}\n`);
     for (const path of result.stale) {
       process.stdout.write(`stale allowlist entry (clean or untracked): ${path}\n`);

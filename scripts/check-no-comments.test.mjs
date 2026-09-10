@@ -168,11 +168,20 @@ test("ts: comment trailing a block before a closing brace is stripped", () => {
   );
 });
 
-test("ts: removing a block comment between identifier characters keeps the tokens separated", () => {
+test("ts: removing a block comment between tokens keeps them separated", () => {
   assert.equal(stripComments("return/* note */value\n", "x.ts"), "return value\n");
   assert.equal(stripComments("const/*c*/x = 1\n", "x.ts"), "const x = 1\n");
-  assert.equal(stripComments("return/* multi\nline */value\n", "x.ts"), "return value\n");
+  assert.equal(stripComments("a+/*c*/+b\n", "x.ts"), "a+ +b\n");
+  assert.equal(stripComments("let x/*c*/=1\n", "x.ts"), "let x =1\n");
   assert.equal(stripComments("const a = 1 /* c */ + 2\n", "x.ts"), "const a = 1 + 2\n");
+});
+
+test("ts: a block comment spanning lines preserves a line terminator (ASI)", () => {
+  // A MultiLineComment containing a line terminator counts as one for
+  // automatic semicolon insertion, so the newline must survive stripping.
+  assert.equal(stripComments("return/* multi\nline */value\n", "x.ts"), "return\nvalue\n");
+  assert.equal(stripComments("return /*\n*/value\n", "x.ts"), "return\nvalue\n");
+  assert.equal(stripComments("foo(/*\n*/x)\n", "x.ts"), "foo(\nx)\n");
 });
 
 test("ts: unclosed block comment refuses to lex", () => {
@@ -202,6 +211,10 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("// @ts-team notes\nconst a = 1\n"), 1);
   assert.equal(tsCount("// eslint is used by downstream consumers\nconst a = 1\n"), 1);
   assert.equal(tsCount("/* eslint enables linting */\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// do not add @ts-ignore here\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// consider biome-ignore later\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// coverage uses v8 ignore below\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// we removed knip-ignore usage\nconst a = 1\n"), 1);
 });
 
 let workDir;
@@ -290,6 +303,36 @@ test("ratchet: allowlist entries absent from the base revision are rejected addi
   assert.ok(run.stdout.includes("allowlist addition not permitted"));
   assert.ok(run.stdout.includes("dirty.ts"));
   assert.ok(run.stdout.includes("added entries: 1"));
+});
+
+test("ratchet: --base catches additions hidden earlier in a multi-commit range", () => {
+  const repo = gitRepo("range-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  const rootSha = execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+  writeFileSync(join(repo, "sneaky.ts"), "// mid-range\nconst a = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\nsneaky.ts\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 2;\n");
+  gitCommit(repo);
+  const args = [
+    SCRIPT,
+    "--check",
+    "--allowlist",
+    "allowlist.txt",
+    "--files",
+    "dirty.zig",
+    "sneaky.ts",
+  ];
+  const viaParent = spawnSync(process.execPath, args, { cwd: repo });
+  assert.equal(viaParent.status, 0, viaParent.stdout);
+  const viaBase = spawnSync(process.execPath, [...args.slice(0, 2), "--base", rootSha, ...args.slice(2)], {
+    cwd: repo,
+  });
+  assert.equal(viaBase.status, 1, viaBase.stdout);
+  assert.ok(viaBase.stdout.includes("allowlist addition not permitted"));
+  assert.ok(viaBase.stdout.includes("sneaky.ts"));
 });
 
 function loadAllowlistFrom(paths) {
