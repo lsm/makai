@@ -1312,12 +1312,16 @@ server eviction (rule 6), and holds no transcript and no persistence.
    `duplicate_sequence` (a candidate the server already consumed, so its
    expected counter is higher; `sequence_gap`, the candidate too high, stays
    terminal because the ascending sweep cannot recover from too-high) —
-   toward the CEILING (the maximum of the tracker and one past the newest
-   pending send). For an ordinary tracked send answered `duplicate_sequence`
+   toward the CEILING (the maximum of the tracker, one past the newest
+   pending send, and the pre-resend high-water the pending records carry —
+   an explicit resend at an older sequence leaves the pre-resend value a
+   reachable server state). For an ordinary tracked send answered `duplicate_sequence`
    — not a probe stop — the evidence is the opposite of a rejection: an
    earlier copy of that sequence was already admitted and the server's
    counter is past it, so the send's record retires as resolved while the
-   tracker keeps its PRE-RESEND high-water — the duplicate answer only ever
+   tracker keeps its PRE-RESEND high-water — the maximum across the tracker
+   and every pending record's pre-send value, since overlapping resends
+   chain-regress their own snapshots — the duplicate answer only ever
    proves the counter is past the sent value, never that it dropped below
    anything, so an explicit resend at an older sequence must not leave its
    regressed tracker behind; the §13.1 rollback is reserved for rejections

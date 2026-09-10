@@ -357,7 +357,15 @@ pub const AgentProtocolClient = struct {
         }
         const entry_sequence = oldest_message_sequence orelse return null;
         const pre_send = @min(entry_sequence, self.peekNextSequence(session_id));
-        const ceiling = @max(self.peekNextSequence(session_id), newest_message_sequence + 1);
+        // The ceiling also spans every pending record's PRE-RESEND
+        // high-water: an explicit resend at an older sequence regresses the
+        // tracker, and the value it held before that regression remains a
+        // REACHABLE server state — a resend@2 whose originals settled with
+        // the server at 4 spans 2..4, not 2..3 (#210 gap 7).
+        var ceiling = @max(self.peekNextSequence(session_id), newest_message_sequence + 1);
+        for (list.items) |pending| {
+            ceiling = @max(ceiling, pending.prior_tracker);
+        }
 
         // Pre-wire phase — every failure here happens with NOTHING on the
         // wire, so nothing is registered and the caller sees a clean error:
@@ -620,14 +628,22 @@ pub const AgentProtocolClient = struct {
                                 // high-water. The duplicate answer only ever
                                 // proves the server is PAST the sent value —
                                 // never that it moved below anything — so the
-                                // tracker may not end under the value it held
-                                // before the send: an explicit resend at an
-                                // older sequence regressed it to sequence+1,
-                                // and keeping that regression would pin every
-                                // later ordinary send on an already-consumed
-                                // counter (#210 gap 7).
+                                // tracker may not end under any value it held
+                                // before a send. Overlapping resends
+                                // chain-regress their own prior snapshots
+                                // (each records the already-lowered tracker),
+                                // so the restore takes the maximum across the
+                                // tracker, the retiring record's pre-send
+                                // value, and every remaining pending record's
+                                // — the true high-water survives in the
+                                // still-pending records (#210 gap 7).
                                 self.retirePendingSend(env.session_id, env.in_reply_to);
-                                const high_water = @max(self.peekNextSequence(env.session_id), entry.prior_tracker);
+                                var high_water = @max(self.peekNextSequence(env.session_id), entry.prior_tracker);
+                                if (self.pending_sends_by_session.getPtr(env.session_id)) |list| {
+                                    for (list.items) |pending| {
+                                        high_water = @max(high_water, pending.prior_tracker);
+                                    }
+                                }
                                 try self.next_sequence_by_session.put(env.session_id, high_water);
                                 return;
                             }
@@ -2815,4 +2831,159 @@ test "AgentProtocolClient duplicate_sequence nack restores the pre-resend high-w
     var next_env = try harness.envelopeAt(4); // start, m1, m2, resend, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
+}
+
+test "AgentProtocolClient duplicate_sequence nack restores the high-water across overlapping resends (#210 gap 7)" {
+    // Overlapping explicit resends chain-regress their prior snapshots:
+    // with the client and server at 4, a resend at 2 records prior 4 and
+    // lowers the tracker to 3; a second resend then records the
+    // ALREADY-lowered 3 as its prior. Its duplicate answer must still
+    // restore 4 — the true high-water survives in the first resend's
+    // still-pending record.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3 — accepted, tracker 4
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // prior 4, tracker 3
+    const second_resend_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // prior 3 (regressed)
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = second_resend_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = second_resend_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    try std.testing.expectEqual(@as(u64, 4), client.peekNextSequence(sid)); // the FIRST resend's prior carries the high-water
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 3), pending.items.len); // m1, m2, and the first resend remain
+
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null);
+    var next_env = try harness.envelopeAt(5); // start, m1, m2, resend, resend2, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), next_env.sequence);
+}
+
+test "AgentProtocolClient probing stop ceiling spans the pre-resend high-water (#210 gap 7)" {
+    // Sends 2 and 3 were accepted and settled (server at 4, tracker 4); an
+    // explicit resend at 2 with an UNKNOWN outcome regresses the tracker to
+    // 3. The reachable server states include the pre-resend 4 — a ceiling
+    // without the pending record's prior would sweep only 2..3 and retire
+    // with the session still registered.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 3, tracker 4
+    // Settle both runs so the pending list is empty before the resend.
+    var first_result = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 4,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer first_result.deinit(allocator);
+    try client.processEnvelope(first_result);
+    var second_result = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 5,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer second_result.deinit(allocator);
+    try client.processEnvelope(second_result);
+    try std.testing.expectEqual(@as(usize, 0), client.pending_sends_by_session.getPtr(sid).?.items.len);
+
+    // The explicit resend at 2 regresses the tracker to 3; its outcome is
+    // unknown (the write's reply never arrives in this test).
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // prior 4, tracker 3
+
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    const probe_stop_id = probe_result.?;
+    var stop1 = try harness.envelopeAt(4); // start, m1, m2, resend, floor stop
+    defer stop1.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), stop1.sequence);
+
+    // Each correlated invalid_request advances the sweep: 2 → 3 → 4, where
+    // the live server actually sits (the prior-derived ceiling).
+    var current_stop_id = probe_stop_id;
+    var expected_sequence: u64 = 3;
+    var write_index: usize = 5;
+    while (expected_sequence <= 4) : ({
+        expected_sequence += 1;
+        write_index += 1;
+    }) {
+        var rejection = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = current_stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+        };
+        defer rejection.deinit(allocator);
+        try client.processEnvelope(rejection);
+        var next_stop = try harness.envelopeAt(write_index);
+        defer next_stop.deinit(allocator);
+        try std.testing.expectEqual(expected_sequence, next_stop.sequence);
+        current_stop_id = next_stop.message_id;
+    }
+
+    // The ceiling bounds the sweep: stop(4) carried the ceiling, so its
+    // rejection retires the probe — no fifth write.
+    var ceiling_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = current_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer ceiling_rejection.deinit(allocator);
+    try client.processEnvelope(ceiling_rejection);
+    try std.testing.expectEqual(@as(usize, 7), harness.writes.items.len); // start, m1, m2, resend, stop(2), stop(3), stop(4)
+    try std.testing.expect(!client.stop_probes_by_session.contains(sid));
 }
