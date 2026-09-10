@@ -993,11 +993,19 @@ Rules:
   for the re-registration. A settlement retires the settled run's own
   message record (the oldest pending message), keeping a long-lived
   session's records bounded by its unresolved sends rather than its
-  history. Slices to follow in the series: explicit-sequence
-  sends with duplicate-evidence handling, the pending-record lifecycle and
-  stale-reply guards, the bounded stop probe for unknown outcomes, and the
-  TUI teardown integration (`[in progress — #210 gap 7 re-sliced from
-  #213]`).
+  history. Explicit-sequence sends `[current — #210 gap 7]`:
+  `sendAgentMessageWithSequence` carries a caller-supplied counter value
+  (recovery paths that know the server's state are not forced to guess);
+  the tracker mirrors it optimistically but restores its PRE-SEND state
+  when the pre-wire bookkeeping fails (nothing reached the wire),
+  `maxInt(u64)` is rejected before any mutation, and a correlated
+  rejection restores the record's pre-send tracker rather than the send's
+  own optimistic regression (a backward explicit send's regression must
+  not pin the tracker below the server). Slices to follow in the series:
+  duplicate-evidence handling for `duplicate_sequence` answers, the
+  pending-record lifecycle and stale-reply guards, the bounded stop probe
+  for unknown outcomes, and the TUI teardown integration
+  (`[in progress — #210 gap 7 re-sliced from #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
