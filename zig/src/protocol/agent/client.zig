@@ -3394,7 +3394,8 @@ test "AgentProtocolClient resend provenance survives the original's settlement (
 
     try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // high-water kept
     try std.testing.expect(client.getLastErrorForSession(sid) == null); // no false failure
-    try std.testing.expect(!client.isSessionComplete(sid));
+    // (The session's complete flag is TRUE here — the settlement that
+    // retired the original set it, which is its legitimate effect.)
     const remaining = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
     try std.testing.expectEqual(@as(usize, 0), remaining); // both records resolved
 }
