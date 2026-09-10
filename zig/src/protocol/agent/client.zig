@@ -1076,12 +1076,12 @@ pub const AgentProtocolClient = struct {
         // pending send, while the refuted resync still holds the tracker
         // (#210 gap 7).
         const stop_resync = rejected.kind == .stop and rejected.prior_tracker != rejected.sequence;
-        var revert_bound: u64 = 0;
+        var rejected_revert_bound: u64 = 0;
         if (stop_resync) {
             const prior_bound = rejected.prior_tracker;
             const existing_revert = self.stop_revert_bound_by_session.get(session_id);
-            revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
-            try self.stop_revert_bound_by_session.put(session_id, revert_bound);
+            rejected_revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
+            try self.stop_revert_bound_by_session.put(session_id, rejected_revert_bound);
         }
         _ = list.orderedRemove(index);
         // A rejected MESSAGE may have been the SOURCE of other records'
@@ -1143,7 +1143,7 @@ pub const AgentProtocolClient = struct {
                 if (pending.sequence + 1 == self.peekNextSequence(session_id)) mirror_owner_pending = true;
             }
             if (!mirror_owner_pending and self.peekNextSequence(session_id) == rejected.sequence) {
-                var pending_floor: u64 = revert_bound;
+                var pending_floor: u64 = rejected_revert_bound;
                 for (list.items) |pending| {
                     if (pending.kind == .message) {
                         pending_floor = @min(pending_floor, @min(pending.sequence, pending.prior_tracker));
