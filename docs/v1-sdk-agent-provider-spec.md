@@ -1001,10 +1001,10 @@ Rules:
   caller-supplied value without advancing past it, and its correlated
   rejection undoes the resync — when the tracker still holds the stop's
   value (a pending mirror counts as the owner of that value only while
-  it is LIVE: a reconciliation that rewrote the tracker after the send
-  — a rejection floor, a busy parity, a restore — superseded the
-  mirror, so ownership follows send/reconciliation ordering, not value
-  equality) — to the pre-resync tracker CAPPED by the still-pending messages'
+  it is LIVE — its own write was the LAST tracker write of any kind:
+  another send's mirror or resync, or a reconciliation's floor or
+  restore, supersedes it, so ownership follows write ordering, never
+  value equality) — to the pre-resync tracker CAPPED by the still-pending messages'
   floor (the pre-resync value may itself be an unresolved send's
   optimistic mirror), max the proven floor (below); wherever the undo is
   skipped, a tracker sitting below the proven floor (a stop's own
@@ -1047,12 +1047,15 @@ Rules:
   silently with the tracker restored to `sequence + 1` MAX the session's
   proven floor (see below), while a
   mismatched payload, a competing different-payload record at the
-  sequence, a non-retry MESSAGE, or a send whose sequence was already
-  proven consumed when it was recorded (a send below the then-proven
-  floor could never have been admitted, so no same-payload source could
-  run or settle — the duplicate must surface however the retry bit
-  reads, unless a SETTLED source demonstrably ran the payload there,
-  which outranks the floor heuristic) keeps the proven step
+  sequence, a non-retry MESSAGE, or an ancestry that was never
+  admissible — every same-payload copy was sent below an
+  already-proven floor, so nothing could have run or settled and the
+  duplicate must surface however the retry bit reads (the check judges
+  the SOURCE's send-time floor, min-inherited down the retry chain: a
+  retry recorded after the floor rose past the sequence keeps the
+  silent path while its source predates the floor, and a SETTLED
+  source demonstrably ran the payload there, outranking the floor
+  heuristic) keeps the proven step
   (`sequence + 1`)
   and SURFACES through the error bookkeeping — nothing of that envelope
   will ever settle; a START duplicate runs the ordinary rejection
@@ -1101,7 +1104,12 @@ Rules:
   proven; optimistic mirrors from unresolved sends never participate —
   an unresolved stop's resync is caller-asserted, and message-rejection
   floors carry the stop's PRE-RESEND prior so the caller's value cannot
-  be laundered into the floor through later snapshots). A higher true
+  be laundered into the floor through later snapshots). Recording a
+  floor propagates allocation failures — a bound is never silently
+  dropped once its envelope has been accepted for processing, since a
+  forgotten floor can wedge the tracker on a consumed sequence; the
+  tracker's own rise to the floor stays best-effort, healing through
+  duplicate evidence. A higher true
   counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
