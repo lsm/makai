@@ -2027,12 +2027,12 @@ test "AgentProtocolClient uncorrelated agent_error keeps the pending send for th
     const client = &harness.client;
 
     const sid = agent_types.generateSessionId();
-    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
     var started_env = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .in_reply_to = null,
+        .in_reply_to = start_id,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_started = .{ .session_id = sid } },
     };
