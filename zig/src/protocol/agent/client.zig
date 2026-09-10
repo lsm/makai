@@ -2384,7 +2384,7 @@ test "AgentProtocolClient explicit-sequence send failure restores the PRE-SEND t
         client.allocator = failing.allocator();
         const sent = client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 7);
         client.allocator = allocator;
-        const failed = if (sent) false else |_| true;
+        const failed = if (sent) |_| false else |_| true;
         if (!failed) continue;
         exercised_failure = true;
         try std.testing.expectEqual(@as(usize, 0), harness.writes.items.len); // nothing on the wire
