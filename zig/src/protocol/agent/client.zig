@@ -461,6 +461,14 @@ pub const AgentProtocolClient = struct {
                 // round-trip is the price of that ambiguity (#210 gap 7).
             },
             .agent_result => |json| {
+                // Reconcile the CONSUMED frame BEFORE the fallible
+                // bookkeeping (the same rule as the agent_error arm): a
+                // settlement retires the settled run's own send even when
+                // the result copy or the session-scoped diagnostics cannot
+                // be allocated — the envelope is already consumed, so a
+                // stale pending entry would survive and bracket a LATER
+                // lost-output probe from the wrong floor (#210 gap 7).
+                self.retireSettledPendingSends(env.session_id);
                 // Allocate the replacement BEFORE releasing the previous
                 // value (same ordering rule as the error arms): a failed
                 // dupe must not leave last_result_json undefined.
@@ -468,10 +476,6 @@ pub const AgentProtocolClient = struct {
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(result_copy);
                 try self.setSessionResult(env.session_id, json);
-                // A settlement resolves every send recorded before the
-                // settled run; the newest pending send may be a later,
-                // still-unresolved one and is retained (#210 gap 7).
-                self.retireSettledPendingSends(env.session_id);
             },
             .agent_error => |e| {
                 // Probe-control replies are consumed BEFORE terminal
@@ -1465,6 +1469,57 @@ test "AgentProtocolClient probing stop honors the rolled-back floor when a rejec
     var second_stop = try harness.envelopeAt(5);
     defer second_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 4), second_stop.sequence); // floor + 1
+}
+
+test "AgentProtocolClient settlement retires the pending send even when the result bookkeeping allocation fails (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — accepted, settles
+
+    // The settlement's result-copy allocation fails: the envelope is already
+    // consumed, but the tracker must still retire the settled send — the
+    // stale entry would bracket a LATER lost-output probe from the wrong
+    // floor (2/3 while the server expects 4 after the next acceptance).
+    var result_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer result_env.deinit(allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    client.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, client.processEnvelope(result_env));
+    client.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), client.pending_sends_by_session.getPtr(sid).?.items.len);
+
+    // The next message is accepted (server now expects 4) and its output is
+    // lost: the probe brackets from the CURRENT entry's pair, not the stale
+    // settled one.
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // tracker 3
+    const probe_result = try client.sendAgentStopProbing(sid, "timeout");
+    try std.testing.expect(probe_result != null);
+    var first_stop = try harness.envelopeAt(3); // start, m1, m2, stop
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), first_stop.sequence);
 }
 
 test "AgentProtocolClient session terminal-state updates keep the previous value when the replacement allocation fails (#210 gap 7)" {
