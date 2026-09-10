@@ -135,7 +135,8 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    dropped); the outgoing-sequence counter update is no longer swallowed
    (no duplicate wire sequences); and a stop's reply fields are built
    BEFORE the session removal, with run cancellation + tool-bridge cleanup
-   running even when the reply's own publication fails. LANDED (#210
+   running even when the reply's own publication fails. LANDED for the zig
+   client here, PENDING #215 for the TS SDK (#210
    gap 7): client sequence control in BOTH clients — split across two PRs at
    review time (TS SDK half in #215; zig `AgentProtocolClient` + TUI half
    here, byte-identical to the tree both PRs reviewed before the split) — the
@@ -162,9 +163,13 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    send AND an observed `agent_started` for the registration, else it sends
    NOTHING: without admission evidence a stop at the tracker's value would
    destroy a foreign owner's fresh session, §6.1). The TS SDK's tracker
-   (`ActiveAgentSession`) marks the `agent_message` send unresolved at send,
+   (`ActiveAgentSession`; pending #215) marks the `agent_message` send
+   unresolved at send,
    rolls back to the pre-send sequence on a correlated rejection, confirms
-   the advanced counter on the first run output, and — while the outcome is
+   the advanced counter on the first run output — an uncorrelated
+   `agent_error` frame excepted (the wire twin of an admission failure's
+   unscoped runtime error, §13.4.1, it keeps the outcome unresolved for the
+   probe) — and — while the outcome is
    unresolved — tears down with the same bounded probe
    (`stopAgentWithSequenceProbe`: pre-send stop, one
    correlated-`invalid_request` retry at the post-send value with
