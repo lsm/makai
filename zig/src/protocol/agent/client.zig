@@ -2058,7 +2058,7 @@ test "AgentProtocolClient uncorrelated agent_error keeps the pending send for th
     try std.testing.expectEqual(@as(usize, 1), pending.items.len);
     const probe_result = try client.sendAgentStopProbing(sid, "timeout");
     try std.testing.expect(probe_result != null);
-    var first_stop = try harness.envelopeAt(3); // start, message, floor stop
+    var first_stop = try harness.envelopeAt(2); // start(0), message(1), floor stop(2)
     defer first_stop.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 2), first_stop.sequence);
 }
