@@ -1000,9 +1000,15 @@ Rules:
   for the re-registration. An explicit STOP RESYNCS the tracker to its
   caller-supplied value without advancing past it, and its correlated
   rejection undoes the resync — when the tracker still holds the stop's
-  value — to the pre-resync tracker CAPPED by the still-pending messages'
+  value (a pending mirror counts as the owner of that value only while
+  it is LIVE: a reconciliation that rewrote the tracker after the send
+  — a rejection floor, a busy parity, a restore — superseded the
+  mirror, so ownership follows send/reconciliation ordering, not value
+  equality) — to the pre-resync tracker CAPPED by the still-pending messages'
   floor (the pre-resync value may itself be an unresolved send's
-  optimistic mirror), max the proven floor (below). A settlement retires
+  optimistic mirror), max the proven floor (below); wherever the undo is
+  skipped, a tracker sitting below the proven floor (a stop's own
+  duplicate_sequence step included) is still raised to it. A settlement retires
   the settled run's own message record (the oldest pending message),
   keeping a long-lived session's records bounded by its unresolved sends
   rather than its history; the settlement also raises the proven floor to
