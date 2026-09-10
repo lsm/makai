@@ -1310,7 +1310,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
    expected counter is higher; `sequence_gap`, the candidate too high, stays
    terminal because the ascending sweep cannot recover from too-high) —
    toward the CEILING (the maximum of the tracker and one past the newest
-   pending send).
+   pending send). For an ordinary tracked send answered `duplicate_sequence`
+   — not a probe stop — the evidence is the opposite of a rejection: an
+   earlier copy of that sequence was already admitted and the server's
+   counter is past it, so the send's record retires as resolved while the
+   tracker keeps its optimistic value; the §13.1 rollback is reserved for
+   rejections that prove the counter did NOT advance.
    The TypeScript SDK's single-message tracker spans exactly the two classic
    states (floor, floor+1); the Zig client, which tracks pipelined sends,
    sweeps every state in between — a second send accepted after the server

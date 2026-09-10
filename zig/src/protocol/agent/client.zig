@@ -568,6 +568,23 @@ pub const AgentProtocolClient = struct {
                 // (#210 gap 7).
                 if (!try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) {
                     if (!self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
+                    // A duplicate_sequence answer is the one wrong-counter
+                    // code that PROVES the server's counter is past the sent
+                    // sequence (the provider surface answers it only when
+                    // received < expected — an earlier copy of this sequence
+                    // was already admitted). The ordinary §13.1 rollback to
+                    // the rejected send's own sequence would pin every later
+                    // send on an already-consumed counter, so instead the
+                    // outcome is treated as KNOWN — no new admission from
+                    // this send: the pending record retires, the tracker
+                    // keeps its optimistic value, and no session error is
+                    // recorded (the admitted copy's run may still be live)
+                    // (#210 gap 7).
+                    const duplicate_admitted = if (n.error_code) |code| code == .duplicate_sequence else false;
+                    if (duplicate_admitted) {
+                        self.retirePendingSend(env.session_id, env.in_reply_to);
+                        return;
+                    }
                     // Rollback first, then fallible bookkeeping (see the
                     // agent_error arm).
                     try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
@@ -686,6 +703,13 @@ pub const AgentProtocolClient = struct {
             });
             self.writeEnvelopeJson(second_json) catch {};
         } else if (session_gone) {
+            // Mirror the correlated-rejection not_found branch: the ACTIVE
+            // IDENTITY clears too — a direct caller retaining it would keep
+            // sending messages to a session the peer has confirmed is gone
+            // instead of starting a replacement (#210 gap 7).
+            if (self.session_id) |active| {
+                if (std.mem.eql(u8, active[0..], session_id[0..])) self.session_id = null;
+            }
             _ = self.next_sequence_by_session.remove(session_id);
             self.clearSessionControlState(session_id);
             try self.session_complete_flags.put(session_id, true);
@@ -1259,6 +1283,9 @@ test "AgentProtocolClient probing stop is bounded: no retry on a non-invalid_req
     // re-registration of the id must start its next start at sequence 1.
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    // The ACTIVE IDENTITY drops with it — a caller that kept it would keep
+    // messaging the session the peer just confirmed is gone.
+    try std.testing.expect(client.session_id == null);
 }
 
 test "AgentProtocolClient probing stop requires a message send: a start-only outcome sends NOTHING (#210 gap 7)" {
@@ -1919,6 +1946,9 @@ test "AgentProtocolClient probing stop consumes the retry's own rejection and ma
     try std.testing.expect(client.isSessionComplete(sid));
     try std.testing.expect(client.getLastErrorForSession(sid) == null);
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    // The ACTIVE IDENTITY drops with the vanished session here too (the
+    // probe's own not_found reply).
+    try std.testing.expect(client.session_id == null);
 }
 
 test "AgentProtocolClient correlated agent_not_found clears state only for a request of the current registration (#210 gap 7)" {
@@ -2457,4 +2487,63 @@ test "AgentProtocolClient probing stop retries on a nack duplicate_sequence reje
         try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len); // no retry
         try std.testing.expect(!client.stop_probes_by_session.contains(sid));
     }
+}
+
+test "AgentProtocolClient tracked-send duplicate_sequence nack retires the record without a rollback (#210 gap 7)" {
+    // Sequence 2 was admitted with its reply lost; the recovery resends
+    // sequence 2 explicitly and the peer answers duplicate_sequence — proof
+    // the server's counter is PAST 2. The ordinary §13.1 rollback would pin
+    // every later send on the consumed counter; instead the resend's record
+    // retires (its outcome is known — no new admission) and the tracker
+    // keeps the optimistic value.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2 — reply lost
+    const resend_id = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 2); // recovery resend
+
+    var duplicate = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = resend_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = resend_id,
+            .reason = OwnedSlice(u8).initBorrowed("duplicate sequence"),
+            .error_code = .duplicate_sequence,
+        } },
+    };
+    defer duplicate.deinit(allocator);
+    try client.processEnvelope(duplicate);
+
+    // No rollback to the consumed 2, no false session failure, and the
+    // resend's record retired while the original's stays for a later probe.
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    const pending = client.pending_sends_by_session.getPtr(sid).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len);
+
+    // The next ordinary send continues PAST the consumed sequence instead of
+    // replaying it as a duplicate.
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null);
+    var next_env = try harness.envelopeAt(3); // start, m1, resend, next
+    defer next_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), next_env.sequence);
 }

@@ -1620,7 +1620,22 @@ pub const TuiRuntime = struct {
                 // recovery performs: the probe below needs the old
                 // registration's pending-send evidence intact.
                 self.clearWebSocketRemote();
-                try self.reconnectWebSocketRemote();
+                self.reconnectWebSocketRemote() catch {
+                    // The reconnect failed AFTER the old socket was
+                    // destroyed: the client's sender still points into the
+                    // freed WebSocketClient, and a later send — the automatic
+                    // stop from stop()/deinit() included — would call that
+                    // dangling context. Defang the sender (every send now
+                    // fails safely before the wire) and drop the orphaned
+                    // session state so later teardown has nothing to stop
+                    // through it; the transport is gone, so there is nothing
+                    // to reconcile and nothing to resend (#210 gap 7).
+                    client.sender = null;
+                    client.removeSessionState(old_sid);
+                    self.remote_session_id = null;
+                    self.remote_pending_session_id = null;
+                    return err;
+                };
                 client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
                 if (client.sendAgentStopProbing(old_sid, "send failed")) |probe_id| {
                     if (probe_id == null) {
@@ -4152,6 +4167,10 @@ const RemoteMock = struct {
     disconnected: bool = false,
     sender_closed: bool = false,
     receiver_closed: bool = false,
+    /// When set, the mock sender fails every write with a reconnectable
+    /// transport error — simulating a dead socket after a send's bookkeeping
+    /// is in place.
+    fail_writes: bool = false,
 
     fn init() RemoteMock {
         return .{ .writes = std.ArrayList([]u8).empty, .reads = std.ArrayList([]u8).empty };
@@ -4174,6 +4193,7 @@ const RemoteMock = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *RemoteMock = @ptrCast(@alignCast(ctx));
+        if (self.fail_writes) return error.BrokenPipe;
         try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
     }
 
@@ -5132,6 +5152,45 @@ test "remote manual submit waits for terminal result after agent_end" {
     });
     _ = tui_session.streamEvents();
     try std.testing.expect(!runtime.remote_turn_in_flight);
+}
+
+test "remote reconnect failure after a broken send defangs the client and drops the dead session" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try runtime.ensureRemoteSession();
+
+    // The websocket-owned send path with a dead socket: the write fails
+    // reconnectably, the handler destroys the old socket, and the reconnect
+    // itself fails (the empty endpoint parses to no URL — deterministic and
+    // offline). The failure path must leave nothing for the later
+    // stop()/deinit() to send through: the client's sender pointed into the
+    // DESTROYED socket, and the stale session state kept it probeable.
+    runtime.remote_config_websocket_owned = true;
+    const ws_client = try std.testing.allocator.create(websocket_transport.WebSocketClient);
+    ws_client.* = websocket_transport.WebSocketClient.init(std.testing.allocator);
+    runtime.websocket_client = ws_client;
+    mock.fail_writes = true;
+    try std.testing.expectError(error.BrokenPipe, tui_session.submitTurn("turn"));
+
+    try std.testing.expect(runtime.remote_client.?.sender == null);
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+
+    // The cancel/stop path (and the deinit above) now has no session, no
+    // sender, and no socket to touch.
+    mock.fail_writes = false;
+    tui_session.cancel();
 }
 
 test "remote correlated agent_not_found surfaces the error before the session state is dropped" {
