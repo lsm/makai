@@ -136,7 +136,10 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    (no duplicate wire sequences); and a stop's reply fields are built
    BEFORE the session removal, with run cancellation + tool-bridge cleanup
    running even when the reply's own publication fails. LANDED (#210
-   gap 7): client sequence control in BOTH clients — the `AgentProtocolClient`
+   gap 7): client sequence control in BOTH clients — split across two PRs at
+   review time (TS SDK half in #215; zig `AgentProtocolClient` + TUI half
+   here, byte-identical to the tree both PRs reviewed before the split) — the
+   `AgentProtocolClient`
    rolls its per-session counter back when a correlated `agent_error`/`nack`
    names the send (`processEnvelope` matches `in_reply_to` against the session's
    outstanding counter-advancing sends and rolls back to the minimum; a
@@ -186,8 +189,9 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    until the next request — the same residual class as §6.1/#205's
    buffered-`agent_started` evidence and §13.4.5's no-generation-on-the-wire
    caveat; closing it needs a client-visible registration generation (future
-   wire revision). With gap 7, every gap of
-   #210 (4–7) has landed; the issue can close with this slice.
+   wire revision). With gap 7 (TS SDK half #215, zig client + TUI here),
+   every gap of #210 (4–7) has landed; the issue can close once both halves
+   merge.
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused

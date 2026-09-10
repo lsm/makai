@@ -8,7 +8,6 @@ import {
   drainStreamFrames,
   drainSessionFrames,
   drainSessionFramesUntilQuiescent,
-  stopAgentWithSequenceProbe,
 } from "./cancel_helpers";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
@@ -77,16 +76,6 @@ type ExecutionOptions = {
  * an exclusive client-generated id is safe to stop unconditionally, and a
  * request-correlated reply to this attempt's own `agent_start` resolves the
  * start's outcome; with neither, a caller-supplied id must not be stopped.
- *
- * `unresolvedMessageSequence` carries the sequence of this attempt's
- * `agent_message` while its outcome is UNRESOLVED (#210 gap 7, §13.4.1):
- * acceptance has no positive receipt, so between the send and the first
- * correlated rejection or run output the server's expected counter may hold
- * either the pre-send value (message rejected, counter rolled back) or the
- * post-send value (accepted, output lost or delayed). While it is set, the
- * teardown stop probes BOTH states instead of sending only the advanced
- * value; a correlated rejection instead rolls the tracker back (§13.1) and
- * clears it.
  */
 type ActiveAgentSession = {
   sessionId?: string;
@@ -96,8 +85,6 @@ type ActiveAgentSession = {
   idClientGenerated?: boolean;
   /** Whether a reply to this attempt's own `agent_start` was observed (correlated `agent_started`, `nack`, or `agent_error`). */
   startReplyObserved?: boolean;
-  /** The sequence this attempt's `agent_message` carried, set at send and cleared when its outcome resolves (correlated rejection → rollback; run output → acceptance confirmed). */
-  unresolvedMessageSequence?: number;
 };
 
 type AgentToolExecutionResult = string | TextContentPart[];
@@ -455,7 +442,7 @@ class StdioAgentApi implements MakaiAgentApi {
    * to the session and would consume the frames of an immediate follow-up
    * attempt, leaving it to time out.
    */
-  private async stopAgentSession(
+  private stopAgentSession(
     session: ActiveAgentSession | undefined,
     sessionId: string | undefined,
     sequence: number,
@@ -482,39 +469,6 @@ class StdioAgentApi implements MakaiAgentApi {
       }
       session.stopped = true;
     }
-    if (session?.unresolvedMessageSequence !== undefined) {
-      // #210 gap 7 (§13.4.1): the attempt's agent_message send never resolved
-      // — a timeout does not prove the acceptance path failed. The server
-      // counter may hold the pre-send value (message rejected, counter rolled
-      // back) or the post-send value (accepted, output lost or delayed), so
-      // the cleanup stop probes BOTH states instead of sending only the
-      // advanced value: without the probe, the rolled-back case rejects the
-      // stop and the owned session leaks indefinitely. The probe is bounded
-      // (one stop, at most one correlated-invalid_request retry) and consumes
-      // its own replies.
-      const preSend = session.unresolvedMessageSequence;
-      session.unresolvedMessageSequence = undefined;
-      await stopAgentWithSequenceProbe(this.transport, sessionId, { preSend, postSend: sequence }, reason);
-      if (options.drain === "background") {
-        drainSessionFrames(this.transport, sessionId);
-        return;
-      }
-      // Drain on EVERY probe outcome, resolved or not (§13.3.1): the probe's
-      // reads are correlated to its stop, and the transport serves a
-      // correlated wait from its reply queue AHEAD of the session queue — so
-      // the `agent_stopped` that resolves the probe can be delivered while
-      // the attempt's late run output is still parked on the session route
-      // (and an unresolved probe leaves whatever parked during it). A
-      // successful probe therefore does not prove the route clean: queued
-      // output from the unresolved run would be claimed by an immediate
-      // same-id follow-up after its start is accepted, returning the
-      // previous run's result or failure. The drain is bounded and AWAITED —
-      // it settles before the completion or error surfaces, so it cannot
-      // race a follow-up — and carries no stopReplyTo: the probe already
-      // consumed the stop's reply, so the drain runs to quiescence.
-      await drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250);
-      return;
-    }
     const stopMessageId = bestEffortStopAgent(this.transport, sessionId, sequence, reason);
     if (options.drain === "quiescent") {
       // Correlating the drain's early exit to THIS stop's reply keeps it
@@ -527,18 +481,6 @@ class StdioAgentApi implements MakaiAgentApi {
       drainSessionFrames(this.transport, sessionId);
     }
     return Promise.resolve();
-  }
-
-  /**
-   * #210 gap 7 (§13.1): a correlated rejection of this attempt's own
-   * `agent_message` proves the server did NOT advance its expected counter —
-   * roll the tracker back to the pre-send value so the teardown stop (and a
-   * corrected retry) uses the right sequence.
-   */
-  private rollbackUnresolvedMessage(activeSession: ActiveAgentSession | undefined): void {
-    if (activeSession?.unresolvedMessageSequence === undefined) return;
-    activeSession.nextSequence = activeSession.unresolvedMessageSequence;
-    activeSession.unresolvedMessageSequence = undefined;
   }
 
   /**
@@ -585,9 +527,6 @@ class StdioAgentApi implements MakaiAgentApi {
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
-    // The agent_message's own message id — a reply correlated to it resolves
-    // the message send's outcome (#210 gap 7).
-    let messageMessageId: string | undefined;
     // Correlation key for frame waits: the agent_start's message id until the
     // agent_message is sent, then the agent_message's id (the reply target
     // for any correlated response to it; async run output carries no
@@ -629,9 +568,6 @@ class StdioAgentApi implements MakaiAgentApi {
           // session this start established, so the §6.1 unknown-outcome
           // stop guard no longer applies from here on.
           if (activeSession) activeSession.startReplyObserved = true;
-          if (messageSent && frame.in_reply_to === messageMessageId) {
-            this.rollbackUnresolvedMessage(activeSession);
-          }
           const error = nackToStreamError(frame, fallbackProviderId);
           if (!startAccepted && error.code === "agent_busy") this.abandonForeignAgentSession(activeSession);
           throw error;
@@ -645,14 +581,6 @@ class StdioAgentApi implements MakaiAgentApi {
           // Correlated rejection: same start-outcome resolution as the nack
           // branch above.
           if (activeSession) activeSession.startReplyObserved = true;
-          if (messageSent && frame.in_reply_to === messageMessageId) {
-            this.rollbackUnresolvedMessage(activeSession);
-          } else if (activeSession?.unresolvedMessageSequence !== undefined) {
-            // An UNCORRELATED agent_error after the message was sent is run
-            // output (the failure pair's settlement, §13.4.2): acceptance is
-            // proven and the advanced counter is confirmed (#210 gap 7).
-            activeSession.unresolvedMessageSequence = undefined;
-          }
           const error = streamErrorFrameToError(frame);
           if (!startAccepted && error.code === "agent_busy") {
             // The id belongs to another live run; stopping would tear that
@@ -674,34 +602,22 @@ class StdioAgentApi implements MakaiAgentApi {
             const messageEnvelope = buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy));
             this.transport.send(messageEnvelope);
             correlateId = messageEnvelope.message_id as string;
-            messageMessageId = correlateId;
-            if (activeSession) {
-              activeSession.nextSequence = 3;
-              // #210 gap 7: the send's outcome is unknown until a correlated
-              // rejection or run output arrives — remember the carried
-              // sequence so the teardown stop can probe both counter states.
-              activeSession.unresolvedMessageSequence = 2;
-            }
+            if (activeSession) activeSession.nextSequence = 3;
             messageSent = true;
           }
           continue;
         }
         if (frame.type === "agent_result") {
-          // Run output proves the message was accepted — the advanced counter
-          // is confirmed (#210 gap 7).
-          if (activeSession) activeSession.unresolvedMessageSequence = undefined;
           const response = responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
           await teardownSession("completed", "quiescent");
           return response;
         }
         if (frame.type === "result" || frame.type === "complete_response") {
-          if (activeSession) activeSession.unresolvedMessageSequence = undefined;
           const response = responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
           await teardownSession("completed", "quiescent");
           return response;
         }
         if (frame.type === "tool_execute") {
-          if (activeSession) activeSession.unresolvedMessageSequence = undefined;
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
           toolsExecuted = true;
           continue;
@@ -711,15 +627,6 @@ class StdioAgentApi implements MakaiAgentApi {
         if (normalized.length === 0) {
           throw new MakaiStreamError(`unexpected frame type while awaiting agent result: ${String(frame.type)}`, { kind: "transport_error" });
         }
-        // Consumed run output clears the unresolved marker: frames that
-        // reached THIS attempt's correlated, post-acceptance waits are the
-        // strongest acceptance tie the wire affords, and the repo's teardown
-        // semantics build on it (abort and failure-pair paths stop at the
-        // advanced counter). A stale trailing frame from a previous run
-        // slipping in is the documented §13.4.3/§6.1 downstream-buffer
-        // residual — the same wire-unobservable class recorded for the
-        // probe's admission gate (#210 gap 7).
-        if (activeSession) activeSession.unresolvedMessageSequence = undefined;
         for (const event of normalized) {
           if (event.type === "error") {
             // Loop-internal failure pair (spec §13.4.2, #205): this error
@@ -754,17 +661,13 @@ class StdioAgentApi implements MakaiAgentApi {
         // Failed runs must tear their session down too: the server keeps it
         // registered (and its id permanently agent_busy) until an agent_stop.
         // Stop only — no drain: the failure-pair path already settled its
-        // teardown (stop + quiescent drain) at its throw site, and a
-        // background drain would consume the frames of an immediate follow-up
-        // attempt on this session id. The stop itself is AWAITED: when the
-        // message send's outcome never resolved (#210 gap 7) it is a bounded
-        // two-state probe (§13.4.1) whose reads must settle before the error
-        // surfaces — an un-awaited probe would race a same-id follow-up and
-        // could eat its frames, and a plain stop at only the advanced value
-        // would be rejected in the rolled-back case, leaking the session.
+        // teardown (stop + quiescent drain) at its throw site, and for the
+        // remaining errors awaiting a drain would delay the error past caller
+        // abort/retry windows while a background drain would consume the
+        // frames of an immediate follow-up attempt on this session id.
         // stopAgentSession's §6.1 guard may still skip the send entirely when
         // the start's outcome never resolved and the id was caller-supplied.
-        await teardownSession("completed");
+        teardownSession("completed");
       }
       throw error;
     }
@@ -894,9 +797,6 @@ class StdioAgentApi implements MakaiAgentApi {
     let messageSent = false;
     let started = false;
     let startAccepted = false;
-    // The agent_message's own message id — a reply correlated to it resolves
-    // the message send's outcome (#210 gap 7).
-    let messageMessageId: string | undefined;
     // Correlation key for frame waits: the agent_start's message id until the
     // agent_message is sent, then the agent_message's id (the reply target
     // for any correlated response to it; async run output carries no
@@ -935,9 +835,6 @@ class StdioAgentApi implements MakaiAgentApi {
           // Correlated rejection: the start's outcome is resolved (§6.1) —
           // see the matching branch in runOnce.
           if (activeSession) activeSession.startReplyObserved = true;
-          if (messageSent && frame.in_reply_to === messageMessageId) {
-            this.rollbackUnresolvedMessage(activeSession);
-          }
           const error = nackToStreamError(frame, fallbackProviderId);
           if (!startAccepted && error.code === "agent_busy") this.abandonForeignAgentSession(activeSession);
           throw error;
@@ -957,20 +854,6 @@ class StdioAgentApi implements MakaiAgentApi {
             this.abandonForeignAgentSession(activeSession);
           }
         }
-        if (messageSent && frame.type === "agent_error" && frame.in_reply_to === messageMessageId) {
-          // Correlated rejection of OUR agent_message (#210 gap 7): the frame
-          // still flows into normalizeAgentFrame below so the consumer sees
-          // the failure, but the tracker must roll back first (§13.1) so the
-          // teardown stop uses the pre-send sequence.
-          this.rollbackUnresolvedMessage(activeSession);
-        } else if (messageSent && activeSession?.unresolvedMessageSequence !== undefined
-          && frame.type !== "agent_started" && frame.type !== "ack" && frame.type !== "agent_stopped") {
-          // Any other post-message frame is run output consumed by THIS
-          // attempt's waits — the strongest acceptance tie the wire affords
-          // (see the matching clear in runOnce; the stale-trailing-frame
-          // caveat is the documented §13.4.3/§6.1 residual).
-          activeSession.unresolvedMessageSequence = undefined;
-        }
         if (frame.type === "agent_started" && !messageSent) {
           if (frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
             // Another call's started reply delivered on the shared session
@@ -983,27 +866,15 @@ class StdioAgentApi implements MakaiAgentApi {
           const messageEnvelope = buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy));
           this.transport.send(messageEnvelope);
           correlateId = messageEnvelope.message_id as string;
-          messageMessageId = correlateId;
-          if (activeSession) {
-            activeSession.nextSequence = 3;
-            // #210 gap 7: the send's outcome is unknown until a correlated
-            // rejection or run output arrives — remember the carried sequence
-            // so the teardown stop can probe both counter states.
-            activeSession.unresolvedMessageSequence = 2;
-          }
+          if (activeSession) activeSession.nextSequence = 3;
           messageSent = true;
           continue;
         }
         if (frame.type === "tool_execute") {
-          if (activeSession) activeSession.unresolvedMessageSequence = undefined;
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
           continue;
         }
         const events = normalizeAgentFrame(frame, toolBuffers);
-        if (events.length > 0 && activeSession?.unresolvedMessageSequence !== undefined) {
-          // Recognized run output proves the message was accepted (#210 gap 7).
-          activeSession.unresolvedMessageSequence = undefined;
-        }
         for (const rawEvent of events) {
           let event = rawEvent;
           if (event.type === "error" && event.code === "auth_required") {
@@ -1052,11 +923,8 @@ class StdioAgentApi implements MakaiAgentApi {
         this.logger.error("agent: stream error", { kind: error.kind, code: error.code, message: error.message });
         // Failed streams must tear their session down too (stop only — the
         // outer stream() catch handles aborts, and a background drain would
-        // consume the frames of an immediate follow-up attempt). The stop is
-        // AWAITED: on an unresolved message outcome it is a bounded two-state
-        // probe (#210 gap 7, §13.4.1) whose reads must settle before the
-        // error surfaces, or they would race a same-id follow-up attempt.
-        await this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
+        // consume the frames of an immediate follow-up attempt).
+        this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
         throw error;
       }
       if (isAbortError(error)) {
@@ -1064,7 +932,7 @@ class StdioAgentApi implements MakaiAgentApi {
         throw error;
       }
       this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
-      await this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
+      this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     } finally {
       // Covers both natural completion and the consumer closing the iterator

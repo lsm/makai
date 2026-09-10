@@ -93,7 +93,6 @@ export {
   drainStreamFrames,
   drainSessionFrames,
   drainSessionFramesUntilQuiescent,
-  stopAgentWithSequenceProbe,
 } from "./cancel_helpers";
 
 export {
