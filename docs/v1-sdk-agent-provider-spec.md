@@ -976,28 +976,41 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slice 1 of the
+  Zig client sequence discipline `[current — #210 gap 7, slice 2 of the
   client sequence-control series]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
-  `agent_error` whose `in_reply_to` names the client's own send) rolls the
-  tracker back to the rejected send's own sequence, so a corrected retry
-  reuses it (every outstanding send is tracked and the rollback takes the
-  MINIMUM — an older unresolved send's floor is never lost to a younger
-  send's rejection); a correlated `agent_not_found` (or `session_expired`)
-  drops the counter state instead, since the session is gone server-side.
-  Stop sends never advance the tracker: an accepted stop consumes the
-  counter with the session, and a rejected stop leaves the expected value
-  in place for its retry; stops are tracked requests too, so a
-  session-gone answer discovered through a stop drops the counter state
-  for the re-registration. A settlement retires the settled run's own
-  message record (the oldest pending message), keeping a long-lived
-  session's records bounded by its unresolved sends rather than its
-  history. Slices to follow in the series: explicit-sequence
-  sends with duplicate-evidence handling, the pending-record lifecycle and
-  stale-reply guards, the bounded stop probe for unknown outcomes, and the
-  TUI teardown integration (`[in progress — #210 gap 7 re-sliced from
-  #213]`).
+  `agent_error` or `nack` whose `in_reply_to` names the client's own send)
+  rolls the tracker back, so a corrected retry reuses the sequence (every
+  outstanding send is tracked and the rollback floor carries every
+  still-unresolved MESSAGE record's pre-send tracker and sequence — the
+  counter the server holds in the all-rejected world; a pending START's
+  floor is never taken, since a non-session-gone rejection proves the
+  counter is past it); a correlated `agent_not_found` (or
+  `session_expired`) drops the counter state instead, since the session is
+  gone server-side. A correlated nack rejects a request exactly like a
+  correlated `agent_error`, while nacks for NON-run requests (models,
+  tool_list, ping, status) stay request-scoped and are dropped. A
+  `duplicate_sequence` answer is duplicate evidence — the server's counter
+  is PROVEN past the sent sequence: a RETRY of a still-unresolved message
+  (`sendAgentMessageWithSequence` at a pending sequence) retires silently
+  with the pre-resend HIGH-WATER restored, while a non-retry send or a
+  START falls through to the ordinary rejection path and surfaces.
+  Explicit-sequence sends (`sendAgentMessageWithSequence`,
+  `sendAgentStopWithSequence`) carry a caller-supplied counter value: the
+  tracker mirrors it optimistically but restores its PRE-SEND state when
+  the pre-wire bookkeeping fails (nothing reached the wire), and
+  `maxInt(u64)` is rejected before any mutation. Stop sends never advance
+  the tracker: an accepted stop consumes the counter with the session, a
+  rejected stop leaves the expected value in place for its retry, and
+  stops are tracked requests too, so a session-gone answer discovered
+  through a stop drops the counter state for the re-registration. A
+  settlement retires the settled run's own message record (the oldest
+  pending message), keeping a long-lived session's records bounded by its
+  unresolved sends rather than its history. Slices to follow in the
+  series: the pending-record lifecycle and stale-reply guards, the bounded
+  stop probe for unknown outcomes, and the TUI teardown integration
+  (`[in progress — #210 gap 7 re-sliced from #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
