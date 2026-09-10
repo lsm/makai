@@ -184,6 +184,11 @@ test("ts: a block comment spanning lines preserves a line terminator (ASI)", () 
   assert.equal(stripComments("foo(/*\n*/x)\n", "x.ts"), "foo(\nx)\n");
 });
 
+test("ts: every ECMAScript line terminator inside a block comment preserves ASI", () => {
+  assert.equal(stripComments("return/*\r*/value\n", "x.ts"), "return\nvalue\n");
+  assert.equal(stripComments("return/*\u2028*/value\n", "x.ts"), "return\nvalue\n");
+});
+
 test("ts: line comments end at every ECMAScript line terminator, not just LF", () => {
   const cr = "const a=1;//c\rconst b=2;\n";
   assert.equal(tsCount(cr), 1);
@@ -373,6 +378,37 @@ test("ratchet: an unresolvable --base falls back to HEAD^1 instead of seeding fr
   assert.equal(run.status, 1, run.stdout);
   assert.ok(run.stdout.includes("allowlist addition not permitted"));
   assert.ok(run.stdout.includes("dirty.ts"));
+});
+
+test("ratchet: retirement is a one-way latch that closes seeding", () => {
+  const repo = gitRepo("retired-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "const x = 1;\n");
+  rmSync(join(repo, "allowlist.txt"));
+  writeFileSync(join(repo, "allowlist.txt.retired"), "");
+  gitCommit(repo);
+  const run = (extra = []) =>
+    spawnSync(
+      process.execPath,
+      [SCRIPT, "--check", ...extra, "--allowlist", "allowlist.txt", "--files", "dirty.zig"],
+      { cwd: repo },
+    );
+
+  const retired = run();
+  assert.equal(retired.status, 0, retired.stdout);
+
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  const recreated = run();
+  assert.equal(recreated.status, 1, recreated.stdout);
+  assert.ok(recreated.stdout.includes("seeding is closed"));
+
+  rmSync(join(repo, "allowlist.txt"));
+  rmSync(join(repo, "allowlist.txt.retired"));
+  const unretired = run();
+  assert.equal(unretired.status, 1, unretired.stdout);
+  assert.ok(unretired.stdout.includes("cannot be undone"));
 });
 
 function loadAllowlistFrom(paths) {

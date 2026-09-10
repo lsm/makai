@@ -15,11 +15,13 @@
 // seeded there pass while the gap-7 series lands; entries whose file is
 // clean or untracked are stale and fail, and entries absent from the
 // base revision (--base's merge-base, else HEAD^1 — the seed itself
-// excepted) are additions and fail, so the list only shrinks.
+// excepted) are additions and fail, so the list only shrinks. The
+// one-time strip later removes the allowlist and leaves
+// no-comments-allowlist.txt.retired, permanently closing seeding.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
@@ -235,6 +237,7 @@ export function findComments(text, fileName) {
 }
 
 export function stripComments(text, fileName = "x.ts") {
+  const lineTerminator = fileName.endsWith(".zig") ? /[\n]/ : TS_LINE_TERMINATOR;
   const comments = findComments(text, fileName);
   if (comments.length === 0) return text;
   const removals = mergeRanges(comments.map((r) => expandRange(text, r)));
@@ -246,11 +249,14 @@ export function stripComments(text, fileName = "x.ts") {
     // fully removed (`alone`) — surrounding newlines already separate the
     // neighbors. Otherwise, when the removal would join two directly
     // abutting non-whitespace characters (`return/*c*/value`,
-    // `a+/*c*/+b`), leave a space. A block comment spanning lines carries
-    // a line terminator for ASI purposes, so removing one inline leaves a
-    // newline (`return/*\n*/value` keeps `return\nvalue`).
+    // `a+/*c*/+b`), leave a space. A block comment containing a line
+    // terminator carries one for ASI purposes, so removing it inline
+    // leaves a newline (`return/*\r*/value` keeps `return\nvalue`; every
+    // ECMAScript terminator for TypeScript, LF for Zig, which has no
+    // block comments anyway).
     if (!alone) {
-      if (text.slice(start, end).includes("\n")) out += "\n";
+      const removed = text.slice(start, end);
+      if (lineTerminator.test(removed)) out += "\n";
       else if (/\S$/.test(out) && end < text.length && /\S/.test(text[end])) out += " ";
     }
     cursor = end;
@@ -278,14 +284,30 @@ export function loadAllowlist(path) {
   return parseAllowlist(readFileSync(path, "utf8"));
 }
 
+// The comparison commit for ratchet diffs: the merge-base of HEAD and the
+// --base revision (the PR base sha or a push's pre-update sha, so additions
+// anywhere in a multi-commit range are caught). An --base that cannot
+// resolve (force-pushed away, zero sha) falls back to HEAD^1 rather than
+// disabling the ratchet; null only when no comparison commit resolves.
+function resolveBaseCommit(cwd, baseRev = null) {
+  if (baseRev) {
+    try {
+      return git(["merge-base", "HEAD", baseRev], cwd).trim();
+    } catch {
+      // fall through to HEAD^1
+    }
+  }
+  try {
+    return git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
+  } catch {
+    return null;
+  }
+}
+
 // Entries of the allowlist as committed in the base revision, or null when
 // no comparison point is determinable — the seed case, where the allowlist
-// is new in this change and every entry is taken as given. The comparison
-// commit is the merge-base of HEAD and the --base revision (the PR base sha
-// or a push's pre-update sha, so additions anywhere in a multi-commit range
-// are caught). An --base that cannot resolve (force-pushed away, zero sha)
-// falls back to HEAD^1 rather than disabling the ratchet; only when no
-// comparison commit resolves at all is the result null.
+// is new in this change and every entry is taken as given (see
+// ratchetViolation for how seeding is closed after retirement).
 export function baseAllowlistEntries(allowlistPath, cwd, baseRev = null) {
   let root;
   try {
@@ -295,26 +317,49 @@ export function baseAllowlistEntries(allowlistPath, cwd, baseRev = null) {
   }
   const rel = relative(root, resolve(cwd, allowlistPath));
   if (rel.startsWith("..")) return null;
-  let base = null;
-  if (baseRev) {
-    try {
-      base = git(["merge-base", "HEAD", baseRev], cwd).trim();
-    } catch {
-      base = null;
-    }
-  }
-  if (!base) {
-    try {
-      base = git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
-    } catch {
-      return null;
-    }
-  }
+  const base = resolveBaseCommit(cwd, baseRev);
+  if (!base) return null;
   try {
     return parseAllowlist(git(["show", `${base}:${rel}`], cwd));
   } catch {
     return null;
   }
+}
+
+// The ratchet is a one-way latch. The planned one-time strip removes the
+// allowlist and leaves a `<allowlist>.retired` marker in its place; from
+// then on seeding is closed — the marker cannot be removed and the
+// allowlist cannot be recreated — so a fresh "seed" of arbitrary dirty
+// paths can never reopen the bypass. Returns a violation message or null.
+export function ratchetViolation(allowlistPath, cwd, baseRev = null) {
+  const marker = `${allowlistPath}.retired`;
+  const markerExists = existsSync(marker);
+  if (markerExists && existsSync(allowlistPath)) {
+    return "ratchet is retired but an allowlist is present — seeding is closed; remove the allowlist";
+  }
+  if (markerExists) return null;
+  let root;
+  try {
+    root = git(["rev-parse", "--show-toplevel"], cwd).trim();
+  } catch {
+    return null;
+  }
+  const markerRel = relative(root, resolve(cwd, marker));
+  if (markerRel.startsWith("..")) return null;
+  // A marker that existed in HEAD (working-tree removal) or in the base
+  // revision (committed removal) but is absent now undoes the retirement.
+  const revs = ["HEAD"];
+  const base = resolveBaseCommit(cwd, baseRev);
+  if (base) revs.push(base);
+  for (const rev of revs) {
+    try {
+      git(["cat-file", "-e", `${rev}:${markerRel}`], cwd);
+      return "ratchet retirement cannot be undone — the retired marker was removed";
+    } catch {
+      // marker not present at this revision
+    }
+  }
+  return null;
 }
 
 export function checkFiles(files, allowlist, baseEntries = null) {
@@ -364,6 +409,11 @@ function main() {
   const allowlist = loadAllowlist(allowlistPath);
 
   if (check) {
+    const violation = ratchetViolation(allowlistPath, process.cwd(), baseRev);
+    if (violation) {
+      process.stdout.write(`${violation}\n`);
+      process.exit(1);
+    }
     const result = checkFiles(files, allowlist, baseAllowlistEntries(allowlistPath, process.cwd(), baseRev));
     for (const file of result.offending) process.stdout.write(`comments remain: ${file}\n`);
     for (const path of result.stale) {

@@ -1,7 +1,9 @@
 # makai zero-comments ratchet (#228): tracked files still carrying comments.
 # Seeded at policy adoption so the gap-7 series (#220-#225) is not blocked;
 # entries are removed as files are cleaned and the list may only shrink.
-# The one-time strip removes this file entirely.
+# The one-time strip removes this file entirely and leaves
+# no-comments-allowlist.txt.retired in its place, permanently closing
+# seeding (the marker cannot be removed and the allowlist cannot return).
 build.zig
 scripts/package-npm.ts
 typescript/src/abort_signal.ts
