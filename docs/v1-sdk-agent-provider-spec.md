@@ -1321,7 +1321,20 @@ server eviction (rule 6), and holds no transcript and no persistence.
    route clean (the
    earlier behavior — advance before the outcome is known, send only the
    advanced value, cleanup stop fails in the rolled-back case, owned session
-   leaks indefinitely — is closed). The Zig client exposes the same probe
+   leaks indefinitely — is closed). That drain is residual-bound on BOTH
+   sides by the same unattributability: frames parking between the stop's
+   acceptance and the drain's reads may be the just-stopped run's trailing
+   output (§13.1 outbound ordering legitimately delivers async output AFTER
+   the stop's synchronous reply) or, equivalently on the wire, the output of
+   a registration that raced onto the just-freed id — no frame carries a
+   registration or run generation (§13.4.5). Draining (a single immediate
+   pass over the parked backlog — the TypeScript teardown's policy) can
+   consume a racing re-registration's parked frames; not draining reinstates
+   the parked-output poisoning of the next same-id run. The chosen policy
+   errs toward route cleanliness with the tightest available consumption;
+   closing either side needs the generation tokens of the future wire
+   revision already recorded for the §6.1/#205 residual class. The Zig
+   client exposes the same probe
    directly (`sendAgentStopProbing`) for recovery paths that drive it manually.
    A start
    rejected before admission

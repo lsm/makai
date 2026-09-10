@@ -197,7 +197,12 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    frame, so a foreign re-registration and our own are wire-indistinguishable
    until the next request — the same residual class as §6.1/#205's
    buffered-`agent_started` evidence and §13.4.5's no-generation-on-the-wire
-   caveat; closing it needs a client-visible registration generation (future
+   caveat; the post-probe backlog drain is bound by the same
+   unattributability (frames parking between the stop's acceptance and the
+   drain may be the dead run's trailing output — §13.1 delivers async output
+   after the stop's synchronous reply — or a racing re-registration's output;
+   the TS teardown's single immediate pass errs toward route cleanliness);
+   closing either needs a client-visible registration generation (future
    wire revision). With gap 7 (TS SDK half #215, zig client + TUI here),
    every gap of #210 (4–7) has landed; the issue can close once both halves
    merge.
