@@ -136,7 +136,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    (no duplicate wire sequences); and a stop's reply fields are built
    BEFORE the session removal, with run cancellation + tool-bridge cleanup
    running even when the reply's own publication fails. LANDED for the zig
-   client here, PENDING #215 for the TS SDK (#210
+   client here, LANDED for the TS SDK in #215 (merged ec2bc2d) (#210
    gap 7): client sequence control in BOTH clients — split across two PRs at
    review time (TS SDK half in #215; zig `AgentProtocolClient` + TUI half
    here, byte-identical to the tree both PRs reviewed before the split) — the
@@ -164,7 +164,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    tracked start (an uncorrelated or foreign started never arms it), else it
    sends NOTHING: without admission evidence a stop at the tracker's value
    would destroy a foreign owner's fresh session, §6.1). The TS SDK's tracker
-   (`ActiveAgentSession`; pending #215) marks the `agent_message` send
+   (`ActiveAgentSession`; landed in #215) marks the `agent_message` send
    unresolved at send,
    rolls back to the pre-send sequence on a correlated rejection, confirms
    the advanced counter on the first run output — an uncorrelated
@@ -176,14 +176,14 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    correlated-`invalid_request` retry at the post-send value with
    correlated reads, acceptance at either settles; both `run()` and
    `stream()`, awaited on error paths so the probe's reads cannot race a
-   same-id follow-up; TS behaviors pending #215). Same-sequence retries
-   and unknown-outcome cleanup are supported in the zig client today, in
-   the TS SDK once #215 lands (§13.1/§13.4.1); the TUI's remote
+   same-id follow-up; TS behaviors landed in #215). Same-sequence retries
+   and unknown-outcome cleanup are supported in BOTH clients (§13.1/§13.4.1);
+   the TUI's remote
    disconnect/cancel teardown routes through the probe first, with the
    plain tracked stop as the ineligible fallback (its ids are
    client-generated and exclusive, §6.1 — the fallback's optimistic
    sequence is the correct one exactly when the probe is ineligible).
-   Review-hardened in the same slice (TS behaviors pending #215): the TS
+   Review-hardened in the same slice (TS behaviors landed in #215): the TS
    teardown drains queued
    session output after the probe settles at EITHER outcome — correlated
    reads are served ahead of the session queue, so the reply resolving
@@ -206,9 +206,9 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    after the stop's synchronous reply — or a racing re-registration's output;
    the TS teardown's single immediate pass errs toward route cleanliness);
    closing either needs a client-visible registration generation (future
-   wire revision). With gap 7 (TS SDK half #215, zig client + TUI here),
-   every gap of #210 (4–7) has landed; the issue can close once both halves
-   merge.
+   wire revision). With gap 7 (TS SDK half #215 merged ec2bc2d; zig client +
+   TUI here), every gap of #210 (4–7) has landed; the issue can close once
+   this half merges.
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused

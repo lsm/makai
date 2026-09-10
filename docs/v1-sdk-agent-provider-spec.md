@@ -976,8 +976,8 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Client sequence discipline `[Zig current — #210 gap 7; TypeScript pending
-  #215]`: both built-in clients
+  Client sequence discipline `[current — #210 gap 7: Zig client + TUI here,
+  TypeScript SDK landed in #215]`: both built-in clients
   mirror the server's counter optimistically — the tracker advances at SEND, before
   the outcome is known — and reconcile on evidence. A CORRELATED rejection (an
   `agent_error`/`nack` whose `in_reply_to` names the client's own send) rolls the
@@ -1033,7 +1033,7 @@ Rules:
   stale trailing frame from a prior run on a quickly
   reused id slipping into those waits is the same documented residual
   class)) — so recovery paths are not forced
-  to guess a counter state. TypeScript claims are `[pending #215]`.
+  to guess a counter state. TypeScript claims `[landed — #215]`.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
@@ -1304,7 +1304,8 @@ server eviction (rule 6), and holds no transcript and no persistence.
    PRE-SEND value. A cleanup stop therefore tries the pre-send sequence and, if
    rejected with a correlated `invalid_request`, the post-send value; acceptance
    at either settles cleanup. Both clients implement this reconciliation
-   `[Zig current — #210 gap 7; TypeScript pending #215]`: the tracker marks
+   `[current — #210 gap 7: Zig client + TUI here, TypeScript SDK landed in
+   #215]`: the tracker marks
    the message send unresolved at
    send; a correlated rejection rolls it back (§13.1) so the ordinary teardown
    stop carries the pre-send sequence, and while the outcome is unresolved the
