@@ -288,7 +288,17 @@ export async function stopAgentWithSequenceProbe(
     if (frame.in_reply_to !== outstanding.messageId) continue;
     if (frame.type === "agent_stopped") return outstanding.sequence;
     const code = correlatedRejectionCode(frame);
-    if (code === "invalid_request" && !retried) {
+    if (code === "invalid_request") {
+      if (retried) {
+        // The RETRY's own rejection is terminal: both candidate states were
+        // rejected — the session was removed or re-registered between the
+        // two stops, so neither value can stop it. Continuing to read would
+        // put the probe's uncorrelated-accepting reads on the shared session
+        // route for the remaining budget, where they could dequeue the NEW
+        // registration's events or result and time that run out (#210 gap
+        // 7). End unresolved; the caller's drain handles the route.
+        break;
+      }
       // The server counter holds the post-send state — retry the stop there.
       retried = true;
       outstanding = { messageId: bestEffortStopAgent(transport, sessionId, sequences.postSend, reason), sequence: sequences.postSend };

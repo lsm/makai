@@ -3231,3 +3231,40 @@ test("stopAgentWithSequenceProbe waits through idle windows for a delayed reject
   assert.equal(acceptedAt, 3);
   assert.deepEqual(sentStops, [2, 3]);
 });
+
+test("stopAgentWithSequenceProbe treats the retry's own rejection as terminal (#210 gap 7)", async () => {
+  // Both candidate states rejected — the session was removed or
+  // re-registered between the two stops, so neither value can stop it. The
+  // probe must END there: its correlated reads also accept uncorrelated
+  // frames, so continuing for the remaining budget could dequeue the NEW
+  // registration's events or result and time that run out.
+  const sessionId = "testNanoIdSess1234567";
+  const sentStops: number[] = [];
+  const replies: StdioFrame[] = [];
+  let readsAfterRetryRejection = 0;
+  let retryRejected = false;
+  const transport = {
+    send: (frame: StdioFrame) => {
+      if (frame.type !== "agent_stop") return;
+      sentStops.push(frame.sequence as number);
+      replies.push({ type: "agent_error", session_id: sessionId, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "invalid_request", message: "invalid sequence" } });
+    },
+    nextFrameForSession: async (_sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
+      const correlate = wait?.correlate;
+      if (retryRejected) readsAfterRetryRejection += 1;
+      const match = correlate !== undefined ? replies.find((entry) => entry.in_reply_to === correlate) : undefined;
+      if (match) {
+        replies.splice(replies.indexOf(match), 1);
+        if (sentStops.length === 2) retryRejected = true;
+        return match;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs ?? 50, 50)));
+      throw new Error("timed out");
+    },
+  };
+
+  const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 50, 400);
+  assert.equal(acceptedAt, undefined);
+  assert.deepEqual(sentStops, [2, 3]);
+  assert.equal(readsAfterRetryRejection, 0, "the probe must not keep reading after both candidate states were rejected");
+});
