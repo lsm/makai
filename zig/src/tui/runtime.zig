@@ -1575,7 +1575,7 @@ pub const TuiRuntime = struct {
         if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection(false);
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
-        var sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+        const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
         const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), messages, self.remoteSerializableTools());
         defer self.allocator.free(message_json);
         self.resetEventStreamForTurn();
