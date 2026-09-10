@@ -409,11 +409,14 @@ pub const AgentProtocolClient = struct {
     /// gap 7) — a caller with positive ownership evidence for an
     /// unknown-outcome start may stop explicitly at the counter state it
     /// knows (§13.2.6). Like `sendAgentStop`, the tracker is not advanced
-    /// past the given value; `maxInt(u64)` is rejected before any mutation
-    /// (the resync below would install it, and a later start's `seq + 1`
-    /// would overflow the tracker).
+    /// past the given value. Unlike a message or start, a stop never
+    /// computes `sequence + 1` — an accepted stop consumes the counter
+    /// WITH the session (clearing the tracker) and a rejected one leaves
+    /// the value in place — so `maxInt(u64)` itself is a legal stop
+    /// sequence (the teardown of a session whose counter reached the
+    /// ceiling); a later START against a tracker at the maximum is
+    /// rejected there instead.
     pub fn sendAgentStopWithSequence(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8, sequence: u64) !agent_types.Ulid {
-        if (sequence == std.math.maxInt(u64)) return error.InvalidSequence;
         const msg_id = agent_types.generateUlid();
         try self.sendStopEnvelope(session_id, msg_id, reason, sequence);
         return msg_id;
@@ -691,8 +694,11 @@ pub const AgentProtocolClient = struct {
                             // the proven step — the ordinary stop-rejection
                             // path below still resolves the record (undoing
                             // any resync, max the floor) and surfaces the
-                            // failure (#210 gap 7).
-                            try self.noteProvenFloor(env.session_id, entry.sequence + 1);
+                            // failure (#210 gap 7). The step is
+                            // overflow-safe: a stop may carry maxInt(u64)
+                            // (the ceiling teardown), and no counter can be
+                            // past the maximum, so there is no step to note.
+                            if (entry.sequence != std.math.maxInt(u64)) try self.noteProvenFloor(env.session_id, entry.sequence + 1);
                         }
                     }
                 }
@@ -879,20 +885,24 @@ pub const AgentProtocolClient = struct {
 
     /// Supersedes the optimistic mirrors of every earlier still-pending
     /// send: only the LAST tracker write owns the value (#210 gap 7).
-    fn bumpTrackerEpoch(self: *Self, session_id: agent_types.SessionId) !void {
-        const gop = try self.tracker_epoch_by_session.getOrPut(session_id);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-    }
-
+    ///
     /// Writes the session's tracker value. EVERY write — a send's
     /// optimistic mirror or resync, a reconciliation's floor or restore —
     /// bumps the session's tracker epoch, so a pending record's mirror
     /// owns the current value only while its own write was the last
-    /// (#210 gap 7).
+    /// (#210 gap 7). The epoch entry is reserved FIRST: a spurious zero
+    /// epoch left by a failed write is indistinguishable from an absent
+    /// one, so a failure between the two reservations leaves no
+    /// observable partial state — while a half-applied write (the value
+    /// stored, the epoch not bumped) would move the tracker with no
+    /// ownership supersession and let the next send skip the server's
+    /// expected sequence.
     fn setTrackerValue(self: *Self, session_id: agent_types.SessionId, value: u64) !void {
-        try self.next_sequence_by_session.put(session_id, value);
-        try self.bumpTrackerEpoch(session_id);
+        const epoch_gop = try self.tracker_epoch_by_session.getOrPut(session_id);
+        const tracker_gop = try self.next_sequence_by_session.getOrPut(session_id);
+        if (!epoch_gop.found_existing) epoch_gop.value_ptr.* = 0;
+        tracker_gop.value_ptr.* = value;
+        epoch_gop.value_ptr.* += 1;
     }
 
     /// Whether a DIFFERENT-payload message record is still pending at the
@@ -1049,7 +1059,11 @@ pub const AgentProtocolClient = struct {
             const prior_bound = rejected.prior_tracker;
             const existing_revert = self.stop_revert_bound_by_session.get(session_id);
             const revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
-            self.stop_revert_bound_by_session.put(session_id, revert_bound) catch {};
+            // Stored under `try`: a dropped bound would let a LATER stop's
+            // rejection restore a prior this refuted resync had
+            // contaminated — the failure must surface, not vanish (#210
+            // gap 7).
+            try self.stop_revert_bound_by_session.put(session_id, revert_bound);
             // The undo guard is OWNERSHIP, not value equality: a later
             // send's optimistic mirror can coincidentally equal the stop's
             // resync value (a message accepted at 6 mirrors the tracker to
@@ -3563,11 +3577,14 @@ test "AgentProtocolClient retries at a sequence below the proven floor surface (
     try std.testing.expectEqual(@as(usize, 1), pending.items.len); // the first A send remains unresolved
 }
 
-test "AgentProtocolClient rejects an un-advanceable explicit stop sequence (#210 gap 7)" {
-    // maxInt(u64) would be installed into the tracker by the explicit
-    // stop's resync, and a later start's seq + 1 would overflow (trap in
-    // safety-checked builds) — rejected before any mutation, like the
-    // message variant.
+test "AgentProtocolClient stops at the sequence maximum are the ceiling teardown (#210 gap 7)" {
+    // A stop never computes sequence + 1 — an accepted stop consumes the
+    // counter WITH the session and clears the tracker — so maxInt(u64)
+    // is a legal stop sequence (the teardown of a session whose counter
+    // reached the ceiling), unlike a message or start whose optimistic
+    // mirror would overflow. The stop sends, and a later start against
+    // the resynced maximum still rejects there.
+    const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
     harness.wire();
@@ -3576,9 +3593,12 @@ test "AgentProtocolClient rejects an un-advanceable explicit stop sequence (#210
     const sid = agent_types.generateSessionId();
     _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
 
-    try std.testing.expectError(error.InvalidSequence, client.sendAgentStopWithSequence(sid, "never", std.math.maxInt(u64)));
-    try std.testing.expectEqual(@as(u64, 2), client.peekNextSequence(sid)); // untouched
-    try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len); // the start only
+    _ = try client.sendAgentStopWithSequence(sid, "teardown", std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), client.peekNextSequence(sid)); // resynced to the ceiling
+    var stop_env = try harness.envelopeAt(1); // start, stop
+    defer stop_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), stop_env.sequence);
+    try std.testing.expectError(error.InvalidSequence, client.sendAgentStartWithSession(sid, "{}", null)); // the start still rejects the ceiling
 }
 
 

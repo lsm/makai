@@ -1006,7 +1006,10 @@ Rules:
   restore, supersedes it, so ownership follows write ordering, never
   value equality) — to the pre-resync tracker CAPPED by the still-pending messages'
   floor (the pre-resync value may itself be an unresolved send's
-  optimistic mirror), max the proven floor (below); wherever the undo is
+  optimistic mirror), max the proven floor (below); the refuted resync's
+  revert bound is durably recorded — an allocation failure surfaces
+  rather than being forgotten, or a later stop's rejection would restore
+  a prior this resync had contaminated; wherever the undo is
   skipped, a tracker sitting below the proven floor (a stop's own
   duplicate_sequence step included) is still raised to it. A settlement retires
   the settled run's own message record (the oldest pending message),
@@ -1025,9 +1028,10 @@ Rules:
   state are not forced to guess);
   the tracker mirrors it optimistically but restores its PRE-SEND state
   when the pre-wire bookkeeping fails (nothing reached the wire),
-  `maxInt(u64)` is rejected before any mutation (both variants, and a
-  start against a tracker already at the maximum is rejected the same
-  way), and a
+  `maxInt(u64)` is rejected before any mutation for the MESSAGE variant
+  (a start against a tracker already at the maximum is rejected the same
+  way; a STOP may carry the maximum itself — a stop never computes
+  `sequence + 1`, so the ceiling teardown is sendable), and a
   correlated rejection restores the record's pre-send tracker rather
   than the send's own optimistic regression (a backward explicit send's
   regression must not pin the tracker below the server) — except
