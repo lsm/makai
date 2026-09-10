@@ -998,10 +998,15 @@ Rules:
   (recovery paths that know the server's state are not forced to guess);
   the tracker mirrors it optimistically but restores its PRE-SEND state
   when the pre-wire bookkeeping fails (nothing reached the wire),
-  `maxInt(u64)` is rejected before any mutation, and a correlated
-  rejection restores the record's pre-send tracker rather than the send's
-  own optimistic regression (a backward explicit send's regression must
-  not pin the tracker below the server). Slices to follow in the series:
+  `maxInt(u64)` is rejected before any mutation (a start against a
+  tracker already at the maximum is rejected the same way), and a
+  correlated rejection restores the record's pre-send tracker rather
+  than the send's own optimistic regression (a backward explicit send's
+  regression must not pin the tracker below the server) — except
+  `agent_busy`: the server validates the sequence before the processing
+  state, so a busy answer proves the sequence MATCHED and the tracker
+  rests at exactly the rejected sequence (a busy-rejected explicit send
+  retries its own sequence, never the stale pre-send tracker). Slices to follow in the series:
   duplicate-evidence handling for `duplicate_sequence` answers, the
   pending-record lifecycle and stale-reply guards, the bounded stop probe
   for unknown outcomes, and the TUI teardown integration

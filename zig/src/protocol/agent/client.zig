@@ -150,6 +150,12 @@ pub const AgentProtocolClient = struct {
         }
 
         const seq = self.peekNextSequence(sid);
+        // The tracker mirrors seq + 1 optimistically: a start attempted while
+        // the tracker sits at maxInt(u64) (left by an explicit maxInt-1
+        // message against this session) is un-advanceable — evaluating the
+        // mirror would trap in safety-checked builds — so it is rejected
+        // before any mutation or wire write (#210 gap 7).
+        if (seq == std.math.maxInt(u64)) return error.InvalidSequence;
         const start_json = try self.serializeEnvelopeForSend(.{
             .session_id = sid,
             .message_id = msg_id,
@@ -1088,4 +1094,23 @@ test "AgentProtocolClient agent_busy rejection of an explicit send preserves the
     var retried = try harness.envelopeAt(1);
     defer retried.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), retried.sequence);
+}
+
+test "AgentProtocolClient rejects a start against a tracker at the sequence maximum (#210 gap 7)" {
+    // An explicit maxInt-1 message leaves the tracker at maxInt(u64); a
+    // start against that session is un-advanceable (its seq + 1 mirror
+    // would trap in safety-checked builds), so it is rejected before any
+    // mutation or wire write — the caller recovers instead of crashing.
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":edge}", null, std.math.maxInt(u64) - 1); // tracker maxInt
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), client.peekNextSequence(sid));
+
+    try std.testing.expectError(error.InvalidSequence, client.sendAgentStartWithSession(sid, "{}", null));
+    try std.testing.expectEqual(@as(usize, 1), harness.writes.items.len); // the message only — nothing sent
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), client.peekNextSequence(sid)); // untouched
 }
