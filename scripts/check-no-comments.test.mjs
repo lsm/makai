@@ -168,6 +168,25 @@ test("ts: comment trailing a block before a closing brace is stripped", () => {
   );
 });
 
+test("ts: a removed comment under a next-line directive keeps the directive's own line", () => {
+  // eslint-disable-next-line targets the immediately following line; if a
+  // removed comment occupied that line, deleting it outright would slide
+  // the suppression onto different code. The blank line preserves the
+  // original attachment.
+  assert.equal(
+    stripComments("// eslint-disable-next-line no-undef\n// explanation\nfoo()\n", "x.ts"),
+    "// eslint-disable-next-line no-undef\n\nfoo()\n",
+  );
+  assert.equal(
+    stripComments("// @ts-expect-error malformed\n// because of X\nconst a = 1\n", "x.ts"),
+    "// @ts-expect-error malformed\n\nconst a = 1\n",
+  );
+  assert.equal(
+    stripComments("// biome-ignore lint/suspicious/noExplicitAny: reason\n// detail\nfoo(1 as any)\n", "x.ts"),
+    "// biome-ignore lint/suspicious/noExplicitAny: reason\n\nfoo(1 as any)\n",
+  );
+});
+
 test("ts: removing a block comment between tokens keeps them separated", () => {
   assert.equal(stripComments("return/* note */value\n", "x.ts"), "return value\n");
   assert.equal(stripComments("const/*c*/x = 1\n", "x.ts"), "const x = 1\n");
@@ -425,6 +444,22 @@ test("ratchet: retirement is a one-way latch that closes seeding", () => {
   const unretired = run();
   assert.equal(unretired.status, 1, unretired.stdout);
   assert.ok(unretired.stdout.includes("cannot be undone"));
+});
+
+test("ratchet: removing the allowlist without the retirement marker fails", () => {
+  const repo = gitRepo("no-marker-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "const x = 1;\n");
+  rmSync(join(repo, "allowlist.txt"));
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("without the retirement marker"));
 });
 
 function loadAllowlistFrom(paths) {

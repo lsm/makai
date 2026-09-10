@@ -186,7 +186,7 @@ function scanZig(text) {
 // then trailing-space and blank-run tidy outside literals only.
 // ---------------------------------------------------------------------------
 
-function expandRange(text, { start, end }) {
+function expandRange(text, { start, end }, preserveLine = false) {
   let lineStart = 0;
   if (start > 0) {
     const nl = text.lastIndexOf("\n", start - 1);
@@ -197,7 +197,10 @@ function expandRange(text, { start, end }) {
   const prefix = text.slice(lineStart, start);
   const suffix = text.slice(end, nlAfter);
   if (/^\s*$/.test(prefix) && /^\s*$/.test(suffix)) {
-    return { start: lineStart, end: Math.min(nlAfter + 1, text.length), alone: true };
+    // Whole-line removal — but when a kept next-line directive sits on the
+    // previous line, keep the newline so the directive still targets a line
+    // of its own instead of sliding onto different code.
+    return { start: lineStart, end: preserveLine ? nlAfter : Math.min(nlAfter + 1, text.length), alone: true };
   }
   let e = end;
   while (e < text.length && (text[e] === " " || text[e] === "\t")) e++;
@@ -243,11 +246,26 @@ export function findComments(text, fileName) {
   return fileName.endsWith(".zig") ? scanZig(text).comments : collectTsCommentRanges(text, fileName);
 }
 
+// Does a kept directive comment occupy the line immediately before this
+// comment's line? Removing a comment-only line directly under a next-line
+// directive would otherwise re-attach the directive to different code.
+function directivePrecedes(text, { start }, keepPatterns) {
+  const lineStart = start > 0 ? text.lastIndexOf("\n", start - 1) + 1 : 0;
+  if (lineStart === 0) return false;
+  const prevEnd = lineStart - 1;
+  const prevStart = text.lastIndexOf("\n", prevEnd - 1) + 1;
+  const t = text.slice(prevStart, prevEnd).trimStart();
+  return (t.startsWith("//") || t.startsWith("/*")) && keepPatterns.some((p) => p.test(t));
+}
+
 export function stripComments(text, fileName = "x.ts") {
   const lineTerminator = fileName.endsWith(".zig") ? /[\n]/ : TS_LINE_TERMINATOR;
+  const keepPatterns = fileName.endsWith(".zig") ? ZIG_KEEP_PATTERNS : TS_KEEP_PATTERNS;
   const comments = findComments(text, fileName);
   if (comments.length === 0) return text;
-  const removals = mergeRanges(comments.map((r) => expandRange(text, r)));
+  const removals = mergeRanges(
+    comments.map((r) => expandRange(text, r, directivePrecedes(text, r, keepPatterns))),
+  );
   let out = "";
   let cursor = 0;
   for (const { start, end, alone } of removals) {
@@ -340,8 +358,9 @@ export function baseAllowlistEntries(allowlistPath, cwd, baseRev = null) {
 // paths can never reopen the bypass. Returns a violation message or null.
 export function ratchetViolation(allowlistPath, cwd, baseRev = null) {
   const marker = `${allowlistPath}.retired`;
+  const allowlistExists = existsSync(allowlistPath);
   const markerExists = existsSync(marker);
-  if (markerExists && existsSync(allowlistPath)) {
+  if (markerExists && allowlistExists) {
     return "ratchet is retired but an allowlist is present — seeding is closed; remove the allowlist";
   }
   if (markerExists) return null;
@@ -352,18 +371,32 @@ export function ratchetViolation(allowlistPath, cwd, baseRev = null) {
     return null;
   }
   const markerRel = relative(root, resolve(cwd, marker));
+  const allowlistRel = relative(root, resolve(cwd, allowlistPath));
   if (markerRel.startsWith("..")) return null;
-  // A marker that existed in HEAD (working-tree removal) or in the base
-  // revision (committed removal) but is absent now undoes the retirement.
   const revs = ["HEAD"];
   const base = resolveBaseCommit(cwd, baseRev);
   if (base) revs.push(base);
+  // A marker that existed in HEAD (working-tree removal) or in the base
+  // revision (committed removal) but is absent now undoes the retirement.
   for (const rev of revs) {
     try {
       git(["cat-file", "-e", `${rev}:${markerRel}`], cwd);
       return "ratchet retirement cannot be undone — the retired marker was removed";
     } catch {
       // marker not present at this revision
+    }
+  }
+  // Removing the allowlist requires the marker: without it a later change
+  // could recreate the file and seed freely, since no base allowlist and no
+  // marker would exist.
+  if (!allowlistExists) {
+    for (const rev of revs) {
+      try {
+        git(["cat-file", "-e", `${rev}:${allowlistRel}`], cwd);
+        return `allowlist removed without the retirement marker — create ${marker} so seeding stays closed`;
+      } catch {
+        // allowlist not present at this revision
+      }
     }
   }
   return null;
