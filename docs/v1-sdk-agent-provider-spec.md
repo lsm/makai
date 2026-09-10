@@ -1004,7 +1004,10 @@ Rules:
   it is LIVE — its own write was the LAST tracker write of any kind:
   another send's mirror or resync, or a reconciliation's floor or
   restore, supersedes it, so ownership follows write ordering, never
-  value equality) — to the pre-resync tracker CAPPED by the still-pending messages'
+  value equality; the undo applies only to a stop that actually MOVED
+  the tracker — an ordinary stop, or an explicit one resynced onto the
+  current value, made no move, and its rejection only lifts the tracker
+  to the proven floor) — to the pre-resync tracker CAPPED by the still-pending messages'
   floor (the pre-resync value may itself be an unresolved send's
   optimistic mirror), max the proven floor (below); the refuted resync's
   revert bound is durably recorded — an allocation failure surfaces
@@ -1113,7 +1116,12 @@ Rules:
   dropped once its envelope has been accepted for processing, since a
   forgotten floor can wedge the tracker on a consumed sequence; the
   tracker's own rise to the floor stays best-effort, healing through
-  duplicate evidence. A higher true
+  duplicate evidence. An accepted start additionally INVALIDATES
+  pending message records below its seeded floor: the start
+  demonstrably consumed those sequences, so no same-payload source
+  could have run — records sent before the started reply was processed
+  snapshot the older floor and would otherwise stay silently eligible
+  for a failure whose settlement can never arrive. A higher true
   counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
