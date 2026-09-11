@@ -5136,7 +5136,6 @@ test "AgentProtocolClient stop probe requires an exclusive registration's correl
 }
 
 test "AgentProtocolClient stop probe requires a recorded message send (#210 gap 7)" {
-    const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
     harness.wire();
@@ -5219,7 +5218,6 @@ test "AgentProtocolClient delayed agent_stopped for another request preserves th
 }
 
 test "AgentProtocolClient a second probe request reuses the in-flight probe (#210 gap 7)" {
-    const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
     harness.wire();
