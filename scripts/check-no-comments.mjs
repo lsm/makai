@@ -13,7 +13,7 @@
 // mode (default, or `--write`: strip + tidy orphaned blank lines).
 // `--check` is ratcheted by scripts/no-comments-allowlist.txt: files
 // seeded there pass while the gap-7 series lands; entries whose file is
-// clean or untracked are stale and fail, so the list only shrinks.
+// clean or untracked are stale and fail.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
