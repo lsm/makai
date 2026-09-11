@@ -39,7 +39,7 @@ function git(args, cwd) {
 const TS_KEEP_PATTERNS = [
   /^#!/,
   /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
-  /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error|nocheck|check)(?=[\s:]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error)(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*biome-ignore(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*eslint-disable(?:-(?:next-)?line)?(?=[\s,]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*eslint-enable(?=[\s,]|$)/,
@@ -63,6 +63,21 @@ const DEFAULT_ALLOWLIST = fileURLToPath(new URL("no-comments-allowlist.txt", imp
 // ---------------------------------------------------------------------------
 
 const TS_LINE_TERMINATOR = /[\n\r\u2028\u2029]/;
+
+// @ts-check/@ts-nocheck are file-wide pragmas: TypeScript processes them
+// only as single-line comments in the file's leading trivia (a shebang and
+// other comments may precede them, code may not), so the block forms and
+// mid-file placements are ordinary comments.
+const TS_PRAGMA_PATTERN = /^\/\/\s*@ts-(?:nocheck|check)(?=[\s:]|$)/;
+const STRIP_BLOCK_COMMENTS = /\/\*[\s\S]*?\*\//g;
+const STRIP_LINE_COMMENTS = new RegExp("//[^\\n\\r\\u2028\\u2029]*", "g");
+
+function isLeadingTsPragma(text, start) {
+  let before = text.slice(0, start);
+  if (before.startsWith("#!")) before = before.slice(before.indexOf("\n") + 1);
+  before = before.replace(STRIP_BLOCK_COMMENTS, "").replace(STRIP_LINE_COMMENTS, "");
+  return /^\s*$/.test(before);
+}
 
 function parse(text, fileName) {
   return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -113,7 +128,11 @@ function collectTsCommentRanges(text, fileName) {
     if (text[i] === "/" && text[i + 1] === "/") {
       let j = i + 2;
       while (j < n && !TS_LINE_TERMINATOR.test(text[j])) j++;
-      if (!TS_KEEP_PATTERNS.some((p) => p.test(text.slice(i, j)))) ranges.push({ start: i, end: j });
+      const slice = text.slice(i, j);
+      const kept =
+        TS_KEEP_PATTERNS.some((p) => p.test(slice)) ||
+        (TS_PRAGMA_PATTERN.test(slice) && isLeadingTsPragma(text, i));
+      if (!kept) ranges.push({ start: i, end: j });
       i = j;
       continue;
     }

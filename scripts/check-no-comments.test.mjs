@@ -219,6 +219,26 @@ test("ts: line comments end at every ECMAScript line terminator, not just LF", (
   assert.ok(lsOut.includes("const b=2;"), lsOut);
 });
 
+test("ts: @ts-check/@ts-nocheck are exempt only as leading single-line pragmas", () => {
+  const kept = [
+    "// @ts-nocheck\nconst a = 1\n",
+    "//@ts-check\nconst a = 1\n",
+    "#!/usr/bin/env node\n// @ts-check\nconst a = 1\n",
+    "/// <reference types=\"node\" />\n// @ts-nocheck\nconst a = 1\n",
+    "const a = 1\n// @ts-ignore\nconst b = 2\n",
+  ];
+  for (const src of kept) {
+    assert.equal(tsCount(src), 0, `expected exempt: ${src.split("\n")[0]}`);
+  }
+  const afterHeader = "/* header */\n// @ts-nocheck\nconst a = 1\n";
+  const found = findComments(afterHeader, "x.ts");
+  assert.equal(found.length, 1);
+  assert.ok(afterHeader.slice(found[0].start, found[0].end).startsWith("/* header"));
+  assert.equal(tsCount("/* @ts-nocheck */\nconst a = 1\n"), 1);
+  assert.equal(tsCount("const a = 1\n// @ts-nocheck\nconst b = 2\n"), 1);
+  assert.equal(tsCount("const a = 1\n// @ts-check\nconst b = 2\n"), 1);
+});
+
 test("ts: unclosed block comment refuses to lex", () => {
   assert.throws(() => stripComments("const a = 1 /* oops\nkeep()\n", "x.ts"), /never closed/);
 });
