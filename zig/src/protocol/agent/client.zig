@@ -116,6 +116,17 @@ const PendingSend = struct {
     send_epoch: u64 = 0,
 };
 
+const StopProbe = struct {
+    first_msg_id: agent_types.Ulid,
+    candidates: []u64,
+    next_index: usize,
+    reason: OwnedSlice(u8),
+};
+
+fn u64Ascending(_: void, a: u64, b: u64) bool {
+    return a < b;
+}
+
 /// Computes a pending MESSAGE record's payload digest (see
 /// `PendingSend.payload_hash`). Each component is tagged, presence-marked,
 /// and length-delimited before hashing — plain concatenation would identify
@@ -176,6 +187,7 @@ pub const AgentProtocolClient = struct {
     /// kind — has superseded (#210 gap 7).
     tracker_epoch_by_session: std.AutoHashMap(agent_types.SessionId, u64),
     admitted_by_session: std.AutoHashMap(agent_types.SessionId, SessionAdmission),
+    stop_probes_by_session: std.AutoHashMap(agent_types.SessionId, StopProbe),
 
     const Self = @This();
 
@@ -192,6 +204,7 @@ pub const AgentProtocolClient = struct {
             .stop_revert_bound_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .tracker_epoch_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .admitted_by_session = std.AutoHashMap(agent_types.SessionId, SessionAdmission).init(allocator),
+            .stop_probes_by_session = std.AutoHashMap(agent_types.SessionId, StopProbe).init(allocator),
         };
     }
 
@@ -224,6 +237,13 @@ pub const AgentProtocolClient = struct {
         self.stop_revert_bound_by_session.deinit();
         self.tracker_epoch_by_session.deinit();
         self.admitted_by_session.deinit();
+
+        var probe_it = self.stop_probes_by_session.iterator();
+        while (probe_it.next()) |entry| {
+            entry.value_ptr.reason.deinit(self.allocator);
+            self.allocator.free(entry.value_ptr.candidates);
+        }
+        self.stop_probes_by_session.deinit();
 
         self.* = undefined;
     }
@@ -507,6 +527,82 @@ pub const AgentProtocolClient = struct {
         try self.writeEnvelopeJson(json);
     }
 
+    pub fn hasActiveStopProbe(self: *Self, session_id: agent_types.SessionId) bool {
+        return self.stop_probes_by_session.contains(session_id);
+    }
+
+    pub fn sendAgentStopProbing(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !?agent_types.Ulid {
+        if (self.stop_probes_by_session.get(session_id)) |existing| {
+            return existing.first_msg_id;
+        }
+        if (!self.isSessionAdmitted(session_id)) return null;
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return null;
+
+        const tracker_value = self.peekNextSequence(session_id);
+        var floor: u64 = tracker_value;
+        var has_message = false;
+        for (list.items) |pending| {
+            if (pending.kind != .message) continue;
+            has_message = true;
+            floor = @min(floor, pending.sequence);
+            floor = @min(floor, pending.prior_tracker);
+        }
+        if (!has_message) return null;
+        floor = @max(floor, self.provenFloor(session_id));
+
+        var candidates = std.ArrayList(u64).empty;
+        errdefer candidates.deinit(self.allocator);
+        try candidates.append(self.allocator, floor);
+        for (list.items) |pending| {
+            if (pending.kind == .message) {
+                if (std.math.add(u64, pending.sequence, 1)) |next| {
+                    try candidates.append(self.allocator, @max(next, floor));
+                } else |_| {}
+            }
+            try candidates.append(self.allocator, @max(pending.prior_tracker, floor));
+        }
+        try candidates.append(self.allocator, @max(tracker_value, floor));
+        std.mem.sort(u64, candidates.items, {}, u64Ascending);
+        var unique_len: usize = 0;
+        for (candidates.items) |value| {
+            if (unique_len > 0 and candidates.items[unique_len - 1] == value) continue;
+            candidates.items[unique_len] = value;
+            unique_len += 1;
+        }
+        candidates.shrinkRetainingCapacity(unique_len);
+
+        const msg_id = agent_types.generateUlid();
+        var payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
+        defer payload.deinit(self.allocator);
+        if (reason) |r| payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r));
+        const stop_json = try self.serializeEnvelopeForSend(.{
+            .session_id = session_id,
+            .message_id = msg_id,
+            .sequence = floor,
+            .timestamp = compat.time.nowMillis(),
+            .payload = payload,
+        });
+        defer self.allocator.free(stop_json);
+
+        var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
+        var reason_owned_by_map = false;
+        errdefer if (!reason_owned_by_map) owned_reason.deinit(self.allocator);
+        const owned_candidates = try candidates.toOwnedSlice(self.allocator);
+        var candidates_owned_by_map = false;
+        errdefer if (!candidates_owned_by_map) self.allocator.free(owned_candidates);
+        try self.stop_probes_by_session.put(session_id, .{
+            .first_msg_id = msg_id,
+            .candidates = owned_candidates,
+            .next_index = 1,
+            .reason = owned_reason,
+        });
+        reason_owned_by_map = true;
+        candidates_owned_by_map = true;
+
+        self.writeEnvelopeJson(stop_json) catch {};
+        return msg_id;
+    }
+
     /// Serializes an envelope for sending, failing BEFORE anything is
     /// written (no sender configured, serialization allocation) — callers
     /// perform their fallible serialization here, before any tracker
@@ -636,6 +732,7 @@ pub const AgentProtocolClient = struct {
                 try self.setSessionResult(env.session_id, json);
             },
             .agent_error => |e| {
+                if (try self.handleProbeReply(env.session_id, env.in_reply_to, e.code)) return;
                 if (env.in_reply_to != null and !self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                 // Roll the tracker back BEFORE the fallible error bookkeeping:
                 // the rejection envelope is already consumed, so an allocation
@@ -665,6 +762,7 @@ pub const AgentProtocolClient = struct {
                 // terminal session error makes the TUI abort a healthy turn.
                 // Unrelated nacks stay request-scoped and are dropped (#210
                 // gap 7).
+                if (try self.handleProbeReply(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code))) return;
                 if (!self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                 // A duplicate_sequence answer is the one wrong-counter code
                 // that PROVES the server's counter is past the sent sequence
@@ -759,6 +857,11 @@ pub const AgentProtocolClient = struct {
                 try self.setSessionError(env.session_id, n.reason.slice());
             },
             .agent_stopped => |p| {
+                if (self.stop_probes_by_session.get(p.session_id)) |probe| {
+                    if (env.in_reply_to) |reply_to| {
+                        if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return;
+                    }
+                }
                 if (self.session_id) |sid| {
                     if (std.mem.eql(u8, sid[0..], p.session_id[0..])) self.session_id = null;
                 }
@@ -780,6 +883,60 @@ pub const AgentProtocolClient = struct {
             list.deinit(self.allocator);
         }
         _ = self.admitted_by_session.remove(session_id);
+        if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
+            var probe = entry.value;
+            probe.reason.deinit(self.allocator);
+            self.allocator.free(probe.candidates);
+        }
+    }
+
+    fn handleProbeReply(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !bool {
+        const reply_to = in_reply_to orelse return false;
+        const probe = self.stop_probes_by_session.get(session_id) orelse return false;
+        if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return false;
+
+        const retry = probe.next_index < probe.candidates.len and (if (code) |c| c == .invalid_request else false);
+        const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
+        const next_index = probe.next_index;
+        const candidates = probe.candidates;
+        var reason = probe.reason;
+        _ = self.stop_probes_by_session.remove(session_id);
+        var candidates_owned_here = true;
+        var reason_owned_here = true;
+        defer {
+            if (candidates_owned_here) self.allocator.free(candidates);
+            if (reason_owned_here) reason.deinit(self.allocator);
+        }
+        if (retry) {
+            const retry_msg_id = agent_types.generateUlid();
+            var retry_payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
+            defer retry_payload.deinit(self.allocator);
+            retry_payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason.slice()));
+            const retry_json = try self.serializeEnvelopeForSend(.{
+                .session_id = session_id,
+                .message_id = retry_msg_id,
+                .sequence = candidates[next_index],
+                .timestamp = compat.time.nowMillis(),
+                .payload = retry_payload,
+            });
+            defer self.allocator.free(retry_json);
+            try self.stop_probes_by_session.put(session_id, .{
+                .first_msg_id = retry_msg_id,
+                .candidates = candidates,
+                .next_index = next_index + 1,
+                .reason = reason,
+            });
+            candidates_owned_here = false;
+            reason_owned_here = false;
+            self.writeEnvelopeJson(retry_json) catch {};
+        } else if (session_gone) {
+            _ = self.next_sequence_by_session.remove(session_id);
+            _ = self.proven_floor_by_session.remove(session_id);
+            _ = self.stop_revert_bound_by_session.remove(session_id);
+            _ = self.tracker_epoch_by_session.remove(session_id);
+            self.clearSessionControlState(session_id);
+        }
+        return true;
     }
 
     /// Retires the pending-send record whose request a reply names (e.g. the
@@ -4797,4 +4954,338 @@ test "AgentProtocolClient plain stop replies reach the session-gone and rejectio
         try std.testing.expect(client.getLastErrorForSession(sid) != null);
         try std.testing.expect(client.isSessionComplete(sid));
     }
+}
+
+fn admitExclusiveSession(harness: *Gap7Harness) !agent_types.SessionId {
+    const start_id = try harness.client.sendAgentStart("{}", null);
+    var start_env = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer start_env.deinit(std.testing.allocator);
+    const sid = start_env.session_id;
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(std.testing.allocator);
+    try harness.client.processEnvelope(started_env);
+    return sid;
+}
+
+fn rejectCorrelatedWithInvalidRequest(allocator: std.mem.Allocator, client: *AgentProtocolClient, sid: agent_types.SessionId, in_reply_to: agent_types.Ulid) !void {
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = in_reply_to,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection.deinit(allocator);
+    try client.processEnvelope(rejection);
+}
+
+test "AgentProtocolClient stop probe retries the post-send state carrying the caller's reason (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len);
+    var first_stop = try harness.envelopeAt(2);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first_stop.sequence);
+    try std.testing.expectEqualStrings("timeout", first_stop.payload.agent_stop.getReason().?);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, probe_id);
+
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len);
+    var retry_stop = try harness.envelopeAt(3);
+    defer retry_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), retry_stop.sequence);
+    try std.testing.expect(std.meta.activeTag(retry_stop.payload) == .agent_stop);
+    try std.testing.expectEqualStrings("timeout", retry_stop.payload.agent_stop.getReason().?);
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+}
+
+test "AgentProtocolClient stop probe settles without a retry when the pre-send stop is accepted (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len);
+
+    var stopped = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid } },
+    };
+    defer stopped.deinit(allocator);
+    try client.processEnvelope(stopped);
+
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(client.isSessionComplete(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+}
+
+test "AgentProtocolClient stop probe is bounded: exhausting the candidate set retires it (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+
+    const first_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, first_id);
+    var retry_stop = try harness.envelopeAt(3);
+    defer retry_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), retry_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, retry_stop.message_id);
+
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient stop probe is bounded: a non-sequence rejection does not retry (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+
+    var busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already processing a message") } },
+    };
+    defer busy.deinit(allocator);
+    try client.processEnvelope(busy);
+
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+}
+
+test "AgentProtocolClient stop probe requires an exclusive registration's correlated agent_started (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const unobserved = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(unobserved, "{}", null);
+    _ = try client.sendAgentMessage(unobserved, "{\"m\":1}", null);
+    const unobserved_writes = harness.writes.items.len;
+    try std.testing.expect((try client.sendAgentStopProbing(unobserved, "timeout")) == null);
+    try std.testing.expectEqual(unobserved_writes, harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(unobserved));
+
+    const supplied = agent_types.generateSessionId();
+    const supplied_start_id = try client.sendAgentStartWithSession(supplied, "{}", null);
+    var supplied_started = agent_types.Envelope{
+        .session_id = supplied,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = supplied_start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = supplied } },
+    };
+    defer supplied_started.deinit(allocator);
+    try client.processEnvelope(supplied_started);
+    _ = try client.sendAgentMessage(supplied, "{\"m\":1}", null);
+    const supplied_writes = harness.writes.items.len;
+    try std.testing.expect((try client.sendAgentStopProbing(supplied, "timeout")) == null);
+    try std.testing.expectEqual(supplied_writes, harness.writes.items.len);
+
+    const generated = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(generated, "{\"m\":1}", null);
+    try std.testing.expect((try client.sendAgentStopProbing(generated, "timeout")) != null);
+}
+
+test "AgentProtocolClient stop probe requires a recorded message send (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    const writes_before = harness.writes.items.len;
+    try std.testing.expect((try client.sendAgentStopProbing(sid, "timeout")) == null);
+    try std.testing.expectEqual(writes_before, harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+}
+
+test "AgentProtocolClient stop probe drops session control state on a gone session (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+
+    var gone = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer gone.deinit(allocator);
+    try client.processEnvelope(gone);
+
+    try std.testing.expectEqual(@as(usize, 3), harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+}
+
+test "AgentProtocolClient delayed agent_stopped for another request preserves the active probe (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+
+    var stale = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 9,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid } },
+    };
+    defer stale.deinit(allocator);
+    try client.processEnvelope(stale);
+
+    try std.testing.expect(client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+
+    var own = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 3,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid } },
+    };
+    defer own.deinit(allocator);
+    try client.processEnvelope(own);
+
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+}
+
+test "AgentProtocolClient a second probe request reuses the in-flight probe (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const first = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    const writes_before = harness.writes.items.len;
+    const second = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    try std.testing.expectEqual(writes_before, harness.writes.items.len);
+}
+
+test "AgentProtocolClient stop probe floor includes the minimum pre-send tracker (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 999);
+
+    const first_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    var first_stop = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, first_id);
+    var retry_stop = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer retry_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1000), retry_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, retry_stop.message_id);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len);
+}
+
+test "AgentProtocolClient stop probe sweeps one-past each unresolved message (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null);
+
+    const first_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    var first_stop = try harness.envelopeAt(3);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), first_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, first_id);
+    var second_stop = try harness.envelopeAt(4);
+    defer second_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), second_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, second_stop.message_id);
+    var third_stop = try harness.envelopeAt(5);
+    defer third_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), third_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, third_stop.message_id);
+    try std.testing.expectEqual(@as(usize, 6), harness.writes.items.len);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
 }
