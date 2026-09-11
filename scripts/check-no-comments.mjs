@@ -32,17 +32,21 @@ function git(args, cwd) {
   return execFileSync("git", args, { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "pipe"] });
 }
 
+// Every pattern matches the COMPLETE directive name followed by a valid
+// continuation (end of comment, whitespace, or the char that opens the
+// directive's argument) — a `\b` alone would accept hyphenated lookalikes
+// (`eslint-disable-policy` is not a directive ESLint processes).
 const TS_KEEP_PATTERNS = [
   /^#!/,
-  /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)\b/,
-  /^(?:\/\/|\/\*+)[\s*]*@ts-(ignore|expect-error|nocheck|check)\b/,
-  /^(?:\/\/|\/\*+)[\s*]*biome-ignore\b/,
-  /^(?:\/\/|\/\*+)[\s*]*eslint-(disable|enable)\b/,
-  /^\/\*+[\s*]*eslint-env\b/,
-  /^(?:\/\/|\/\*+)[\s*]*oxlint-(disable|enable)\b/,
-  /^(?:\/\/|\/\*+)[\s*]*@public\b/,
-  /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore\b/,
-  /^(?:\/\/|\/\*+)[\s*]*knip-ignore\b/,
+  /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error|nocheck|check)(?=[\s:]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*biome-ignore(?=[\s:]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*eslint-(?:disable|enable)(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^\/\*+[\s*]*eslint-env(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*oxlint-(?:disable|enable)(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*@public(?=[\s:]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore(?=[\s]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*knip-ignore(?=[\s:]|$)/,
 ];
 
 const ZIG_KEEP_PATTERNS = [/^\/\/ zig fmt: (off|on)[ \t\r]*$/];
