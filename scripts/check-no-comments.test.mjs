@@ -268,6 +268,53 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("/// <summary>documentation</summary>\nconst a = 1\n"), 1);
 });
 
+test("ts: @ts-check/@ts-nocheck are exempt only as leading single-line pragmas", () => {
+  const kept = [
+    "// @ts-nocheck\nconst a = 1\n",
+    "//@ts-check\nconst a = 1\n",
+    "#!/usr/bin/env node\n// @ts-check\nconst a = 1\n",
+    '/// <reference types="node" />\n// @ts-nocheck\nconst a = 1\n',
+    "const a = 1\n// @ts-ignore\nconst b = 2\n",
+    "const a = 1\n// @ts-expect-error\nconst b = 2\n",
+  ];
+  for (const src of kept) {
+    assert.equal(tsCount(src), 0, `expected exempt: ${src.split("\n")[0]}`);
+  }
+  const afterHeader = "/* header */\n// @ts-nocheck\nconst a = 1\n";
+  const found = findComments(afterHeader, "x.ts");
+  assert.equal(found.length, 1);
+  assert.ok(afterHeader.slice(found[0].start, found[0].end).startsWith("/* header"));
+  assert.equal(tsCount("/* @ts-nocheck */\nconst a = 1\n"), 1);
+  assert.equal(tsCount("const a = 1\n// @ts-nocheck\nconst b = 2\n"), 1);
+  assert.equal(tsCount("const a = 1\n// @ts-check\nconst b = 2\n"), 1);
+  assert.equal(tsCount('const a = "// @ts-check"\n// @ts-nocheck\nconst b = 2\n'), 1);
+});
+
+test("ts: /// directives are exempt only in the file's leading trivia", () => {
+  const kept = [
+    '/// <reference types="node" />\nconst a = 1\n',
+    '/// <amd-dependency path="./x.js" />\nconst a = 1\n',
+    '/// <amd-module name="x" />\nconst a = 1\n',
+    '/// <reference types="node" />\n/// <reference lib="dom" />\nconst a = 1\n',
+    '#!/usr/bin/env node\n/// <reference types="node" />\nconst a = 1\n',
+  ];
+  for (const src of kept) {
+    assert.equal(tsCount(src), 0, `expected exempt: ${src.split("\n")[0]}`);
+  }
+  const afterLineComment = '// harness config\n/// <reference types="node" />\nconst a = 1\n';
+  const foundComment = findComments(afterLineComment, "x.ts");
+  assert.equal(foundComment.length, 1);
+  assert.ok(afterLineComment.slice(foundComment[0].start, foundComment[0].end).startsWith("// harness"));
+  const afterHeader = '/* header */\n/// <reference types="node" />\nconst a = 1\n';
+  const found = findComments(afterHeader, "x.ts");
+  assert.equal(found.length, 1);
+  assert.ok(afterHeader.slice(found[0].start, found[0].end).startsWith("/* header"));
+  assert.equal(tsCount('const a = 1\n/// <reference types="node" />\n'), 1);
+  assert.equal(tsCount('#!/usr/bin/env node\nconst a = 1\n/// <reference types="node" />\n'), 1);
+  assert.equal(tsCount('const a = 1/// <reference types="node" />\n'), 1);
+  assert.equal(tsCount('const a = 1\n/// <amd-module name="x" />\n'), 1);
+});
+
 let workDir;
 test.beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "no-comments-"));
