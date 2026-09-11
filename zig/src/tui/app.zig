@@ -175,8 +175,6 @@ pub const ApprovalWaiter = struct {
         self.decision = .reject;
     }
 
-    /// Reject the currently pending approval wait without shutting the waiter
-    /// down, so future approval requests can still block normally.
     pub fn rejectPending(self: *ApprovalWaiter) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -254,9 +252,6 @@ pub const ProductionRuntime = struct {
         };
         if (maybe_store) |*store| {
             defer store.deinit();
-            // A malformed or unreadable config file must not brick TUI startup;
-            // fall back to defaults on non-OOM load errors (matching the
-            // previous saved-model loader behavior).
             saved_config = store.loadIfExists() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => null,
@@ -382,26 +377,10 @@ pub const App = struct {
     last_view_height: usize = 8,
     inline_history_flushed: usize = 0,
     last_inline_view_lines: usize = 4,
-    /// When an active session is deleted, the local/runtime message history is
-    /// cleared once the cancelled run becomes idle.
     pending_session_reset: bool = false,
-    /// Drop late events from a deleted run until a new turn signals itself via
-    /// agent_start, preventing deleted-run leftovers from being saved/applied to
-    /// the next session.
     quarantine_events: bool = false,
-    /// The runtime generation at the time the active session was deleted. Events
-    /// stamped with a generation less than or equal to this value are treated as
-    /// stale and dropped while quarantine is active.
     quarantine_generation: u32 = 0,
-    /// Events from a new turn that arrive before their lifecycle marker
-    /// (agent_start/turn_start) are buffered here so they are not dropped while
-    /// quarantine is still active.
     quarantine_buffer: std.ArrayList(tui_runtime.TuiEvent) = .empty,
-    /// Text staged for the system clipboard, flushed to the terminal via OSC 52
-    /// on the next `update` (where a mutable `Context` is available). Owned.
-    ///
-    /// `Ctrl+Y` / `/copy` provide an explicit OSC 52 copy path for when
-    /// dragging selection isn't convenient.
     pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
@@ -411,10 +390,6 @@ pub const App = struct {
         approval_waiter.* = .{ .allocator = allocator };
         runtime_options.tool_approval_ctx = approval_waiter;
         runtime_options.tool_approval_callback = approvalCallback;
-        // The runtime is heap-allocated so its address is stable: the session
-        // created below stores a pointer back to it, and `App` is returned by
-        // value (moved into its caller). An inline runtime would leave that
-        // pointer dangling after the move.
         const runtime_ptr = try allocator.create(tui_runtime.TuiRuntime);
         runtime_ptr.* = tui_runtime.TuiRuntime.init(allocator, runtime_options) catch |err| {
             allocator.destroy(runtime_ptr);
@@ -436,12 +411,9 @@ pub const App = struct {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
             app.state.telemetry.context_window = model.context_window;
         }
-        // Initialize session store and generate a session ID.
         app.store = session_store.Store.initDefault(allocator) catch null;
         try app.ensureSessionId();
         app.working_dir = currentPathOwned(allocator) catch try allocator.dupe(u8, "");
-        // Pre-populate sessions list on a best-effort basis. Startup should not
-        // lose the interactive runtime just because saved-session discovery fails.
         app.loadSessions() catch |err| try app.recordError(@errorName(err));
         return app;
     }
@@ -485,7 +457,6 @@ pub const App = struct {
         try self.state.status.setSessionId(self.allocator, self.session_id);
     }
 
-    /// Load sessions from the store into state.sessions.
     pub fn loadSessions(self: *App) !void {
         const store = self.store orelse return;
         var metas = try store.list();
@@ -503,7 +474,6 @@ pub const App = struct {
         }
     }
 
-    /// Resume the session currently selected in the session picker.
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
         self.state.clampSessionSelectionToFilter();
@@ -513,13 +483,7 @@ pub const App = struct {
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
-        // Drain any events that were queued before the resume completed while the
-        // old delete-state flags are still active, so stale events are dropped
-        // rather than saved under the resumed session.
         self.discardPendingEvents();
-        // Only clear the active-session delete state once the resume has
-        // successfully installed the loaded session. Also discard any buffered
-        // quarantine events so they cannot be replayed into an unrelated session.
         self.pending_session_reset = false;
         self.quarantine_events = false;
         for (self.quarantine_buffer.items) |*buf_ev| {
@@ -539,7 +503,6 @@ pub const App = struct {
         } else {
             try self.state.status.setModelWithContext(self.allocator, loaded.metadata.model, loaded.metadata.provider, 0);
         }
-        // Replay events into transcript and status counters.
         for (loaded.events.items) |*event| {
             try self.applyRuntimeEvent(event.*);
             self.hydrateToolDisplayPreview(event.*) catch |err| try self.recordError(@errorName(err));
@@ -571,10 +534,6 @@ pub const App = struct {
                 session.clearQueuedMessages();
             }
             if (self.runtime) |runtime| {
-                // Cancel any in-flight work first.  Only reset the runtime message
-                // context when it is safe to do so without blocking the UI.  For the
-                // remote backend replaceMessages is non-blocking; for the local backend
-                // we avoid waiting on a cancelled worker and only clear when idle.
                 runtime.cancel();
                 switch (runtime.backend) {
                     .remote => runtime.replaceMessages(&.{}) catch {},
@@ -591,8 +550,6 @@ pub const App = struct {
             self.state.clearQueuedPreviews();
             self.inline_history_flushed = 0;
             self.pending_session_reset = true;
-            // Drop any buffered events from a previous active-delete quarantine
-            // so they cannot replay into a newer session.
             for (self.quarantine_buffer.items) |*buf_ev| {
                 var mutable = buf_ev.*;
                 mutable.deinit(self.allocator);
@@ -613,7 +570,6 @@ pub const App = struct {
         TuiModel.ensureSessionSelectionVisible(self);
     }
 
-    /// Providers that expose an interactive login or API-key setup flow.
     const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
 
     const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
@@ -649,7 +605,6 @@ pub const App = struct {
         return null;
     }
 
-    /// Open the model picker, pre-selecting the currently active model.
     fn openModelPicker(self: *App) void {
         self.state.menu_scroll = 0;
         self.state.menu_index = 0;
@@ -727,7 +682,6 @@ pub const App = struct {
         };
     }
 
-    /// Apply the model highlighted in the model picker, then return to normal.
     fn applySelectedModel(self: *App) !void {
         const runtime = self.runtime orelse return error.NoRuntimeConfigured;
         const models = runtime.availableModels();
@@ -752,8 +706,6 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
-    /// Start the login/setup worker for a provider index. The flow then drives
-    /// forward via `pollLogin()` on each tick.
     fn startLoginProviderIndex(self: *App, idx: usize) !void {
         const provider = login_providers[idx];
         self.state.mode = .normal;
@@ -783,7 +735,6 @@ pub const App = struct {
         try self.startLoginProviderIndex(idx);
     }
 
-    /// Start the login/setup worker for the highlighted provider.
     fn applySelectedLogin(self: *App) !void {
         const idx = @min(self.state.menu_index, login_providers.len - 1);
         try self.startLoginProviderIndex(idx);
@@ -832,9 +783,6 @@ pub const App = struct {
         }
     }
 
-    /// Drive the active login session forward. Called each tick; surfaces the
-    /// authorization URL, switches to an input prompt when the worker blocks on
-    /// pasted input, and persists credentials when the flow completes.
     fn pollLogin(self: *App) !void {
         const session = self.login orelse return;
         switch (session.poll()) {
@@ -886,7 +834,6 @@ pub const App = struct {
         }
     }
 
-    /// Tear down the active login session and leave any input mode.
     fn finishLogin(self: *App) void {
         if (self.login) |session| {
             session.deinit();
@@ -896,8 +843,6 @@ pub const App = struct {
         self.state.focusComposer();
     }
 
-    /// Persist freshly obtained credentials, replacing any existing entry for
-    /// the provider. Does not take ownership of `creds`.
     fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
         var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
         defer storage.deinit();
@@ -906,11 +851,9 @@ pub const App = struct {
         var owned = false;
         errdefer if (!owned) self.allocator.free(key);
         if (std.mem.eql(u8, provider_id, "kimi")) {
-            // Kimi uses API key auth with optional region in provider_data
             const api_key = try self.allocator.dupe(u8, creds.access);
             errdefer if (!owned) self.allocator.free(api_key);
 
-            // Copy provider_data if present (format: "region:china" or "region:global")
             const provider_data: ?[]const u8 = if (creds.provider_data) |pd|
                 try self.allocator.dupe(u8, pd)
             else
@@ -924,7 +867,6 @@ pub const App = struct {
                 removed.value.deinit(self.allocator);
             }
 
-            // Store with region data if present
             if (provider_data) |pd| {
                 try storage.providers.put(key, .{ .oauth = .{
                     .refresh = "",
@@ -972,7 +914,6 @@ pub const App = struct {
         try runtime.replaceModels(models, current_model);
     }
 
-    /// Hand pasted input to the worker the login flow is blocked on.
     fn submitLoginInput(self: *App, text: []const u8) void {
         const session = self.login orelse {
             self.state.mode = .normal;
@@ -988,7 +929,6 @@ pub const App = struct {
         self.state.focusComposer();
     }
 
-    /// Abort an in-progress login.
     fn cancelLogin(self: *App) void {
         self.finishLogin();
         self.state.appendTranscript(.system, "login cancelled") catch {};
@@ -1022,11 +962,8 @@ pub const App = struct {
         }
     }
 
-    /// Save one event to the session store (best-effort: ignores errors).
     fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
         const store = self.store orelse return;
-        // Save replay-critical and debug-visible events while still rejecting
-        // oversized payloads that would make the JSONL session unwieldy.
         switch (event) {
             .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             .text_delta => |payload| {
@@ -1135,9 +1072,6 @@ pub const App = struct {
 
             const gen = ev.generation();
             if (self.quarantine_generation > 0 and gen <= self.quarantine_generation) {
-                // Stale event from the deleted run; keep dropping it even after
-                // quarantine ends so late deltas/terminal events cannot reach the
-                // new session.
                 continue;
             }
 
@@ -1145,13 +1079,9 @@ pub const App = struct {
                 const is_lifecycle = ev == .agent_start or ev == .turn_start;
                 const is_terminal = ev == .agent_end or ev == .@"error";
                 if (is_lifecycle or is_terminal) {
-                    // Lifecycle marker or terminal event for the new turn: replay
-                    // buffered fresh events in order, then process the marker/event.
                     self.quarantine_events = false;
                     {
                         defer {
-                            // On any exit (success or error), clean up buffered
-                            // events that have not yet been replayed.
                             for (self.quarantine_buffer.items) |*remaining| {
                                 var mutable = remaining.*;
                                 mutable.deinit(self.allocator);
@@ -1159,10 +1089,6 @@ pub const App = struct {
                             self.quarantine_buffer.clearRetainingCapacity();
                         }
                         while (self.quarantine_buffer.items.len > 0) {
-                            // Extract each item before processing so the buffer
-                            // only holds unprocessed events; this prevents a
-                            // mid-replay error from double-freeing already-deinited
-                            // slots via the outer defer.
                             var mutable = self.quarantine_buffer.orderedRemove(0);
                             defer mutable.deinit(self.allocator);
                             if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
@@ -1172,8 +1098,6 @@ pub const App = struct {
                         }
                     }
                 } else {
-                    // Fresh event that arrived before its lifecycle marker;
-                    // buffer it so the prompt/deltas are not lost.
                     const cloned = try ev.clone(self.allocator);
                     self.quarantine_buffer.append(self.allocator, cloned) catch |err| {
                         var to_free = cloned;
@@ -1269,21 +1193,12 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
-            // While quarantine is active all queued events are treated as stale;
-            // do not save them under the current (possibly new/resumed) session.
-            // Also drop events stamped with a generation at or before the last
-            // active-delete quarantine so they cannot leak into a resumed session.
             if (!self.quarantine_events and ev.generation() > self.quarantine_generation) {
                 self.saveEvent(ev);
             }
         }
     }
 
-    /// If an active-session delete left local history cleanup pending because
-    /// the local agent was not yet idle, clear it now if the agent is idle.
-    /// Returns error.PendingSessionReset when the local agent is still finishing
-    /// the cancelled run, so the caller can reject/defer the new turn instead of
-    /// blocking the UI thread waiting for idle.
     fn applyPendingSessionResetSync(self: *App) !void {
         if (!self.pending_session_reset) return;
         if (self.runtime) |runtime| {
@@ -1403,9 +1318,6 @@ pub const App = struct {
 
         if (command.kind == .abort) {
             if (self.approval_waiter) |waiter| waiter.rejectPending();
-            // /abort during an approval returns the TUI to normal mode; reset
-            // focus to the composer so follow-up typing isn't swallowed by a
-            // stale transcript/tools focus.
             if (self.state.mode == .normal) self.state.focusComposer();
         }
 
@@ -1416,7 +1328,6 @@ pub const App = struct {
                 self.inline_history_flushed = 0;
             },
             .open_session_picker => {
-                // Refresh sessions list from store then open the picker.
                 try self.loadSessions();
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
@@ -1482,15 +1393,12 @@ pub const App = struct {
         field.* = next;
     }
 
-    /// Stage text for the system clipboard. The bytes are copied; the actual
-    /// OSC 52 write happens in `update` via `flushClipboard`.
     fn stageClipboard(self: *App, text: []const u8) void {
         const dup = self.allocator.dupe(u8, text) catch return;
         if (self.pending_clipboard) |old| self.allocator.free(old);
         self.pending_clipboard = dup;
     }
 
-    /// Write any staged clipboard text to the terminal's clipboard (OSC 52).
     fn flushClipboard(self: *App, ctx: *zz.Context) void {
         const text = self.pending_clipboard orelse return;
         self.pending_clipboard = null;
@@ -1502,7 +1410,6 @@ pub const App = struct {
         if (!copied) self.recordError("clipboard unavailable") catch {};
     }
 
-    /// Copy the most recent assistant reply to the system clipboard.
     fn copyLastAssistant(self: *App) void {
         const text = self.state.lastAssistantText() orelse {
             self.state.appendTranscript(.system, "nothing to copy yet") catch {};
@@ -1512,7 +1419,6 @@ pub const App = struct {
         self.state.appendTranscript(.system, "copied last reply to clipboard") catch {};
     }
 
-    /// Copy the full transcript to the system clipboard.
     fn copyTranscript(self: *App) void {
         const text = self.state.transcriptToText(self.allocator) catch {
             self.recordError("copy failed") catch {};
@@ -1719,18 +1625,14 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
     }
 }
 
-/// Module-level state for the external editor launch (T11).
-/// Stores the owned temp file path so the stateless `perform` fn can access it.
 var editor_tmp_path: []u8 = &.{};
 var editor_tmp_allocator: ?std.mem.Allocator = null;
 
 const editor_tmp_dir_prefix = "makai-editor-";
 const editor_tmp_file_name = "composer.txt";
 
-/// T11: Write composer buffer to a temp file and return a batch command that
-/// exits alt screen, runs the editor, and returns an editor_done message.
 fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiModel.Msg) {
-    if (@import("builtin").is_test) return null; // skip in tests
+    if (@import("builtin").is_test) return null;
     if (@import("builtin").os.tag == .windows) return null;
 
     const content = app.state.composer.buffer.items;
@@ -1740,7 +1642,6 @@ fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiMode
         allocator.free(tmp_path);
     }
 
-    // Store owned path in module-level state for the perform fn.
     if (editor_tmp_path.len > 0) {
         cleanupExternalEditorTempPath(editor_tmp_path);
         allocator.free(editor_tmp_path);
@@ -1848,7 +1749,6 @@ fn freeEditorArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
     allocator.free(argv);
 }
 
-/// Stateless perform fn: spawns $EDITOR on the temp file and reads result back.
 fn runEditorPerform() ?TuiModel.Msg {
     if (editor_tmp_path.len == 0) return TuiModel.Msg{ .editor_failed = {} };
     const allocator = editor_tmp_allocator orelse return TuiModel.Msg{ .editor_failed = {} };
@@ -1860,14 +1760,12 @@ fn runEditorPerform() ?TuiModel.Msg {
         editor_tmp_allocator = null;
     }
 
-    // Resolve $EDITOR or fall back to vi.
     const editor_owned = compat.getEnvVarOwned(allocator, "EDITOR") catch
         (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return TuiModel.Msg{ .editor_failed = {} });
     defer allocator.free(editor_owned);
     const argv = buildEditorArgv(allocator, editor_owned, path) catch return TuiModel.Msg{ .editor_failed = {} };
     defer freeEditorArgv(allocator, argv);
 
-    // Spawn editor and wait.
     var child = std.process.spawn(defaultIo(), .{
         .argv = argv,
         .stdin = .inherit,
@@ -1877,7 +1775,6 @@ fn runEditorPerform() ?TuiModel.Msg {
     defer if (child.id != null) child.kill(defaultIo());
     _ = child.wait(defaultIo()) catch return TuiModel.Msg{ .editor_failed = {} };
 
-    // Read file back.
     const content = std.Io.Dir.readFileAlloc(.cwd(), defaultIo(), path, allocator, .limited(10 * 1024 * 1024)) catch return TuiModel.Msg{ .editor_failed = {} };
 
     return TuiModel.Msg{ .editor_done = content };
@@ -1892,9 +1789,7 @@ pub const TuiModel = struct {
         mouse: zz.MouseEvent,
         tick: struct { timestamp: u64, delta: u64 },
         quit: void,
-        /// Content read back from the external editor (owned by persistent allocator).
         editor_done: []u8,
-        /// External editor failed after leaving alt screen; restore terminal state.
         editor_failed: void,
     };
 
@@ -1925,12 +1820,8 @@ pub const TuiModel = struct {
         const app = &(self.app orelse return .none);
         switch (msg) {
             .editor_done => |content| {
-                // Content was read back from the external editor. Load into composer.
                 defer ctx.persistent_allocator.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
-                // The composer is the only pane whose contents were edited; ensure
-                // focus is on it so subsequent typing is not swallowed by a stale
-                // transcript/tools focus.
                 app.state.focusComposer();
                 return editorReturnCommand();
             },
@@ -1944,10 +1835,6 @@ pub const TuiModel = struct {
                         'c' => return .quit,
                         'k' => {
                             if (app.state.mode == .normal) {
-                                // Native scrollback never renders the selectable
-                                // transcript pane; skip it when cycling backward so
-                                // tools -> composer instead of tools -> transcript
-                                // (which render would redirect back to tools).
                                 if (@import("builtin").is_test) {
                                     app.state.focusPrevPane();
                                 } else if (ctx._terminal != null and app.state.focus_pane == .tools) {
@@ -1959,13 +1846,7 @@ pub const TuiModel = struct {
                             return .none;
                         },
                         'g' => {
-                            // T11: Open external editor with current composer buffer.
-                            // The editor edits the composer contents, so focus it on
-                            // launch and return so typing after the editor closes is
-                            // not consumed by a stale transcript/tools focus.
                             app.state.focusComposer();
-                            // In tests, ctx may be undefined; skip launching the
-                            // external editor without dereferencing ctx fields.
                             if (@import("builtin").is_test) return .none;
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
@@ -1989,12 +1870,7 @@ pub const TuiModel = struct {
                             return .none;
                         },
                         'd' => {
-                            // Issue #137: cycle time → date+time → off for
-                            // transcript message timestamps.  When the session
-                            // picker is open, Ctrl+D is handled there as the
-                            // delete shortcut instead.
                             if (app.state.mode == .session_picker) {
-                                // fall through to session picker handling below
                             } else {
                                 _ = app.state.cycleTimestampDisplay();
                                 return .none;
@@ -2048,7 +1924,6 @@ pub const TuiModel = struct {
                         return .none;
                     }
                 }
-                // Session picker navigation and filtering.
                 if (app.state.mode == .session_picker) {
                     if (app.state.session_delete_confirm) {
                         switch (key.key) {
@@ -2098,7 +1973,6 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
-                // Pasted-input prompt during an OAuth login flow.
                 if (app.state.mode == .login_input) {
                     switch (key.key) {
                         .enter => {
@@ -2119,7 +1993,6 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
-                // Single-column selector menu navigation.
                 if (isMenuMode(app.state.mode)) {
                     switch (key.key) {
                         .up => app.moveMenuSelection(-1),
@@ -2164,9 +2037,6 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
-                // Normal-mode focus/selection navigation. When a non-composer pane
-                // is focused, consume the key so it does not fall through to the
-                // composer handlers and mutate the draft buffer.
                 if (app.state.mode == .normal) {
                     if (key.key == .tab) {
                         app.state.focusNextPane();
@@ -2208,7 +2078,6 @@ pub const TuiModel = struct {
                         };
                         const text = app.state.composer.text();
                         if (app.state.mode == .approval) {
-                            // Only /abort is allowed while a tool approval is pending.
                             const command = tui_commands.parse(text) catch return .none;
                             if (command.kind != .abort) return .none;
                         }
@@ -2237,9 +2106,6 @@ pub const TuiModel = struct {
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
-                                // Remote backend does not support steering mid-stream; keep the
-                                // draft in the composer and let the composer hint explain why.
-                                // Still allow slash commands such as /quit and /abort to run.
                                 const trimmed = std.mem.trim(u8, text, " \t\r\n");
                                 if (std.mem.startsWith(u8, trimmed, "/")) {
                                     app.submit(text) catch |err| {
@@ -2263,9 +2129,6 @@ pub const TuiModel = struct {
                             };
                         }
                         if (consumed) {
-                            // Only record history when the draft was actually consumed (submitted,
-                            // steered, queued, or run as a slash command). An ignored remote Enter
-                            // keeps the draft in the composer so it must not pollute Up-arrow history.
                             app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                             app.state.composer.clear();
                             app.drainEvents() catch |err| {
@@ -2288,7 +2151,6 @@ pub const TuiModel = struct {
                     .down => {
                         _ = app.state.composerHistoryNext() catch false;
                     },
-                    // PageUp/PageDown scroll by 5 lines for faster navigation.
                     .page_up => app.state.transcript_scroll += 5,
                     .page_down => app.state.transcript_scroll -|= 5,
                     .escape => app.state.mode = .normal,
@@ -2304,8 +2166,6 @@ pub const TuiModel = struct {
             },
             .quit => return .quit,
         }
-        // A command (e.g. `/copy`) may have staged clipboard text; flush it now
-        // that a mutable Context is in hand.
         flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
         app.flushClipboard(ctx);
         return .none;
@@ -2316,10 +2176,6 @@ pub const TuiModel = struct {
         const width: usize = @max(ctx.width, 20);
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
-        // A single one-line status bar sits below the composer; the transcript
-        // fills the rest of the screen. The tool panel and verbose telemetry
-        // panel were removed — their context/token data already lives in the
-        // status line, and tool details are available via `/tools`.
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
@@ -2327,9 +2183,6 @@ pub const TuiModel = struct {
         }) catch "";
         const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
         if (ctx._terminal != null and app.state.mode == .normal and app.state.focus_pane == .transcript) {
-            // Native scrollback renders only the active transcript tail, not the
-            // selectable transcript view. Skip that hidden pane so Tab can reach
-            // the visible tools pane when available.
             if (app.state.tools.items.len > 0) {
                 app.state.focus_pane = .tools;
                 if (app.state.selected_tool_index == null) app.state.selected_tool_index = app.state.tools.items.len - 1;
@@ -2432,8 +2285,6 @@ pub const TuiModel = struct {
                 const available = height -| (countLines(status) + countLines(composer) + countLines(queued) + min_transcript + panel_chrome);
                 const tool_panel_height = @min(8, available);
                 if (tool_panel_height < 4) {
-                    // The tool panel cannot fit; fall back focus to the composer so
-                    // the normal-mode key handler does not swallow printable keys.
                     app.state.focus_pane = .composer;
                     break :blk "";
                 }
@@ -2442,8 +2293,6 @@ pub const TuiModel = struct {
         };
         if (ctx._terminal != null) {
             if (app.state.focus_pane == .transcript) {
-                // Native scrollback renders only the active transcript tail, not
-                // the selectable transcript view; avoid an invisible focus pane.
                 app.state.focusComposer();
             }
             const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
@@ -2789,7 +2638,6 @@ fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store
     return a.last_active > b.last_active;
 }
 
-/// Build the default export filename, e.g. "transcript-20260615-120000-123.md".
 fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
     const millis = compat.time.nowMillis();
     const secs: i64 = @divFloor(millis, 1000);
@@ -2843,7 +2691,6 @@ fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
-/// Format a session label from metadata: "model provider YYYY-MM-DD HH:MM".
 fn formatSessionLabel(allocator: std.mem.Allocator, meta: session_store.SessionMetadata) ![]u8 {
     const ts = meta.last_active;
     const secs: i64 = @divFloor(ts, 1000);
@@ -3223,9 +3070,6 @@ test "multi-line /help output renders all lines into transcript view" {
     const rendered = try transcript_view.render(std.testing.allocator, &app.state, .{ .width = 100, .height = 30 });
     defer std.testing.allocator.free(rendered);
 
-    // Every command name must appear in the rendered transcript — the previous
-    // bug (inline_style theme stripped newlines) collapsed the whole help
-    // listing to a single truncated line.
     const expect = [_][]const u8{
         "/help",  "/model",       "/provider", "/status",
         "/tools", "/permissions", "/view",     "/compact",
@@ -3316,7 +3160,6 @@ test "App submit abort does not permanently shut down approval waiter" {
     try std.testing.expect(!waiter.shutting_down);
     try std.testing.expect(waiter.decision == .reject);
 
-    // Verify the waiter can still accept a future approval decision.
     waiter.decision = null;
     try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "edit_file", "{}");
     try app.decideApproval(true, false);
@@ -3608,8 +3451,6 @@ test "App drain quarantines late events until the next turn starts" {
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // Stale event from the deleted turn (generation <= quarantine_generation)
-    // is dropped rather than buffered or applied.
     try mock.eventStream().push(.{ .text_delta = .{
         .generation = 1,
         .content_index = 0,
@@ -3646,8 +3487,6 @@ test "App drain exits quarantine on turn_start for remote-style streams" {
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // Stale event from the deleted turn (generation <= quarantine_generation)
-    // is dropped rather than buffered or applied.
     try mock.eventStream().push(.{ .text_delta = .{
         .generation = 1,
         .content_index = 0,
@@ -3678,8 +3517,6 @@ test "App drain ignores stale lifecycle events while quarantined" {
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // Events from the cancelled run carry the same generation as the deleted
-    // turn and must not end quarantine, even if they are lifecycle events.
     try mock.eventStream().push(.{ .agent_start = .{ .generation = 1 } });
     try mock.eventStream().push(.{ .turn_start = .{ .generation = 1 } });
     try mock.eventStream().push(.{ .text_delta = .{
@@ -3691,8 +3528,6 @@ test "App drain ignores stale lifecycle events while quarantined" {
     try std.testing.expect(app.quarantine_events);
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
 
-    // Only a lifecycle event from a newer turn (higher generation) ends
-    // quarantine and allows its following deltas through.
     try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
     try mock.eventStream().push(.{ .text_delta = .{
         .generation = 2,
@@ -3715,9 +3550,6 @@ test "App drain buffers fresh user message_end during quarantine until lifecycle
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // Remote runs enqueue the synthetic user message_end before the remote
-    // turn_start arrives. It belongs to the new turn (generation 2) and must
-    // be preserved, not dropped.
     try mock.eventStream().push(.{ .message_end = .{
         .generation = 2,
         .role = .user,
@@ -3752,10 +3584,6 @@ test "App drain ends quarantine on fresh terminal error and surfaces it" {
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // A fresh user message_end arrives before the lifecycle marker, followed by
-    // a terminal error before any agent_start/turn_start. The error must end
-    // quarantine, flush the buffer, and be surfaced instead of being buffered
-    // forever.
     try mock.eventStream().push(.{ .message_end = .{
         .generation = 2,
         .role = .user,
@@ -3786,7 +3614,6 @@ test "App drain keeps filtering stale generations after quarantine ends" {
     app.quarantine_events = true;
     app.quarantine_generation = 1;
 
-    // Lifecycle marker from the new turn ends quarantine.
     try mock.eventStream().push(.{ .agent_start = .{ .generation = 2 } });
     try mock.eventStream().push(.{ .text_delta = .{
         .generation = 2,
@@ -3796,8 +3623,6 @@ test "App drain keeps filtering stale generations after quarantine ends" {
     try app.drainEvents();
     try std.testing.expect(!app.quarantine_events);
 
-    // A late stale delta from the deleted run arrives afterwards and must still
-    // be dropped, not applied to the new session.
     try mock.eventStream().push(.{ .text_delta = .{
         .generation = 1,
         .content_index = 0,
@@ -4119,8 +3944,6 @@ test "TuiModel allows /abort slash command during approval mode" {
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, model.app.?.state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("Turn aborted.", model.app.?.state.transcript.items[0].text.items);
-    // /abort during approval must also reset focus to the composer so follow-up
-    // typing is not swallowed by a stale transcript/tools focus.
     try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
 }
 
@@ -4222,7 +4045,6 @@ test "session picker delete and nav keys fall back to filter input" {
     try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
     try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
 
-    // The literal keys used for delete/navigation become ordinary filter input.
     _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
     try std.testing.expectEqualStrings("d", model.app.?.state.sessionFilterText());
     try std.testing.expect(!model.app.?.state.session_delete_confirm);
@@ -4233,7 +4055,6 @@ test "session picker delete and nav keys fall back to filter input" {
     _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
     try std.testing.expectEqualStrings("djk", model.app.?.state.sessionFilterText());
 
-    // Clear the filter and search for a real row; Ctrl+d should then confirm.
     _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
     _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
     _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
@@ -4385,7 +4206,6 @@ test "TuiModel Ctrl+K cycles focus pane backwards" {
 
     const ctrl_k = zz.KeyEvent{ .key = .{ .char = 'k' }, .modifiers = .{ .ctrl = true } };
 
-    // Tab forward to tools, then Ctrl+K back to transcript.
     _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
     _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
     try std.testing.expectEqual(tui_state.FocusPane.tools, model.app.?.state.focus_pane);
@@ -4521,9 +4341,6 @@ test "resume selected session clears delete reset flags" {
     app.pending_session_reset = true;
     app.quarantine_events = true;
 
-    // Without a runtime configured, resume fails and the stale delete-state flags
-    // must stay active so a subsequent drain can still clear the deleted history
-    // and quarantine late events.
     try std.testing.expectError(error.NoRuntimeConfigured, app.resumeSelectedSession());
     try std.testing.expect(app.pending_session_reset);
     try std.testing.expect(app.quarantine_events);
@@ -4594,8 +4411,6 @@ test "resume selected session clears delete reset flags on success" {
     try std.testing.expectEqualStrings("s1", app.session_id);
 }
 
-// =====================================================================// Mock provider for ProductionRuntime lifetime regression tests
-// =====================================================================
 const MockProvider = struct {
     fn stream(
         model: ai_types.Model,
@@ -4694,10 +4509,6 @@ fn drainStreamAndVerify(allocator: std.mem.Allocator, stream: *event_stream.Assi
     try std.testing.expect(stream.getResult() != null);
 }
 
-// Regression test: initBridge() must be called after init() so the bridge's
-// registry pointer is stable. This test would crash with hash map corruption
-// if init() initialized the bridge with a dangling pointer to the local
-// variable's registry.
 test "ProductionRuntime initBridge gives stable registry pointer" {
     const allocator = std.testing.allocator;
     var production = try ProductionRuntime.init(allocator);
@@ -4716,8 +4527,6 @@ test "ProductionRuntime initBridge gives stable registry pointer" {
     try drainStreamAndVerify(allocator, stream);
 }
 
-// Reuse scenario: the same ProductionRuntime (and therefore the same stable
-// registry pointer) can be used for multiple sequential streams.
 test "ProductionRuntime multiple sequential streams reuse stable pointer" {
     const allocator = std.testing.allocator;
     var production = try ProductionRuntime.init(allocator);
@@ -4738,12 +4547,6 @@ test "ProductionRuntime multiple sequential streams reuse stable pointer" {
     }
 }
 
-// Lifetime ordering: stream threads may outlive TuiSession/TuiRuntime but
-// must not outlive ProductionRuntime, because the stream thread references
-// ProductionRuntime.registry. This test simulates that ordering by starting
-// a stream through the protocol client, dropping the TuiRuntime/TuiSession
-// that originated the request, and verifying the stream still completes and
-// ProductionRuntime.deinit() is safe.
 test "ProductionRuntime outlives stream threads from dropped TuiRuntime" {
     const allocator = std.testing.allocator;
     var production = try ProductionRuntime.init(allocator);
@@ -4758,8 +4561,6 @@ test "ProductionRuntime outlives stream threads from dropped TuiRuntime" {
         const s = try protocol.stream(test_model, testContext(), .{ .api_key = "test-key" }, allocator);
         break :blk s;
     };
-    // TuiRuntimeOptions and any associated TuiSession are now out of scope,
-    // but the stream thread still references production.registry.
     defer {
         stream.deinit();
         allocator.destroy(stream);

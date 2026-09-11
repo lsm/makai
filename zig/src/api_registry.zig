@@ -33,11 +33,9 @@ pub const ApiProvider = struct {
     api: []const u8,
     stream: ApiStreamFunction,
     stream_simple: ApiStreamSimpleFunction,
-    /// Optional storage provider ID used to resolve and refresh OAuth credentials.
     auth_provider_id: ?[]const u8 = null,
     auth_refresh_fn: ?AuthStorageRefreshFunction = null,
     auth_get_api_key_fn: ?AuthStorageApiKeyFunction = null,
-    /// Optional provider-specific detector for terminal auth failures from stream errors.
     is_auth_failure: ?AuthFailureDetector = null,
 };
 
@@ -65,7 +63,6 @@ pub const ApiRegistry = struct {
         }
         self.providers.deinit();
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 

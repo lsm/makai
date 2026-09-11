@@ -4,23 +4,17 @@ const json_writer = @import("json_writer");
 const content_partial = @import("content_partial");
 
 pub const SerializationOptions = struct {
-    /// If true, include lightweight partial field in events
     include_partial: bool = false,
-    /// If true, use lightweight ContentBlockPartial instead of full AssistantMessage
     use_lightweight_partial: bool = true,
 };
 
-/// Server-side state tracker for partial serialization
 pub const PartialState = struct {
     allocator: std.mem.Allocator,
 
-    /// Block partials indexed by content_index
     blocks: std.AutoHashMap(usize, content_partial.ContentBlockPartial),
 
-    /// Running usage totals
     usage: ai_types.Usage,
 
-    /// Metadata
     model: []const u8 = "",
     api: []const u8 = "",
     provider: []const u8 = "",
@@ -42,24 +36,19 @@ pub const PartialState = struct {
         self.blocks.deinit();
     }
 
-    /// Update state based on incoming event
     pub fn processEvent(self: *PartialState, event: ai_types.AssistantMessageEvent) !void {
         switch (event) {
             .start => |s| {
-                // Store metadata from start event
                 self.model = s.partial.model;
                 self.api = s.partial.api;
                 self.provider = s.partial.provider;
             },
             .text_start => |e| {
-                // Initialize text block partial
                 try self.blocks.put(e.content_index, .{ .text = .{} });
             },
             .text_delta => |d| {
-                // Update text accumulation
                 const entry = try self.blocks.getOrPut(d.content_index);
                 if (!entry.found_existing) {
-                    // Block wasn't initialized with text_start, create it now
                     entry.value_ptr.* = .{ .text = .{} };
                 }
                 switch (entry.value_ptr.*) {
@@ -67,17 +56,14 @@ pub const PartialState = struct {
                         t.accumulated_len += d.delta.len;
                     },
                     else => {
-                        // Type mismatch, overwrite with text
                         entry.value_ptr.* = .{ .text = .{ .accumulated_len = d.delta.len } };
                     },
                 }
             },
             .thinking_start => |e| {
-                // Initialize thinking block partial
                 try self.blocks.put(e.content_index, .{ .thinking = .{} });
             },
             .thinking_delta => |d| {
-                // Update thinking accumulation
                 const entry = try self.blocks.getOrPut(d.content_index);
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .{ .thinking = .{} };
@@ -92,11 +78,9 @@ pub const PartialState = struct {
                 }
             },
             .toolcall_start => |e| {
-                // Initialize tool call block partial
                 try self.blocks.put(e.content_index, .{ .tool_call = .{} });
             },
             .toolcall_delta => |d| {
-                // Update tool call JSON accumulation
                 const entry = try self.blocks.getOrPut(d.content_index);
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .{ .tool_call = .{} };
@@ -111,7 +95,6 @@ pub const PartialState = struct {
                 }
             },
             .toolcall_end => |e| {
-                // Finalize tool call with id/name
                 const id = try self.allocator.dupe(u8, e.tool_call.id);
                 const name = try self.allocator.dupe(u8, e.tool_call.name);
                 try self.blocks.put(e.content_index, .{
@@ -123,20 +106,17 @@ pub const PartialState = struct {
                 });
             },
             .done => |d| {
-                // Update final usage
                 self.usage = d.message.usage;
             },
             .text_end, .thinking_end, .@"error", .keepalive => {},
         }
     }
 
-    /// Get partial for a specific block
     pub fn getBlockPartial(self: *PartialState, content_index: usize) ?content_partial.ContentBlockPartial {
         return self.blocks.get(content_index);
     }
 };
 
-/// Serialize an event with optional lightweight partial
 pub fn serializeEvent(
     event: ai_types.AssistantMessageEvent,
     partial_state: ?*PartialState,
@@ -261,19 +241,15 @@ pub fn serializeEvent(
     return result;
 }
 
-/// Serialize an event for protocol envelope (with envelope fields)
 pub fn serializeEventForEnvelope(
     event: ai_types.AssistantMessageEvent,
     partial_state: ?*PartialState,
     options: SerializationOptions,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    // For now, this is the same as serializeEvent
-    // In the future, envelope-specific fields can be added here
     return try serializeEvent(event, partial_state, options, allocator);
 }
 
-/// Serialize a lightweight block partial into the JSON output
 fn serializeBlockPartial(w: *json_writer.JsonWriter, content_index: usize, partial: content_partial.ContentBlockPartial) !void {
     try w.writeKey("partial");
     try w.beginObject();
@@ -304,7 +280,6 @@ fn serializeBlockPartial(w: *json_writer.JsonWriter, content_index: usize, parti
             try w.endObject();
         },
         .inactive => {
-            // Don't serialize inactive blocks
             try w.endObject();
             return;
         },
@@ -314,7 +289,6 @@ fn serializeBlockPartial(w: *json_writer.JsonWriter, content_index: usize, parti
     try w.endObject();
 }
 
-/// Serialize AssistantContent block (copied from transport.zig pattern)
 fn serializeAssistantContent(w: *json_writer.JsonWriter, block: ai_types.AssistantContent) !void {
     try w.beginObject();
 
@@ -343,10 +317,6 @@ fn serializeAssistantContent(w: *json_writer.JsonWriter, block: ai_types.Assista
     try w.endObject();
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 test "PartialState init and deinit" {
     var state = PartialState.init(std.testing.allocator);
     defer state.deinit();
@@ -370,30 +340,24 @@ test "processEvent tracks text accumulation" {
         .timestamp = 0,
     };
 
-    // Start event
     const start_event: ai_types.AssistantMessageEvent = .{ .start = .{ .partial = partial } };
     try state.processEvent(start_event);
 
-    // Text start
     const text_start_event: ai_types.AssistantMessageEvent = .{ .text_start = .{ .content_index = 0, .partial = partial } };
     try state.processEvent(text_start_event);
 
-    // First delta
     const delta1_event: ai_types.AssistantMessageEvent = .{ .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = partial } };
     try state.processEvent(delta1_event);
 
-    // Check accumulation
     const block = state.getBlockPartial(0);
     try std.testing.expect(block != null);
     if (block) |b| {
         try std.testing.expectEqual(@as(@TypeOf(b), .{ .text = .{ .accumulated_len = 5 } }), b);
     }
 
-    // Second delta
     const delta2_event: ai_types.AssistantMessageEvent = .{ .text_delta = .{ .content_index = 0, .delta = " World", .partial = partial } };
     try state.processEvent(delta2_event);
 
-    // Check accumulated length
     const block2 = state.getBlockPartial(0);
     try std.testing.expect(block2 != null);
     if (block2) |b| {
@@ -415,22 +379,18 @@ test "processEvent tracks tool call accumulation" {
         .timestamp = 0,
     };
 
-    // Tool call start
     const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .id = "tool-123", .name = "bash", .partial = partial } };
     try state.processEvent(tc_start_event);
 
-    // First delta
     const delta1_event: ai_types.AssistantMessageEvent = .{ .toolcall_delta = .{ .content_index = 0, .delta = "{\"cmd\":", .partial = partial } };
     try state.processEvent(delta1_event);
 
-    // Check accumulation
     const block = state.getBlockPartial(0);
     try std.testing.expect(block != null);
     if (block) |b| {
         try std.testing.expectEqual(@as(usize, 7), b.tool_call.json_len);
     }
 
-    // Tool call end with id/name
     const tc_end_event: ai_types.AssistantMessageEvent = .{ .toolcall_end = .{
         .content_index = 0,
         .tool_call = .{
@@ -442,13 +402,11 @@ test "processEvent tracks tool call accumulation" {
     } };
     try state.processEvent(tc_end_event);
 
-    // Check final state
     const block2 = state.getBlockPartial(0);
     try std.testing.expect(block2 != null);
     if (block2) |b| {
         try std.testing.expectEqualStrings("tool-123", b.tool_call.getId().?);
         try std.testing.expectEqualStrings("bash", b.tool_call.getName().?);
-        // {"cmd": "ls"} = 13 characters
         try std.testing.expectEqual(@as(usize, 13), b.tool_call.json_len);
     }
 }
@@ -478,10 +436,8 @@ test "serializeEvent without partial omits partial field" {
     const json = try serializeEvent(event, null, options, std.testing.allocator);
     defer std.testing.allocator.free(json);
 
-    // Should not contain "partial" field
     try std.testing.expect(std.mem.find(u8, json, "\"partial\"") == null);
 
-    // Should contain basic fields
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"text_delta\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"content_index\":0") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"delta\":\"Hello\"") != null);
@@ -501,18 +457,15 @@ test "serializeEvent with lightweight partial includes block partial" {
         .timestamp = 0,
     };
 
-    // Process start and text_start to initialize state
     const start_event: ai_types.AssistantMessageEvent = .{ .start = .{ .partial = partial } };
     try state.processEvent(start_event);
 
     const text_start_event: ai_types.AssistantMessageEvent = .{ .text_start = .{ .content_index = 0, .partial = partial } };
     try state.processEvent(text_start_event);
 
-    // Process delta to accumulate
     const delta1_event: ai_types.AssistantMessageEvent = .{ .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = partial } };
     try state.processEvent(delta1_event);
 
-    // Serialize next delta
     const delta2_event: ai_types.AssistantMessageEvent = .{ .text_delta = .{ .content_index = 0, .delta = " World", .partial = partial } };
     try state.processEvent(delta2_event);
 
@@ -524,13 +477,10 @@ test "serializeEvent with lightweight partial includes block partial" {
     const json = try serializeEvent(delta2_event, &state, options, std.testing.allocator);
     defer std.testing.allocator.free(json);
 
-    // Should contain partial field
     try std.testing.expect(std.mem.find(u8, json, "\"partial\"") != null);
 
-    // Should contain accumulated length
     try std.testing.expect(std.mem.find(u8, json, "\"accumulated_len\":11") != null);
 
-    // Should contain text block partial
     try std.testing.expect(std.mem.find(u8, json, "\"text\":") != null);
 }
 
@@ -548,7 +498,6 @@ test "serializeEvent produces valid JSON" {
         .timestamp = 0,
     };
 
-    // Test various event types
     const events = [_]ai_types.AssistantMessageEvent{
         .{ .start = .{ .partial = partial } },
         .{ .text_start = .{ .content_index = 0, .partial = partial } },
@@ -563,11 +512,9 @@ test "serializeEvent produces valid JSON" {
         const json = try serializeEvent(event, null, options, std.testing.allocator);
         defer std.testing.allocator.free(json);
 
-        // Basic JSON validation - should start with { and end with }
         try std.testing.expect(json[0] == '{');
         try std.testing.expect(json[json.len - 1] == '}');
 
-        // Should contain type field
         try std.testing.expect(std.mem.find(u8, json, "\"type\"") != null);
     }
 }
@@ -586,14 +533,12 @@ test "serializeEvent for thinking_delta includes partial" {
         .timestamp = 0,
     };
 
-    // Process thinking events
     const thinking_start_event: ai_types.AssistantMessageEvent = .{ .thinking_start = .{ .content_index = 0, .partial = partial } };
     try state.processEvent(thinking_start_event);
 
     const delta_event: ai_types.AssistantMessageEvent = .{ .thinking_delta = .{ .content_index = 0, .delta = "thinking...", .partial = partial } };
     try state.processEvent(delta_event);
 
-    // Verify state was updated - "thinking..." = 11 characters
     const block = state.getBlockPartial(0);
     try std.testing.expect(block != null);
     if (block) |b| {
@@ -608,7 +553,6 @@ test "serializeEvent for thinking_delta includes partial" {
     const json = try serializeEvent(delta_event, &state, options, std.testing.allocator);
     defer std.testing.allocator.free(json);
 
-    // Should contain thinking partial
     try std.testing.expect(std.mem.find(u8, json, "\"thinking\":") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"accumulated_len\":11") != null);
 }
@@ -627,7 +571,6 @@ test "serializeEvent for toolcall_delta includes partial" {
         .timestamp = 0,
     };
 
-    // Process tool call events
     const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .id = "tool-123", .name = "bash", .partial = partial } };
     try state.processEvent(tc_start_event);
 
@@ -642,7 +585,6 @@ test "serializeEvent for toolcall_delta includes partial" {
     const json = try serializeEvent(delta_event, &state, options, std.testing.allocator);
     defer std.testing.allocator.free(json);
 
-    // Should contain tool_call partial
     try std.testing.expect(std.mem.find(u8, json, "\"tool_call\":") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"json_len\":7") != null);
 }
@@ -661,21 +603,18 @@ test "processEvent handles multiple blocks" {
         .timestamp = 0,
     };
 
-    // Text block at index 0
     const text_start: ai_types.AssistantMessageEvent = .{ .text_start = .{ .content_index = 0, .partial = partial } };
     try state.processEvent(text_start);
 
     const text_delta: ai_types.AssistantMessageEvent = .{ .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = partial } };
     try state.processEvent(text_delta);
 
-    // Tool call at index 1
     const tc_start: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 1, .id = "tool-456", .name = "search", .partial = partial } };
     try state.processEvent(tc_start);
 
     const tc_delta: ai_types.AssistantMessageEvent = .{ .toolcall_delta = .{ .content_index = 1, .delta = "{}", .partial = partial } };
     try state.processEvent(tc_delta);
 
-    // Check both blocks exist
     try std.testing.expect(state.blocks.count() == 2);
 
     const block0 = state.getBlockPartial(0);
@@ -720,7 +659,6 @@ test "serializeEventForEnvelope produces valid output" {
     const json = try serializeEventForEnvelope(event, null, options, std.testing.allocator);
     defer std.testing.allocator.free(json);
 
-    // Should produce valid JSON
     try std.testing.expect(json[0] == '{');
     try std.testing.expect(json[json.len - 1] == '}');
 }

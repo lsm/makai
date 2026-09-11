@@ -1,10 +1,3 @@
-//! Command palette component.
-//!
-//! Fuzzy-filtered command launcher, modeled on VS Code's Ctrl-P. Holds a list
-//! of commands (label + description + id) and a filter prompt. Renders a
-//! bordered pop-up suitable for placing on top of other content using
-//! layout.place or layout.layer. Consumers drive it with handleKey and read
-//! back selected().
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -21,11 +14,9 @@ pub const Command = struct {
     id: []const u8,
     label: []const u8,
     description: []const u8 = "",
-    /// Optional shortcut hint shown on the right ("⌘K", "Ctrl+P", etc).
     shortcut: []const u8 = "",
 };
 
-/// Result returned by handleKey so the caller knows whether to dismiss or run.
 pub const KeyResult = enum {
     ignored,
     consumed,
@@ -37,16 +28,13 @@ pub const CommandPalette = struct {
     allocator: std.mem.Allocator,
 
     commands: std.array_list.Managed(Command),
-    /// Indices into commands, filtered and sorted by fuzzy score.
     filtered: std.array_list.Managed(usize),
-    /// Filter text entered by the user.
     query: std.array_list.Managed(u8),
 
     cursor: usize,
     max_visible: u16,
     width: u16,
     prompt: []const u8,
-    /// Placeholder shown in the input when the query is empty.
     placeholder: []const u8,
 
     border_chars: border_mod.BorderChars,
@@ -131,10 +119,6 @@ pub const CommandPalette = struct {
         self.query.deinit();
     }
 
-    /// Add a command. The palette clones every string in `cmd` (id, label,
-    /// description, shortcut) so the caller is free to pass arena-allocated,
-    /// formatted, or otherwise short-lived strings — no lifetime tracking
-    /// required.
     pub fn addCommand(self: *CommandPalette, cmd: Command) !void {
         const owned = try self.cloneCommand(cmd);
         errdefer self.freeCommand(owned);
@@ -142,8 +126,6 @@ pub const CommandPalette = struct {
         try self.rebuildFilter();
     }
 
-    /// Replace all commands. Each input command's strings are cloned. Old
-    /// commands are freed.
     pub fn setCommands(self: *CommandPalette, cmds: []const Command) !void {
         self.freeAllCommandStrings();
         self.commands.clearRetainingCapacity();
@@ -155,9 +137,6 @@ pub const CommandPalette = struct {
         try self.rebuildFilter();
     }
 
-    /// Convenience: load every enabled action from a registry, formatting its
-    /// binding as the shortcut hint. Cleaner than building Command structs by
-    /// hand and avoids the need to manage shortcut-string lifetimes.
     pub fn setFromRegistry(self: *CommandPalette, registry: *const ActionRegistry) !void {
         self.freeAllCommandStrings();
         self.commands.clearRetainingCapacity();
@@ -167,8 +146,6 @@ pub const CommandPalette = struct {
                 try ActionRegistry.formatKey(self.allocator, b)
             else
                 try self.allocator.dupe(u8, "");
-            // shortcut is heap-owned; cloneCommand will dup again, so free
-            // the temporary after.
             defer self.allocator.free(shortcut);
 
             const owned = try self.cloneCommand(.{
@@ -183,7 +160,6 @@ pub const CommandPalette = struct {
         try self.rebuildFilter();
     }
 
-    /// Reset the typed query and cursor without touching the command list.
     pub fn clear(self: *CommandPalette) !void {
         self.query.clearRetainingCapacity();
         self.cursor = 0;
@@ -217,7 +193,6 @@ pub const CommandPalette = struct {
         for (self.commands.items) |c| self.freeCommand(c);
     }
 
-    /// Returns the currently highlighted command, if any.
     pub fn selected(self: *const CommandPalette) ?Command {
         if (self.cursor >= self.filtered.items.len) return null;
         return self.commands.items[self.filtered.items[self.cursor]];
@@ -289,7 +264,6 @@ pub const CommandPalette = struct {
         defer inner.deinit();
         const w = &inner.writer;
 
-        // Input row.
         const prompt_styled = try self.prompt_style.render(allocator, self.prompt);
         defer allocator.free(prompt_styled);
         try w.writeAll(prompt_styled);
@@ -305,7 +279,6 @@ pub const CommandPalette = struct {
         }
         try w.writeByte('\n');
 
-        // Results.
         if (self.filtered.items.len == 0) {
             const empty = try self.empty_style.render(allocator, "No commands match");
             defer allocator.free(empty);

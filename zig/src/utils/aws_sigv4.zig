@@ -1,16 +1,12 @@
 const std = @import("std");
 const compat = @import("compat");
 
-/// AWS SigV4 signing utilities for Bedrock API authentication
-/// Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
-
 pub const SignedRequest = struct {
     authorization: []const u8,
     x_amz_date: []const u8,
     x_amz_security_token: ?[]const u8,
 };
 
-/// Sign a request using AWS Signature Version 4
 pub fn signRequest(
     method: []const u8,
     uri: []const u8,
@@ -31,7 +27,6 @@ pub fn signRequest(
     const date_stamp = try formatDateStamp(timestamp, allocator);
     defer allocator.free(date_stamp);
 
-    // Build canonical request
     const canonical_request = try buildCanonicalRequest(
         method,
         uri,
@@ -42,7 +37,6 @@ pub fn signRequest(
     );
     defer allocator.free(canonical_request);
 
-    // Build string to sign
     const credential_scope = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}/{s}/aws4_request",
@@ -60,14 +54,12 @@ pub fn signRequest(
     );
     defer allocator.free(string_to_sign);
 
-    // Calculate signature
     const signing_key = try deriveSigningKey(secret_key, date_stamp, region, service, allocator);
     defer allocator.free(signing_key);
 
     const signature = try hmacSha256Hex(string_to_sign, signing_key, allocator);
     defer allocator.free(signature);
 
-    // Build authorization header
     const signed_headers = try getSignedHeaders(headers, allocator);
     defer allocator.free(signed_headers);
 
@@ -84,7 +76,6 @@ pub fn signRequest(
     };
 }
 
-/// Build canonical request string
 fn buildCanonicalRequest(
     method: []const u8,
     uri: []const u8,
@@ -109,7 +100,6 @@ fn buildCanonicalRequest(
     );
 }
 
-/// Build canonical headers string (sorted, lowercase, trimmed)
 fn buildCanonicalHeaders(headers: std.StringHashMap([]const u8), allocator: std.mem.Allocator) ![]u8 {
     var header_list: std.ArrayList(struct { key: []const u8, value: []const u8 }) = .{};
     defer header_list.deinit(allocator);
@@ -120,7 +110,6 @@ fn buildCanonicalHeaders(headers: std.StringHashMap([]const u8), allocator: std.
         try header_list.append(allocator, .{ .key = lower_key, .value = entry.value_ptr.* });
     }
 
-    // Sort by key
     std.mem.sort(
         @TypeOf(header_list.items[0]),
         header_list.items,
@@ -144,7 +133,6 @@ fn buildCanonicalHeaders(headers: std.StringHashMap([]const u8), allocator: std.
     return result.toOwnedSlice(allocator);
 }
 
-/// Get signed headers string (sorted, lowercase, semicolon-separated)
 fn getSignedHeaders(headers: std.StringHashMap([]const u8), allocator: std.mem.Allocator) ![]u8 {
     var header_names: std.ArrayList([]const u8) = .{};
     defer header_names.deinit(allocator);
@@ -155,7 +143,6 @@ fn getSignedHeaders(headers: std.StringHashMap([]const u8), allocator: std.mem.A
         try header_names.append(allocator, lower_key);
     }
 
-    // Sort
     std.mem.sort([]const u8, header_names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
@@ -174,7 +161,6 @@ fn getSignedHeaders(headers: std.StringHashMap([]const u8), allocator: std.mem.A
     return result.toOwnedSlice(allocator);
 }
 
-/// Derive AWS SigV4 signing key
 fn deriveSigningKey(
     secret_key: []const u8,
     date_stamp: []const u8,
@@ -193,27 +179,23 @@ fn deriveSigningKey(
     return try allocator.dupe(u8, &k_signing);
 }
 
-/// Compute HMAC-SHA256
 fn hmacSha256(data: []const u8, key: []const u8) ![32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&out, data, key);
     return out;
 }
 
-/// Compute HMAC-SHA256 and return hex string
 fn hmacSha256Hex(data: []const u8, key: []const u8, allocator: std.mem.Allocator) ![]u8 {
     const hash = try hmacSha256(data, key);
     return hexEncode(&hash, allocator);
 }
 
-/// Compute SHA256 hash and return hex string
 fn sha256Hex(data: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
     return hexEncode(&hash, allocator);
 }
 
-/// Convert bytes to hex string (lowercase)
 fn hexEncode(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
     const result = try allocator.alloc(u8, bytes.len * 2);
     const hex_chars = "0123456789abcdef";
@@ -224,7 +206,6 @@ fn hexEncode(bytes: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return result;
 }
 
-/// Format timestamp as ISO8601 date-time (YYYYMMDDTHHMMSSZ)
 fn formatAmzDate(timestamp: i64, allocator: std.mem.Allocator) ![]u8 {
     const epoch_seconds = std.math.cast(u64, timestamp) orelse return error.InvalidTimestamp;
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(@divFloor(epoch_seconds, std.time.s_per_day)) };
@@ -243,7 +224,6 @@ fn formatAmzDate(timestamp: i64, allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
-/// Format timestamp as date stamp (YYYYMMDD)
 fn formatDateStamp(timestamp: i64, allocator: std.mem.Allocator) ![]u8 {
     const epoch_seconds = std.math.cast(u64, timestamp) orelse return error.InvalidTimestamp;
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(@divFloor(epoch_seconds, std.time.s_per_day)) };
@@ -256,8 +236,6 @@ fn formatDateStamp(timestamp: i64, allocator: std.mem.Allocator) ![]u8 {
         .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 },
     );
 }
-
-// Tests
 
 test "sha256Hex" {
     const allocator = std.testing.allocator;
@@ -285,7 +263,7 @@ test "hexEncode" {
 
 test "formatAmzDate" {
     const allocator = std.testing.allocator;
-    const timestamp: i64 = 1609459200; // 2021-01-01 00:00:00 UTC
+    const timestamp: i64 = 1609459200;
     const date = try formatAmzDate(timestamp, allocator);
     defer allocator.free(date);
     try std.testing.expectEqualStrings("20210101T000000Z", date);
@@ -293,7 +271,7 @@ test "formatAmzDate" {
 
 test "formatDateStamp" {
     const allocator = std.testing.allocator;
-    const timestamp: i64 = 1609459200; // 2021-01-01 00:00:00 UTC
+    const timestamp: i64 = 1609459200;
     const date = try formatDateStamp(timestamp, allocator);
     defer allocator.free(date);
     try std.testing.expectEqualStrings("20210101", date);

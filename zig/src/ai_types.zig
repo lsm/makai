@@ -86,7 +86,7 @@ pub const ToolChoice = union(enum) {
     auto: void,
     none: void,
     required: void,
-    function: []const u8, // function name
+    function: []const u8,
 };
 
 pub const StreamOptions = struct {
@@ -100,38 +100,20 @@ pub const StreamOptions = struct {
     cancel_token: ?CancelToken = null,
     on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
-    /// Enable extended thinking. For Opus 4.6+: uses adaptive thinking.
-    /// For older models: uses budget-based thinking with thinking_budget_tokens.
     thinking_enabled: bool = false,
-    /// Token budget for extended thinking (older models only).
     thinking_budget_tokens: ?u32 = null,
-    /// Effort level for adaptive thinking (Opus 4.6+ only). Values: "low", "medium", "high", "max".
     thinking_effort: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Reasoning effort level for OpenAI-compatible endpoints. Values: "minimal", "low", "medium", "high", "xhigh".
     reasoning_effort: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Reasoning summary format: "auto" | "concise" | "detailed"
     reasoning_summary: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Whether to include encrypted reasoning content
     include_reasoning_encrypted: bool = false,
-    /// Whether reasoning is enabled (for GPT-5 juice workaround)
     reasoning_enabled: bool = true,
-    /// Service tier for OpenAI Responses API: "default", "flex", "priority"
     service_tier: ?ServiceTier = null,
-    /// Metadata for the request
     metadata: ?Metadata = null,
-    /// Tool choice behavior
     tool_choice: ?ToolChoice = null,
-    /// Owned storage for `tool_choice.function` when deserialized/cloned.
     owned_tool_choice_function: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// HTTP connection timeout in milliseconds (default: 30s)
     http_timeout_ms: ?u64 = 30_000,
-    /// Ping interval in milliseconds for streaming keepalive
     ping_interval_ms: ?u64 = null,
-    /// Owned storage for headers when deserialized/cloned.
     owned_headers: ?OwnedSlice(HeaderPair) = null,
-    /// When true, the provider should configure its returned stream to own deep
-    /// copies of every event. The protocol server sets this because the consumer
-    /// may outlive the producer thread, so borrowed slices would dangle.
     requires_owned_stream_events: bool = false,
 
     pub fn getApiKey(self: *const StreamOptions) ?[]const u8 {
@@ -159,7 +141,6 @@ pub const StreamOptions = struct {
         return if (summary.len > 0) summary else null;
     }
 
-    /// Free all owned memory.
     pub fn deinit(self: *StreamOptions, allocator: std.mem.Allocator) void {
         self.api_key.deinit(allocator);
         self.session_id.deinit(allocator);
@@ -191,7 +172,6 @@ pub const SimpleStreamOptions = struct {
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
     reasoning_summary: ?[]const u8 = null,
-    /// HTTP connection timeout in milliseconds (default: 30s)
     http_timeout_ms: ?u64 = 30_000,
 };
 
@@ -228,7 +208,6 @@ pub const UserContentPart = union(enum) {
     text: TextContent,
     image: ImageContent,
 
-    /// Free all owned memory.
     pub fn deinit(self: *UserContentPart, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .text => |*t| {
@@ -247,12 +226,10 @@ pub const UserContent = union(enum) {
     text: []const u8,
     parts: []const UserContentPart,
 
-    /// Free all owned memory.
     pub fn deinit(self: *UserContent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .text => |t| allocator.free(t),
             .parts => |parts| {
-                // Cast to mutable since we're freeing owned memory
                 const mut_parts: []UserContentPart = @constCast(parts);
                 for (mut_parts) |*part| {
                     part.deinit(allocator);
@@ -279,8 +256,6 @@ pub const Usage = struct {
     total_tokens: u64 = 0,
     cost: UsageCost = .{},
 
-    /// Calculate dollar costs from token usage using the model's pricing rates.
-    /// Prices are per 1 million tokens.
     pub fn calculateCost(self: *Usage, model_cost: Cost) void {
         self.cost.input = (@as(f64, @floatFromInt(self.input)) / 1_000_000.0) * model_cost.input;
         self.cost.output = (@as(f64, @floatFromInt(self.output)) / 1_000_000.0) * model_cost.output;
@@ -294,13 +269,11 @@ pub const UserMessage = struct {
     content: UserContent,
     timestamp: i64,
 
-    /// Free all owned memory.
     pub fn deinit(self: *UserMessage, allocator: std.mem.Allocator) void {
         self.content.deinit(allocator);
     }
 };
 
-/// Reference to raw data stored outside the model transcript.
 pub const ArtifactReference = struct {
     artifact_id: []const u8,
     uri: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -347,7 +320,6 @@ pub const AssistantMessage = struct {
     stop_reason: StopReason,
     error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     timestamp: i64,
-    /// If true, api/provider/model strings are owned and will be freed in deinit
     is_owned: bool = false,
 
     pub fn getErrorMessage(self: *const AssistantMessage) ?[]const u8 {
@@ -355,36 +327,20 @@ pub const AssistantMessage = struct {
         return if (err.len > 0) err else null;
     }
 
-    /// Free owned memory.
-    ///
-    /// Ownership contract (see docs/zig-stream-memory-ownership.md):
-    /// - Content-block strings (text, thinking, tool_call, image) are freed
-    ///   UNCONDITIONALLY — every block string must be heap-allocated with
-    ///   `allocator`. Providers must dupe all content strings before building
-    ///   the message they pass to `EventStream.complete()`; string literals
-    ///   here are a bus error waiting to happen.
-    /// - `api`/`provider`/`model` are freed only when `is_owned` is true.
-    /// - `error_message` tracks its own ownership (OwnedSlice).
-    /// Only call this on a message you know owns its content: messages built
-    /// by `cloneAssistantMessage`/`cloneResult` (is_owned = true), or results
-    /// a provider handed to `complete()` on a stream you are deiniting.
     pub fn deinit(self: *AssistantMessage, allocator: std.mem.Allocator) void {
         for (self.content) |block| {
             switch (block) {
                 .text => |t| {
-                    // Only free non-empty text - empty slices may be static string literals
                     if (t.text.len > 0) allocator.free(t.text);
                     if (t.text_signature) |s| allocator.free(s);
                 },
                 .thinking => |t| {
-                    // Only free non-empty thinking - empty slices may be static
                     if (t.thinking.len > 0) allocator.free(t.thinking);
                     if (t.thinking_signature) |s| allocator.free(s);
                 },
                 .tool_call => |tc| {
                     allocator.free(tc.id);
                     allocator.free(tc.name);
-                    // Only free non-empty arguments_json - empty slices may be static
                     if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
                     if (tc.thought_signature) |s| allocator.free(s);
                 },
@@ -395,7 +351,6 @@ pub const AssistantMessage = struct {
             }
         }
         allocator.free(self.content);
-        // Free duped string fields only if owned (providers set is_owned=true when duping)
         if (self.is_owned) {
             allocator.free(self.api);
             allocator.free(self.provider);
@@ -405,10 +360,6 @@ pub const AssistantMessage = struct {
     }
 };
 
-/// Free a built-up `AssistantContent` slice owned by the caller. Used by providers
-/// to clean up `content_blocks` when assembling a final `AssistantMessage` fails
-/// partway (e.g., a `model.api` duplicate triggers OOM). Mirrors the per-block
-/// cleanup in `AssistantMessage.deinit` but does not touch any metadata strings.
 pub fn deinitAssistantContent(allocator: std.mem.Allocator, blocks: []AssistantContent) void {
     for (blocks) |block| {
         switch (block) {
@@ -449,11 +400,9 @@ pub const ToolResultMessage = struct {
         return if (details.len > 0) details else null;
     }
 
-    /// Free all owned memory.
     pub fn deinit(self: *ToolResultMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
-        // Cast to mutable since we're freeing owned memory
         const mut_content: []UserContentPart = @constCast(self.content);
         for (mut_content) |*part| {
             part.deinit(allocator);
@@ -469,8 +418,6 @@ pub const Message = union(enum) {
     assistant: AssistantMessage,
     tool_result: ToolResultMessage,
 
-    /// Free all owned memory. Only call this if the message was created via
-    /// deserialization (which dupes all string fields).
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .user => |*msg| msg.deinit(allocator),
@@ -497,8 +444,6 @@ const compact_keep_recent_messages = 8;
 const compact_max_message_chars = 800;
 const compact_max_summary_chars = 12 * 1024;
 
-/// Replace older history with one bounded synthetic summary message while
-/// preserving the most recent messages verbatim.
 pub fn compactMessageHistory(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !CompactMessagesResult {
     const before = messages.items.len;
     if (before <= compact_keep_recent_messages + 1) return .{ .before = before, .after = before };
@@ -627,7 +572,6 @@ pub const Tool = struct {
     description: []const u8,
     parameters_schema_json: []const u8,
 
-    /// Free all owned memory.
     pub fn deinit(self: *Tool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
@@ -639,7 +583,6 @@ pub const Context = struct {
     system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     messages: []const Message,
     tools: ?[]const Tool = null,
-    /// If true, arrays and strings are owned and will be freed in deinit
     is_owned: bool = false,
 
     pub fn getSystemPrompt(self: *const Context) ?[]const u8 {
@@ -647,22 +590,16 @@ pub const Context = struct {
         return if (prompt.len > 0) prompt else null;
     }
 
-    /// Free all owned memory. Only frees arrays/collections if is_owned is true
-    /// (set by deserializer or when explicitly allocating).
     pub fn deinit(self: *Context, allocator: std.mem.Allocator) void {
         self.system_prompt.deinit(allocator);
         if (!self.is_owned) return;
 
-        // Free messages array and contents
-        // Cast to mutable since we're freeing owned memory
         const mut_messages: []Message = @constCast(self.messages);
         for (mut_messages) |*msg| {
             msg.deinit(allocator);
         }
         allocator.free(self.messages);
-        // Free tools array and contents
         if (self.tools) |tools| {
-            // Cast to mutable since we're freeing owned memory
             const mut_tools: []Tool = @constCast(tools);
             for (mut_tools) |*tool| {
                 tool.deinit(allocator);
@@ -680,29 +617,17 @@ pub const Cost = struct {
 };
 
 pub const OpenAICompatOptions = struct {
-    /// Whether the provider supports the `store` field
     supports_store: ?bool = null,
-    /// Whether the provider supports the `developer` role (vs `system`)
     supports_developer_role: ?bool = null,
-    /// Whether the provider supports `reasoning_effort`
     supports_reasoning_effort: ?bool = null,
-    /// Whether the provider supports usage in streaming
     supports_usage_in_streaming: ?bool = true,
-    /// Which field to use for max tokens
     max_tokens_field: enum { max_completion_tokens, max_tokens } = .max_completion_tokens,
-    /// Whether tool results require the `name` field
     requires_tool_result_name: ?bool = null,
-    /// Whether a user message after tool results requires an assistant message in between
     requires_assistant_after_tool_result: ?bool = null,
-    /// Whether thinking blocks must be converted to text
     requires_thinking_as_text: ?bool = null,
-    /// Whether tool call IDs must be normalized to Mistral format
     requires_mistral_tool_ids: ?bool = null,
-    /// Format for reasoning/thinking parameter
     thinking_format: enum { openai, zai, qwen } = .openai,
-    /// Whether the provider supports the `strict` field in tool definitions
     supports_strict_mode: ?bool = true,
-    /// Whether an Anthropic-compatible endpoint supports one-hour prompt caching
     supports_anthropic_cache_ttl: ?bool = null,
 };
 
@@ -724,11 +649,8 @@ pub const Model = struct {
     max_tokens: u32,
     headers: ?[]const HeaderPair = null,
     compat: ?OpenAICompatOptions = null,
-    /// If true, string fields are owned and will be freed in deinit
     is_owned: bool = false,
 
-    /// Free all owned memory. Only frees strings if is_owned is true
-    /// (set by deserializer or when explicitly duping).
     pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
         if (!self.is_owned) return;
 
@@ -737,12 +659,10 @@ pub const Model = struct {
         allocator.free(self.api);
         allocator.free(self.provider);
         allocator.free(self.base_url);
-        // Free input slice and its contents
         for (self.input) |input| {
             allocator.free(input);
         }
         allocator.free(self.input);
-        // Free headers if present
         if (self.headers) |headers| {
             for (headers) |header| {
                 allocator.free(header.name);
@@ -774,13 +694,6 @@ pub const AssistantMessageEvent = union(enum) {
     keepalive: void,
 };
 
-/// Deep copy a `ToolCall`.
-///
-/// `toolcall_end` events carry tool-call strings BORROWED from provider-managed
-/// buffers — they share storage with the completed result's `tool_call` blocks
-/// and must not be freed or kept past the provider's buffer lifetime. Use this
-/// helper when collecting tool calls from events; free the copies with
-/// `deinitToolCall`.
 pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) error{OutOfMemory}!ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
     errdefer allocator.free(id);
@@ -802,11 +715,9 @@ pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) error{Ou
     };
 }
 
-/// Free a `ToolCall` produced by `cloneToolCall`.
 pub fn deinitToolCall(allocator: std.mem.Allocator, tool_call: *ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
-    // Only free non-empty arguments_json - empty slices may be static
     if (tool_call.arguments_json.len > 0) allocator.free(tool_call.arguments_json);
     if (tool_call.thought_signature) |s| allocator.free(s);
 }
@@ -815,7 +726,6 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
     var content = try allocator.alloc(AssistantContent, msg.content.len);
     var cloned_count: usize = 0;
     errdefer {
-        // Free any successfully cloned content blocks on error
         for (content[0..cloned_count]) |block| {
             switch (block) {
                 .text => |t| {
@@ -841,9 +751,6 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         allocator.free(content);
     }
 
-    // Each field dupe carries its own errdefer so a mid-block OOM frees the
-    // partially built block; cloned_count (and the outer errdefer above) then
-    // only has to cover fully constructed blocks.
     for (msg.content, 0..) |block, i| {
         content[i] = switch (block) {
             .text => |t| blk: {
@@ -929,8 +836,6 @@ pub fn deinitAssistantMessageOwned(allocator: std.mem.Allocator, msg: *Assistant
     msg.deinit(allocator);
 }
 
-/// Deep copy an AssistantMessageEvent, duplicating all owned strings.
-/// The caller is responsible for calling deinitEvent on the returned copy.
 pub fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: AssistantMessageEvent) !AssistantMessageEvent {
     return switch (event) {
         .start => |s| .{ .start = .{
@@ -1051,8 +956,6 @@ pub fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: Assistant
     };
 }
 
-/// Free all allocated strings in an AssistantMessageEvent.
-/// Call this when you own an event that was deep-copied.
 pub fn deinitAssistantMessageEvent(allocator: std.mem.Allocator, event: *AssistantMessageEvent) void {
     switch (event.*) {
         .start => |*s| s.partial.deinit(allocator),
@@ -1096,7 +999,6 @@ pub fn deinitAssistantMessageEvent(allocator: std.mem.Allocator, event: *Assista
     }
 }
 
-/// Deep clone a Message. Caller owns the returned message and must call deinit().
 pub fn cloneMessage(allocator: std.mem.Allocator, msg: Message) !Message {
     return switch (msg) {
         .user => |u| .{ .user = .{
@@ -1108,7 +1010,6 @@ pub fn cloneMessage(allocator: std.mem.Allocator, msg: Message) !Message {
     };
 }
 
-/// Deep clone UserContent.
 fn cloneUserContent(content: UserContent, allocator: std.mem.Allocator) !UserContent {
     return switch (content) {
         .text => |t| .{ .text = try allocator.dupe(u8, t) },
@@ -1129,7 +1030,6 @@ fn cloneUserContent(content: UserContent, allocator: std.mem.Allocator) !UserCon
     };
 }
 
-/// Deep clone UserContentPart.
 fn cloneUserContentPart(allocator: std.mem.Allocator, part: UserContentPart) !UserContentPart {
     return switch (part) {
         .text => |t| blk: {
@@ -1160,7 +1060,6 @@ fn cloneUserContentPart(allocator: std.mem.Allocator, part: UserContentPart) !Us
     };
 }
 
-/// Deep clone ToolResultMessage.
 fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !ToolResultMessage {
     const cloned_content = try allocator.alloc(UserContentPart, tr.content.len);
     var initialized: usize = 0;
@@ -1268,16 +1167,13 @@ fn cloneArtifactReference(allocator: std.mem.Allocator, artifact: ArtifactRefere
     };
 }
 
-/// Deep clone a Context. Caller owns the returned context and must call deinit().
 pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
-    // Clone system_prompt
     var system_prompt = if (ctx.getSystemPrompt()) |sp|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer system_prompt.deinit(allocator);
 
-    // Clone messages
     const messages = try allocator.alloc(Message, ctx.messages.len);
     var initialized_messages: usize = 0;
     errdefer {
@@ -1290,7 +1186,6 @@ pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
         initialized_messages += 1;
     }
 
-    // Clone tools
     var tools: ?[]Tool = null;
     if (ctx.tools) |t| {
         const owned_tools = try allocator.alloc(Tool, t.len);
@@ -1327,9 +1222,7 @@ pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
     };
 }
 
-/// Deep clone a Model. Caller owns the returned model and must call deinit().
 pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
-    // Clone string fields
     const id = try allocator.dupe(u8, model.id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, model.name);
@@ -1341,7 +1234,6 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
     const base_url = try allocator.dupe(u8, model.base_url);
     errdefer allocator.free(base_url);
 
-    // Clone input array
     const input = try allocator.alloc([]const u8, model.input.len);
     errdefer allocator.free(input);
     for (model.input, 0..) |inp, i| {
@@ -1349,7 +1241,6 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
         input[i] = try allocator.dupe(u8, inp);
     }
 
-    // Clone headers if present
     var headers: ?[]HeaderPair = null;
     if (model.headers) |h| {
         headers = try allocator.alloc(HeaderPair, h.len);
@@ -1418,10 +1309,6 @@ test "cloneAssistantMessage deep copies text content" {
 }
 
 test "cloneAssistantMessage is leak-free when an allocation fails mid-clone" {
-    // Sweep every allocation index: each induced OutOfMemory must unwind
-    // cleanly. cloneResult()/cloneAssistantMessage() are advertised as the
-    // safe extraction path, so their error path must not leak. The testing
-    // allocator underneath the failing allocator reports any leak at test end.
     const allocator = std.testing.allocator;
 
     const content = [_]AssistantContent{
@@ -1440,8 +1327,6 @@ test "cloneAssistantMessage is leak-free when an allocation fails mid-clone" {
         .timestamp = 0,
     };
 
-    // Generous upper bound: fail_index values past the real allocation count
-    // simply succeed and are deinit'd.
     var fail_index: usize = 0;
     while (fail_index <= 20) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
@@ -1457,8 +1342,6 @@ test "cloneAssistantMessage is leak-free when an allocation fails mid-clone" {
 test "cloneToolCall deep copies borrowed tool-call strings" {
     const allocator = std.testing.allocator;
 
-    // tool_call strings in toolcall_end events are borrowed from provider
-    // buffers (literals here) — the clone must own independent copies.
     const borrowed = ToolCall{
         .id = "call-1",
         .name = "get_weather",
@@ -1529,16 +1412,10 @@ test "compactMessageHistory summarizes older messages and keeps recent messages"
 }
 
 test "AssistantMessageEventStream deinit drains unpolled events" {
-    // This test verifies that deinit() properly drains events without crashing.
-    // Note: Delta strings in AssistantMessageEvent are typically slices into
-    // provider-managed buffers (e.g., JSON parser buffers) and are NOT freed
-    // by deinit(). Providers manage the underlying buffer lifetimes.
     const event_stream = @import("event_stream");
     var stream = event_stream.AssistantMessageEventStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Create a text_delta event with heap-allocated delta string
-    // In real providers, this is typically a slice into a provider buffer
     const delta_str = try std.testing.allocator.dupe(u8, "test delta content");
     const partial = AssistantMessage{
         .content = &.{},
@@ -1558,8 +1435,6 @@ test "AssistantMessageEventStream deinit drains unpolled events" {
     };
     try stream.push(event);
 
-    // Poll the event and free the delta string ourselves
-    // (deinit does NOT free delta strings - they're provider-managed)
     if (stream.poll()) |evt| {
         switch (evt) {
             .text_delta => |d| std.testing.allocator.free(d.delta),
@@ -1567,7 +1442,6 @@ test "AssistantMessageEventStream deinit drains unpolled events" {
         }
     }
 
-    // Complete with an empty result
     const result = AssistantMessage{
         .content = &.{},
         .api = "google-generative-ai",
@@ -1581,9 +1455,6 @@ test "AssistantMessageEventStream deinit drains unpolled events" {
 }
 
 test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
-    // This test verifies that deinit properly drains events.
-    // Note: tool_call fields in events are typically slices into provider-managed buffers
-    // and are NOT freed by deinit(). Callers should poll events and manage their own cleanup.
     const event_stream = @import("event_stream");
     var stream = event_stream.AssistantMessageEventStream.init(std.testing.allocator);
     defer stream.deinit();
@@ -1614,8 +1485,6 @@ test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
     };
     try stream.push(event);
 
-    // Poll the event and free the tool_call strings ourselves
-    // (deinit does NOT free tool_call fields - they're typically provider-managed)
     if (stream.poll()) |evt| {
         switch (evt) {
             .toolcall_end => |tc| {
@@ -1638,7 +1507,6 @@ test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
     };
     stream.complete(result);
 
-    // deinit() is called by defer above
 }
 
 test "Usage.calculateCost computes correct dollar costs" {
@@ -1668,11 +1536,9 @@ test "Usage.calculateCost computes correct dollar costs" {
 test "OpenAICompatOptions defaults are correct" {
     const compat = OpenAICompatOptions{};
 
-    // Check default values
     try std.testing.expect(compat.supports_store == null);
     try std.testing.expect(compat.supports_developer_role == null);
     try std.testing.expect(compat.supports_reasoning_effort == null);
-    // supports_usage_in_streaming defaults to true (not null)
     try std.testing.expect(compat.supports_usage_in_streaming == true);
     try std.testing.expectEqual(@as(@TypeOf(compat.max_tokens_field), .max_completion_tokens), compat.max_tokens_field);
     try std.testing.expect(compat.requires_tool_result_name == null);
@@ -1680,7 +1546,6 @@ test "OpenAICompatOptions defaults are correct" {
     try std.testing.expect(compat.requires_thinking_as_text == null);
     try std.testing.expect(compat.requires_mistral_tool_ids == null);
     try std.testing.expectEqual(@as(@TypeOf(compat.thinking_format), .openai), compat.thinking_format);
-    // supports_strict_mode defaults to true (not null)
     try std.testing.expect(compat.supports_strict_mode == true);
 }
 

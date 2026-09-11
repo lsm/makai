@@ -1,5 +1,3 @@
-//! Terminal abstraction layer providing cross-platform terminal control.
-//! Handles raw mode, alternate screen, mouse tracking, and input/output.
 
 const std = @import("std");
 const FixedWriter = std.Io.Writer.fixed;
@@ -9,7 +7,6 @@ pub const screen = @import("screen.zig");
 const unicode = @import("../unicode.zig");
 const Environment = @import("../core/environment.zig").Environment;
 
-// Platform-specific implementation
 const is_wasm = builtin.os.tag == .wasi or builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
 const platform = if (is_wasm)
     @import("platform/wasm.zig")
@@ -53,13 +50,9 @@ pub const KittyImageOptions = struct {
     placement_id: ?u32 = null,
     move_cursor: bool = true,
     quiet: bool = true,
-    /// Z-index for layering. Negative = behind text, positive = above.
     z_index: ?i32 = null,
-    /// Enable unicode placeholders for text-reflow participation.
     unicode_placeholder: bool = false,
-    /// Pixel width of the image (required for RGB/RGBA direct data).
     pixel_width: ?u32 = null,
-    /// Pixel height of the image (required for RGB/RGBA direct data).
     pixel_height: ?u32 = null,
 };
 
@@ -74,7 +67,6 @@ pub const KittyImageFileOptions = struct {
     unicode_placeholder: bool = false,
 };
 
-/// Options for transmitting an image to the Kitty cache without display.
 pub const KittyTransmitOptions = struct {
     image_id: u32,
     format: KittyImageFormat = .png,
@@ -83,7 +75,6 @@ pub const KittyTransmitOptions = struct {
     pixel_height: ?u32 = null,
 };
 
-/// Options for placing a previously cached Kitty image.
 pub const KittyPlaceOptions = struct {
     image_id: u32,
     placement_id: ?u32 = null,
@@ -95,7 +86,6 @@ pub const KittyPlaceOptions = struct {
     unicode_placeholder: bool = false,
 };
 
-/// What to delete from the Kitty image cache.
 pub const KittyDeleteTarget = union(enum) {
     by_id: u32,
     by_placement: struct { image_id: u32, placement_id: u32 },
@@ -109,7 +99,6 @@ pub const Iterm2ImageFileOptions = struct {
     move_cursor: bool = true,
 };
 
-/// Options for in-memory iTerm2 image rendering.
 pub const Iterm2ImageDataOptions = struct {
     width_cells: ?u16 = null,
     height_cells: ?u16 = null,
@@ -129,7 +118,6 @@ pub const ImageFileOptions = struct {
     unicode_placeholder: bool = false,
 };
 
-/// Options for rendering in-memory image data with auto protocol selection.
 pub const ImageDataOptions = struct {
     format: KittyImageFormat = .png,
     pixel_width: ?u32 = null,
@@ -145,7 +133,6 @@ pub const ImageDataOptions = struct {
     unicode_placeholder: bool = false,
 };
 
-/// Preferred image protocol for protocol-selection overrides.
 pub const ImageProtocol = enum {
     auto,
     kitty,
@@ -154,16 +141,11 @@ pub const ImageProtocol = enum {
 };
 
 pub const SixelImageFileOptions = struct {
-    /// Optional max captured converter output (bytes).
     max_output_bytes: usize = 32 * 1024 * 1024,
-    /// Optional pixel width hint for img2sixel (-w flag).
     width_pixels: ?u32 = null,
-    /// Optional pixel height hint for img2sixel (-h flag).
     height_pixels: ?u32 = null,
 };
 
-/// OSC 52 clipboard target selector.
-/// Standard values are `c`, `p`, `q`, `s`, or cut buffers `0`..`7`.
 pub const Osc52Target = union(enum) {
     clipboard,
     primary,
@@ -187,8 +169,6 @@ pub const Osc52Target = union(enum) {
     }
 };
 
-/// OSC 52 passthrough strategy.
-/// `tmux` and `dcs` wrap OSC inside DCS passthrough for multiplexers.
 pub const Osc52Passthrough = enum {
     auto,
     none,
@@ -196,31 +176,19 @@ pub const Osc52Passthrough = enum {
     dcs,
 };
 
-/// Default OSC 52 behavior for this terminal instance.
 pub const Osc52Config = struct {
-    /// Master switch for clipboard writes.
     enabled: bool = true,
-    /// Allow OSC 52 clipboard queries (`?`) for reading clipboard content.
     query_enabled: bool = true,
-    /// Require a TTY before sending OSC 52.
     require_tty: bool = true,
-    /// Default target selection.
     target: Osc52Target = .clipboard,
-    /// Sequence terminator (BEL is widely compatible).
     terminator: ansi.OscTerminator = .bel,
-    /// Passthrough mode (`auto` detects tmux/screen-like environments).
     passthrough: Osc52Passthrough = .auto,
-    /// Optional input payload limit (bytes). `null` = no library limit.
     max_bytes: ?usize = null,
-    /// Query timeout for clipboard reads.
     query_timeout_ms: i32 = 180,
-    /// Optional decoded output limit for clipboard reads.
     max_read_bytes: ?usize = null,
-    /// Require selector match on responses (strict mode).
     strict_query_target: bool = false,
 };
 
-/// Per-call OSC 52 overrides.
 pub const Osc52WriteOptions = struct {
     target: ?Osc52Target = null,
     terminator: ?ansi.OscTerminator = null,
@@ -229,7 +197,6 @@ pub const Osc52WriteOptions = struct {
     max_bytes: ?usize = null,
 };
 
-/// Per-call OSC 52 clipboard query overrides.
 pub const Osc52ReadOptions = struct {
     target: ?Osc52Target = null,
     terminator: ?ansi.OscTerminator = null,
@@ -240,31 +207,19 @@ pub const Osc52ReadOptions = struct {
     strict_target: ?bool = null,
 };
 
-/// Terminal configuration options
 pub const Config = struct {
-    /// Use alternate screen buffer
     alt_screen: bool = true,
-    /// Hide cursor during operation
     hide_cursor: bool = true,
-    /// Enable mouse tracking
     mouse: bool = false,
-    /// Enable wheel scrolling in the alternate screen without mouse tracking.
     alternate_scroll: bool = false,
-    /// Clear the full screen during setup.
     clear_on_setup: bool = true,
-    /// Enable bracketed paste mode
     bracketed_paste: bool = true,
-    /// Custom input file (default: stdin)
     input: ?std.Io.File = null,
-    /// Custom output file (default: stdout)
     output: ?std.Io.File = null,
-    /// Enable Kitty keyboard protocol
     kitty_keyboard: bool = false,
-    /// OSC 52 clipboard configuration
     osc52: Osc52Config = .{},
 };
 
-/// Terminal abstraction
 pub const Terminal = struct {
     io: std.Io,
     environment: *const Environment,
@@ -291,7 +246,6 @@ pub const Terminal = struct {
             const stdout = config.output orelse std.Io.File.stdout();
             const stdin = config.input orelse std.Io.File.stdin();
 
-            // Apply custom fd overrides
             if (builtin.os.tag != .windows) {
                 if (config.input) |inp| state.stdin_fd = inp.handle;
                 if (config.output) |o| state.stdout_fd = o.handle;
@@ -322,54 +276,38 @@ pub const Terminal = struct {
     }
 
     pub fn setup(self: *Terminal) !void {
-        // Setup signal handlers
         platform.setupSignals() catch {};
 
-        // Enable raw mode
         try platform.enableRawMode(&self.state);
 
-        // Clear terminal modes that can survive a crashed previous run. This is
-        // especially important for Kitty keyboard protocol: if left enabled,
-        // Ctrl+C reaches the user's shell as CSI bytes like `99;5u`.
         try self.writeBytes(ansi.kitty_keyboard_disable_all);
         try self.writeBytes(ansi.kitty_keyboard_reset);
         try self.writeBytes(ansi.bracketed_paste_disable);
         try self.writeBytes("\x1b[?1007l");
         try self.writeBytes(mouse.disableSequence(.normal));
 
-        // Enter alternate screen
         if (self.config.alt_screen) {
             try self.writeBytes(ansi.alt_screen_enter);
             self.state.in_alt_screen = true;
         }
 
-        // Hide cursor
         if (self.config.hide_cursor) {
             try self.writeBytes(ansi.cursor_hide);
         }
 
-        // Enable normal mouse tracking (button/wheel only) with SGR encoding.
-        // This can capture plain clicks in many terminals, so apps that need
-        // native drag selection should prefer alternate_scroll below.
         if (self.config.mouse) {
             try self.writeBytes(mouse.enableSequence(.normal));
             self.state.mouse_enabled = true;
         }
 
-        // In xterm-compatible terminals, alternate-scroll converts wheel
-        // input in the alternate screen into cursor up/down key events. This
-        // preserves native drag selection because mouse buttons are not
-        // reported to the application.
         if (self.config.alternate_scroll) {
             try self.writeBytes("\x1b[?1007h");
         }
 
-        // Enable bracketed paste
         if (self.config.bracketed_paste) {
             try self.writeBytes(ansi.bracketed_paste_enable);
         }
 
-        // Enable Kitty keyboard protocol
         if (self.config.kitty_keyboard) {
             try self.writeBytes(ansi.kitty_keyboard_enable);
         }
@@ -377,7 +315,6 @@ pub const Terminal = struct {
         self.detectUnicodeWidthCapabilities();
         self.detectImageCapabilities();
 
-        // Clear screen
         if (self.config.clear_on_setup) {
             try self.writeBytes(ansi.screen_clear);
             try self.writeBytes(ansi.cursor_home);
@@ -387,7 +324,6 @@ pub const Terminal = struct {
     }
 
     pub fn cleanup(self: *Terminal) void {
-        // Disable Kitty keyboard protocol
         if (self.config.kitty_keyboard) {
             self.writeBytes(ansi.kitty_keyboard_disable_all) catch {};
             self.writeBytes(ansi.kitty_keyboard_disable) catch {};
@@ -399,12 +335,10 @@ pub const Terminal = struct {
             self.unicode_width_caps.mode_2027 = false;
         }
 
-        // Disable bracketed paste
         if (self.config.bracketed_paste) {
             self.writeBytes(ansi.bracketed_paste_disable) catch {};
         }
 
-        // Disable mouse
         if (self.state.mouse_enabled) {
             self.writeBytes(mouse.disableSequence(.normal)) catch {};
             self.state.mouse_enabled = false;
@@ -414,32 +348,26 @@ pub const Terminal = struct {
             self.writeBytes("\x1b[?1007l") catch {};
         }
 
-        // Show cursor
         if (self.config.hide_cursor) {
             self.writeBytes(ansi.cursor_show) catch {};
         }
 
-        // Exit alternate screen
         if (self.state.in_alt_screen) {
             self.writeBytes(ansi.alt_screen_exit) catch {};
             self.state.in_alt_screen = false;
         }
 
-        // Reset attributes
         self.writeBytes(ansi.reset) catch {};
 
         self.flush() catch {};
 
-        // Restore terminal mode — always runs even if writes above failed
         platform.disableRawMode(&self.state);
     }
 
-    /// Write bytes through the buffered terminal writer.
     fn writeBytes(self: *Terminal, bytes: []const u8) !void {
         try self.writer().writeAll(bytes);
     }
 
-    /// Get terminal size
     pub fn getSize(self: *Terminal) !Size {
         if (is_wasm) {
             return platform.getSize({});
@@ -450,7 +378,6 @@ pub const Terminal = struct {
         }
     }
 
-    /// Read input with timeout (in milliseconds)
     pub fn readInput(self: *Terminal, buffer: []u8, timeout_ms: i32) !usize {
         if (self.pending_input_len > 0) {
             const take = @min(buffer.len, self.pending_input_len);
@@ -464,72 +391,59 @@ pub const Terminal = struct {
         return self.readPlatformInput(buffer, timeout_ms);
     }
 
-    /// Check if terminal was resized
     pub fn checkResize(self: *Terminal) bool {
         _ = self;
         return platform.checkResize();
     }
 
-    /// Get a Writer interface.
     pub fn writer(self: *Terminal) *std.Io.Writer {
         self.out.bind();
         return &self.out.writer;
     }
 
-    /// Flush buffered terminal output to the underlying sink.
     pub fn flush(self: *Terminal) !void {
         try self.writer().flush();
     }
 
-    /// Clear the screen
     pub fn clear(self: *Terminal) !void {
         try self.writeBytes(ansi.screen_clear);
         try self.writeBytes(ansi.cursor_home);
     }
 
-    /// Move cursor to position (0-indexed)
     pub fn moveTo(self: *Terminal, row: u16, col: u16) !void {
         var buf: [32]u8 = undefined;
         const len = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ row + 1, col + 1 }) catch return;
         try self.writeBytes(len);
     }
 
-    /// Show the cursor
     pub fn showCursor(self: *Terminal) !void {
         try self.writeBytes(ansi.cursor_show);
     }
 
-    /// Hide the cursor
     pub fn hideCursor(self: *Terminal) !void {
         try self.writeBytes(ansi.cursor_hide);
     }
 
-    /// Enable mouse tracking
     pub fn enableMouse(self: *Terminal) !void {
         try self.writeBytes(mouse.enableSequence(.normal));
         self.state.mouse_enabled = true;
     }
 
-    /// Disable mouse tracking
     pub fn disableMouse(self: *Terminal) !void {
         try self.writeBytes(mouse.disableSequence(.normal));
         self.state.mouse_enabled = false;
     }
 
-    /// Set window title
     pub fn setTitle(self: *Terminal, title: []const u8) !void {
         try self.writeBytes("\x1b]0;");
         try self.writeBytes(title);
         try self.writeBytes("\x07");
     }
 
-    /// Copy bytes to the system clipboard using OSC 52 with instance defaults.
-    /// Returns `false` when disabled by config, rejected by local guardrails, or not suitable for this output.
     pub fn setClipboard(self: *Terminal, bytes: []const u8) !bool {
         return self.setClipboardWithOptions(bytes, .{});
     }
 
-    /// Copy bytes to the system clipboard using OSC 52 with per-call overrides.
     pub fn setClipboardWithOptions(self: *Terminal, bytes: []const u8, options: Osc52WriteOptions) !bool {
         if (!self.config.osc52.enabled) return false;
 
@@ -554,14 +468,10 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Query clipboard bytes via OSC 52 (`...?;?`).
-    /// Returns `null` when unsupported, disabled, timed out, or rejected by guardrails.
     pub fn getClipboard(self: *Terminal, allocator: std.mem.Allocator) !?[]u8 {
         return self.getClipboardWithOptions(allocator, .{});
     }
 
-    /// Query clipboard bytes via OSC 52 (`...?;?`) with per-call overrides.
-    /// Returns `null` when unsupported, disabled, timed out, or rejected by guardrails.
     pub fn getClipboardWithOptions(self: *Terminal, allocator: std.mem.Allocator, options: Osc52ReadOptions) !?[]u8 {
         if (!self.config.osc52.enabled or !self.config.osc52.query_enabled) return null;
 
@@ -605,13 +515,11 @@ pub const Terminal = struct {
         return null;
     }
 
-    /// Write a string at position
     pub fn writeAt(self: *Terminal, row: u16, col: u16, str: []const u8) !void {
         try self.moveTo(row, col);
         try self.writeBytes(str);
     }
 
-    /// Check if stdin is a TTY
     pub fn isTty(self: *Terminal) bool {
         _ = self;
         if (is_wasm) return true;
@@ -645,8 +553,6 @@ pub const Terminal = struct {
         return self.image_caps.sixel;
     }
 
-    /// Draw image bytes using Kitty graphics protocol (`t=d`).
-    /// Returns `false` when unsupported or no data is provided.
     pub fn drawKittyImage(self: *Terminal, image_data: []const u8, options: KittyImageOptions) !bool {
         if (!self.image_caps.kitty_graphics or image_data.len == 0) return false;
 
@@ -669,8 +575,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Draw a PNG image by file path using Kitty graphics protocol (`t=f`).
-    /// Returns `false` when unsupported or path is empty.
     pub fn drawKittyImageFromFile(self: *Terminal, path: []const u8, options: KittyImageFileOptions) !bool {
         if (!self.image_caps.kitty_graphics or path.len == 0) return false;
 
@@ -691,8 +595,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Transmit an image to the Kitty cache without displaying it (`a=t`).
-    /// Use `placeKittyImage` later to display it by ID.
     pub fn transmitKittyImage(self: *Terminal, payload: []const u8, options: KittyTransmitOptions) !bool {
         if (!self.image_caps.kitty_graphics or payload.len == 0) return false;
 
@@ -720,7 +622,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Transmit an image file to the Kitty cache without displaying it (`a=t,t=f`).
     pub fn transmitKittyImageFromFile(self: *Terminal, path: []const u8, options: KittyTransmitOptions) !bool {
         if (!self.image_caps.kitty_graphics or path.len == 0) return false;
         if (!fileExists(self.io, path)) return false;
@@ -735,7 +636,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Display a previously cached image by ID (`a=p`).
     pub fn placeKittyImage(self: *Terminal, options: KittyPlaceOptions) !bool {
         if (!self.image_caps.kitty_graphics) return false;
 
@@ -751,12 +651,10 @@ pub const Terminal = struct {
         if (options.z_index) |z| try params_writer.print(",z={d}", .{z});
         if (options.unicode_placeholder) try params_writer.writeAll(",U=1");
 
-        // Virtual placement has no payload.
         try ansi.kittyGraphics(self.writer(), params_writer.buffered(), "");
         return true;
     }
 
-    /// Delete images/placements from the Kitty cache (`a=d`).
     pub fn deleteKittyImage(self: *Terminal, target: KittyDeleteTarget) !bool {
         if (!self.image_caps.kitty_graphics) return false;
 
@@ -774,8 +672,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Draw a file image via iTerm2 inline image protocol (`OSC 1337`).
-    /// Returns `false` when unsupported or path is empty.
     pub fn drawIterm2ImageFromFile(self: *Terminal, path: []const u8, options: Iterm2ImageFileOptions) !bool {
         if (!self.image_caps.iterm2_inline_image or path.len == 0) return false;
         if (!fileExists(self.io, path)) return false;
@@ -805,8 +701,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Draw in-memory image data via iTerm2 inline image protocol.
-    /// Returns `false` when unsupported or data is empty.
     pub fn drawIterm2ImageData(self: *Terminal, data: []const u8, options: Iterm2ImageDataOptions) !bool {
         if (!self.image_caps.iterm2_inline_image or data.len == 0) return false;
 
@@ -824,14 +718,10 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Draw an image file using the best available protocol.
-    /// Prefers Kitty graphics, then iTerm2 inline images, then Sixel.
-    /// Use `protocol` to override the auto-selection.
     pub fn drawImageFromFile(self: *Terminal, path: []const u8, options: ImageFileOptions) !bool {
         return self.drawImageFromFileWithProtocol(path, options, .auto);
     }
 
-    /// Draw an image file using a specific or auto-selected protocol.
     pub fn drawImageFromFileWithProtocol(self: *Terminal, path: []const u8, options: ImageFileOptions, protocol: ImageProtocol) !bool {
         if (path.len == 0) return false;
         if (!fileExists(self.io, path)) return false;
@@ -898,12 +788,10 @@ pub const Terminal = struct {
         }
     }
 
-    /// Draw in-memory image data using the best available protocol.
     pub fn drawImageData(self: *Terminal, data: []const u8, options: ImageDataOptions) !bool {
         return self.drawImageDataWithProtocol(data, options, .auto);
     }
 
-    /// Draw in-memory image data using a specific or auto-selected protocol.
     pub fn drawImageDataWithProtocol(self: *Terminal, data: []const u8, options: ImageDataOptions, protocol: ImageProtocol) !bool {
         if (data.len == 0) return false;
 
@@ -938,7 +826,6 @@ pub const Terminal = struct {
                 return false;
             },
             .sixel => {
-                // Sixel only supports pre-encoded data or file paths.
                 if (self.image_caps.sixel) {
                     self.sendSixelPayload(data) catch return false;
                     return true;
@@ -978,10 +865,6 @@ pub const Terminal = struct {
         }
     }
 
-    /// Draw a Sixel image from file.
-    /// Supports either:
-    /// - pre-encoded `.sixel`/`.six` data files, or
-    /// - regular image files converted through `img2sixel` when available.
     pub fn drawSixelFromFile(self: *Terminal, path: []const u8, options: SixelImageFileOptions) !bool {
         if (!self.image_caps.sixel or path.len == 0) return false;
         if (!fileExists(self.io, path)) return false;
@@ -1084,7 +967,6 @@ pub const Terminal = struct {
 
         if (kitty_candidate) {
             kitty = self.queryKittyGraphicsSupport() catch false;
-            // Keep an env fallback only outside multiplexers where probe failures are uncommon.
             if (!kitty and !in_multiplexer) {
                 kitty = env.has_kitty_window;
             }
@@ -1132,7 +1014,6 @@ pub const Terminal = struct {
 
             var payload_end = osc_end;
             if (start > 0 and bytes[start - 1] == 0x1b and bytes[osc_end] == 0x1b and osc_end + 1 < bytes.len and bytes[osc_end + 1] == '\\') {
-                // DCS passthrough can encode inner ST as ESC ESC \.
                 if (payload_end > payload_start) payload_end -= 1;
             }
 
@@ -1308,7 +1189,6 @@ pub const Terminal = struct {
             return;
         }
 
-        // iTerm2 supports multipart transfer to avoid oversized OSC sequences.
         try self.writeBytes(ansi.OSC ++ "1337;MultipartFile=");
         try self.writeBytes(params);
         try self.writeBytes("\x07");
@@ -1354,7 +1234,6 @@ pub const Terminal = struct {
             return;
         }
 
-        // Multipart transfer for large payloads.
         try self.writeBytes(ansi.OSC ++ "1337;MultipartFile=");
         try self.writeBytes(params);
         try self.writeBytes("\x07");
@@ -1654,7 +1533,6 @@ pub const Terminal = struct {
         if (!self.environment.looksLikeKittyTerminal()) return false;
 
         const cpr = "\x1b[6n";
-        // CR, CPR, draw 2-cell space via kitty OSC 66 width-only, CPR.
         const probe = "\r" ++ cpr ++ "\x1b]66;w=2; \x07" ++ cpr;
         try self.writeBytes(probe);
         try self.flush();
@@ -1805,8 +1683,6 @@ pub const Terminal = struct {
         return true;
     }
 
-    /// Buffered writer that exposes a `std.Io.Writer` interface and drains to
-    /// the terminal's output sink (stdout file, or the wasm host on wasm).
     pub const Writer = struct {
         io: std.Io,
         file: if (is_wasm) void else std.Io.File,
@@ -1823,10 +1699,6 @@ pub const Terminal = struct {
             };
         }
 
-        /// Wires the `std.Io.Writer` to the local buffer. Called by the
-        /// containing `Terminal` whenever it hands the writer out, so the
-        /// buffer pointer stays valid even if the `Terminal` was moved.
-        /// `writer.end` is preserved across moves, so re-binding is safe.
         pub fn bind(self: *Writer) void {
             self.writer.buffer = &self.buffer;
         }
@@ -1840,9 +1712,6 @@ pub const Terminal = struct {
                 io_w.end = 0;
             }
 
-            // The std.Io.Writer.VTable contract treats data.len == 0 as a
-            // pure flush; the splat pattern lives at data[data.len - 1] so we
-            // must early-return before indexing.
             if (data.len == 0) return 0;
 
             var consumed: usize = 0;

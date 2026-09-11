@@ -20,7 +20,6 @@ pub const InProcessProviderProtocolBridge = struct {
         return .{ .registry = registry };
     }
 
-    /// Return an agent-compatible protocol client interface.
     pub fn protocolClient(self: *InProcessProviderProtocolBridge) agent_types.ProtocolClient {
         return .{
             .stream_fn = streamViaProtocol,
@@ -112,16 +111,10 @@ fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const 
         .low => "low",
         .medium => "medium",
         .high => "high",
-        // xhigh is reserved for models after gpt-5.1-codex-max; other
-        // families reject the request outright, so clamp to high.
         .xhigh => if (supportsXhighReasoning(model_id)) "xhigh" else "high",
     };
 }
 
-/// Whether the model supports the `none` reasoning effort: per the bundled
-/// OpenAI specification (docs/openai/responses.md), `none` is available on
-/// GPT models from gpt-5.1 onward; earlier families only take low/medium/
-/// high and default to medium.
 fn isGpt51OrLater(model_id: []const u8) bool {
     const prefix = "gpt-5.";
     if (!std.mem.startsWith(u8, model_id, prefix)) return false;
@@ -130,11 +123,6 @@ fn isGpt51OrLater(model_id: []const u8) bool {
     return std.ascii.isDigit(minor[0]) and minor[0] >= '1';
 }
 
-/// Whether the model family accepts the `xhigh` reasoning effort. Per the
-/// bundled OpenAI specification (docs/openai/responses.md), xhigh is
-/// supported for models after gpt-5.1-codex-max — the codex-max family
-/// itself and later minor versions (gpt-5.2 onward); `high` is accepted by
-/// every reasoning-capable family.
 fn supportsXhighReasoning(model_id: []const u8) bool {
     if (std.mem.indexOf(u8, model_id, "codex-max") != null) return true;
     const prefix = "gpt-5.";
@@ -221,7 +209,6 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
 
     const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.model.id, ctx.api_key, ctx.session_id);
 
-    // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
     var request_model = ctx.model;
     request_model.is_owned = false;
     var request_context = ctx.context;
@@ -255,7 +242,6 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         compat.time.sleepNs(1 * std.time.ns_per_ms);
     }
 
-    // Final drain after completion.
     _ = runtime.pumpOnce(&client) catch {};
     drainClientEvents(&client, ctx.out_stream, ctx.allocator) catch |err| {
         ctx.out_stream.completeWithError(@errorName(err));
@@ -377,9 +363,6 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
-    // Provide an explicit api_key so the binary-side credential resolver
-    // (M-006) does not reject the request with `auth_required`. The mock
-    // provider does not validate the key value.
     const stream = try protocol.stream(model, ctx, .{ .api_key = "test-key" }, allocator);
     defer {
         stream.deinit();
@@ -396,8 +379,6 @@ test "InProcessProviderProtocolBridge smoke test" {
     const result = stream.getResult().?;
     var owned_result = result;
     owned_result.deinit(allocator);
-    // We already freed the result contents above. Null the reference so
-    // stream.deinit() doesn't attempt a double-free.
     stream.result = null;
 
     try std.testing.expect(saw_start);
@@ -415,17 +396,14 @@ test "provider protocol bridge maps thinking level to stream options" {
     try std.testing.expect(opts.reasoning_enabled);
     try std.testing.expectEqual(@as(?u32, 8192), opts.thinking_budget_tokens);
     try std.testing.expectEqualStrings("max", opts.getThinkingEffort().?);
-    // gpt-5.1 rejects xhigh; the mapper clamps it to high.
     try std.testing.expectEqualStrings("high", opts.getReasoningEffort().?);
 
     const codex_max = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.1-codex-max", null, null);
     try std.testing.expectEqualStrings("xhigh", codex_max.getReasoningEffort().?);
 
-    // Later families ship after gpt-5.1-codex-max and accept xhigh.
     const gpt52_xhigh = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.2", null, null);
     try std.testing.expectEqualStrings("xhigh", gpt52_xhigh.getReasoningEffort().?);
 
-    // Post-5.1 families accept none; pre-5.1 families do not.
     const gpt52_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.2", null, null);
     try std.testing.expectEqualStrings("none", gpt52_off.getReasoningEffort().?);
     const gpt5_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5", null, null);
@@ -496,8 +474,6 @@ test "InProcessProviderProtocolBridge preserves streamed tool call terminal resu
                 .partial = p,
             } }) catch {};
 
-            // Match OpenAI Responses behavior: terminal result can omit streamed
-            // function-call content and report a generic stop reason.
             s.complete(try ai_types.cloneAssistantMessage(a, .{
                 .content = &.{},
                 .api = model.api,

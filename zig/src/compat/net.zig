@@ -23,10 +23,6 @@ pub const AddressList = struct {
     }
 };
 
-/// TCP stream wrapper used as the stable Makai networking boundary.
-///
-/// Uses streams produced by Makai default-context networking helpers without
-/// exposing raw `std.Io` in this public wrapper API.
 pub const Stream = struct {
     inner: std.Io.net.Stream,
 
@@ -68,25 +64,19 @@ fn readAll(stream: *Stream, buffer: []u8) !void {
     }
 }
 
-/// Accepted TCP connection returned by `accept`.
 pub const Connection = struct {
     stream: Stream,
     address: Address,
 };
 
-/// Return the bound listener address through Makai's selected networking backend.
 pub fn listenAddress(server: *const Server) Address {
     return server.socket.address;
 }
 
-/// Stop a TCP listener through the compatibility networking boundary.
 pub fn closeServer(server: *Server) void {
     server.deinit(defaultIo());
 }
 
-/// Accept a TCP connection and wrap its stream at the Makai compatibility seam.
-///
-/// Preserves this helper shape over Makai's selected networking backend.
 pub fn accept(server: *Server) !Connection {
     const stream = try server.accept(defaultIo());
     return .{
@@ -95,13 +85,6 @@ pub fn accept(server: *Server) !Connection {
     };
 }
 
-/// Resolve a host/port into an address.
-///
-/// Returns the first resolved address, preserving DNS hostname support in
-/// addition to literal IP inputs. Keeps this public signature while routing
-/// through the selected Makai networking context internally.
-///
-/// `allocator` owns temporary DNS resolver allocations during this call.
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
     var list = try resolveAddressList(allocator, host, port);
     defer list.deinit();
@@ -110,9 +93,6 @@ pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16)
     return list.addrs[0];
 }
 
-/// Resolve a host/port into an owned address list for DNS-style consumers.
-///
-/// Callers own the returned list and must call `deinit`.
 pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !*AddressList {
     const list = try allocator.create(AddressList);
     errdefer allocator.destroy(list);
@@ -150,7 +130,6 @@ pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: 
     return list;
 }
 
-/// Connect to the first reachable TCP peer from a resolved address list.
 pub fn tcpConnectAny(list: *const AddressList) !Stream {
     if (list.addrs.len == 0) return error.UnknownHostName;
 
@@ -166,19 +145,16 @@ pub fn tcpConnectAny(list: *const AddressList) !Stream {
     return last_err orelse error.ConnectionRefused;
 }
 
-/// Connect to a TCP host, trying resolved addresses in resolver order.
 pub fn tcpConnectHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !Stream {
     var list = try resolveAddressList(allocator, host, port);
     defer list.deinit();
     return tcpConnectAny(list);
 }
 
-/// Connect to a TCP peer through the Makai default I/O context.
 pub fn tcpConnect(address: Address) !Stream {
     return Stream.init(try address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }));
 }
 
-/// Listen for TCP connections on `address` through the Makai default I/O context.
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
     return address.listen(defaultIo(), options);
 }

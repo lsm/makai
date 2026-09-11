@@ -1,5 +1,3 @@
-//! RadioGroup component.
-//! Single-select option group with radio button semantics.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -11,24 +9,19 @@ pub fn RadioGroup(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
 
-        // Items
         items: std.array_list.Managed(Item),
 
-        // State
         selected: ?usize,
         cursor: usize,
         height: u16,
         y_offset: usize,
 
-        // Focus
         focused: bool,
 
-        // Symbols
         cursor_symbol: []const u8,
         selected_symbol: []const u8,
         unselected_symbol: []const u8,
 
-        // Styling
         item_style: style_mod.Style,
         selected_style: style_mod.Style,
         cursor_style: style_mod.Style,
@@ -127,7 +120,6 @@ pub fn RadioGroup(comptime T: type) type {
             return null;
         }
 
-        // Focus protocol
         pub fn focus(self: *Self) void {
             self.focused = true;
         }
@@ -230,7 +222,6 @@ pub fn RadioGroup(comptime T: type) type {
                 const item = self.items.items[idx];
                 const is_selected = self.selected != null and self.selected.? == idx;
 
-                // Cursor
                 if (idx == self.cursor and self.focused) {
                     const styled = try self.cursor_style.render(allocator, self.cursor_symbol);
                     try writer.writeAll(styled);
@@ -240,7 +231,6 @@ pub fn RadioGroup(comptime T: type) type {
                     }
                 }
 
-                // Radio symbol
                 const radio_sym = if (is_selected) self.selected_symbol else self.unselected_symbol;
                 const radio_s = if (!item.enabled)
                     self.disabled_style
@@ -251,7 +241,6 @@ pub fn RadioGroup(comptime T: type) type {
                 const styled_radio = try radio_s.render(allocator, radio_sym);
                 try writer.writeAll(styled_radio);
 
-                // Label
                 const lbl_style = if (!item.enabled)
                     self.disabled_style
                 else if (idx == self.cursor and self.focused)
@@ -263,7 +252,6 @@ pub fn RadioGroup(comptime T: type) type {
                 const styled_label = try lbl_style.render(allocator, item.label);
                 try writer.writeAll(styled_label);
 
-                // Description
                 if (item.description.len > 0) {
                     try writer.writeAll(" - ");
                     try writer.writeAll(item.description);

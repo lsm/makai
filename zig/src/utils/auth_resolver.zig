@@ -1,23 +1,3 @@
-//! Credential resolution for the Zig binary's protocol request path.
-//!
-//! Per `docs/ts-sdk-chat-integration-plan.md` Phase 2a, the binary owns all
-//! auth resolution. TypeScript clients never read token files or handle
-//! refresh tokens directly; they may only pass an explicit API key on the
-//! request. When no key is provided, the binary loads stored credentials by
-//! `provider_id`.
-//!
-//! Resolution order:
-//!   1. If the request supplies a non-empty `api_key`, use it as-is.
-//!   2. Otherwise, look up `provider_id` in `AuthStorage`.
-//!      - For `api_key` entries, return the stored key.
-//!      - For `oauth` entries, return the stored access token.
-//!   3. If neither is available, return `error.AuthRequired`. The protocol
-//!      layer maps this to a `nack` with `error_code = auth_required`.
-//!
-//! NOTE: M-006 is the load path only. M-007 layers refresh-on-expiry and
-//! retry-on-upstream-auth-failure on top of this resolver. Provider-specific
-//! token exchange (e.g. GitHub Copilot's bearer-token swap) is also handled
-//! by M-007's refresh path, since it shares the same OAuth provider plumbing.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -27,13 +7,9 @@ pub const AuthStorage = storage_mod.AuthStorage;
 pub const ProviderAuth = storage_mod.ProviderAuth;
 
 pub const AuthResolveError = error{
-    /// No explicit API key was provided and no stored credentials exist for
-    /// `provider_id`. Surfaced to clients as `error_code = auth_required`.
     AuthRequired,
 } || std.mem.Allocator.Error;
 
-/// A resolved API key. The slice is always heap-allocated by `resolveApiKey`
-/// so the caller can free it uniformly without tracking ownership.
 pub const ResolvedKey = struct {
     api_key: []u8,
 
@@ -43,13 +19,6 @@ pub const ResolvedKey = struct {
     }
 };
 
-/// Resolve the API key to use for an upstream provider call.
-///
-/// `auth_storage` may be null when the runtime has not loaded an auth file
-/// yet — in that case only the explicit `provided_api_key` path can succeed.
-///
-/// The returned `ResolvedKey.api_key` is owned by `allocator`; callers must
-/// call `deinit` once they are done injecting it into request options.
 pub fn resolveApiKey(
     allocator: std.mem.Allocator,
     auth_storage: ?*AuthStorage,
@@ -72,17 +41,11 @@ pub fn resolveApiKey(
             return .{ .api_key = dup };
         },
         .oauth => |creds| {
-            // M-006: load access token directly. M-007 will add refresh on
-            // expiry plus provider-specific token exchange.
             const dup = try allocator.dupe(u8, creds.access);
             return .{ .api_key = dup };
         },
     }
 }
-
-// =========================================================================
-// Tests
-// =========================================================================
 
 const testing = std.testing;
 
@@ -97,7 +60,6 @@ test "resolveApiKey - explicit api key wins, no storage lookup" {
     var storage = makeStorage(testing.allocator);
     defer storage.deinit();
 
-    // Storage has a different key for the same provider — must NOT be used.
     const provider_id = try testing.allocator.dupe(u8, "anthropic");
     const stored = try testing.allocator.dupe(u8, "stored-key");
     try storage.providers.put(provider_id, .{ .api_key = stored });

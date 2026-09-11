@@ -1,12 +1,3 @@
-//! Braille canvas with direct pixel-grid API.
-//!
-//! Each terminal cell holds 2x4 sub-cell "pixels" via Unicode braille
-//! characters (U+2800..U+28FF). Pixel coordinates use (px, py) with origin at
-//! top-left; cell coordinates use (col, row).
-//!
-//! For chart-style data plotting, see `Canvas`. This component is intended
-//! for raw pixel work — world maps, scopes, simple bitmaps — where the
-//! caller already knows pixel coordinates.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -17,12 +8,6 @@ pub const Style = style_mod.Style;
 
 const BRAILLE_BASE: u21 = 0x2800;
 
-/// Bit position within a braille cell for each (sub_x, sub_y) coordinate.
-/// Layout matches Unicode braille:
-///   0 3
-///   1 4
-///   2 5
-///   6 7
 const BRAILLE_BITS = [4][2]u8{
     .{ 0x01, 0x08 },
     .{ 0x02, 0x10 },
@@ -44,9 +29,7 @@ const TextOverlay = struct {
 
 pub const BrailleCanvas = struct {
     allocator: std.mem.Allocator,
-    /// Cell width (each cell = 2 pixels wide).
     cell_width: u16,
-    /// Cell height (each cell = 4 pixels tall).
     cell_height: u16,
 
     cells: []BrailleCell,
@@ -109,7 +92,6 @@ pub const BrailleCanvas = struct {
         self.background_glyph = glyph;
     }
 
-    /// Pixel grid dimensions.
     pub fn pixelWidth(self: *const BrailleCanvas) u16 {
         return self.cell_width *| 2;
     }
@@ -189,7 +171,6 @@ pub const BrailleCanvas = struct {
     }
 
     pub fn drawLineStyled(self: *BrailleCanvas, x0: i32, y0: i32, x1: i32, y1: i32, style: Style) void {
-        // Bresenham.
         var x = x0;
         var y = y0;
         const dx = @as(i32, @intCast(@abs(x1 - x0)));
@@ -248,7 +229,6 @@ pub const BrailleCanvas = struct {
             self.setPixelStyled(cx, cy, style);
             return;
         }
-        // Midpoint circle algorithm.
         var x: i32 = radius;
         var y: i32 = 0;
         var err: i32 = 1 - radius;
@@ -271,7 +251,6 @@ pub const BrailleCanvas = struct {
         }
     }
 
-    /// Overlay text at cell coordinates, replacing the braille at those cells.
     pub fn drawText(self: *BrailleCanvas, col: u16, row: u16, text: []const u8, style: Style) !void {
         const owned = try self.text_arena.allocator().dupe(u8, text);
         var s = style;
@@ -280,14 +259,11 @@ pub const BrailleCanvas = struct {
     }
 
     pub fn view(self: *const BrailleCanvas, allocator: std.mem.Allocator) ![]const u8 {
-        // Materialize each cell into a string (braille char or background),
-        // styled. Then apply text overlays.
         const total_cells = @as(usize, self.cell_width) * @as(usize, self.cell_height);
         var glyph_for_cell = try allocator.alloc(?[]const u8, total_cells);
         defer allocator.free(glyph_for_cell);
         for (glyph_for_cell) |*g| g.* = null;
 
-        // Apply text overlays first so they take precedence.
         for (self.overlays.items) |ov| {
             if (ov.row >= self.cell_height) continue;
             var col: u16 = ov.col;
@@ -352,7 +328,6 @@ test "out-of-bounds writes are ignored" {
     defer c.deinit();
     c.setPixel(-1, -1);
     c.setPixel(100, 100);
-    // Nothing crashes; nothing set.
     try std.testing.expect(!c.isPixelSet(0, 0));
 }
 
@@ -397,7 +372,6 @@ test "drawText overlay replaces braille" {
     try c.drawText(0, 0, "hi", Style{});
     const out = try c.view(allocator);
     defer allocator.free(out);
-    // Both characters should appear somewhere; styling may sit between them.
     try std.testing.expect(std.mem.indexOfScalar(u8, out, 'h') != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, 'i') != null);
 }

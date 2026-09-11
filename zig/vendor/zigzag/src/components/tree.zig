@@ -1,12 +1,9 @@
-//! Tree component for displaying hierarchical data.
-//! Renders a tree structure with expandable nodes and customizable enumerators.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 
-/// Enumerator defines the prefix characters for tree rendering
 pub const Enumerator = struct {
     item_prefix: []const u8,
     last_prefix: []const u8,
@@ -14,7 +11,6 @@ pub const Enumerator = struct {
     empty_prefix: []const u8,
 };
 
-/// Default tree enumerator with box-drawing characters
 pub const DefaultEnumerator = Enumerator{
     .item_prefix = "├── ",
     .last_prefix = "└── ",
@@ -22,7 +18,6 @@ pub const DefaultEnumerator = Enumerator{
     .empty_prefix = "    ",
 };
 
-/// Rounded tree enumerator
 pub const RoundedEnumerator = Enumerator{
     .item_prefix = "├── ",
     .last_prefix = "╰── ",
@@ -80,7 +75,6 @@ pub fn Tree(comptime T: type) type {
             self.root_indices.deinit();
         }
 
-        /// Add a root node, returns its index
         pub fn addRoot(self: *Self, value: T, label: []const u8) !usize {
             const idx = self.nodes.items.len;
             try self.nodes.append(.{
@@ -94,7 +88,6 @@ pub fn Tree(comptime T: type) type {
             return idx;
         }
 
-        /// Add a child node to a parent, returns child index
         pub fn addChild(self: *Self, parent: usize, value: T, label: []const u8) !usize {
             const idx = self.nodes.items.len;
             try self.nodes.append(.{
@@ -108,19 +101,16 @@ pub fn Tree(comptime T: type) type {
             return idx;
         }
 
-        /// Toggle expand/collapse of a node
         pub fn toggleNode(self: *Self, idx: usize) void {
             if (idx < self.nodes.items.len) {
                 self.nodes.items[idx].expanded = !self.nodes.items[idx].expanded;
             }
         }
 
-        /// Set enumerator style
         pub fn setEnumerator(self: *Self, e: Enumerator) void {
             self.enumerator = e;
         }
 
-        /// Render the tree
         pub fn view(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
             var result: Writer.Allocating = .init(allocator);
             const writer = &result.writer;
@@ -144,14 +134,11 @@ pub fn Tree(comptime T: type) type {
             const node = self.nodes.items[node_idx];
             const active_style = node.style_override orelse self.label_style;
 
-            // Write prefix
             try writer.writeAll(prefix);
 
-            // Write label
             const styled_label = try active_style.render(allocator, node.label);
             try writer.writeAll(styled_label);
 
-            // Render children if expanded
             if (node.expanded and node.children.items.len > 0) {
                 const children = node.children.items;
                 for (children, 0..) |child_idx, ci| {
@@ -160,7 +147,6 @@ pub fn Tree(comptime T: type) type {
                     const connector = if (is_last) self.enumerator.last_prefix else self.enumerator.item_prefix;
                     const child_prefix = if (is_last) self.enumerator.empty_prefix else self.enumerator.indent_prefix;
 
-                    // Build new prefix for children
                     var new_prefix = std.array_list.Managed(u8).init(allocator);
                     if (!is_root) {
                         try new_prefix.appendSlice(prefix);
@@ -168,7 +154,6 @@ pub fn Tree(comptime T: type) type {
                     try new_prefix.appendSlice(child_prefix);
                     const new_prefix_str = try new_prefix.toOwnedSlice();
 
-                    // Write connector and recurse
                     var connector_prefix = std.array_list.Managed(u8).init(allocator);
                     if (!is_root) {
                         try connector_prefix.appendSlice(prefix);

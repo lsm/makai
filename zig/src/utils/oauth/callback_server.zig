@@ -2,7 +2,6 @@ const std = @import("std");
 const compat = @import("compat");
 const net = compat.net;
 
-/// Local HTTP callback server for OAuth
 pub const CallbackServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
@@ -11,7 +10,6 @@ pub const CallbackServer = struct {
     state: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
 
-    /// Start callback server on 127.0.0.1
     pub fn start(allocator: std.mem.Allocator, port: u16) !CallbackServer {
         const address = try net.resolveAddress(allocator, "127.0.0.1", port);
         const listener = try net.tcpListen(address, .{
@@ -25,12 +23,10 @@ pub const CallbackServer = struct {
         };
     }
 
-    /// Wait for OAuth callback with timeout
     pub fn waitForCode(self: *CallbackServer, timeout_ms: u64) !?[]const u8 {
         const deadline = compat.time.nowMillis() + @as(i64, @intCast(timeout_ms));
 
         while (compat.time.nowMillis() < deadline) {
-            // Accept connection with timeout
             var connection = net.accept(&self.listener) catch |err| {
                 if (err == error.WouldBlock) {
                     compat.time.sleepMs(100);
@@ -40,14 +36,12 @@ pub const CallbackServer = struct {
             };
             defer connection.stream.close();
 
-            // Read HTTP request
             var buffer: [4096]u8 = undefined;
             const bytes_read = try connection.stream.read(&buffer);
             if (bytes_read == 0) continue;
 
             const request = buffer[0..bytes_read];
 
-            // Parse query string from GET request
             if (std.mem.startsWith(u8, request, "GET ")) {
                 const query_start = std.mem.find(u8, request, "?") orelse {
                     try self.sendResponse(&connection.stream, false, "No query parameters");
@@ -57,7 +51,6 @@ pub const CallbackServer = struct {
                 const query_end = std.mem.find(u8, request[query_start..], " ") orelse request.len - query_start;
                 const query = request[query_start + 1 .. query_start + query_end];
 
-                // Parse code and state
                 var code: ?[]const u8 = null;
                 var state: ?[]const u8 = null;
                 var error_param: ?[]const u8 = null;
@@ -90,10 +83,9 @@ pub const CallbackServer = struct {
             }
         }
 
-        return null; // Timeout
+        return null;
     }
 
-    /// Send HTML response to browser
     fn sendResponse(self: *CallbackServer, stream: *net.Stream, success: bool, error_msg: ?[]const u8) !void {
         const html = if (success)
             \\HTTP/1.1 200 OK
@@ -124,7 +116,6 @@ pub const CallbackServer = struct {
         try stream.writeAll(html);
     }
 
-    /// Stop callback server and free resources
     pub fn stop(self: *CallbackServer) void {
         net.closeServer(&self.listener);
         if (self.code) |code| {

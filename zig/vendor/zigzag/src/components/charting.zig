@@ -1,4 +1,3 @@
-//! Shared plotting primitives for chart-like components.
 
 const std = @import("std");
 const Writer = std.Io.Writer;

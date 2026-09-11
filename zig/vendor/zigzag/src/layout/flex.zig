@@ -1,49 +1,20 @@
-//! Constraint-based Flexbox layout engine for ZigZag TUI.
-//!
-//! Resolves sizing constraints and computes rectangular areas
-//! for a list of flex items along a main axis (row or column),
-//! with support for gaps, cross-axis alignment, main-axis
-//! justification, and line wrapping.
-//!
-//! ## Example
-//!
-//! ```zig
-//! const areas = try flex.layout(allocator, 80, 24, &.{
-//!     .{ .constraint = .{ .percentage = 30 } },
-//!     .{ .constraint = .{ .min = 10 } },
-//!     .{ .constraint = .fill },
-//! }, .{ .direction = .row, .gap = 1 });
-//! ```
 
 const std = @import("std");
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// A sizing constraint for one flex item.
 pub const Constraint = union(enum) {
-    /// Exactly `n` cells.
     fixed: u16,
-    /// A percentage of total available space (0-100).
     percentage: u8,
-    /// At least `n` cells (can grow to fill).
     min: u16,
-    /// At most `n` cells (can shrink to fit).
     max: u16,
-    /// Ratio: `num / den` of available space.
     ratio: struct { num: u16, den: u16 },
-    /// Take all remaining space after fixed/percentage items.
     fill,
 };
 
-/// Main-axis direction.
 pub const Direction = enum {
     row,
     column,
 };
 
-/// Cross-axis alignment.
 pub const Alignment = enum {
     start,
     center,
@@ -51,7 +22,6 @@ pub const Alignment = enum {
     stretch,
 };
 
-/// Main-axis content distribution.
 pub const Justify = enum {
     start,
     center,
@@ -61,12 +31,10 @@ pub const Justify = enum {
     space_evenly,
 };
 
-/// Describes a single flex child.
 pub const Item = struct {
     constraint: Constraint = .fill,
 };
 
-/// Layout options.
 pub const FlexOptions = struct {
     direction: Direction = .row,
     gap: u16 = 0,
@@ -75,7 +43,6 @@ pub const FlexOptions = struct {
     wrap: bool = false,
 };
 
-/// An output rectangle (in cell coordinates).
 pub const Rect = struct {
     x: u16,
     y: u16,
@@ -83,14 +50,6 @@ pub const Rect = struct {
     height: u16,
 };
 
-// ---------------------------------------------------------------------------
-// Core layout algorithm
-// ---------------------------------------------------------------------------
-
-/// Compute layout rectangles for `items` inside a container of
-/// `total_width` x `total_height` cells.
-///
-/// Returns a slice of `Rect` allocated with `allocator`.
 pub fn layout(
     allocator: std.mem.Allocator,
     total_width: u16,
@@ -109,7 +68,6 @@ pub fn layout(
     return layoutLine(allocator, total_width, total_height, items, options, 0, 0);
 }
 
-/// Layout a single line of items (no wrapping).
 fn layoutLine(
     allocator: std.mem.Allocator,
     total_width: u16,
@@ -124,12 +82,10 @@ fn layoutLine(
     const main_total: u16 = if (is_row) total_width else total_height;
     const cross_total: u16 = if (is_row) total_height else total_width;
 
-    // Total gap space
     const gap_count: u16 = if (n > 1) @intCast(n - 1) else 0;
     const total_gap: u16 = gap_count * options.gap;
     const avail: u16 = if (main_total > total_gap) main_total - total_gap else 0;
 
-    // -- Phase 1: resolve constraints to sizes --------------------------------
     var sizes = try allocator.alloc(u16, n);
     defer allocator.free(sizes);
 
@@ -168,7 +124,6 @@ fn layoutLine(
         }
     }
 
-    // -- Phase 2: distribute remaining space among fill items -----------------
     const remaining: u16 = if (avail > @as(u16, @intCast(@min(used, avail)))) avail - @as(u16, @intCast(@min(used, avail))) else 0;
     if (fill_count > 0 and remaining > 0) {
         const per_fill: u16 = remaining / fill_count;
@@ -184,7 +139,6 @@ fn layoutLine(
         }
     }
 
-    // Grow `min` items if there is leftover space
     if (fill_count == 0 and remaining > 0) {
         var min_count: u16 = 0;
         for (items) |item| {
@@ -205,7 +159,6 @@ fn layoutLine(
         }
     }
 
-    // Shrink `max` items so they don't exceed their cap
     for (items, 0..) |item, i| {
         if (item.constraint == .max) {
             const cap = item.constraint.max;
@@ -213,7 +166,6 @@ fn layoutLine(
         }
     }
 
-    // Clamp all sizes so total doesn't exceed available space
     {
         var sum: u32 = 0;
         for (sizes) |s| sum += s;
@@ -226,7 +178,6 @@ fn layoutLine(
         }
     }
 
-    // -- Phase 3: compute positions using justification ----------------------
     var positions = try allocator.alloc(u16, n);
     defer allocator.free(positions);
 
@@ -245,7 +196,6 @@ fn layoutLine(
             .space_evenly => 0,
         };
 
-        // Compute per-item extra spacing for space_* modes
         var between_extra: u16 = 0;
         var before_first: u16 = 0;
 
@@ -279,7 +229,6 @@ fn layoutLine(
         }
     }
 
-    // -- Phase 4: build output Rects -----------------------------------------
     var rects = try allocator.alloc(Rect, n);
 
     for (0..n) |i| {
@@ -309,10 +258,6 @@ fn layoutLine(
     return rects;
 }
 
-// ---------------------------------------------------------------------------
-// Wrapped layout
-// ---------------------------------------------------------------------------
-
 fn layoutWrapped(
     allocator: std.mem.Allocator,
     total_width: u16,
@@ -323,7 +268,6 @@ fn layoutWrapped(
     const is_row = options.direction == .row;
     const main_total: u16 = if (is_row) total_width else total_height;
 
-    // First pass: figure out which items go on which line
     var lines = std.array_list.Managed(LineRange).init(allocator);
     defer lines.deinit();
 
@@ -342,7 +286,6 @@ fn layoutWrapped(
             line_used += gap_needed + item_size;
         }
     }
-    // Last line
     if (line_start < items.len) {
         try lines.append(.{ .start = line_start, .end = items.len });
     }
@@ -389,13 +332,9 @@ fn estimateSize(constraint: Constraint, total: u16) u32 {
         .min => |v| v,
         .max => |v| v,
         .ratio => |r| if (r.den == 0) 0 else (@as(u32, total) * r.num) / r.den,
-        .fill => 1, // minimum estimate for wrapping purposes
+        .fill => 1,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "basic row layout" {
     const allocator = std.testing.allocator;

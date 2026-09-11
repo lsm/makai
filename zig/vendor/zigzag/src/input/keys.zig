@@ -1,10 +1,7 @@
-//! Key definitions for keyboard input handling.
-//! Provides a comprehensive set of key types for terminal input.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 
-/// Modifier keys that can be combined with other keys
 pub const Modifiers = packed struct {
     shift: bool = false,
     alt: bool = false,
@@ -25,12 +22,9 @@ pub const Modifiers = packed struct {
     }
 };
 
-/// Represents a keyboard key
 pub const Key = union(enum) {
-    // Character keys
     char: u21,
 
-    // Function keys
     f1,
     f2,
     f3,
@@ -44,7 +38,6 @@ pub const Key = union(enum) {
     f11,
     f12,
 
-    // Navigation keys
     up,
     down,
     left,
@@ -54,21 +47,17 @@ pub const Key = union(enum) {
     page_up,
     page_down,
 
-    // Editing keys
     insert,
     delete,
     backspace,
 
-    // Control keys
     enter,
     tab,
     escape,
     space,
 
-    // Paste (bracketed paste content)
     paste: []const u8,
 
-    // Special
     null_key,
     unknown: []const u8,
 
@@ -85,7 +74,6 @@ pub const Key = union(enum) {
         };
     }
 
-    /// Returns the character if this is a char key, null otherwise
     pub fn toChar(self: Key) ?u21 {
         return switch (self) {
             .char => |c| c,
@@ -96,7 +84,6 @@ pub const Key = union(enum) {
         };
     }
 
-    /// Returns a human-readable string for the key
     pub fn name(self: Key) []const u8 {
         return switch (self) {
             .char => "char",
@@ -134,14 +121,12 @@ pub const Key = union(enum) {
     }
 };
 
-/// Key event type (for Kitty keyboard protocol)
 pub const KeyEventType = enum {
     press,
     repeat,
     release,
 };
 
-/// A key event with modifiers
 pub const KeyEvent = struct {
     key: Key,
     modifiers: Modifiers = .{},
@@ -151,12 +136,10 @@ pub const KeyEvent = struct {
         return self.key.eql(other.key) and self.modifiers.eql(other.modifiers);
     }
 
-    /// Create a key event from a character
     pub fn char(c: u21) KeyEvent {
         return .{ .key = .{ .char = c } };
     }
 
-    /// Create a key event with ctrl modifier
     pub fn ctrl(c: u21) KeyEvent {
         return .{
             .key = .{ .char = c },
@@ -164,7 +147,6 @@ pub const KeyEvent = struct {
         };
     }
 
-    /// Create a key event with alt modifier
     pub fn alt(c: u21) KeyEvent {
         return .{
             .key = .{ .char = c },
@@ -172,7 +154,6 @@ pub const KeyEvent = struct {
         };
     }
 
-    /// Format the key event for display
     pub fn format(self: KeyEvent, writer: *Writer) Writer.Error!void {
         if (self.modifiers.ctrl) try writer.writeAll("ctrl+");
         if (self.modifiers.alt) try writer.writeAll("alt+");

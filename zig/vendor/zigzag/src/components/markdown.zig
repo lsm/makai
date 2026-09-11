@@ -1,5 +1,3 @@
-//! Markdown renderer for terminal output.
-//! Converts a subset of markdown to ANSI-styled text.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -8,7 +6,6 @@ const Color = @import("../style/color.zig").Color;
 const border_mod = @import("../style/border.zig");
 
 pub const Markdown = struct {
-    // Styling
     h1_style: style_mod.Style,
     h2_style: style_mod.Style,
     h3_style: style_mod.Style,
@@ -24,7 +21,6 @@ pub const Markdown = struct {
     hr_style: style_mod.Style,
     text_style: style_mod.Style,
 
-    // Layout
     width: u16,
     hr_char: []const u8,
 
@@ -125,13 +121,11 @@ pub const Markdown = struct {
         };
     }
 
-    /// Render markdown text to styled terminal output.
     pub fn render(self: *const Markdown, allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         errdefer result.deinit();
         const writer = &result.writer;
 
-        // Intermediate styled spans get freed in bulk at end of render.
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const tmp = arena.allocator();
@@ -145,16 +139,12 @@ pub const Markdown = struct {
             if (!first_line) try writer.writeByte('\n');
             first_line = false;
 
-            // Code block toggle. Track the opener length so a four-backtick
-            // block can safely contain literal triple-backtick examples without
-            // prematurely closing the displayed block.
             const trimmed_for_fence = std.mem.trimStart(u8, line, " ");
             const fence_len = countLeadingChar(trimmed_for_fence, '`');
             if (fence_len >= 3 and (!in_code_block or isCodeFenceClose(trimmed_for_fence, code_fence_len))) {
                 in_code_block = !in_code_block;
                 if (in_code_block) {
                     code_fence_len = fence_len;
-                    // Opening fence
                     const bar = try self.code_block_border.render(tmp, "┌");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
@@ -166,7 +156,6 @@ pub const Markdown = struct {
                     try writer.writeAll(end);
                 } else {
                     code_fence_len = 0;
-                    // Closing fence
                     const bar = try self.code_block_border.render(tmp, "└");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
@@ -182,7 +171,7 @@ pub const Markdown = struct {
 
             if (in_code_block) {
                 const block_width = self.codeBlockWidth();
-                const inner_width = block_width - 4; // border + side padding
+                const inner_width = block_width - 4;
                 const visible_len = @min(line.len, inner_width);
                 const start_bar = try self.code_block_border.render(tmp, "│ ");
                 try writer.writeAll(start_bar);
@@ -196,7 +185,6 @@ pub const Markdown = struct {
 
             const trimmed = std.mem.trimStart(u8, line, " ");
 
-            // Horizontal rule
             if (trimmed.len >= 3 and isAllChar(trimmed, '-')) {
                 const dash = try self.hr_style.render(tmp, self.hr_char);
                 for (0..@min(self.width, 60)) |_| {
@@ -213,7 +201,6 @@ pub const Markdown = struct {
                 continue;
             }
 
-            // Headers
             if (std.mem.startsWith(u8, trimmed, "### ")) {
                 const content = trimmed[4..];
                 const styled = try self.h3_style.render(tmp, content);
@@ -233,7 +220,6 @@ pub const Markdown = struct {
                 continue;
             }
 
-            // Blockquote
             if (std.mem.startsWith(u8, trimmed, "> ")) {
                 const content = trimmed[2..];
                 const bar = try self.blockquote_bar.render(tmp, "│ ");
@@ -243,7 +229,6 @@ pub const Markdown = struct {
                 continue;
             }
 
-            // Unordered list
             if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.startsWith(u8, trimmed, "* ")) {
                 const indent = line.len - trimmed.len;
                 for (0..indent) |_| try writer.writeByte(' ');
@@ -255,7 +240,6 @@ pub const Markdown = struct {
                 continue;
             }
 
-            // Ordered list (simple: "1. ", "2. ", etc.)
             if (trimmed.len >= 3 and trimmed[0] >= '0' and trimmed[0] <= '9') {
                 if (std.mem.indexOf(u8, trimmed[0..@min(4, trimmed.len)], ". ")) |dot_pos| {
                     const indent = line.len - trimmed.len;
@@ -269,12 +253,10 @@ pub const Markdown = struct {
                 }
             }
 
-            // Empty line
             if (trimmed.len == 0) {
                 continue;
             }
 
-            // Regular paragraph with inline formatting
             const styled = try self.renderInline(tmp, line);
             try writer.writeAll(styled);
         }
@@ -282,9 +264,6 @@ pub const Markdown = struct {
         return result.toOwnedSlice();
     }
 
-    /// Render inline formatting: **bold**, *italic*, `code`, [links](url)
-    /// `allocator` should be a short-lived/arena allocator: intermediate styled
-    /// spans are leaked into it (freed in bulk when the arena is reset).
     fn renderInline(self: *const Markdown, allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         errdefer result.deinit();
@@ -292,7 +271,6 @@ pub const Markdown = struct {
 
         var i: usize = 0;
         while (i < text.len) {
-            // Bold: **text**
             if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
                 if (std.mem.indexOf(u8, text[i + 2 ..], "**")) |end| {
                     const content = text[i + 2 .. i + 2 + end];
@@ -303,7 +281,6 @@ pub const Markdown = struct {
                 }
             }
 
-            // Italic: *text*
             if (text[i] == '*' and (i + 1 >= text.len or text[i + 1] != '*')) {
                 if (std.mem.indexOfScalar(u8, text[i + 1 ..], '*')) |end| {
                     const content = text[i + 1 .. i + 1 + end];
@@ -314,7 +291,6 @@ pub const Markdown = struct {
                 }
             }
 
-            // Inline code: `code`
             if (text[i] == '`') {
                 if (std.mem.indexOfScalar(u8, text[i + 1 ..], '`')) |end| {
                     const content = text[i + 1 .. i + 1 + end];
@@ -325,7 +301,6 @@ pub const Markdown = struct {
                 }
             }
 
-            // Link: [text](url)
             if (text[i] == '[') {
                 if (std.mem.indexOfScalar(u8, text[i + 1 ..], ']')) |text_end| {
                     const link_text = text[i + 1 .. i + 1 + text_end];
@@ -348,7 +323,6 @@ pub const Markdown = struct {
                 }
             }
 
-            // Regular character
             try writer.writeByte(text[i]);
             i += 1;
         }
@@ -382,15 +356,12 @@ pub const Markdown = struct {
     }
 };
 
-
 test "markdown renderer respects long backtick fence length" {
     const src = "````text\n```mermaid\nflowchart TD\n```\n````";
     var md = Markdown.init();
     const out = try md.render(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
 
-    // One outer opener and one outer closer; inner triple-backtick lines should
-    // render as code content, not toggle the code-block state.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "┌"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "└"));
     try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") != null);

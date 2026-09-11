@@ -1,31 +1,25 @@
 const std = @import("std");
 const compat = @import("compat");
 
-/// Retry configuration
 pub const RetryConfig = struct {
     max_retries: u32 = 3,
     base_delay_ms: u64 = 1000,
-    max_delay_ms: u64 = 60000, // 60 seconds max cap
+    max_delay_ms: u64 = 60000,
     jitter_factor: f32 = 0.2,
 
-    /// Calculate delay for given attempt with optional server-provided delay.
-    /// Returns null if max_delay_ms is exceeded (when server delay too large).
     pub fn nextDelay(self: *const RetryConfig, attempt: u32, server_delay_ms: ?u64) ?u64 {
         const base = server_delay_ms orelse blk: {
-            // Exponential backoff: base_delay_ms * 2^attempt
             const shift: u6 = @intCast(@min(attempt, 63));
             break :blk self.base_delay_ms * (@as(u64, 1) << shift);
         };
         if (self.max_delay_ms > 0 and base > self.max_delay_ms) {
-            return null; // Exceeds max allowed delay
+            return null;
         }
 
-        // Apply jitter if factor > 0
         if (self.jitter_factor > 0) {
             const seed = @as(u64, @intCast(compat.time.nowNanos()));
             var prng = std.Random.DefaultPrng.init(seed);
             const rand = prng.random().float(f32);
-            // jitter_mult ranges from (1 - jitter_factor) to (1 + jitter_factor)
             const jitter_mult = 1.0 + self.jitter_factor * (rand - 0.5) * 2.0;
             const jittered: u64 = @intFromFloat(@as(f64, @floatFromInt(base)) * @as(f64, jitter_mult));
             return @min(jittered, self.max_delay_ms);
@@ -33,21 +27,19 @@ pub const RetryConfig = struct {
         return base;
     }
 
-    /// Check if status code is retryable
     pub fn isRetryableStatus(self: *const RetryConfig, status: std.http.Status) bool {
         _ = self;
         return switch (status) {
-            .too_many_requests => true, // 429
-            .internal_server_error => true, // 500
-            .bad_gateway => true, // 502
-            .service_unavailable => true, // 503
-            .gateway_timeout => true, // 504
+            .too_many_requests => true,
+            .internal_server_error => true,
+            .bad_gateway => true,
+            .service_unavailable => true,
+            .gateway_timeout => true,
             else => false,
         };
     }
 };
 
-/// HTTP status codes that are retryable (transient errors)
 pub fn isRetryable(status_code: u16) bool {
     return switch (status_code) {
         429, 500, 502, 503, 504 => true,
@@ -55,27 +47,20 @@ pub fn isRetryable(status_code: u16) bool {
     };
 }
 
-/// Calculate exponential backoff delay in milliseconds.
-/// Returns min(base_delay_ms * 2^attempt, max_delay_ms)
 pub fn calculateDelay(attempt: u8, base_delay_ms: u32, max_delay_ms: u32) u64 {
     const shift: u6 = @intCast(@min(attempt, 63));
     const exp_delay: u64 = @as(u64, base_delay_ms) *% (@as(u64, 1) << shift);
     return @min(exp_delay, max_delay_ms);
 }
 
-/// Extract retry delay from Retry-After header value.
-/// Supports integer seconds format. Returns delay in milliseconds, or null.
 pub fn extractRetryDelayFromHeader(header_value: ?[]const u8) ?u64 {
     const value = header_value orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
 
-    // Try parsing as integer seconds
     if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
         return seconds * 1000;
     } else |_| {}
 
-    // Try parsing as HTTP date (RFC 1123)
-    // Format: "Wed, 21 Oct 2015 07:28:00 GMT"
     if (parseHttpDate(trimmed)) |timestamp_ms| {
         const now_ms = @as(u64, @intCast(compat.time.nowSeconds())) * 1000;
         if (timestamp_ms > now_ms) {
@@ -86,43 +71,33 @@ pub fn extractRetryDelayFromHeader(header_value: ?[]const u8) ?u64 {
     return null;
 }
 
-/// Parse HTTP date string (RFC 1123 format)
 fn parseHttpDate(date_str: []const u8) ?u64 {
-    // Format: "Wed, 21 Oct 2015 07:28:00 GMT"
-    // We need at least 29 characters
     if (date_str.len < 29) return null;
 
-    // Find the day (skip "Day, ")
     var idx: usize = 5;
 
-    // Parse day
     const day_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const day = std.fmt.parseInt(u32, date_str[idx..day_end], 10) catch return null;
     idx = day_end + 1;
 
-    // Parse month
     const month_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const month_str = date_str[idx..month_end];
     const month = monthFromString(month_str) orelse return null;
     idx = month_end + 1;
 
-    // Parse year
     const year_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const year = std.fmt.parseInt(u32, date_str[idx..year_end], 10) catch return null;
     idx = year_end + 1;
 
-    // Parse time HH:MM:SS
     const hour = std.fmt.parseInt(u32, date_str[idx .. idx + 2], 10) catch return null;
     idx += 3;
     const minute = std.fmt.parseInt(u32, date_str[idx .. idx + 2], 10) catch return null;
     idx += 3;
     const second = std.fmt.parseInt(u32, date_str[idx .. idx + 2], 10) catch return null;
 
-    // Convert to Unix timestamp (simplified, assumes UTC)
     return dateTimeToTimestamp(year, month, day, hour, minute, second);
 }
 
-/// Convert month name to number (1-12)
 fn monthFromString(month: []const u8) ?u32 {
     const months = [_][]const u8{
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -136,14 +111,11 @@ fn monthFromString(month: []const u8) ?u32 {
     return null;
 }
 
-/// Convert date/time components to Unix timestamp in milliseconds
 fn dateTimeToTimestamp(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) u64 {
-    // Simplified calculation (assumes valid date)
     var y = year;
     var m = month;
     const d = day;
 
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     if (m <= 2) {
         y -= 1;
         m += 12;
@@ -158,17 +130,9 @@ fn dateTimeToTimestamp(year: u32, month: u32, day: u32, hour: u32, minute: u32, 
     return timestamp_s * 1000;
 }
 
-/// Extract retry delay from error response body patterns (in milliseconds).
-/// Checks body patterns like:
-/// - "reset after 18h31m10s" -> parse duration
-/// - "Please retry in Xs" or "Please retry in Xms"
-/// - "retryDelay": "34.074824224s" (JSON)
-/// Returns milliseconds with 1-second buffer added.
 pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
-    // Pattern 1: "reset after ..." (formats: "18h31m10s", "10m15s", "6s", "39s")
     if (indexOfCaseInsensitive(error_text, "reset after")) |start_idx| {
-        const rest = error_text[start_idx + 11 ..]; // "reset after" is 11 chars
-        // Find the duration part
+        const rest = error_text[start_idx + 11 ..];
         var end_idx: usize = 0;
         for (rest, 0..) |c, i| {
             if (c == '.' or c == ',' or c == '\n' or c == '\r') {
@@ -185,17 +149,14 @@ pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
         }
     }
 
-    // Pattern 2: "Please retry in X[ms|s]"
     if (indexOfCaseInsensitive(error_text, "please retry in")) |start_idx| {
-        const rest = error_text[start_idx + 15 ..]; // "please retry in" is 15 chars
+        const rest = error_text[start_idx + 15 ..];
         if (parseRetryInFormat(rest)) |ms| {
             return normalizeDelay(ms);
         }
     }
 
-    // Pattern 3: "retryDelay": "34.074824224s" (JSON field in error details)
     if (indexOfCaseInsensitive(error_text, "\"retrydelay\"")) |start_idx| {
-        // Find the colon and value
         const after_key = error_text[start_idx..];
         if (std.mem.find(u8, after_key, ":")) |colon_idx| {
             const after_colon = std.mem.trimStart(u8, after_key[colon_idx + 1 ..], " \t");
@@ -208,15 +169,12 @@ pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
     return null;
 }
 
-/// Normalize delay by adding 1-second buffer and ensuring positive
 fn normalizeDelay(ms: u64) ?u64 {
     if (ms == 0) return null;
-    return ms + 1000; // Add 1-second buffer
+    return ms + 1000;
 }
 
-/// Parse "X[ms|s]" format like "34.074824224s" or "500ms"
 fn parseRetryInFormat(text: []const u8) ?u64 {
-    // Skip any leading whitespace or quotes
     var start: usize = 0;
     for (text, 0..) |c, i| {
         if (c != ' ' and c != '\t' and c != '"') {
@@ -225,7 +183,6 @@ fn parseRetryInFormat(text: []const u8) ?u64 {
         }
     }
 
-    // Find the number end
     var num_end: usize = start;
     var has_dot = false;
     for (text[start..], start..) |c, i| {
@@ -244,7 +201,6 @@ fn parseRetryInFormat(text: []const u8) ?u64 {
     const num_str = text[start..num_end];
     const rest = text[num_end..];
 
-    // Check for "ms" or "s" suffix
     const value = parseFloat(num_str) catch return null;
     if (value <= 0) return null;
 
@@ -262,20 +218,16 @@ fn parseRetryInFormat(text: []const u8) ?u64 {
     return null;
 }
 
-/// Parse duration string like "18h31m10s" or "10m15s" or "6s"
-/// Returns milliseconds
 pub fn parseDuration(duration_str: []const u8) ?u64 {
     var total_ms: u64 = 0;
     var i: usize = 0;
 
     while (i < duration_str.len) {
-        // Skip whitespace
         while (i < duration_str.len and (duration_str[i] == ' ' or duration_str[i] == '\t')) {
             i += 1;
         }
         if (i >= duration_str.len) break;
 
-        // Parse number
         const num_start = i;
         var has_dot = false;
         while (i < duration_str.len) {
@@ -294,18 +246,16 @@ pub fn parseDuration(duration_str: []const u8) ?u64 {
         const num_str = duration_str[num_start..i];
         const value = parseFloat(num_str) catch return null;
 
-        // Parse unit
         if (i >= duration_str.len) break;
         const unit_char = std.ascii.toLower(duration_str[i]);
 
         const multiplier: f64 = if (unit_char == 'm') blk: {
-            // Check if next char is 's' for milliseconds
             if (i + 1 < duration_str.len and std.ascii.toLower(duration_str[i + 1]) == 's') {
                 i += 2;
                 break :blk 1;
             }
             i += 1;
-            break :blk 60 * 1000; // minutes
+            break :blk 60 * 1000;
         } else if (unit_char == 'h') blk: {
             i += 1;
             break :blk 3600 * 1000;
@@ -322,9 +272,7 @@ pub fn parseDuration(duration_str: []const u8) ?u64 {
     return if (total_ms > 0) total_ms else null;
 }
 
-/// Parse a float string, handling both integer and decimal formats
 fn parseFloat(str: []const u8) !f64 {
-    // Simple float parsing
     var result: f64 = 0;
     var divisor: f64 = 1;
     var after_dot = false;
@@ -354,7 +302,6 @@ fn parseFloat(str: []const u8) !f64 {
     return result;
 }
 
-/// Check if error message indicates a retryable error
 pub fn isRetryableError(error_text: []const u8) bool {
     const patterns = [_][]const u8{
         "resource exhausted",
@@ -376,18 +323,15 @@ pub fn isRetryableError(error_text: []const u8) bool {
     return false;
 }
 
-/// Sleep for specified milliseconds, checking cancel token periodically.
-/// Returns false if cancelled, true if completed normally.
 pub fn sleepMs(ms: u64, cancel_token: ?*const std.atomic.Value(bool)) bool {
     const check_interval_ms: u64 = 100;
     const ns_per_ms: u64 = std.time.ns_per_ms;
     var remaining: u64 = ms;
 
     while (remaining > 0) {
-        // Check cancel token
         if (cancel_token) |token| {
             if (token.load(.acquire)) {
-                return false; // Cancelled
+                return false;
             }
         }
 
@@ -396,10 +340,9 @@ pub fn sleepMs(ms: u64, cancel_token: ?*const std.atomic.Value(bool)) bool {
         remaining -= sleep_time;
     }
 
-    return true; // Completed
+    return true;
 }
 
-/// Case-insensitive substring search
 pub fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len > haystack.len) return null;
 
@@ -417,8 +360,6 @@ pub fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-// Tests
-
 test "RetryConfig nextDelay with exponential backoff" {
     const config = RetryConfig{ .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
@@ -432,7 +373,7 @@ test "RetryConfig nextDelay respects max_delay_ms" {
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
     try std.testing.expectEqual(@as(?u64, 4000), config.nextDelay(2, null));
-    try std.testing.expectEqual(@as(?u64, null), config.nextDelay(3, null)); // 8000 > 5000
+    try std.testing.expectEqual(@as(?u64, null), config.nextDelay(3, null));
 }
 
 test "RetryConfig nextDelay uses server delay when provided" {
@@ -450,17 +391,17 @@ test "RetryConfig nextDelay rejects server delay exceeding max" {
 test "RetryConfig isRetryableStatus" {
     const config = RetryConfig{};
 
-    try std.testing.expect(config.isRetryableStatus(.too_many_requests)); // 429
-    try std.testing.expect(config.isRetryableStatus(.internal_server_error)); // 500
-    try std.testing.expect(config.isRetryableStatus(.bad_gateway)); // 502
-    try std.testing.expect(config.isRetryableStatus(.service_unavailable)); // 503
-    try std.testing.expect(config.isRetryableStatus(.gateway_timeout)); // 504
+    try std.testing.expect(config.isRetryableStatus(.too_many_requests));
+    try std.testing.expect(config.isRetryableStatus(.internal_server_error));
+    try std.testing.expect(config.isRetryableStatus(.bad_gateway));
+    try std.testing.expect(config.isRetryableStatus(.service_unavailable));
+    try std.testing.expect(config.isRetryableStatus(.gateway_timeout));
 
-    try std.testing.expect(!config.isRetryableStatus(.ok)); // 200
-    try std.testing.expect(!config.isRetryableStatus(.bad_request)); // 400
-    try std.testing.expect(!config.isRetryableStatus(.unauthorized)); // 401
-    try std.testing.expect(!config.isRetryableStatus(.forbidden)); // 403
-    try std.testing.expect(!config.isRetryableStatus(.not_found)); // 404
+    try std.testing.expect(!config.isRetryableStatus(.ok));
+    try std.testing.expect(!config.isRetryableStatus(.bad_request));
+    try std.testing.expect(!config.isRetryableStatus(.unauthorized));
+    try std.testing.expect(!config.isRetryableStatus(.forbidden));
+    try std.testing.expect(!config.isRetryableStatus(.not_found));
 }
 
 test "isRetryable identifies retryable status codes" {
@@ -478,15 +419,10 @@ test "isRetryable identifies retryable status codes" {
 }
 
 test "calculateDelay exponential backoff" {
-    // attempt 0: 1000 * 1 = 1000
     try std.testing.expectEqual(@as(u64, 1000), calculateDelay(0, 1000, 60000));
-    // attempt 1: 1000 * 2 = 2000
     try std.testing.expectEqual(@as(u64, 2000), calculateDelay(1, 1000, 60000));
-    // attempt 2: 1000 * 4 = 4000
     try std.testing.expectEqual(@as(u64, 4000), calculateDelay(2, 1000, 60000));
-    // attempt 3: 1000 * 8 = 8000
     try std.testing.expectEqual(@as(u64, 8000), calculateDelay(3, 1000, 60000));
-    // attempt 6: 1000 * 64 = 64000, capped at 60000
     try std.testing.expectEqual(@as(u64, 60000), calculateDelay(6, 1000, 60000));
 }
 
@@ -509,51 +445,44 @@ test "extractRetryDelayFromHeader returns null for invalid input" {
 }
 
 test "parseDuration parses various formats" {
-    // Just seconds
     try std.testing.expectEqual(@as(?u64, 6000), parseDuration("6s"));
     try std.testing.expectEqual(@as(?u64, 39000), parseDuration("39s"));
 
-    // Minutes and seconds
-    try std.testing.expectEqual(@as(?u64, 615000), parseDuration("10m15s")); // 10*60*1000 + 15*1000
+    try std.testing.expectEqual(@as(?u64, 615000), parseDuration("10m15s"));
 
-    // Hours, minutes, seconds
-    try std.testing.expectEqual(@as(?u64, 66670000), parseDuration("18h31m10s")); // 18*3600*1000 + 31*60*1000 + 10*1000
+    try std.testing.expectEqual(@as(?u64, 66670000), parseDuration("18h31m10s"));
 
-    // With decimal
     try std.testing.expectEqual(@as(?u64, 1500), parseDuration("1.5s"));
 }
 
 test "parseDuration returns null for invalid input" {
     try std.testing.expectEqual(@as(?u64, null), parseDuration(""));
     try std.testing.expectEqual(@as(?u64, null), parseDuration("invalid"));
-    try std.testing.expectEqual(@as(?u64, null), parseDuration("5x")); // unknown unit
+    try std.testing.expectEqual(@as(?u64, null), parseDuration("5x"));
 }
 
 test "extractRetryDelayFromBody parses reset after pattern" {
-    // Basic seconds
     const result1 = extractRetryDelayFromBody("Your quota will reset after 39s");
     try std.testing.expect(result1 != null);
-    try std.testing.expectEqual(@as(u64, 40000), result1.?); // 39000 + 1000 buffer
+    try std.testing.expectEqual(@as(u64, 40000), result1.?);
 
-    // Hours, minutes, seconds: 18*3600 + 31*60 + 10 = 66670 seconds = 66670000ms + 1000 = 66671000
     const result2 = extractRetryDelayFromBody("reset after 18h31m10s please wait");
     try std.testing.expect(result2 != null);
-    try std.testing.expectEqual(@as(u64, 66671000), result2.?); // 66670000 + 1000 buffer
+    try std.testing.expectEqual(@as(u64, 66671000), result2.?);
 }
 
 test "extractRetryDelayFromBody parses please retry in pattern" {
     const result1 = extractRetryDelayFromBody("Please retry in 30s");
     try std.testing.expect(result1 != null);
-    try std.testing.expectEqual(@as(u64, 31000), result1.?); // 30000 + 1000 buffer
+    try std.testing.expectEqual(@as(u64, 31000), result1.?);
 
     const result2 = extractRetryDelayFromBody("Please retry in 500ms");
     try std.testing.expect(result2 != null);
-    try std.testing.expectEqual(@as(u64, 1500), result2.?); // 500 + 1000 buffer
+    try std.testing.expectEqual(@as(u64, 1500), result2.?);
 
-    // 34.074824224s -> 34074ms (truncated) + 1000 = 35074
     const result3 = extractRetryDelayFromBody("Please retry in 34.074824224s");
     try std.testing.expect(result3 != null);
-    try std.testing.expectEqual(@as(u64, 35074), result3.?); // 34074 + 1000 buffer
+    try std.testing.expectEqual(@as(u64, 35074), result3.?);
 }
 
 test "extractRetryDelayFromBody parses retryDelay JSON field" {
@@ -606,7 +535,6 @@ test "sleepMs respects cancel token" {
     const ns_per_ms: u64 = std.time.ns_per_ms;
     var cancelled = std.atomic.Value(bool).init(false);
 
-    // Start a timer to cancel after 10ms
     const ThreadCtx = struct {
         cancel_token: *std.atomic.Value(bool),
         fn run(self: *@This()) void {
@@ -618,10 +546,7 @@ test "sleepMs respects cancel token" {
     const thread = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
     defer thread.join();
 
-    // Sleep for 200ms with 100ms check interval, should be cancelled within ~100ms
     const completed = sleepMs(200, &cancelled);
-    // Due to timing, this should almost always be cancelled
-    // But we can't guarantee it, so we just verify the function runs without crashing
     _ = completed;
 }
 
@@ -642,15 +567,11 @@ test "parseFloat parses numbers" {
 test "RetryConfig nextDelay applies jitter" {
     var config = RetryConfig{ .jitter_factor = 0.2 };
 
-    // With jitter_factor=0.2, delay should be in range [800, 1200]
-    // (1000 * (1-0.2) to 1000 * (1+0.2))
     const d1 = config.nextDelay(0, null);
     try std.testing.expect(d1 != null);
     try std.testing.expect(d1.? >= 800);
     try std.testing.expect(d1.? <= 1200);
 
-    // Verify jitter is being applied (values may differ)
-    // Note: This test may rarely fail if both random values are identical
 }
 
 test "RetryConfig nextDelay with jitter_factor 0 returns exact value" {
@@ -658,7 +579,6 @@ test "RetryConfig nextDelay with jitter_factor 0 returns exact value" {
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
 }
-
 
 test "retry_time_zero_timeout_completes_without_sleep" {
     var cancelled = std.atomic.Value(bool).init(false);

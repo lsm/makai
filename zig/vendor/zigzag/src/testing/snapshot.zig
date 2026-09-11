@@ -1,19 +1,3 @@
-//! Snapshot testing utilities.
-//!
-//! Lets tests assert that a rendered view matches a golden file on disk. When
-//! a snapshot does not exist, it is written on the first run. Set the
-//! environment variable `ZIGZAG_UPDATE_SNAPSHOTS=1` to overwrite existing
-//! snapshots, e.g. after an intentional change:
-//!
-//!     ZIGZAG_UPDATE_SNAPSHOTS=1 zig build test
-//!
-//! Typical usage inside a test:
-//!
-//!     try zz.testing.expectSnapshot(
-//!         std.testing.allocator,
-//!         "tests/snapshots/welcome.snap",
-//!         rendered_output,
-//!     );
 
 const std = @import("std");
 const ansi = @import("../terminal/ansi.zig");
@@ -23,22 +7,10 @@ pub const SnapshotError = error{
 } || std.fs.File.OpenError || std.fs.File.WriteError || std.mem.Allocator.Error;
 
 pub const Options = struct {
-    /// If true, the rendered output has ANSI CSI escape sequences stripped
-    /// before comparison and before writing new snapshots. This produces
-    /// stable golden files for components whose styling is decorative.
     strip_ansi: bool = true,
-    /// Trailing spaces on each line are stripped before comparison. Helps
-    /// when padding fluctuates between renders.
     trim_trailing_whitespace: bool = true,
 };
 
-/// Assert that `actual` matches the snapshot stored at `path`.
-///
-/// If the file does not exist, it is created with the current output and the
-/// test passes. If the environment variable `ZIGZAG_UPDATE_SNAPSHOTS=1` is
-/// set, the file is overwritten with the current output and the test passes.
-/// Otherwise the stored and actual content must match byte-for-byte after
-/// applying `Options`.
 pub fn expectSnapshot(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -56,7 +28,6 @@ pub fn expectSnapshotOpts(
     const normalized = try normalize(allocator, actual, opts);
     defer allocator.free(normalized);
 
-    // Ensure parent directory exists so callers don't have to mkdir.
     if (std.fs.path.dirname(path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
     }
@@ -82,7 +53,6 @@ pub fn expectSnapshotOpts(
     defer allocator.free(existing_norm);
 
     if (!std.mem.eql(u8, existing_norm, normalized)) {
-        // Print a unified-ish diff to stderr so the mismatch is actionable.
         printDiff(path, existing_norm, normalized);
         return SnapshotError.SnapshotMismatch;
     }
@@ -129,13 +99,11 @@ fn stripAnsi(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             continue;
         }
 
-        // ESC encountered. Consume the sequence.
         i += 1;
         if (i >= input.len) break;
 
         const next = input[i];
         if (next == '[') {
-            // CSI: ESC [ ... final
             i += 1;
             while (i < input.len) {
                 const b = input[i];
@@ -143,7 +111,6 @@ fn stripAnsi(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
                 if ((b >= '@' and b <= '~')) break;
             }
         } else if (next == ']') {
-            // OSC: ESC ] ... ST or BEL
             i += 1;
             while (i < input.len) {
                 const b = input[i];
@@ -158,7 +125,6 @@ fn stripAnsi(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
                 i += 1;
             }
         } else {
-            // Two-byte ESC sequence (ESC Fe / Fp / Fs).
             i += 1;
         }
     }
@@ -185,7 +151,6 @@ fn trimTrailingWhitespace(allocator: std.mem.Allocator, input: []const u8) ![]u8
 }
 
 fn printDiff(path: []const u8, expected: []const u8, actual: []const u8) void {
-    // Avoid allocating in diff path — just dump both snippets.
     const stderr = std.debug;
     stderr.print(
         "\nSnapshot mismatch: {s}\n" ++
@@ -217,7 +182,6 @@ test "expectSnapshot creates file when missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Change cwd to tmp so relative paths resolve there.
     var orig = try std.fs.cwd().openDir(".", .{});
     defer orig.close();
     try tmp.dir.setAsCwd();
@@ -226,7 +190,6 @@ test "expectSnapshot creates file when missing" {
     try expectSnapshot(allocator, "snap.txt", "hello world");
     try expectSnapshot(allocator, "snap.txt", "hello world");
 
-    // Different content should mismatch.
     const err = expectSnapshot(allocator, "snap.txt", "hello there");
     try std.testing.expectError(SnapshotError.SnapshotMismatch, err);
 }

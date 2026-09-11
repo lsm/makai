@@ -41,34 +41,16 @@ const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
 const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
 const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
-/// The background pump runs every loop iteration (~1ms while idle); the
-/// idle-session sweep inside it is throttled to this interval so the O(n)
-/// scan over registered sessions does not spin with the pump.
 const SESSION_SWEEP_INTERVAL_MS: i64 = 1_000;
-/// Settlement message for a run whose distributed tool wait failed because
-/// stdin closed (§13.2.7, #210 gap 4): the tool host is the disconnected
-/// client, so the wait can never be satisfied — EOF before settlement is
-/// failure, never success.
 const STDIO_DISCONNECT_TOOL_WAIT_MESSAGE = "client disconnected while the run waited for a distributed tool_result";
-/// Settlement message for a run whose event publication failed anywhere
-/// between consuming an event from the stream and committing it to the
-/// outbox (§13.4.2, #210 gap 5): the consumed event cannot be
-/// reconstructed, so the client's event stream is truncated — the run may
-/// never settle "successfully" through `agent_result`; it settles through
-/// the loop-internal failure pair instead.
 const STDIO_EVENT_PUBLICATION_FAILED_MESSAGE = "run event publication failed; event stream truncated before settlement";
-/// Settlement message for a stream that completed with neither a result nor
-/// a recoverable error (§13.4.2, #210 gap 5): `completeWithError` marks the
-/// stream done even when its error-message copy hit OOM, leaving no outcome
-/// to publish or retry — the run settles through the failure pair with this
-/// typed failure rather than being retained forever.
 const STDIO_RUN_WITHOUT_OUTCOME_MESSAGE = "run ended without a deliverable outcome (terminal lost to allocation failure)";
 
-const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
-const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
-const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
-const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30; // ~30ms with STDIO_IDLE_SLEEP_NS.
-const TEST_AGENT_POLL_ITERS_DEFAULT: usize = 2_000; // ~2s with STDIO_IDLE_SLEEP_NS.
+const TEST_AUTH_POLL_ITERS_SHORT: usize = 20;
+const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600;
+const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200;
+const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30;
+const TEST_AGENT_POLL_ITERS_DEFAULT: usize = 2_000;
 
 fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -161,12 +143,6 @@ const PreparedAgentRun = struct {
 
 const StdioToolRequest = struct {
     session_id: AgentProtocolTypes.SessionId,
-    /// The registration generation the requesting run was admitted under
-    /// (§13.4.5, #204): the request may be published as a `tool_execute`
-    /// only while this is still the id's current generation. The run's
-    /// agent thread enqueues without observing its cancel token first, so a
-    /// request can land after a stop's bridge discard — existence alone
-    /// would then route it into an id a new `agent_start` re-registered.
     generation: u64,
     tool_call_id: []u8,
     tool_name: []u8,
@@ -183,17 +159,7 @@ const StdioToolRequest = struct {
 const StdioToolKey = struct {
     session_id: AgentProtocolTypes.SessionId,
     tool_call_id: []u8,
-    /// The `message_id` of the `tool_execute` envelope this key tracks
-    /// (§13.1, #210 gap 6): only a `tool_result` whose `in_reply_to` names
-    /// it may settle the wait, so a stale reply from an earlier execution
-    /// of a reused `tool_call_id` cannot be attributed to the current
-    /// execution.
     request_message_id: AgentProtocolTypes.Ulid,
-    /// The registration generation of the run whose `tool_execute` this
-    /// key tracks (§13.4.5, #210): result CONSUMPTION is generation-bound
-    /// too — a stopped run's cancelled wait can resume after the id was
-    /// re-registered and the new run published the same `tool_call_id`,
-    /// and a pair-only pop would steal the new run's result and key.
     generation: u64,
 
     fn deinit(self: *StdioToolKey, allocator: std.mem.Allocator) void {
@@ -205,8 +171,6 @@ const StdioToolKey = struct {
 const StdioToolResult = struct {
     session_id: AgentProtocolTypes.SessionId,
     tool_call_id: []u8,
-    /// The reply's `in_reply_to` (§13.3.4, #210 gap 6): must name the
-    /// `message_id` of the `tool_execute` the current wait is parked on.
     in_reply_to: ?AgentProtocolTypes.Ulid,
     result_json: []u8,
     details_json: []u8,
@@ -225,9 +189,6 @@ const StdioToolBridge = struct {
     requests: std.ArrayList(StdioToolRequest) = .empty,
     in_flight: std.ArrayList(StdioToolKey) = .empty,
     results: std.ArrayList(StdioToolResult) = .empty,
-    /// Latched once the host observed stdin EOF (§13.2.7, #210 gap 4): the
-    /// tool host is the disconnected client, so every distributed tool wait
-    /// fails from here on instead of polling forever.
     disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn markDisconnected(self: *StdioToolBridge) void {
@@ -277,15 +238,6 @@ const StdioToolBridge = struct {
         });
     }
 
-    /// Peeks the head request WITHOUT removing it (§13.4.2, #210 gap 5):
-    /// publication commits by removing the head only after the
-    /// `tool_execute` envelope is enqueued, so an allocation failure
-    /// anywhere in between retries on the next pump instead of freeing the
-    /// request with the agent thread's wait still parked on it (no in-flight
-    /// key, no retry — the run settled never). The returned struct is a
-    /// copy: its strings stay owned by the queued request, which only this
-    /// host thread removes, so they are safe to read after the mutex is
-    /// released but must not be freed by the caller.
     fn peekFrontRequest(self: *StdioToolBridge) ?StdioToolRequest {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -293,10 +245,6 @@ const StdioToolBridge = struct {
         return self.requests.items[0];
     }
 
-    /// Removes and frees the head request — the commit (or the stale/
-    /// disconnected drop) of a peeked publication. Only the host thread
-    /// removes requests, so the head is still the request `peekFrontRequest`
-    /// returned.
     fn popFrontRequest(self: *StdioToolBridge, allocator: std.mem.Allocator) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -310,18 +258,6 @@ const StdioToolBridge = struct {
         errdefer allocator.free(owned_tool_call_id);
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        // A new execution of the same (session, tool_call_id) supersedes
-        // any key already present (#210 gap 6): the correlation lookup is
-        // first-match, so a leaked stale key — e.g. one that survived a
-        // stop whose reply publication failed before the bridge discard
-        // (§13.4.4) — must not shadow the current execution's request, or
-        // it would both accept a stale reply and reject the current
-        // execution's own correctly-correlated reply. A queued result that
-        // already passed the OLD key's correlation survives the same leak
-        // and must be purged with it: the pop matches by (session,
-        // tool_call_id) only, so it would hand the stale result to the new
-        // execution while the duplicate-result check rejects the new
-        // execution's own reply.
         self.removeInFlightLocked(allocator, session_id, tool_call_id);
         self.removeResultsLocked(allocator, session_id, tool_call_id);
         try self.in_flight.append(allocator, .{
@@ -335,12 +271,6 @@ const StdioToolBridge = struct {
     fn enqueueResult(self: *StdioToolBridge, allocator: std.mem.Allocator, result: StdioToolResult) !bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        // §13.1 (#210 gap 6): a result settles the current wait only when it
-        // is correlated to the outstanding `tool_execute` — the in-flight key
-        // must exist (no unsolicited or already-consumed reply) and the
-        // reply's `in_reply_to` must name that request's `message_id`, so a
-        // delayed or retried result from an earlier execution of a reused
-        // `tool_call_id` is discarded instead of misattributed.
         const in_flight_key = self.findInFlightLocked(result.session_id, result.tool_call_id) orelse return false;
         const reply_to = result.in_reply_to orelse return false;
         if (!std.mem.eql(u8, &reply_to, &in_flight_key.request_message_id)) return false;
@@ -349,13 +279,6 @@ const StdioToolBridge = struct {
         return true;
     }
 
-    /// Pops the queued result settling THIS generation's wait (#210): the
-    /// consumption is bound to the waiting execution's registration
-    /// generation and, through its in-flight key, to the request the reply
-    /// correlates to. A stopped run's cancelled wait that resumes after the
-    /// id was re-registered and the new run published the same
-    /// `tool_call_id` finds no key of its own generation and consumes
-    /// nothing — the new run's result and key survive for the new run.
     fn popResult(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8, generation: u64) ?StdioToolResult {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -444,11 +367,6 @@ const StdioToolBridge = struct {
         }
     }
 
-    /// Removes every queued result for the (session, tool_call_id) pair —
-    /// the results-queue half of `markInFlight`'s supersession (#210 gap 6):
-    /// a result that passed the OLD request's correlation and survived a
-    /// §13.4.4 bridge-discard leak must not be handed to the new execution
-    /// by the key-only pop. Caller must hold the mutex.
     fn removeResultsLocked(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) void {
         var idx: usize = 0;
         while (idx < self.results.items.len) {
@@ -465,25 +383,12 @@ const StdioToolBridge = struct {
 const StdioAgentToolExecutor = struct {
     bridge: *StdioToolBridge,
     session_id: AgentProtocolTypes.SessionId,
-    /// The registration generation of the run this executor serves
-    /// (§13.4.5, #204) — stamped onto every tool request it enqueues so
-    /// publication can discard requests whose registration is no longer
-    /// current.
     generation: u64,
-    /// Shared with the owning `ActiveAgentRun` (#210 gap 4): set by the
-    /// tool wait when it fails on the disconnect latch, read by the run
-    /// pump so the run settles through the failure pair instead of
-    /// whatever termination the loop reached after losing its tool host.
     disconnect_failed: *std.atomic.Value(bool),
 };
 
 const ActiveAgentRun = struct {
     session_id: AgentProtocolTypes.SessionId,
-    /// The registration generation this run was admitted under (§13.4.5,
-    /// #204). The run may publish only while `sessionGeneration(session_id)`
-    /// still equals this value: null means the id was stopped or evicted, a
-    /// different value means it was re-registered — either way the run is
-    /// stale and its remaining publications are discarded.
     generation: u64,
     stream: *agent_loop.AgentEventStream,
     context: *agent_loop.AgentContext,
@@ -491,32 +396,11 @@ const ActiveAgentRun = struct {
     prompts: []ai_types.Message,
     tools: []agent_loop.AgentTool,
     cancel_flag: *std.atomic.Value(bool),
-    /// Set when one of the run's distributed tool waits failed on the
-    /// disconnect latch (#210 gap 4): the run needed client input after
-    /// EOF, so its settlement is a typed failure — never a success
-    /// `agent_result` (§13.4.6's EOF-before-settlement rule).
     disconnect_failed: *std.atomic.Value(bool),
     tool_executor: *StdioAgentToolExecutor,
     terminal_event_json: ?[]u8 = null,
-    /// Transactional settlement progress (§13.4.2/§13.4.3, #210 gap 5): the
-    /// run records which terminal publications have committed so that a
-    /// publication failure which propagates (surfacing as the host's typed
-    /// runtime error frame) leaves the next pump RESUMING the settlement —
-    /// never re-publishing a processed terminal, never settling twice, never
-    /// leaving the run unsettled with nothing to retry.
-    ///
-    /// The authoritative settlement frame (`agent_result` or the settlement
-    /// `agent_error` envelope) committed to the outbox — never publish it
-    /// again.
     settlement_frame_published: bool = false,
-    /// The failure pair's leading error-event projection committed. The pair
-    /// is ONE settlement (§13.4.2) delivered by its first frame, so the
-    /// projection must never be re-published while retrying the envelope.
     failure_event_published: bool = false,
-    /// An agent_event was consumed from the stream but never committed to
-    /// the outbox (serialization or publication failure): the client's event
-    /// stream is truncated, so a success settlement would misreport the run
-    /// — the settlement converts to the loop-internal failure pair.
     event_publication_failed: bool = false,
 
     fn cancel(self: *ActiveAgentRun) void {
@@ -540,13 +424,6 @@ const ActiveAgentRun = struct {
     }
 };
 
-// NOTE: legacy auth-context globals (`g_auth_ctx`, `AuthContext`, OAuth-callback
-// bridges, fixture/anthropic/github login helpers, `saveOAuthCredentials`) were
-// removed in M-013 when the CLI auth commands were migrated to thin wrappers
-// over the auth protocol runtime. The orchestration now lives in
-// `src/tools/auth_cli.zig` (driving `AuthProtocolServer` in-process) and is
-// shared with the `--stdio` mode below.
-
 const StdioProtocolLoop = struct {
     allocator: std.mem.Allocator,
     registry: *api_registry.ApiRegistry,
@@ -560,7 +437,6 @@ const StdioProtocolLoop = struct {
     tool_bridge: StdioToolBridge,
     auth_server: AuthProtocolServer,
     auth_pipe: in_process.SerializedPipe,
-    /// Monotonic clock of the last idle-session sweep (ms); 0 = never swept.
     last_session_sweep_mono_ms: i64 = 0,
 
     const Self = @This();
@@ -667,17 +543,6 @@ const StdioProtocolLoop = struct {
                     .allocator = self.allocator,
                 };
                 runtime.pumpClientMessages() catch |err| {
-                    // §13.4.4 (#210 gap 5): the stop transaction — session
-                    // removal (already done inside the pump), run
-                    // cancellation, tool-bridge discard — must complete even
-                    // when the reply's own publication fails: the reply is
-                    // serialized and written synchronously here, outside the
-                    // outbox, and the server removed the session before
-                    // building it. Skipping the cancel path on that failure
-                    // left the cancelled run publishing into a dead id and
-                    // stale bridge keys alive until process exit. Clean up
-                    // first, then surface the failure (the host's dispatch
-                    // error frame).
                     self.finishAgentStopCancellation(stopped_session, had_stop_session);
                     return err;
                 };
@@ -730,20 +595,6 @@ const StdioProtocolLoop = struct {
         return forwarded;
     }
 
-    /// Evicts agent sessions idle longer than the server's configured TTL
-    /// (spec §13.2.6 rule 6, #202). Runs after the run pumps so a session
-    /// settled in this tick already carries its fresh activity timestamp, and
-    /// is throttled to `SESSION_SWEEP_INTERVAL_MS` because the background
-    /// pump runs every loop iteration. Both the throttle and the idleness
-    /// comparison ride the monotonic clock so wall-clock adjustments cannot
-    /// distort them. An evicted session cannot have a live run (in-flight
-    /// runs are never idle), so the tool-bridge discard is defensive parity
-    /// with the `agent_stop` teardown path. On an allocation failure
-    /// mid-collection the server still evicts the partial batch before
-    /// erroring, so the bridge cleanup below runs for whatever was collected
-    /// BEFORE the error propagates — skipping it would leak bridge entries
-    /// for already-removed ids, and a re-registered id could then accept a
-    /// stale delayed tool_result against the leftover in-flight key.
     fn sweepIdleAgentSessions(self: *Self) !void {
         const now_mono_ms = try compat.time.monotonicMillis();
         if (now_mono_ms - self.last_session_sweep_mono_ms < SESSION_SWEEP_INTERVAL_MS) return;
@@ -778,12 +629,6 @@ const StdioProtocolLoop = struct {
         return self.auth_server.activeFlowCount() > 0;
     }
 
-    /// Latch stdin EOF (§13.2.7, #210 gap 4). Called by the stdio host once
-    /// the receive stream is done: the client — the host of every
-    /// distributed tool — is gone, so active tool waits fail with a typed
-    /// error, their runs settle through the failure pair, and the run pump
-    /// drains instead of blocking `hasActiveAgentRuns()` forever.
-    /// Idempotent.
     pub fn markStdinDisconnected(self: *Self) void {
         self.tool_bridge.markDisconnected();
     }
@@ -796,13 +641,6 @@ const StdioProtocolLoop = struct {
 
             self.startAgentRun(owned_pending) catch |err| {
                 if (err == error.OutOfMemory) return err;
-                // Mark the recoverable status BEFORE publishing the pair
-                // (§13.4.2, #210 gap 5): a mid-pair OOM propagates (the
-                // host surfaces it as a typed runtime error frame) with the
-                // session already `.error` — leaving it `.processing` would
-                // wedge the id against both new messages and TTL eviction,
-                // since the consumed pending message leaves nothing to
-                // retry.
                 self.agent_server.markSessionError(owned_pending.session_id) catch {};
                 try self.publishAgentLoopError(owned_pending.session_id, .internal_error, @errorName(err));
                 continue;
@@ -813,18 +651,7 @@ const StdioProtocolLoop = struct {
     }
 
     fn startAgentRun(self: *Self, pending: agent_protocol_server.PendingAgentMessage) !void {
-        // §13.2.4's one-active-run-per-session rule is generation-scoped
-        // (§13.4.5, #204): only a run admitted under the id's CURRENT
-        // registration blocks a new start. A cancelled run of a previous
-        // registration can still be listed (it lives until its provider
-        // stream drains); it must not fail the re-created id's run with
-        // `AgentBusy` — the pump's generation check discards the stale run's
-        // publications instead.
         const generation = self.agent_server.sessionGeneration(pending.session_id) orelse {
-            // Not reachable on the serialized single-threaded host
-            // (`removeSession` drops pending messages with the session);
-            // defensively refuse to start a run against no registration —
-            // there is nothing to execute for and nothing to publish to.
             return error.SessionNotFound;
         };
         if (self.hasActiveRunForGeneration(pending.session_id, generation)) return error.AgentBusy;
@@ -920,14 +747,6 @@ const StdioProtocolLoop = struct {
         while (idx < self.active_agent_runs.items.len) {
             var run = &self.active_agent_runs.items[idx];
 
-            // §13.4.5 (#204): a run may publish only while its own
-            // registration is still the CURRENT one for the id — the
-            // generation is null when the id was stopped or evicted, and a
-            // different value when it was re-registered. Either way the run
-            // is stale: cancel it (so its provider stream drains promptly)
-            // and discard every remaining publication — no events, no
-            // settlement, no state mutation — so a cancelled run can never
-            // settle an id a new `agent_start` re-created.
             const registration_current = blk: {
                 const generation = self.agent_server.sessionGeneration(run.session_id);
                 break :blk generation != null and generation.? == run.generation;
@@ -944,9 +763,6 @@ const StdioProtocolLoop = struct {
                 }
 
                 if (std.meta.activeTag(event) == .agent_end) {
-                    // A failure to even serialize the terminal projection
-                    // drops the already-consumed event — truncation, not a
-                    // silent success (#210 gap 5).
                     run.terminal_event_json = serializeAgentLoopEvent(self.allocator, run.session_id, event) catch |err| {
                         run.event_publication_failed = true;
                         return err;
@@ -961,13 +777,6 @@ const StdioProtocolLoop = struct {
                 };
                 defer self.allocator.free(event_json);
                 self.agent_server.publishAgentEvent(run.session_id, event_json) catch |err| {
-                    // The event was consumed from the run stream and cannot
-                    // be reconstructed, so whatever failed here the client's
-                    // event stream is truncated from this point (#210 gap
-                    // 5): the run's settlement converts to the failure pair
-                    // below instead of reporting a silently-truncated
-                    // success. The OOM itself still propagates so the host
-                    // surfaces it as a typed runtime error frame.
                     run.event_publication_failed = true;
                     if (err == error.OutOfMemory) return err;
                 };
@@ -981,26 +790,8 @@ const StdioProtocolLoop = struct {
             }
 
             if (registration_current) {
-                // Settle-or-propagate exactly once (§13.4.2/§13.4.3, #210
-                // gap 5): each step records its progress on the run, a
-                // failure propagates for the host to surface as a typed
-                // runtime error frame, and the next pump RESUMES where this
-                // one stopped — never re-publishing a committed frame or
-                // projection, never leaving a processed terminal to be
-                // re-emitted.
                 if (!run.settlement_frame_published) {
                     if (run.disconnect_failed.load(.acquire)) {
-                        // §13.2.7/§13.4.6 (#210 gap 4): the run needed client
-                        // input after stdin EOF — a distributed tool wait can
-                        // never be satisfied by a disconnected tool host, so
-                        // whatever termination the loop reached afterwards, the
-                        // settlement is a typed failure, never a success
-                        // `agent_result`. Checked before the stream error: the
-                        // disconnect is the root cause even when the stream
-                        // also failed later. §3.5's loop-internal failure shape
-                        // carries one terminal error event and no trailing
-                        // `agent_end`, so the captured terminal projection is
-                        // dropped rather than published after the pair.
                         self.dropTerminalProjection(run);
                         try self.publishRunFailurePair(run, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE);
                         forwarded += 1;
@@ -1009,18 +800,10 @@ const StdioProtocolLoop = struct {
                         try self.publishRunFailurePair(run, .internal_error, msg);
                         forwarded += 1;
                     } else if (run.event_publication_failed) {
-                        // (#210 gap 5): events were consumed from the
-                        // stream but never published — the client's event
-                        // stream is truncated, so the run may not settle
-                        // "successfully". Same loop-internal failure shape:
-                        // one terminal error event, no trailing agent_end.
                         self.dropTerminalProjection(run);
                         try self.publishRunFailurePair(run, .internal_error, STDIO_EVENT_PUBLICATION_FAILED_MESSAGE);
                         forwarded += 1;
                     } else if (run.stream.getResult()) |result| {
-                        // The SDK derives its terminal agent_end from this frame, so an
-                        // agent-level termination (iteration cap) must override the
-                        // final turn's own stop reason here as well.
                         const result_reason: []const u8 = if (result.termination) |termination|
                             @tagName(termination)
                         else
@@ -1028,32 +811,12 @@ const StdioProtocolLoop = struct {
                         const result_json = try transport.serializeResultWithStopReason(result.final_message, result_reason, self.allocator);
                         defer self.allocator.free(result_json);
                         self.agent_server.publishAgentResult(run.session_id, result_json) catch |err| switch (err) {
-                            // Nothing was published: keep the run queued and
-                            // propagate, so the next pump retries the
-                            // settlement — and the trailing `agent_end`
-                            // below stays suppressed until the frame
-                            // commits (publishing it after a failed result
-                            // would let event-only consumers project
-                            // SUCCESS with no authoritative result frame).
                             error.OutOfMemory => return err,
-                            // SessionNotFound is unreachable while the
-                            // registration check above passed (removal and
-                            // this pump share one thread); discard
-                            // defensively.
                             else => {},
                         };
                         run.settlement_frame_published = true;
                         forwarded += 1;
                     } else {
-                        // Done with neither result nor error: the stream's
-                        // `completeWithError` marks it completed even when
-                        // duplicating its error message hit OOM (the outcome
-                        // is then unrecoverable — retrying cannot make it
-                        // reappear), so settle through the failure pair with
-                        // a generic typed failure instead of retaining the
-                        // run forever: the stdio shutdown drain waits on
-                        // `hasActiveAgentRuns()` and would hang (#210 gap 5,
-                        // review).
                         self.dropTerminalProjection(run);
                         try self.publishRunFailurePair(run, .internal_error, STDIO_RUN_WITHOUT_OUTCOME_MESSAGE);
                         forwarded += 1;
@@ -1061,11 +824,6 @@ const StdioProtocolLoop = struct {
                 }
 
                 if (run.settlement_frame_published) {
-                    // The trailing `agent_end` projection publishes only
-                    // after the settlement frame committed, exactly once:
-                    // on failure it stays captured on the run and the next
-                    // pump retries it (the settlement frame itself is never
-                    // re-published).
                     if (run.terminal_event_json) |event_json| {
                         self.agent_server.publishAgentEvent(run.session_id, event_json) catch |err| switch (err) {
                             error.OutOfMemory => return err,
@@ -1080,32 +838,16 @@ const StdioProtocolLoop = struct {
                     continue;
                 }
             } else {
-                // Stale run (§13.4.5): every publication discarded — remove
-                // it without settling.
                 var removed = self.active_agent_runs.orderedRemove(idx);
                 removed.deinit(self.allocator);
                 continue;
             }
 
-            // The settlement has not committed yet (a publication failure
-            // propagated above or the outcome is still pending): keep the
-            // run queued for the next pump to resume.
             idx += 1;
         }
         return forwarded;
     }
 
-    /// Publishes the loop-internal failure pair — the terminal error-event
-    /// projection followed by the settlement `agent_error` envelope, ONE
-    /// settlement (§13.4.2) — transactionally (#210 gap 5): progress is
-    /// recorded on the run after each frame commits, so a retry after a
-    /// propagated failure resumes where it stopped instead of re-publishing
-    /// the projection. The pair's session-status flip rides the ENVELOPE's
-    /// commit (`publishAgentError` flips after appending): while any part
-    /// of the pair is pending the session stays `.processing` — a follow-up
-    /// `agent_message` is then rejected `agent_busy` at admission (clean
-    /// non-admission) rather than accepted and later converted into an
-    /// `AgentBusy` settlement by the retained run.
     fn publishRunFailurePair(
         self: *Self,
         run: *ActiveAgentRun,
@@ -1117,18 +859,10 @@ const StdioProtocolLoop = struct {
             defer self.allocator.free(event_json);
             self.agent_server.publishAgentEvent(run.session_id, event_json) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                // SessionNotFound is unreachable while the caller's
-                // registration check held; discard defensively.
                 else => {},
             };
             run.failure_event_published = true;
         }
-        // The authoritative envelope is retried until it commits — never
-        // abandoned after the projection: the Zig client settles only on
-        // `agent_error`/`agent_result`/a correlated `nack`
-        // (`processEnvelope` merely queues an `agent_event`), so a
-        // projection-only delivery would strand its session-complete
-        // tracking (#210 gap 5, review).
         self.agent_server.publishAgentError(run.session_id, code, message) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {},
@@ -1136,27 +870,11 @@ const StdioProtocolLoop = struct {
         run.settlement_frame_published = true;
     }
 
-    /// Drops the run's captured trailing `agent_end` projection — the
-    /// loop-internal failure shape (§3.5) publishes no trailing `agent_end`
-    /// after the failure pair.
     fn dropTerminalProjection(self: *Self, run: *ActiveAgentRun) void {
         if (run.terminal_event_json) |event_json| self.allocator.free(event_json);
         run.terminal_event_json = null;
     }
 
-    /// Whether a run admitted under `generation` is still listed for the
-    /// session — the generation-scoped form of the one-active-run-per-session
-    /// check (§13.2.4 read through §13.4.5, #204). Runs of older
-    /// registrations never match: they are cancelled and their publications
-    /// discarded by the pump, so they do not make the session busy. Neither
-    /// do runs whose settlement frame already committed (#210 gap 5,
-    /// review): such a run is a publication straggler — at most retrying
-    /// its trailing `agent_end` projection — while its session is already
-    /// `.ready` (`publishAgentResult` flipped it). Counting it busy would
-    /// turn a newly ACCEPTED `agent_message` into an `AgentBusy`
-    /// internal-error settlement on the next pump instead of letting it
-    /// run; the straggler's late trailing projection is the §13.4.3
-    /// stale-`agent_end` case consumers already drain per §6.1.
     fn hasActiveRunForGeneration(self: *Self, session_id: AgentProtocolTypes.SessionId, generation: u64) bool {
         for (self.active_agent_runs.items) |run| {
             if (run.settlement_frame_published) continue;
@@ -1165,13 +883,6 @@ const StdioProtocolLoop = struct {
         return false;
     }
 
-    /// Completes the cancellation half of a validated `agent_stop` the
-    /// dispatch already handed to the server: when the server removed the
-    /// session (`had_stop_session and !hasSession`), every run under the id
-    /// is stale — cancel them and discard the session's tool-bridge state.
-    /// Runs on BOTH the success path and the reply-publication failure path
-    /// of the stop dispatch (§13.4.4, #210 gap 5) so the teardown half of
-    /// the stop transaction can never be skipped by a failed reply.
     fn finishAgentStopCancellation(
         self: *Self,
         stopped_session: ?AgentProtocolTypes.SessionId,
@@ -1185,16 +896,6 @@ const StdioProtocolLoop = struct {
     }
 
     fn cancelAgentRun(self: *Self, session_id: AgentProtocolTypes.SessionId) void {
-        // A validated stop deregisters the id, so EVERY run listed under it
-        // is stale — cancel them all, not just the first match. With
-        // generation-scoped admission (§13.4.5, #204) a stale run of a
-        // previous registration can be listed alongside the current
-        // registration's run, and runs append in generation order, so a
-        // first-match lookup cancels the already-cancelled old run and
-        // leaves the live one running through the stop — able to enqueue
-        // distributed tool work after the bridge discard below, which
-        // `publishPendingToolRequests` (existence-checked only) would then
-        // emit into a re-registered id.
         for (self.active_agent_runs.items) |*run| {
             if (std.mem.eql(u8, run.session_id[0..], session_id[0..])) run.cancel();
         }
@@ -1215,25 +916,8 @@ const StdioProtocolLoop = struct {
     fn publishPendingToolRequests(self: *Self) !usize {
         var published: usize = 0;
         while (true) {
-            // Transactional publication (§13.4.2, #210 gap 5): the request
-            // stays queued until its `tool_execute` envelope is committed
-            // to the outbox. Popping first — the old order — freed the
-            // request on any allocation failure between here and the
-            // enqueue, leaving the agent thread's tool wait parked on a
-            // request that would never be published (no in-flight key, so
-            // no reply could ever correlate; no retry): the run settled
-            // never. With the head kept in place a failure propagates
-            // (surfacing as the host's typed runtime error frame) and the
-            // next pump retries the same request.
             const request = self.tool_bridge.peekFrontRequest() orelse break;
 
-            // §13.4.5 (#204): a tool request publishes only while its run's
-            // registration is still the CURRENT one for the id. The
-            // enqueuing agent thread does not observe its cancel token
-            // before enqueueing, so a request can land after a stop's
-            // bridge discard — session existence alone would then emit a
-            // stale `tool_execute` into an id a new `agent_start`
-            // re-registered.
             const registration_current = blk: {
                 const current = self.agent_server.sessionGeneration(request.session_id);
                 break :blk current != null and current.? == request.generation;
@@ -1242,20 +926,11 @@ const StdioProtocolLoop = struct {
                 self.tool_bridge.popFrontRequest(self.allocator);
                 continue;
             }
-            // §13.2.7 (#210 gap 4): once stdin has closed, no client can
-            // answer a `tool_execute` — drop the request instead of
-            // publishing into a dead pipe; the enqueueing wait fails
-            // through the bridge's disconnect latch.
             if (self.tool_bridge.isDisconnected()) {
                 self.tool_bridge.popFrontRequest(self.allocator);
                 continue;
             }
 
-            // Own the payload copies before the envelope literal: a failure
-            // between dupes must free the earlier ones (the literal's
-            // errdefer is not armed until the struct is assigned), and once
-            // the envelope exists its own deinit owns them — the flag keeps
-            // the two owners from double-freeing.
             var payload_owned_by_env = false;
             const owned_tool_call_id = try self.allocator.dupe(u8, request.tool_call_id);
             errdefer if (!payload_owned_by_env) self.allocator.free(owned_tool_call_id);
@@ -1278,16 +953,9 @@ const StdioProtocolLoop = struct {
             errdefer env.deinit(self.allocator);
             payload_owned_by_env = true;
 
-            // The in-flight key carries the published request's
-            // `message_id` (so a later `tool_result` must be correlated to
-            // THIS `tool_execute` to settle the wait, #210 gap 6, §13.1)
-            // and the run's registration generation (so result CONSUMPTION
-            // is bound to the waiting execution, §13.4.5).
             try self.tool_bridge.markInFlight(self.allocator, request.session_id, request.tool_call_id, env.message_id, request.generation);
             errdefer self.tool_bridge.discardInFlight(self.allocator, request.session_id, request.tool_call_id);
             try self.agent_server.enqueueEnvelope(env);
-            // Committed: only now may the queued request — whose strings
-            // `env` copied — leave the bridge.
             self.tool_bridge.popFrontRequest(self.allocator);
             published += 1;
         }
@@ -1313,7 +981,6 @@ const StdioProtocolLoop = struct {
 
         if (has_stream_id and has_session_id) return null;
         if (has_stream_id) {
-            // Auth and provider envelopes both use `stream_id`; refine by type first.
             if (envelope_type) |ty| {
                 if (isAuthEnvelopeType(ty)) return .auth;
             }
@@ -1337,16 +1004,6 @@ const StdioProtocolLoop = struct {
     ) !usize {
         var drained: usize = 0;
         var receiver = pipe.clientReceiver();
-        // Buffer-before-advance (#210 gap 5, §13.4.2): reserve the list slot
-        // BEFORE reading the pipe — `readLine` advances the pipe's read
-        // position as soon as it returns a line, so an append failure after
-        // the pop would drop an already-delivered frame (and leak it). With
-        // the slot reserved up front the append cannot fail; a failure
-        // earlier in the iteration leaves the frame in the pipe for the
-        // next drain to deliver. An empty pipe reserves nothing at all —
-        // draining must not be able to fail when there is nothing pending
-        // (the host's error path would otherwise strand frames already
-        // buffered for the pipes drained before this one).
         while (true) {
             if (receiver.read_pos_ptr.* >= receiver.buffer.items.len) break;
             try lines.ensureUnusedCapacity(self.allocator, 1);
@@ -1409,10 +1066,6 @@ fn prepareAgentRun(
     errdefer allocator.free(system_prompt);
 
     var options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
-    // GPT-5 Pro only supports the `high` reasoning effort (bundled OpenAI
-    // spec, docs/openai/responses.md): normalize every request, not just
-    // requests without an explicit level, since other values are rejected
-    // by the API.
     if (std.mem.eql(u8, model.provider, "openai") and std.mem.startsWith(u8, model.id, "gpt-5-pro")) {
         options.thinking_level = .high;
     }
@@ -1426,9 +1079,6 @@ fn prepareAgentRun(
     };
 }
 
-/// Base URL for canonical refs outside the production catalog (the catalog
-/// only covers Codex OAuth + Kimi). Shared with the protocol server, which
-/// defaults empty client-supplied base URLs the same way (#183).
 const defaultBaseUrlForRef = provider_base_url.defaultBaseUrlForRef;
 const envOrEmpty = provider_base_url.envOwnedOrNull;
 const isReasoningModelRef = provider_base_url.isReasoningModelRef;
@@ -1443,11 +1093,6 @@ fn isResponsesOnlyModel(model_id: []const u8) bool {
         std.mem.startsWith(u8, model_id, "computer-use-preview");
 }
 
-/// A custom base URL is OpenAI-compatible by default. Set
-/// `<PROVIDER>_BASE_URL_IS_PROXY=true` (or `MAKAI_BASE_URL_IS_PROXY=true`)
-/// only when it transparently preserves the canonical vendor API. Shared
-/// with the protocol server, which applies it to client models that rely on
-/// env-resolved base URLs (#183).
 const transparentProxyCompat = provider_base_url.transparentProxyCompat;
 
 fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
@@ -1456,9 +1101,6 @@ fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
 }
 
-/// Parses the `MAKAI_AGENT_SESSION_IDLE_TTL_MS` value (milliseconds; `0`
-/// disables eviction). Absent, empty, or unparsable values yield null so the
-/// agent server falls back to its library default TTL.
 fn sessionIdleTtlFromEnvValue(raw: ?[]const u8) ?u64 {
     const value = raw orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -1781,13 +1423,6 @@ fn executeStdioToolViaAgentProtocol(
             if (token.isCancelled()) return error.Cancelled;
         }
         if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id, executor.generation)) |tool_result| return tool_result;
-        // §13.2.7/§13.4.6 (#210 gap 4): stdin EOF means the tool host is
-        // disconnected — this wait can never be satisfied by a new reply.
-        // A result delivered before EOF wins: the host latches the
-        // disconnect only after stdin's ring is fully drained, so no
-        // further result can be enqueued past this point — but this
-        // iteration's pop may have raced the last dispatch, so re-check
-        // once before failing.
         if (executor.bridge.isDisconnected()) {
             if (try popAndBuild(executor.bridge, allocator, executor.session_id, tool_call_id, executor.generation)) |tool_result| return tool_result;
             executor.disconnect_failed.store(true, .release);
@@ -2195,12 +1830,6 @@ fn serializeAgentLoopEvent(
         },
         .agent_end => |payload| {
             try w.writeStringField("type", "agent_end");
-            // Terminal identity and outcome come from the run's final message
-            // (loop-emitted events carry it explicitly, including the
-            // synthesized placeholder when no turn ran); fall back to the
-            // last assistant message for hand-built events. History must not
-            // supply the identity — it can end with an older turn's message
-            // from a different model.
             var terminal: ?ai_types.AssistantMessage = payload.final_message;
             if (terminal == null) {
                 const messages = payload.messages.slice();
@@ -2213,9 +1842,6 @@ fn serializeAgentLoopEvent(
                     }
                 }
             }
-            // Agent-level termination (e.g. max turns, cancellation) overrides
-            // the final turn's reason so raw agent-protocol consumers see the
-            // failure detail without the preceding agent_result frame.
             const agent_stop_reason: ?[]const u8 = if (payload.termination) |termination|
                 @tagName(termination)
             else if (terminal) |message|
@@ -2226,9 +1852,6 @@ fn serializeAgentLoopEvent(
                 try w.writeStringField("stop_reason", reason);
             }
             if (terminal) |message| {
-                // Event-only peers have no agent_result frame; the resolved
-                // provider/api keep SDK auth retry targetable for opaque refs
-                // and let clients scope provider-specific error semantics.
                 if (message.provider.len > 0) {
                     try w.writeStringField("provider_id", message.provider);
                 }
@@ -2457,10 +2080,6 @@ fn validatedAgentStopSessionFromLine(line: []const u8, allocator: std.mem.Alloca
     const payload_session = getStringField(payload.object, "session_id") orelse return null;
     const payload_id = AgentProtocolTypes.parseSessionId(payload_session) orelse return null;
 
-    // §13.1 (#204): a stop whose envelope and payload ids disagree is not a
-    // validated stop — the server rejects it `invalid_request` before any
-    // removal, and this host must likewise not cancel the payload-id
-    // session's run or discard its tool-bridge state on its own.
     if (!std.mem.eql(u8, &envelope_id, &payload_id)) return null;
 
     return payload_id;
@@ -2593,14 +2212,6 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
             }
         }
 
-        // §13.2.7 (#210 gap 4): a done receive stream means stdin EOF — the
-        // client hosting every distributed tool is gone. A done stream can
-        // still hold a final undispatched chunk (the reader pushes the last
-        // line before completing), so the latch waits for the ring to drain
-        // too: every frame delivered before EOF — possibly the tool_result
-        // that must win its wait — is dispatched first, and from the latch
-        // on no further result can arrive. The loop below can then actually
-        // drain `hasActiveAgentRuns()` instead of blocking forever.
         if (stdin_stream.isDone() and !stdin_stream.hasPending()) stdio_loop.markStdinDisconnected();
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
@@ -2611,10 +2222,6 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
 
         const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
             try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
-            // Frames buffered before the failure still reach stdout (#210
-            // gap 5, review): the pipe may deliver nothing further (EOF),
-            // and gating the flush on the recovered drain count would
-            // strand them forever.
             if (outbound_lines.items.len > 0) {
                 try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
                 did_work = true;
@@ -2635,7 +2242,6 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
         }
     }
 
-    // Drain any final buffered input/output before shutdown.
     while (stdin_stream.poll()) |chunk| {
         var mutable_chunk = chunk;
         defer mutable_chunk.deinit(allocator);
@@ -2656,8 +2262,6 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
     };
     const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
         try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
-        // Same flush-on-error as the main loop (#210 gap 5, review): the
-        // shutdown drain must not strand frames buffered before a failure.
         if (outbound_lines.items.len > 0) {
             try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
         }
@@ -2697,10 +2301,6 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
     try tui_app.run(allocator, io);
 }
 
-/// Non-interactive print mode: stream a single prompt against a model resolved
-/// from the production catalog (using stored credentials) and print every event.
-/// Mirrors the exact provider code path the TUI uses, so it reproduces (and
-/// exposes) streaming bugs without needing a real terminal.
 fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         perr("error: -p requires a prompt argument\n");
@@ -2743,9 +2343,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     perr("[print] building kimi model from env...\n");
 
-    // Read the API key from KIMI_API_KEY unless explicitly asked to use saved
-    // credentials. Region follows KIMI_REGION first, then the stored Kimi
-    // provider_data when --storage is used, then China as the default.
     const api_key_copy: ?[]u8 = if (use_storage_auth) null else blk: {
         const api_key_env = compat.getEnvVarOwned(allocator, "KIMI_API_KEY") catch |err| {
             perrf("error: set KIMI_API_KEY to use -p, or pass --storage to use saved credentials: {s}\n", .{@errorName(err)});
@@ -2762,7 +2359,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     else
         "https://api.kimi.com/coding";
 
-    // Build the Kimi model inline (same shape as model_catalog.kimiModel).
     const model = ai_types.Model{
         .id = model_id,
         .name = model_id,
@@ -2776,7 +2372,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .max_tokens = 16_384,
     };
 
-    // Register built-in API providers so we can resolve the stream fn.
     var registry = api_registry.ApiRegistry.init(allocator);
     defer registry.deinit();
     try register_builtins.registerBuiltInApiProviders(&registry);
@@ -2787,7 +2382,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     _ = provider;
 
-    // Build a single-turn context from the prompt.
     const messages = try allocator.alloc(ai_types.Message, 1);
     defer allocator.free(messages);
     messages[0] = .{ .user = .{ .content = .{ .text = prompt }, .timestamp = compat.time.nowSeconds() } };
@@ -2805,9 +2399,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     perr("[print] starting stream via protocol bridge...\n");
 
-    // Use the in-process protocol bridge — the EXACT path the TUI's agent loop
-    // uses (streamViaProtocol → runStreamThread → ProtocolServer/Client). This
-    // reproduces TUI streaming bugs that the direct stream_simple path misses.
     var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
     const protocol = bridge.protocolClient();
 
@@ -2850,8 +2441,6 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // Direct provider path signals completion via complete()+getResult(), not a
-    // pushed .done event, so a null return here can be normal — check the result.
     if (stream.getError()) |e| {
         perrf("[print] stream error: {s}\n", .{e});
     } else if (stream.getResult()) |result| {
@@ -3044,19 +2633,14 @@ fn runPrintTuiRuntime(allocator: std.mem.Allocator, prompt: []const u8) !void {
     }
 }
 
-/// Write directly to stderr — `std.debug.print` is unbuffered (lock-protected
-/// direct writer) so diagnostics survive even if the process is killed mid-hang.
 fn perr(msg: []const u8) void {
     std.debug.print("{s}", .{msg});
 }
 
-/// Formatted variant of `perr`.
 fn perrf(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
 }
 
-/// Production auth-server options for the CLI wrapper. Real OAuth flows are
-/// enabled and credentials are persisted to ~/.makai/auth.json by the runtime.
 const PRODUCTION_AUTH_SERVER_OPTIONS = auth_protocol_server.AuthProtocolServer.Options{
     .persist_credentials = true,
     .enable_real_oauth = true,
@@ -3072,10 +2656,6 @@ fn handleAuth(
     return handleAuthWithOptions(args, allocator, stdin, stdout, stderr, PRODUCTION_AUTH_SERVER_OPTIONS);
 }
 
-/// Drive the auth protocol runtime in-process to service `makai auth providers`
-/// and `makai auth login`. Output shape matches the pre-M-013 CLI so existing
-/// scripts/tooling continue to work unchanged. Tests inject options that
-/// disable real OAuth and credential persistence.
 fn handleAuthWithOptions(
     args: []const []const u8,
     allocator: std.mem.Allocator,
@@ -3241,8 +2821,6 @@ fn fixtureToolUseStream(
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.owns_events = true;
     s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
-    // Every turn requests tools without emitting any calls, so the loop
-    // exhausts the iteration cap immediately.
     s.complete(.{
         .content = &.{},
         .api = "fixture-tooluse-api",
@@ -3282,9 +2860,6 @@ fn fixtureDistributedToolStream(
     s.owns_events = true;
     s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
-    // Content-block strings of a completed result are freed UNCONDITIONALLY
-    // at stream deinit (AssistantMessage.deinit's ownership contract), so
-    // the fixture must hand over allocator-owned strings — no literals.
     const owned_id = try allocator.dupe(u8, "dist-call-1");
     errdefer allocator.free(owned_id);
     const owned_name = try allocator.dupe(u8, "lookup");
@@ -3299,8 +2874,6 @@ fn fixtureDistributedToolStream(
         .arguments_json = owned_args,
     } };
 
-    // Every turn emits one distributed tool call, so a run driven by this
-    // fixture parks in `executeStdioToolViaAgentProtocol`'s wait.
     s.complete(.{
         .content = content,
         .api = "fixture-dist-api",
@@ -3539,9 +3112,6 @@ fn makeProviderStreamRequestEnvelopeJson(
             .stream_request = .{
                 .model = fixtureModel(api),
                 .context = .{ .messages = &.{} },
-                // Provide an explicit api_key so the binary's credential resolver
-                // (M-006) does not reject the request with `auth_required`. The
-                // fixture providers do not validate the key value.
                 .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-fixture-key") },
             },
         },
@@ -3559,15 +3129,12 @@ fn pumpAndDrainStdioLoop(
 }
 
 test "MAKAI_AGENT_SESSION_IDLE_TTL_MS value parsing" {
-    // Absent / empty / garbage -> null (library default TTL applies).
     try std.testing.expect(sessionIdleTtlFromEnvValue(null) == null);
     try std.testing.expect(sessionIdleTtlFromEnvValue("") == null);
     try std.testing.expect(sessionIdleTtlFromEnvValue("   ") == null);
     try std.testing.expect(sessionIdleTtlFromEnvValue("soon") == null);
     try std.testing.expect(sessionIdleTtlFromEnvValue("-1") == null);
 
-    // Well-formed values parse, including surrounding whitespace and the
-    // disable sentinel.
     try std.testing.expectEqual(@as(?u64, 0), sessionIdleTtlFromEnvValue("0"));
     try std.testing.expectEqual(@as(?u64, 1234), sessionIdleTtlFromEnvValue("1234"));
     try std.testing.expectEqual(@as(?u64, 42), sessionIdleTtlFromEnvValue(" 42 \r\n"));
@@ -4002,9 +3569,6 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
-        // No registration exists for this id in this test; generation 0
-        // matches no real registration, which is fine — the run is never
-        // pumped, only torn down at deinit.
         .generation = 0,
         .stream = stream,
         .context = context,
@@ -4186,8 +3750,6 @@ test "prepareAgentRun normalizes gpt-5-pro thinking level to high" {
 
     var prepared_low = try prepareAgentRun(allocator, explicit_low);
     defer prepared_low.deinit(allocator);
-    // GPT-5 Pro only supports the high effort; lower explicit values are
-    // normalized instead of forwarded for the API to reject.
     try std.testing.expectEqual(ai_types.ThinkingLevel.high, prepared_low.options.thinking_level);
 
     var unset = agent_protocol_server.PendingAgentMessage{
@@ -4306,8 +3868,6 @@ test "stdio tool bridge publishes tool requests and consumes tool results" {
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(wrong_session_json)));
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
 
-    // A result whose `in_reply_to` does not name the outstanding
-    // `tool_execute` is discarded (#210 gap 6): the wait stays parked.
     var mismatched_env = AgentProtocolTypes.Envelope{
         .session_id = session_id,
         .message_id = AgentProtocolTypes.generateUlid(),
@@ -4411,8 +3971,6 @@ test "stdio tool bridge drops queued requests for stopped sessions" {
     defer stdio_loop.deinit();
 
     const session_id = AgentProtocolTypes.generateSessionId();
-    // Generation 0 matches no registration (this id was never registered) —
-    // the request must be dropped exactly as it was on the existence check.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, 0, "call-1", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 0), try stdio_loop.publishPendingToolRequests());
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
@@ -4444,17 +4002,11 @@ test "publishPendingToolRequests drops stale-generation requests after id re-reg
     const second_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
     try std.testing.expect(second_generation > first_generation);
 
-    // A request enqueued by the OLD registration's agent thread after the
-    // stop's bridge discard (its enqueue precedes the cancel-token check,
-    // so the discard cannot prevent it): the id exists again, but not for
-    // that generation — the stale `tool_execute` must not be emitted into
-    // the new registration.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, first_generation, "stale-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 0), try stdio_loop.publishPendingToolRequests());
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
 
-    // The new registration's own request publishes normally.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, second_generation, "fresh-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
 }
@@ -4481,9 +4033,6 @@ test "stale tool_result for a reused tool_call_id is rejected by in_reply_to cor
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
     clearOwnedLines(allocator, &outbound);
 
-    // First execution of the reused id: published, answered, consumed. The
-    // publish only enqueues the frame into the server outbox — a background
-    // pump must move it to the pipe before the drain can observe it.
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
@@ -4495,9 +4044,6 @@ test "stale tool_result for a reused tool_call_id is rejected by in_reply_to cor
     var consumed = stdio_loop.tool_bridge.popResult(allocator, session_id, "dup-call", stdio_loop.agent_server.sessionGeneration(session_id).?).?;
     consumed.deinit(allocator);
 
-    // A later execution REUSES the tool_call_id; its outstanding
-    // tool_execute is a different message. A delayed reply to the FIRST
-    // execution must not settle the second wait (#210 gap 6).
     try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, stdio_loop.agent_server.sessionGeneration(session_id).?, "dup-call", "lookup", "{}");
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
@@ -4505,15 +4051,12 @@ test "stale tool_result for a reused tool_call_id is rejected by in_reply_to cor
     defer second_env.deinit(allocator);
     try std.testing.expect(!std.mem.eql(u8, &first_env.message_id, &second_env.message_id));
 
-    // Stale reply (in_reply_to names the first execution): discarded.
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(first_result_json)));
-    // Uncorrelated reply (no in_reply_to): discarded.
     const bare_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", null, "bare");
     defer allocator.free(bare_result_json);
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(bare_result_json)));
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
 
-    // The correctly-correlated reply settles the CURRENT execution.
     const second_result_json = try makeToolResultEnvelopeJson(allocator, session_id, "dup-call", second_env.message_id, "second");
     defer allocator.free(second_result_json);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(second_result_json));
@@ -4539,10 +4082,6 @@ test "distributed tool wait fails promptly on the disconnect latch" {
         .disconnect_failed = &disconnect_flag,
     };
 
-    // Stdin EOF latched before the wait runs: it enqueues its request, then
-    // fails on the first poll iteration with the typed error, flags the run
-    // disconnect-failed, and marks the run cancelled so the loop stops
-    // issuing turns (#210 gap 4). No sleep-spin, no hang.
     bridge.markDisconnected();
     try std.testing.expectError(
         error.ClientDisconnected,
@@ -4550,8 +4089,6 @@ test "distributed tool wait fails promptly on the disconnect latch" {
     );
     try std.testing.expect(disconnect_flag.load(.acquire));
     try std.testing.expect(cancel_flag.load(.acquire));
-    // The wait's own request stays unpublished (the publisher drops it on
-    // the latch); its bridge entry is freed at deinit.
     try std.testing.expectEqual(@as(usize, 1), bridge.requests.items.len);
 }
 
@@ -4583,9 +4120,6 @@ test "tool result delivered before the disconnect latch settles its wait" {
     };
     try std.testing.expect(try bridge.enqueueResult(allocator, delivered));
 
-    // The client answered and only then closed stdin: the queued result is
-    // checked before the latch, so the wait settles with the answer — EOF
-    // before settlement is failure, but this settlement already happened.
     bridge.markDisconnected();
     var tool_result = try executeStdioToolViaAgentProtocol(@ptrCast(&executor), "call-1", "lookup", "{}", .{ .cancelled = &cancel_flag }, null, null, allocator);
     defer tool_result.deinit(allocator);
@@ -4612,11 +4146,6 @@ test "tool result enqueued after the disconnect latch still wins the wait" {
         .disconnect_failed = &disconnect_flag,
     };
 
-    // The straddle the single pre-latch pop cannot close: the wait's poll
-    // missed the last dispatch, the host then latched EOF, and only now is
-    // the delivered result visible in the bridge. The latch makes further
-    // enqueues impossible, so the post-latch re-check is final — a result
-    // delivered before EOF still wins (§13.2.7 rule 7).
     bridge.markDisconnected();
     try bridge.markInFlight(allocator, session_id, "call-1", request_id, 0);
     const delivered = StdioToolResult{
@@ -4647,15 +4176,7 @@ test "a new execution supersedes a leaked in-flight key for the same tool_call_i
     const stale_request_id = AgentProtocolTypes.generateUlid();
     const current_request_id = AgentProtocolTypes.generateUlid();
 
-    // A key leaked past a stop whose reply publication failed before the
-    // bridge discard (§13.4.4), then the id re-registered and the provider
-    // reused the tool_call_id: the new execution's key must supersede the
-    // stale one — first-match correlation must never see the leak.
     try bridge.markInFlight(allocator, session_id, "dup-call", stale_request_id, 1);
-    // A reply to the stale request that already passed its correlation and
-    // queued before the leak: it must be purged together with the key, or
-    // the key-only pop would hand it to the new execution while the
-    // duplicate-result check rejects the new execution's own reply.
     const stale_queued_result = StdioToolResult{
         .session_id = session_id,
         .tool_call_id = try allocator.dupe(u8, "dup-call"),
@@ -4706,13 +4227,6 @@ test "result consumption is generation-bound: a stale wait cannot steal the new 
     const session_id = AgentProtocolTypes.generateSessionId();
     const new_request_id = AgentProtocolTypes.generateUlid();
 
-    // The stop discarded the old registration's bridge state, the id was
-    // re-registered, and the new run published and received its correctly
-    // correlated reply — while the OLD run's cancelled wait thread was
-    // preempted between its cancel check and its pop (#210, §13.4.5). The
-    // stale wait (generation 1) must consume nothing: the queued result
-    // and the in-flight key belong to the new registration's run
-    // (generation 2), and a pair-only pop would have stolen both.
     try bridge.markInFlight(allocator, session_id, "dup-call", new_request_id, 2);
     const new_result = StdioToolResult{
         .session_id = session_id,
@@ -4764,10 +4278,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     const tools_json =
         \\[{"name":"lookup","description":"Lookup","parameters_schema":{"type":"object"}}]
     ;
-    // `message_json` is freed by the envelope's payload deinit (it owns the
-    // slice), mirroring `makeAgentMessageEnvelopeJson`. The small iteration
-    // cap bounds the fixture's post-EOF turn ping-pong (every turn requests
-    // the same distributed tool).
     const message_json = try std.fmt.allocPrint(
         allocator,
         "{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}],\"tools\":{s},\"options\":{{\"max_iterations\":3}}}}",
@@ -4789,8 +4299,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     defer allocator.free(message_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
 
-    // The real run thread parks in the distributed tool wait: pump until
-    // its tool_execute is published.
     var saw_tool_execute = false;
     for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
@@ -4802,9 +4310,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     }
     try std.testing.expect(saw_tool_execute);
 
-    // The host observes stdin EOF (§13.2.7, #210 gap 4): the wait fails
-    // with the typed error, the run settles through the failure pair, and
-    // the run pump drains instead of hanging on the wait forever.
     stdio_loop.markStdinDisconnected();
     for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
@@ -4816,9 +4321,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     var saw_disconnect_settlement = false;
     for (outbound.items) |line| {
         try std.testing.expect(std.mem.find(u8, line, "\"type\":\"agent_result\"") == null);
-        // §3.5's loop-internal failure shape carries one terminal error
-        // event and no trailing agent_end — the disconnect settlement must
-        // not publish the run's captured terminal projection after the pair.
         try std.testing.expect(std.mem.find(u8, line, "\"agent_end\"") == null);
         if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
             std.mem.find(u8, line, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE) != null)
@@ -4828,8 +4330,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     }
     try std.testing.expect(saw_disconnect_settlement);
 
-    // The failed run marks the session .error, and no tool request
-    // enqueued after EOF is published into the dead pipe.
     try std.testing.expectEqual(
         AgentProtocolTypes.AgentStatus.@"error",
         stdio_loop.agent_server.sessions.get(session_id).?.status,
@@ -4837,11 +4337,6 @@ test "stdin EOF settles a distributed-tool-waiting run with a typed failure" {
     try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
 }
 
-/// Appends a hand-built `ActiveAgentRun` for settlement tests (#210 gap 5):
-/// no agent-loop thread — the caller completes the run's stream directly
-/// (result or error), so the allocations observed while pumping are the
-/// settlement's own. The model and slices are borrowed/static; the run's
-/// `deinit` is a no-op for them.
 fn appendManualAgentRun(
     loop: *StdioProtocolLoop,
     session_id: AgentProtocolTypes.SessionId,
@@ -4889,8 +4384,6 @@ fn appendManualAgentRun(
     return &loop.active_agent_runs.items[loop.active_agent_runs.items.len - 1];
 }
 
-/// Completes a manual run's stream with a success-shaped outcome (borrowed,
-/// static content — the stream does not own it).
 fn completeManualRunWithResult(run: *ActiveAgentRun) void {
     run.stream.complete(.{
         .messages = ai_types.OwnedSlice(ai_types.Message).initBorrowed(&[_]ai_types.Message{}),
@@ -4911,11 +4404,6 @@ fn completeManualRunWithResult(run: *ActiveAgentRun) void {
 test "result settlement is transactional under allocation failure: no false success, exactly once" {
     const allocator = std.testing.allocator;
 
-    // #210 gap 5: sweep every allocation of the settlement pump — wherever
-    // the failure strikes, the trailing `agent_end` projection must never
-    // reach the client without the authoritative `agent_result` frame, and
-    // after the allocator recovers the run settles EXACTLY once (the frame
-    // and the projection are each published once, in order).
     var k: usize = 0;
     while (k <= 16) : (k += 1) {
         var failing = std.testing.FailingAllocator.init(allocator, .{});
@@ -4953,12 +4441,8 @@ test "result settlement is transactional under allocation failure: no false succ
             if (std.mem.find(u8, line, "\"type\":\"agent_result\"") != null) mid_result_count += 1;
             if (std.mem.find(u8, line, "agent_end") != null) mid_end_count += 1;
         }
-        // The false-success coupling: a trailing projection implies the
-        // settlement frame committed first.
         try std.testing.expect(mid_end_count <= mid_result_count);
 
-        // The allocator recovers: the settlement resumes (or the still-queued
-        // frames deliver) and completes.
         _ = try stdio_loop.pumpBackground();
         _ = try stdio_loop.drainOutbound(&outbound);
 
@@ -4979,10 +4463,6 @@ test "result settlement is transactional under allocation failure: no false succ
             if (std.mem.find(u8, line, STDIO_EVENT_PUBLICATION_FAILED_MESSAGE) != null) truncated = true;
         }
         if (truncated) {
-            // The failure struck while serializing/publishing an EVENT (the
-            // captured agent_end): the consumed event is unrecoverable, so
-            // the run converts to the truncation settlement — never a
-            // success `agent_result`, never a trailing projection.
             try std.testing.expectEqual(@as(usize, 0), result_count);
             try std.testing.expectEqual(@as(usize, 0), end_count);
             try std.testing.expectEqual(
@@ -5005,11 +4485,6 @@ test "result settlement is transactional under allocation failure: no false succ
 test "failure-pair settlement is transactional under allocation failure: single settlement, no re-emitted projection" {
     const allocator = std.testing.allocator;
 
-    // #210 gap 5: sweep every allocation of the failure-pair pump — the
-    // terminal error-event projection is delivered EXACTLY once (a mid-pair
-    // failure removes the run instead of re-processing the stream and
-    // re-emitting it), the settlement envelope commits at most once, and
-    // the run is never left queued.
     var k: usize = 0;
     while (k <= 14) : (k += 1) {
         var failing = std.testing.FailingAllocator.init(allocator, .{});
@@ -5047,8 +4522,6 @@ test "failure-pair settlement is transactional under allocation failure: single 
         }
         try std.testing.expect(mid_error_events <= 1);
 
-        // The allocator recovers: an uncommitted settlement resumes and
-        // frames still queued in the outbox deliver.
         _ = try stdio_loop.pumpBackground();
         _ = try stdio_loop.drainOutbound(&outbound);
 
@@ -5059,10 +4532,6 @@ test "failure-pair settlement is transactional under allocation failure: single 
                 std.mem.find(u8, line, "fixture stream failure") != null) error_events += 1;
             if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null) error_envelopes += 1;
         }
-        // The pair is ONE settlement (§13.4.2): its leading projection is
-        // never re-emitted by a retry, and the authoritative envelope — the
-        // frame the Zig client actually settles on — is retried until it
-        // commits, so it is ALWAYS delivered exactly once.
         try std.testing.expectEqual(@as(usize, 1), error_events);
         try std.testing.expectEqual(@as(usize, 1), error_envelopes);
         try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
@@ -5093,8 +4562,6 @@ test "a run with a dropped agent_event never settles successfully" {
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
-    // The run completed successfully, but one of its events was consumed
-    // from the stream and never published.
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
     try run.stream.push(.{ .agent_end = .{} });
     completeManualRunWithResult(run);
@@ -5105,9 +4572,6 @@ test "a run with a dropped agent_event never settles successfully" {
 
     var saw_truncation_settlement = false;
     for (outbound.items) |line| {
-        // A truncated stream never settles through agent_result (§13.4.2,
-        // #210 gap 5), and the loop-internal failure shape carries no
-        // trailing agent_end.
         try std.testing.expect(std.mem.find(u8, line, "\"type\":\"agent_result\"") == null);
         try std.testing.expect(std.mem.find(u8, line, "agent_end") == null);
         if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
@@ -5149,19 +4613,12 @@ test "event publication failure marks the stream truncated and converts the sett
     try run.stream.push(.{ .turn_start = {} });
     completeManualRunWithResult(run);
 
-    // Fail the run pump's first allocation — the serialization of the one
-    // queued event. The event is consumed from the stream by the poll, so
-    // the failed publication truncates the stream (#210 gap 5): the run
-    // must be marked and kept queued for the settlement to convert.
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, stdio_loop.pumpAgentRuns());
     failing.fail_index = std.math.maxInt(usize);
     try std.testing.expectEqual(@as(usize, 1), stdio_loop.active_agent_runs.items.len);
     try std.testing.expect(stdio_loop.active_agent_runs.items[0].event_publication_failed);
 
-    // Recovery via the full background pump: it settles the run through the
-    // truncation pair AND flushes the outbox into the pipe — the run pump
-    // alone only queues the frames server-side.
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
 
@@ -5181,9 +4638,6 @@ test "event publication failure marks the stream truncated and converts the sett
 test "tool-request publication failure keeps the request queued and retries exactly once" {
     const allocator = std.testing.allocator;
 
-    // #210 gap 5: sweep every allocation of the tool-request publication —
-    // the request stays queued on failure (the agent thread's wait remains
-    // satisfiable) and the retry publishes exactly one `tool_execute`.
     var k: usize = 0;
     while (k <= 6) : (k += 1) {
         var failing = std.testing.FailingAllocator.init(allocator, .{});
@@ -5204,21 +4658,16 @@ test "tool-request publication failure keeps the request queued and retries exac
         try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
         const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
-        // A run's agent thread enqueued a distributed tool request.
         try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, generation, "call-1", "lookup", "{}");
 
         failing.fail_index = failing.alloc_index + k;
         if (stdio_loop.publishPendingToolRequests()) |_| {
-            // The failure landed past this publication's allocations (or
-            // there were none left to fail): it published normally.
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            // The request was not freed out from under its wait.
             try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.requests.items.len);
             try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
         }
 
-        // Recovery publishes exactly once.
         failing.fail_index = std.math.maxInt(usize);
         _ = try stdio_loop.publishPendingToolRequests();
         try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
@@ -5236,13 +4685,6 @@ test "tool-request publication failure keeps the request queued and retries exac
 test "stop-reply publication failure still cancels runs and discards tool-bridge state" {
     const allocator = std.testing.allocator;
 
-    // #210 gap 5 (§13.4.4): the stop transaction must complete — session
-    // removed, runs cancelled, tool-bridge state discarded — even when the
-    // `agent_stopped` reply's own publication fails. The reply is built and
-    // written synchronously in the dispatch, AFTER the server removed the
-    // session, so the last allocations of a successful dispatch are exactly
-    // the critical window: measure where a successful stop dispatch's
-    // allocations end, then fail inside that tail.
     var probe = std.testing.FailingAllocator.init(allocator, .{});
     const probe_allocations = blk: {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -5277,7 +4719,6 @@ test "stop-reply publication failure still cancels runs and discards tool-bridge
         try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
         const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
-        // A live run and leftover bridge state for the session.
         _ = try appendManualAgentRun(&stdio_loop, session_id, generation);
         try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, generation, "call-1", "lookup", "{}");
         try stdio_loop.tool_bridge.markInFlight(allocator, session_id, "call-1", AgentProtocolTypes.generateUlid(), generation);
@@ -5293,8 +4734,6 @@ test "stop-reply publication failure still cancels runs and discards tool-bridge
         }
         failing.fail_index = std.math.maxInt(usize);
 
-        // Whenever the stop reached the server, the WHOLE transaction
-        // completed — even when the reply's publication failed.
         if (!stdio_loop.agent_server.hasSession(session_id)) {
             try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
             try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
@@ -5304,8 +4743,6 @@ test "stop-reply publication failure still cancels runs and discards tool-bridge
             if (dispatch_errored) saw_failed_reply_with_session_removed = true;
         }
     }
-    // The sweep actually exercised the critical window: a stop whose reply
-    // publication failed while the session had already been removed.
     try std.testing.expect(saw_failed_reply_with_session_removed);
 }
 
@@ -5324,13 +4761,10 @@ test "stdio drain never drops a delivered frame on failure" {
         outbound.deinit(allocator);
     }
 
-    // One frame already delivered into the agent pipe.
     var server_sender = stdio_loop.agent_pipe.serverSender();
     try server_sender.write("{\"type\":\"agent_result\"}");
     try server_sender.flush();
 
-    // The drain's allocation fails: nothing is buffered and — the gap-5
-    // invariant — the frame is NOT lost (buffer-before-advance).
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, stdio_loop.drainOutbound(&outbound));
     failing.fail_index = std.math.maxInt(usize);
@@ -5339,9 +4773,6 @@ test "stdio drain never drops a delivered frame on failure" {
     try std.testing.expectEqual(@as(usize, 1), try stdio_loop.drainOutbound(&outbound));
     try std.testing.expect(std.mem.find(u8, outbound.items[0], "agent_result") != null);
 
-    // An empty pipe reserves nothing at all: draining with nothing pending
-    // cannot fail, so a drain error can never strand frames buffered for
-    // earlier pipes (review finding on #210 gap 5).
     clearOwnedLines(allocator, &outbound);
     failing.fail_index = failing.alloc_index;
     try std.testing.expectEqual(@as(usize, 0), try stdio_loop.drainOutbound(&outbound));
@@ -5374,18 +4805,11 @@ test "a settled run retrying its trailing projection does not make the session b
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
-    // A publication STRAGGLER (review finding on #210 gap 5): the run's
-    // `agent_result` committed (the session is `.ready`) but its trailing
-    // `agent_end` projection is still pending a retry — the exact state a
-    // trailing-publication OOM leaves.
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
     completeManualRunWithResult(run);
     run.terminal_event_json = try serializeAgentLoopEvent(allocator, session_id, .{ .agent_end = .{} });
     run.settlement_frame_published = true;
 
-    // A new message arrives before the retry: it must be ADMITTED — the
-    // straggler is not active work — not turned into an `AgentBusy`
-    // internal-error settlement on the next pump.
     const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
     defer allocator.free(message_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
@@ -5395,8 +4819,6 @@ test "a settled run retrying its trailing projection does not make the session b
         if (!stdio_loop.hasActiveAgentRuns()) break;
         compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
-    // Both runs drained: the straggler's only removal path publishes its
-    // trailing projection first, and the new run ran to its own settlement.
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
     for (outbound.items) |line| {
         try std.testing.expect(std.mem.find(u8, line, "AgentBusy") == null);
@@ -5429,18 +4851,10 @@ test "a pending result publication keeps the session non-admissible until the re
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
-    // The state a failed result publication leaves (review on #210 gap 5):
-    // the run is retained with its settlement uncommitted and — because the
-    // status flip now rides the append — the session is still
-    // `.processing`, exactly as an admitted run implies.
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
     completeManualRunWithResult(run);
     stdio_loop.agent_server.sessions.getPtr(session_id).?.status = .processing;
 
-    // A follow-up message while the result publication is pending is
-    // REJECTED at admission (clean non-admission: `agent_busy`, sequence
-    // not consumed) — not accepted and later converted into an `AgentBusy`
-    // internal-error settlement by the retained run.
     const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
     defer allocator.free(message_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
@@ -5457,8 +4871,6 @@ test "a pending result publication keeps the session non-admissible until the re
     }
     try std.testing.expect(saw_busy_rejection);
 
-    // The retry commits the result: the session becomes admissible again —
-    // the same message is now admitted (its sequence was never consumed).
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
@@ -5501,18 +4913,12 @@ test "a stream completed without an outcome settles with a typed failure instead
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
-    // `completeWithError` marks the stream done even when copying its error
-    // message hits OOM (review on #210 gap 5): done with neither an error
-    // nor a result — no branch of the settlement chain has an outcome to
-    // publish, and retrying can never produce one.
     failing.fail_index = failing.alloc_index;
     run.stream.completeWithError("lost outcome");
     failing.fail_index = std.math.maxInt(usize);
     try std.testing.expect(run.stream.isDone());
     try std.testing.expect(run.stream.getError() == null);
 
-    // The run must still settle — through the generic failure pair — and be
-    // removed, or `hasActiveAgentRuns()` would hang the stdio shutdown.
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
 
@@ -5796,7 +5202,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"error_message\":\"invalid anthropic URL\"") != null);
     }
 
-    // Successful turns must not carry an empty error_message field.
     {
         const event = agent_loop.AgentEvent{ .turn_end = .{
             .message = .{
@@ -5815,7 +5220,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"error_message\"") == null);
     }
 
-    // agent_end derives its outcome from the last assistant message.
     {
         const messages = [_]ai_types.Message{
             .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
@@ -5841,7 +5245,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"provider_id\":\"fixture\"") != null);
     }
 
-    // agent_end without an assistant message stays minimal.
     {
         const prompts = [_]ai_types.Message{
             .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
@@ -5856,8 +5259,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"error_message\"") == null);
     }
 
-    // Iteration-cap termination reports the agent-level reason instead of the
-    // final turn's tool_use.
     {
         const messages = [_]ai_types.Message{
             .{ .assistant = .{
@@ -5881,7 +5282,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"tool_use\"") == null);
     }
 
-    // Zero-iteration runs still report the max-turns termination.
     {
         const prompts = [_]ai_types.Message{
             .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
@@ -5896,8 +5296,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"max_turns\"") != null);
     }
 
-    // Cancellation overrides any historical assistant reason and keeps the
-    // resolved api alongside the provider for downstream scoping.
     {
         const messages = [_]ai_types.Message{
             .{ .assistant = .{
@@ -5923,8 +5321,6 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"api\":\"fixture-ok-api\"") != null);
     }
 
-    // No-turn runs take their identity from the run's final message, never
-    // from an older assistant turn lingering in the history.
     {
         const messages = [_]ai_types.Message{
             .{ .assistant = .{
@@ -6113,8 +5509,6 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
-        // The failure pair must reach the client, so this hand-built run
-        // binds the generation of the live registration created above.
         .generation = stdio_loop.agent_server.sessionGeneration(session_id).?,
         .stream = stream,
         .context = context,
@@ -6145,12 +5539,6 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
 }
 
-// ============================================================================
-// Stopped-id reuse race (spec §13.4.5, #204 gap 3): a cancelled run's late
-// publications must not settle — or mutate — an id a new agent_start
-// re-created.
-// ============================================================================
-
 test "stopped session's late run publications are discarded after id re-registration" {
     const allocator = std.testing.allocator;
 
@@ -6168,9 +5556,6 @@ test "stopped session's late run publications are discarded after id re-registra
 
     const session_id = AgentProtocolTypes.generateSessionId();
 
-    // First registration, with an in-flight run whose stream yields an event
-    // and then fails — exactly the publications a stale run must never
-    // deliver to the re-created id.
     const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
     defer allocator.free(start_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
@@ -6204,15 +5589,9 @@ test "stopped session's late run publications are discarded after id re-registra
         .tool_executor = tool_executor,
     });
 
-    // Stop mid-run, then immediately re-register the same id. No run pump
-    // executes in between (dispatchInboundLine only pumps client messages),
-    // so the cancelled run is still listed with its publications undelivered
-    // — the §13.4.5 race window.
     const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
     defer allocator.free(stop_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
-    // The stop cancelled the still-listed run (asserted here: the pump's
-    // removal below destroys the run's objects, cancel_flag included).
     try std.testing.expect(cancel_flag.load(.acquire));
 
     const restart_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
@@ -6223,14 +5602,8 @@ test "stopped session's late run publications are discarded after id re-registra
 
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
-    // The stale run was drained and removed (its cancellation by the stop
-    // was asserted above; the pump's orderedRemove destroys the run's
-    // objects, so cancel_flag is no longer readable here).
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
 
-    // But it published nothing into the re-created registration: no run
-    // events, no settlement error, and the fresh container was never marked
-    // .error by the stale run's failure.
     for (outbound.items) |line| {
         try std.testing.expect(std.mem.find(u8, line, "late stale failure") == null);
         var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
@@ -6267,10 +5640,6 @@ test "re-created session's admitted run is not failed by the stopped registratio
     const session_id = AgentProtocolTypes.generateSessionId();
     const model_ref_text = "fixture/fixture-ok-api@fixture-model";
 
-    // First registration with an in-flight run whose provider stream never
-    // drains: after the stop it stays listed (cancelled) while the id is
-    // re-registered — the run a naive one-active-run check would wrongly
-    // treat as making the session busy.
     const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
     defer allocator.free(start_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
@@ -6302,8 +5671,6 @@ test "re-created session's admitted run is not failed by the stopped registratio
         .tool_executor = tool_executor,
     });
 
-    // Stop mid-run (the old run is cancelled but stays listed), re-register,
-    // and admit a message against the fresh registration.
     const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
     defer allocator.free(stop_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
@@ -6317,9 +5684,6 @@ test "re-created session's admitted run is not failed by the stopped registratio
     defer allocator.free(message_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
 
-    // The new run must start despite the listed old-registration run and
-    // settle through agent_result (the pre-fix behavior was an AgentBusy
-    // run-start failure pair that marked the fresh session .error).
     var saw_result_line = false;
     for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
@@ -6341,9 +5705,6 @@ test "re-created session's admitted run is not failed by the stopped registratio
         try std.testing.expect(env.payload != .agent_error);
     }
 
-    // The re-created registration settled clean through its own run's
-    // result, and the stale run is still listed (its stream never drained)
-    // without blocking anything.
     try std.testing.expectEqual(
         AgentProtocolTypes.AgentStatus.ready,
         stdio_loop.agent_server.sessions.get(session_id).?.status,
@@ -6362,10 +5723,6 @@ test "agent_stop cancels every listed run for the id, including the current regi
 
     const session_id = AgentProtocolTypes.generateSessionId();
 
-    // Registration G1 with a never-draining run; stop, re-register (G2),
-    // and list that registration's run too — two same-id runs, the state
-    // generation-scoped admission makes possible (the pre-#204 busy check
-    // never let a second same-id run start).
     const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
     defer allocator.free(start_req);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
@@ -6431,18 +5788,12 @@ test "agent_stop cancels every listed run for the id, including the current regi
         });
     }
 
-    // Stopping the second registration must cancel BOTH listed runs: the
-    // first-match form cancelled only the (already cancelled) stale run and
-    // left the current registration's run running through the stop — free
-    // to enqueue distributed tool work after the stop's bridge discard.
     const second_stop = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
     defer allocator.free(second_stop);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(second_stop));
     try std.testing.expect(stale_flag.load(.acquire));
     try std.testing.expect(current_flag.load(.acquire));
     try std.testing.expect(!stdio_loop.agent_server.hasSession(session_id));
-    // Both runs stay listed (never-draining streams); loop teardown frees
-    // them.
     try std.testing.expectEqual(@as(usize, 2), stdio_loop.active_agent_runs.items.len);
 }
 
@@ -6453,7 +5804,6 @@ test "writeOwnedLinesAndClear clears owned lines on write failure" {
     const write_file = pipe[1];
     defer compat.stdio.close(read_file);
 
-    // Force write error path.
     compat.stdio.close(write_file);
 
     var lines = std.ArrayList([]const u8).empty;
@@ -6593,10 +5943,6 @@ test "stdio mode exits promptly on stdin EOF with a registered session" {
     defer allocator.free(ready_line);
     try std.testing.expectEqualStrings("{\"type\":\"ready\",\"protocol_version\":\"1\"}", ready_line);
 
-    // Register a session so the EOF path runs with live agent-protocol
-    // state, then drop the write side of stdin: the host must observe EOF,
-    // latch the disconnect, and exit cleanly (§13.2.7, #210 gap 4) instead
-    // of outliving the connection.
     const session_id = AgentProtocolTypes.generateSessionId();
     const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
     defer allocator.free(start_req);
@@ -6701,22 +6047,11 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     try std.testing.expect(runner.err == null);
 }
 
-// =============================================================================
-// CLI wrapper integration tests (end-to-end via handleAuthWithOptions)
-//
-// These tests exercise the full `makai auth ...` CLI wrapper path: argv
-// parsing, in-process auth protocol runtime, and pipe-backed stdio. They
-// inject server options that disable real OAuth + credential persistence so
-// the wrapper never touches `~/.makai/auth.json` or external services.
-// =============================================================================
-
 const TEST_AUTH_SERVER_OPTIONS = auth_protocol_server.AuthProtocolServer.Options{
     .persist_credentials = false,
     .enable_real_oauth = false,
 };
 
-/// Spawn `handleAuthWithOptions` on a worker thread fed by pipe-backed stdio
-/// so tests can stream input and read output without touching real fds.
 const AuthCliHarness = struct {
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -6749,8 +6084,6 @@ const AuthCliHarness = struct {
 
     fn run(self: *AuthCliHarness) void {
         defer {
-            // The wrapper does not own these fds; closing them here lets the
-            // reader side observe EOF after the command finishes.
             compat.stdio.close(self.stdout_write);
             compat.stdio.close(self.stderr_write);
             compat.stdio.close(self.stdin_read);
@@ -6787,7 +6120,6 @@ test "handleAuth providers end-to-end through CLI wrapper emits provider ids" {
     var harness = try AuthCliHarness.init(allocator, &.{"providers"});
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
-    // No stdin needed; close immediately so the worker doesn't block on read.
     compat.stdio.close(harness.stdin_write);
 
     const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
@@ -6842,7 +6174,6 @@ test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
     var harness = try AuthCliHarness.init(allocator, &.{ "login", "--provider", "test-fixture" });
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
-    // Reject first attempt to force the prompt loop to iterate, then accept.
     try compat.stdio.writeAll(harness.stdin_write, "not-the-answer\nok\n");
     compat.stdio.close(harness.stdin_write);
 
@@ -6863,7 +6194,6 @@ test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
     ) != null);
     try std.testing.expect(std.mem.find(u8, stdout_bytes, "Login successful.") != null);
 
-    // Tokens must never appear in CLI-visible streams.
     try std.testing.expect(std.mem.find(u8, stdout_bytes, "fixture-refresh-token") == null);
     try std.testing.expect(std.mem.find(u8, stdout_bytes, "fixture-access-token") == null);
     try std.testing.expect(std.mem.find(u8, stderr_bytes, "fixture-refresh-token") == null);
@@ -6947,8 +6277,6 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     const allocator = std.testing.allocator;
     var model = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-model");
     defer model.deinit(allocator);
-    // Env ANTHROPIC_BASE_URL may override in the test environment; either way
-    // the base URL must no longer be empty.
     try std.testing.expect(model.base_url.len > 0);
 
     var reasoning = try modelFromCanonicalRef(allocator, "openai/openai-responses@o3-custom");
@@ -6959,8 +6287,6 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     defer chat.deinit(allocator);
     try std.testing.expect(!chat.reasoning);
 
-    // Non-catalog Anthropic refs must carry reasoning so a selected thinking
-    // level is not silently dropped by the adapter's thinking gate.
     var claude = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-model");
     defer claude.deinit(allocator);
     try std.testing.expect(claude.reasoning);
@@ -6973,8 +6299,6 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     defer sonnet37.deinit(allocator);
     try std.testing.expect(sonnet37.reasoning);
 
-    // Legacy families never support thinking; the adapter must not emit a
-    // thinking object for them.
     for ([_][]const u8{ "claude-2.0", "claude-1.2", "claude-v1", "claude-instant" }) |legacy_id| {
         const ref = try std.fmt.allocPrint(allocator, "anthropic/anthropic-messages@{s}", .{legacy_id});
         defer allocator.free(ref);

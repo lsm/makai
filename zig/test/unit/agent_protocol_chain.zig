@@ -124,9 +124,6 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
     const loop_stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, .{
         .model = model,
         .protocol = bridge.protocolClient(),
-        // M-006: provide an explicit api_key so the binary's credential
-        // resolver does not reject the upstream stream_request with
-        // `auth_required`. The mock provider does not validate the key value.
         .api_key = "test-key",
     });
     defer {
@@ -150,11 +147,6 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
 }
 
 test "agent_start dual-key parse binds the session under either payload key (#198)" {
-    // Wire-level: the payload id travels under the canonical `session_id`
-    // key (new clients) or the legacy `resume_session_id` alias (older
-    // clients); the server binds the session container to that id in both
-    // cases, and the §13.1 envelope-agreement check applies to whichever
-    // key carried it.
     const allocator = std.testing.allocator;
 
     const keys = [_][]const u8{ "session_id", "resume_session_id" };
@@ -162,9 +154,6 @@ test "agent_start dual-key parse binds the session under either payload key (#19
         var server = AgentProtocolServer.init(allocator);
         defer server.deinit();
 
-        // The chain test's `agent_types` import is the agent-LAYER types
-        // module, which has no id parsers; the protocol agent types (and
-        // their parseSessionId) are re-exported by the envelope module.
         const sid = agent_envelope.protocol_types.parseSessionId("aaaaaaaaaaaaaaaaaaaaa").?;
         const mid = "00000000000000000000000002";
         const json = try std.fmt.allocPrint(
@@ -181,8 +170,6 @@ test "agent_start dual-key parse binds the session under either payload key (#19
         var resp = (try server.handleEnvelope(env)).?;
         defer resp.deinit(allocator);
 
-        // The container is bound to the payload id (not a server-generated
-        // one) and the reply travels under the same id.
         try std.testing.expect(resp.payload == .agent_started);
         try std.testing.expectEqual(sid, resp.payload.agent_started.session_id);
         try std.testing.expectEqual(sid, resp.session_id);

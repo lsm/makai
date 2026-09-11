@@ -49,15 +49,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
         .agent_start => |p| {
             try w.writeStringField("config_json", p.config_json);
             if (p.getSystemPrompt()) |prompt| try w.writeStringField("system_prompt", prompt);
-            // #198: canonical payload key is `session_id` — a correlation key
-            // (spec §13.1), never a resume handle. The legacy
-            // `resume_session_id` alias is ALSO emitted, with the same value:
-            // a pre-rename server cannot read the canonical key and would
-            // otherwise generate its own id (the Zig client adopts it, but
-            // its sequence counter stays keyed under the sent id, so the
-            // next message would carry sequence 1 where the server expects
-            // 2). Dual-key servers take the canonical value when both keys
-            // appear; the alias emission is transitional.
             if (p.session_id) |id| {
                 const id_str = try agent_types.sessionIdToString(id, allocator);
                 defer allocator.free(id_str);
@@ -274,11 +265,6 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         const config = try allocator.dupe(u8, payload.get("config_json").?.string);
         var result = agent_types.AgentStartRequest{ .config_json = config };
         if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        // #198: canonical payload key is `session_id`; `resume_session_id` is
-        // a legacy alias (same value, misleading name) accepted permanently
-        // for older clients. When both keys appear the canonical one wins —
-        // the §13.1 envelope-agreement check compares the effective payload
-        // id whichever key carried it.
         if (payload.get("session_id")) |v| {
             result.session_id = try parseSessionIdRequired(v.string);
         } else if (payload.get("resume_session_id")) |v| {
@@ -383,13 +369,6 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "nack")) {
         const rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string);
         const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
-        // forward-compat: unknown error codes degrade to null rather than
-        // failing deserialization. This is intentional asymmetry from the
-        // other enum parsers in this file (which fail with InvalidEnumValue):
-        // a newer peer may emit a code our build doesn't know about, and we
-        // would rather still surface the human-readable `reason` than reject
-        // the whole nack envelope. Callers MUST treat `null` as "unrecognised
-        // code" and fall back to `reason` for diagnostics.
         const error_code = if (payload.get("error_code")) |v|
             std.meta.stringToEnum(agent_types.ErrorCode, v.string)
         else
@@ -570,12 +549,6 @@ fn deserializeModelDescriptor(
     };
 }
 
-// `.unknown` is a forward-compatibility sentinel — auth states added in
-// future protocol versions degrade gracefully to `.unknown` rather than
-// failing deserialization (intentionally asymmetric with `parseModelLifecycle`
-// / `parseModelCapability` / `parseModelSource` / `parseReasoningLevel`,
-// which all fail hard on unknown strings because those enums have no
-// "unknown" sentinel and a missing variant indicates a real protocol bug).
 fn parseAuthStatus(str: []const u8) model_catalog_types.AuthStatus {
     if (std.mem.eql(u8, str, "authenticated")) return .authenticated;
     if (std.mem.eql(u8, str, "login_required")) return .login_required;
@@ -691,9 +664,6 @@ test "agent_start payload serializes the id under session_id plus the legacy ali
     const json = try serializeEnvelope(env, allocator);
     defer allocator.free(json);
 
-    // Canonical key present AND the legacy alias rides along with the SAME
-    // value, so pre-rename servers (which read only the alias) keep binding
-    // the caller's id; dual-key servers take the canonical value.
     var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed_json.deinit();
     const payload = parsed_json.value.object.get("payload").?.object;

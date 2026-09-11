@@ -1,40 +1,7 @@
-/// Agent module - high-level agent loop abstraction
-///
-/// This module provides two levels of API:
-///
-/// 1. Low-level API: `agentLoop()` and `agentLoopContinue()` functions
-///    - Stateless generator functions that emit events via AgentEventStream
-///    - Full control over execution flow
-///
-/// 2. High-level API: `Agent` class
-///    - Stateful wrapper that manages subscriptions and message queues
-///    - Easier to use for most use cases
-///
-/// ## Provider Access
-///
-/// The agent uses a ProtocolClient interface to communicate with the provider layer.
-/// This abstracts away transport, credentials, and provider-specific details.
-///
-/// ### Example: In-Process Provider Access
-/// ```zig
-/// const protocol = createInProcessProtocolClient(allocator, &registry);
-/// var agent = Agent.init(allocator, .{
-///     .protocol = protocol,
-/// });
-/// ```
-///
-/// ### Example: Remote Protocol Server
-/// ```zig
-/// const protocol = createRemoteProtocolClient(allocator, "ws://localhost:8080");
-/// var agent = Agent.init(allocator, .{
-///     .protocol = protocol,
-/// });
-/// ```
 const std = @import("std");
 const types = @import("agent_types");
 const agent_loop_mod = @import("agent_loop");
 
-// Re-export all public types from types.zig
 pub const AgentEvent = types.AgentEvent;
 pub const AgentEndPayload = types.AgentEndPayload;
 pub const TurnEndPayload = types.TurnEndPayload;
@@ -66,31 +33,22 @@ pub const AgentLoopResult = types.AgentLoopResult;
 pub const AgentEventStream = types.AgentEventStream;
 pub const QueueMode = types.QueueMode;
 
-// Re-export ProtocolClient types
 pub const ProtocolClient = types.ProtocolClient;
 pub const ProtocolOptions = types.ProtocolOptions;
 pub const ProtocolStreamFn = types.ProtocolStreamFn;
 
-// Re-export low-level functions from agent_loop.zig
 pub const agentLoop = agent_loop_mod.agentLoop;
 pub const agentLoopContinue = agent_loop_mod.agentLoopContinue;
 
-// Re-export high-level Agent class from agent.zig
 pub const Agent = @import("agent.zig").Agent;
 pub const AgentOptions = @import("agent.zig").AgentOptions;
 pub const InProcessProviderProtocolBridge = @import("provider_protocol_bridge.zig").InProcessProviderProtocolBridge;
 
-// Re-export commonly used types from dependencies for convenience
 pub const ai_types = @import("ai_types");
 pub const api_registry = @import("api_registry");
 pub const event_stream = @import("event_stream");
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 test {
-    // Run all tests in the module
     _ = types;
     _ = agent_loop_mod;
     _ = @import("agent.zig");
@@ -98,7 +56,6 @@ test {
 }
 
 test "module exports all required types" {
-    // Verify all types are accessible by referencing them
     const event: AgentEvent = undefined;
     const tool: AgentTool = undefined;
     const config: AgentLoopConfig = undefined;
@@ -113,7 +70,6 @@ test "module exports all required types" {
     const protocol: ProtocolClient = undefined;
     const protocol_opts: ProtocolOptions = undefined;
 
-    // Use the variables to avoid unused errors
     _ = event;
     _ = tool;
     _ = config;

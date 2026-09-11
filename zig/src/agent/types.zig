@@ -8,29 +8,14 @@ pub const permission = @import("permission");
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 pub const ArtifactReference = ai_types.ArtifactReference;
 
-// ============================================================================
-// Agent Event Types
-// ============================================================================
-
-/// Agent-level termination reason for a finished run. Distinct from the
-/// turn-scoped `StopReason` on assistant messages: when set, it reports why
-/// the *run* ended (e.g. the iteration cap, cancellation) rather than echoing
-/// the final turn's own stop reason.
 pub const AgentTermination = enum {
     max_turns,
     cancelled,
 };
 
-/// Payload for agent_end event
 pub const AgentEndPayload = struct {
     messages: OwnedSlice(ai_types.Message) = OwnedSlice(ai_types.Message).initBorrowed(&.{}),
-    /// Set when the run terminated for an agent-level reason (iteration cap);
-    /// null when the run ended with the final turn's stop reason.
     termination: ?AgentTermination = null,
-    /// Terminal assistant turn of this run (a borrowed view of the loop
-    /// result's final message, including its synthesized placeholder when no
-    /// turn ran). Serializers prefer it over scanning `messages`, whose
-    /// history may end with an assistant message from an older turn/model.
     final_message: ?ai_types.AssistantMessage = null,
 
     pub fn deinit(self: *AgentEndPayload, allocator: std.mem.Allocator) void {
@@ -38,7 +23,6 @@ pub const AgentEndPayload = struct {
     }
 };
 
-/// Payload for turn_end event
 pub const TurnEndPayload = struct {
     message: ai_types.AssistantMessage,
     tool_results: OwnedSlice(ai_types.ToolResultMessage) = OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
@@ -52,12 +36,10 @@ pub const TurnEndPayload = struct {
     }
 };
 
-/// Payload for message_start event
 pub const MessageStartPayload = struct {
     message: ai_types.Message,
 };
 
-/// Payload for message_update event
 pub const MessageUpdatePayload = struct {
     message: ai_types.AssistantMessage,
     event: ai_types.AssistantMessageEvent,
@@ -71,12 +53,10 @@ pub const MessageUpdatePayload = struct {
     }
 };
 
-/// Payload for message_end event
 pub const MessageEndPayload = struct {
     message: ai_types.Message,
 };
 
-/// Aggregate byte/token pressure for one provider request context.
 pub const ContextUsagePayload = struct {
     system_prompt_bytes: u64 = 0,
     message_bytes: u64 = 0,
@@ -98,7 +78,6 @@ pub const PromptSegmentCacheRole = enum {
     dynamic,
 };
 
-/// Cache-aware prompt segment accounting for TUI context-pressure views.
 pub const PromptSegmentUsagePayload = struct {
     segment: PromptSegmentKind,
     cache_role: PromptSegmentCacheRole,
@@ -107,14 +86,12 @@ pub const PromptSegmentUsagePayload = struct {
     item_count: u32 = 0,
 };
 
-/// Payload for tool_execution_start event
 pub const ToolExecutionStartPayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     args_json: []const u8,
 };
 
-/// Payload for tool_execution_update event
 pub const ToolExecutionUpdatePayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
@@ -122,7 +99,6 @@ pub const ToolExecutionUpdatePayload = struct {
     partial_result_json: []const u8,
 };
 
-/// Payload for tool_execution_end event
 pub const ToolExecutionEndPayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
@@ -141,24 +117,19 @@ pub const ToolExecutionEndPayload = struct {
     artifacts: []const ArtifactReference = &.{},
 };
 
-/// Agent event types emitted during execution
 pub const AgentEvent = union(enum) {
-    // Agent lifecycle
     agent_start: void,
     agent_end: AgentEndPayload,
 
-    // Turn lifecycle (turn = one assistant response + tool executions)
     turn_start: void,
     turn_end: TurnEndPayload,
 
-    // Message lifecycle
     message_start: MessageStartPayload,
     message_update: MessageUpdatePayload,
     message_end: MessageEndPayload,
     context_usage: ContextUsagePayload,
     prompt_segment_usage: PromptSegmentUsagePayload,
 
-    // Tool execution lifecycle
     tool_execution_start: ToolExecutionStartPayload,
     tool_execution_update: ToolExecutionUpdatePayload,
     tool_execution_end: ToolExecutionEndPayload,
@@ -172,11 +143,6 @@ pub const AgentEvent = union(enum) {
     }
 };
 
-// ============================================================================
-// Agent Tool Types
-// ============================================================================
-
-/// Tool result returned from execute
 pub const AgentToolResult = struct {
     content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -195,7 +161,6 @@ pub const AgentToolResult = struct {
     }
 };
 
-/// Callback for streaming tool execution updates
 pub const ToolUpdateCallback = *const fn (
     ctx: ?*anyopaque,
     tool_call_id: []const u8,
@@ -203,7 +168,6 @@ pub const ToolUpdateCallback = *const fn (
     partial_result_json: []const u8,
 ) void;
 
-/// Tool execution function signature used by local tool runtimes behind ToolProtocolServer.
 pub const ToolExecuteFn = *const fn (
     tool_call_id: []const u8,
     args_json: []const u8,
@@ -213,7 +177,6 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
-/// Context-aware runtime function used only inside ToolProtocolServer.
 pub const ToolRuntimeExecuteFn = *const fn (
     ctx: ?*anyopaque,
     tool_call_id: []const u8,
@@ -224,7 +187,6 @@ pub const ToolRuntimeExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
-/// Single tool protocol dispatch path used by the agent loop.
 pub const ToolProtocolExecuteFn = *const fn (
     ctx: ?*anyopaque,
     tool_call_id: []const u8,
@@ -267,11 +229,6 @@ pub const ToolOutputMiddlewareInput = struct {
     raw_total_bytes: u64,
 };
 
-/// Hook point for reversible tool-output filtering/artifact backing.
-///
-/// Implementations may mutate `result` in place, for example by replacing a
-/// large text payload with a compact summary plus `ArtifactReference` entries.
-/// The hook owns any memory it puts into `result`.
 pub const ToolOutputMiddlewareFn = *const fn (
     ctx: ?*anyopaque,
     input: ToolOutputMiddlewareInput,
@@ -300,9 +257,8 @@ pub const ToolApprovalDecisionFn = *const fn (
 
 pub const ToolApprovalFn = ToolApprovalDecisionFn;
 
-/// Agent tool definition
 pub const AgentTool = struct {
-    label: []const u8, // Human-readable label for UI
+    label: []const u8,
     name: []const u8,
     description: []const u8,
     short_description: ?[]const u8 = null,
@@ -315,7 +271,6 @@ pub const AgentTool = struct {
     approval_ui_ctx: ?*anyopaque = null,
     approval_ui_fn: ?ToolApprovalUiFn = null,
 
-    /// Convert to ai_types.Tool for LLM requests
     pub fn toTool(self: AgentTool, allocator: std.mem.Allocator) !ai_types.Tool {
         _ = allocator;
         return .{
@@ -326,12 +281,6 @@ pub const AgentTool = struct {
     }
 };
 
-// ============================================================================
-// Protocol Client Interface
-// ============================================================================
-
-/// Options for protocol streaming (agent-level concerns only).
-/// Transport and credential details are handled by the protocol client.
 pub const ProtocolOptions = struct {
     api_key: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -343,7 +292,6 @@ pub const ProtocolOptions = struct {
     max_tokens: ?u32 = null,
 };
 
-/// Stream function signature for ProtocolClient.
 pub const ProtocolStreamFn = *const fn (
     ctx: ?*anyopaque,
     model: ai_types.Model,
@@ -352,18 +300,11 @@ pub const ProtocolStreamFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!*event_stream.AssistantMessageEventStream;
 
-/// Protocol client interface for agent loop.
-/// Abstracts away transport, credentials, and provider specifics.
-/// This is the single interface the agent loop uses to communicate
-/// with the provider layer.
 pub const ProtocolClient = struct {
-    /// Stream function pointer
     stream_fn: ProtocolStreamFn,
 
-    /// Context pointer passed to stream_fn
     ctx: ?*anyopaque = null,
 
-    /// Convenience method to call the stream function
     pub fn stream(
         self: ProtocolClient,
         model: ai_types.Model,
@@ -375,14 +316,6 @@ pub const ProtocolClient = struct {
     }
 };
 
-// ============================================================================
-// Legacy Stream Function (for backward compatibility)
-// ============================================================================
-
-/// Custom stream function for provider access.
-/// If provided, used directly. Otherwise, falls back to registry lookup.
-/// This allows both in-process (via registry) and remote (via protocol client) access.
-/// Note: Prefer using ProtocolClient for new code.
 pub const AgentStreamFn = *const fn (
     model: ai_types.Model,
     context: ai_types.Context,
@@ -390,52 +323,38 @@ pub const AgentStreamFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!*event_stream.AssistantMessageEventStream;
 
-// ============================================================================
-// Agent Loop Config
-// ============================================================================
-
-/// Context transformation function - converts messages before LLM call
 pub const TransformContextFn = *const fn (
     ctx: ?*anyopaque,
     messages: []const ai_types.Message,
     allocator: std.mem.Allocator,
 ) anyerror![]const ai_types.Message;
 
-/// Steering message callback - returns messages to inject mid-run
 pub const GetSteeringMessagesFn = *const fn (
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
 ) anyerror!?[]const ai_types.Message;
 
-/// Follow-up message callback - returns messages after agent would stop
 pub const GetFollowUpMessagesFn = *const fn (
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
 ) anyerror!?[]const ai_types.Message;
 
-/// Convert AgentMessage to LLM Message (simplified - just filter for now)
 pub const ConvertToLlmFn = *const fn (
     ctx: ?*anyopaque,
     messages: []const ai_types.Message,
     allocator: std.mem.Allocator,
 ) anyerror![]const ai_types.Message;
 
-/// Dynamic API key resolution
 pub const GetApiKeyFn = *const fn (
     ctx: ?*anyopaque,
     provider: []const u8,
 ) ?[]const u8;
 
-/// Configuration for agent loop execution
 pub const AgentLoopConfig = struct {
-    // Required
     model: ai_types.Model,
 
-    // Protocol client (single interface to provider layer)
-    // This abstracts away transport, credentials, and provider specifics.
     protocol: ProtocolClient,
 
-    // Tools (optional)
     tools: ?[]const AgentTool = null,
     execute_tool_via_protocol_fn: ToolProtocolExecuteFn = defaultToolProtocolExecute,
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
@@ -444,20 +363,17 @@ pub const AgentLoopConfig = struct {
     permission_engine: ?*permission.PermissionEngine = null,
     compact_tool_output: bool = false,
 
-    // Streaming options (passed through to protocol)
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
     thinking_level: ai_types.ThinkingLevel = .minimal,
 
-    // Agent-specific options
-    max_iterations: ?u32 = null, // Max tool use iterations
+    max_iterations: ?u32 = null,
     session_id: ?[]const u8 = null,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: ?u32 = 60_000,
 
-    // Callbacks
     transform_context_fn: ?TransformContextFn = null,
     transform_context_ctx: ?*anyopaque = null,
     get_steering_messages_fn: ?GetSteeringMessagesFn = null,
@@ -470,11 +386,6 @@ pub const AgentLoopConfig = struct {
     get_api_key_ctx: ?*anyopaque = null,
 };
 
-// ============================================================================
-// Agent Context
-// ============================================================================
-
-/// Context for agent execution - holds messages, system prompt, and tools
 pub const AgentContext = struct {
     system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     messages: std.ArrayList(ai_types.Message),
@@ -494,7 +405,6 @@ pub const AgentContext = struct {
     }
 
     pub fn deinit(self: *AgentContext) void {
-        // Free messages if owned
         for (self.messages.items) |*msg| {
             msg.deinit(self.allocator);
         }
@@ -511,11 +421,6 @@ pub const AgentContext = struct {
     }
 };
 
-// ============================================================================
-// Agent State
-// ============================================================================
-
-/// State tracked by the high-level Agent class
 pub const AgentState = struct {
     system_prompt: []const u8 = "",
     model: ?ai_types.Model = null,
@@ -549,7 +454,6 @@ pub const AgentState = struct {
         self.clearStreamMessage();
         if (self.system_prompt.len > 0) self.allocator.free(self.system_prompt);
         self.error_message.deinit(self.allocator);
-        // Note: doesn't own model or tools
         self.pending_tool_calls.deinit();
     }
 
@@ -561,17 +465,10 @@ pub const AgentState = struct {
     }
 };
 
-// ============================================================================
-// Agent Event Stream
-// ============================================================================
-
-/// Result from agent loop execution
 pub const AgentLoopResult = struct {
     messages: OwnedSlice(ai_types.Message),
     final_message: ai_types.AssistantMessage,
     iterations: u32,
-    /// Agent-level termination reason when the run ended for a reason other
-    /// than the final turn's stop reason (e.g. the iteration cap).
     termination: ?AgentTermination = null,
 
     pub fn deinit(self: *AgentLoopResult, allocator: std.mem.Allocator) void {
@@ -581,36 +478,17 @@ pub const AgentLoopResult = struct {
     }
 };
 
-/// Event stream for agent events
 pub const AgentEventStream = event_stream.EventStream(AgentEvent, AgentLoopResult);
 
-// ============================================================================
-// Queue Mode
-// ============================================================================
-
-/// Mode for message queue delivery
 pub const QueueMode = enum {
     all,
     one_at_a_time,
 };
 
-// ============================================================================
-// AgentMessage - Extended Message Type
-// ============================================================================
-
-/// Custom message types can be added by apps.
-/// This placeholder allows for future extension without breaking changes.
-/// Apps that need custom message types can create their own union that
-/// includes this AgentMessage as one of its variants.
 pub const CustomAgentMessage = union(enum) {
-    /// Placeholder for custom message types.
-    /// Apps should define their own specific message types.
     custom: struct {
-        /// Type identifier for the custom message
         type: []const u8,
-        /// JSON-encoded payload
         payload: []const u8,
-        /// Timestamp in milliseconds
         timestamp: i64,
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -626,50 +504,35 @@ pub const CustomAgentMessage = union(enum) {
     }
 };
 
-/// AgentMessage is the union of LLM-compatible Message types and custom message types.
-/// This separation allows apps to track additional metadata (artifacts, notifications, etc.)
-/// that shouldn't be sent to the LLM but should be tracked in the conversation history.
-///
-/// Use `convertToLlm` in AgentLoopConfig to filter/convert AgentMessages to LLM-compatible
-/// Messages before each LLM call.
 pub const AgentMessage = union(enum) {
-    /// Standard LLM message (user, assistant, or tool_result)
     llm: ai_types.Message,
-    /// Custom application-specific message
     custom: CustomAgentMessage,
 
-    /// Create an AgentMessage from a standard LLM Message
     pub fn fromLlm(msg: ai_types.Message) AgentMessage {
         return .{ .llm = msg };
     }
 
-    /// Create an AgentMessage from a user message
     pub fn fromUser(user: ai_types.UserMessage) AgentMessage {
         return .{ .llm = .{ .user = user } };
     }
 
-    /// Create an AgentMessage from an assistant message
     pub fn fromAssistant(assistant: ai_types.AssistantMessage) AgentMessage {
         return .{ .llm = .{ .assistant = assistant } };
     }
 
-    /// Create an AgentMessage from a tool result message
     pub fn fromToolResult(tool_result: ai_types.ToolResultMessage) AgentMessage {
         return .{ .llm = .{ .tool_result = tool_result } };
     }
 
-    /// Check if this is an LLM-compatible message
     pub fn isLlmCompatible(self: AgentMessage) bool {
         return self == .llm;
     }
 
-    /// Get the LLM message if this is an LLM-compatible message
     pub fn getLlm(self: AgentMessage) ?ai_types.Message {
         if (self == .llm) return self.llm;
         return null;
     }
 
-    /// Get timestamp from any message variant
     pub fn getTimestamp(self: AgentMessage) i64 {
         return switch (self) {
             .llm => |msg| switch (msg) {
@@ -681,7 +544,6 @@ pub const AgentMessage = union(enum) {
         };
     }
 
-    /// Free all owned memory
     pub fn deinit(self: *AgentMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .llm => |*msg| msg.deinit(allocator),
@@ -689,10 +551,6 @@ pub const AgentMessage = union(enum) {
         }
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "AgentEvent tags are correct" {
     const event: AgentEvent = .agent_start;
@@ -716,7 +574,6 @@ test "AgentContext appendMessage" {
     var context = AgentContext.init(std.testing.allocator);
     defer context.deinit();
 
-    // Create a message with owned strings
     const text = try std.testing.allocator.dupe(u8, "Hello");
     const msg = ai_types.Message{
         .user = .{
@@ -745,7 +602,7 @@ test "AgentTool.toTool conversion" {
         .description = "A test tool",
         .short_description = "Test compact",
         .parameters_schema_json = "{}",
-        .execute = undefined, // Runtime registration callback only; agent loop never calls directly.
+        .execute = undefined,
     };
 
     const converted = try tool.toTool(std.testing.allocator);
@@ -857,7 +714,6 @@ test "AgentEndPayload deinit with owned strings" {
     };
 
     payload.deinit(std.testing.allocator);
-    // Should not leak
 }
 
 test "TurnEndPayload with tool results" {
@@ -874,12 +730,10 @@ test "TurnEndPayload with tool results" {
         .tool_results = OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
     };
 
-    // Just verify it compiles and has correct fields
     try std.testing.expect(payload.tool_results.slice().len == 0);
 }
 
 test "ProtocolClient has stream method" {
-    // This is a compile-time check that ProtocolClient has the expected interface
     const client: ProtocolClient = .{
         .stream_fn = undefined,
         .ctx = null,
@@ -916,7 +770,6 @@ test "AgentMessage fromLlm" {
 }
 
 test "AgentMessage custom message" {
-    // Create with owned strings
     const msg_type = try std.testing.allocator.dupe(u8, "notification");
     const payload = try std.testing.allocator.dupe(u8, "{\"text\": \"Test notification\"}");
 

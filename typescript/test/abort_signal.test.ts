@@ -1,12 +1,3 @@
-/**
- * Tests for AbortSignal support across execution, models, and auth APIs.
- *
- * Acceptance criteria from the task:
- * - `AbortSignal.abort()` before call → immediate rejection
- * - `AbortSignal.timeout(5000)` → aborts after timeout
- * - Manual `controller.abort()` during streaming → stream stops, resources cleaned up
- * - No resource leaks (listeners removed, transport closed)
- */
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -24,15 +15,10 @@ const REQUEST = {
   messages: [{ role: "user" as const, content: "hello" }],
 };
 
-// ---------------------------------------------------------------------------
-// Scripted transport for unit-level abort tests
-// ---------------------------------------------------------------------------
-
 class AbortTestTransport {
   public readonly sent: StdioFrame[] = [];
   private readonly frames: StdioFrame[];
   private readonly failWith?: Error;
-  /** Pending promise entries — call rejectAll() to clean up. */
   private readonly pendingEntries: Array<{ reject: (reason?: unknown) => void; timer: NodeJS.Timeout }> = [];
 
   constructor(frames: StdioFrame[] = [], failWith?: Error) {
@@ -44,7 +30,6 @@ class AbortTestTransport {
     this.sent.push(frame);
   }
 
-  /** Reject all pending promises to prevent dangling promise leaks in node:test. */
   rejectAll(): void {
     for (const entry of this.pendingEntries.splice(0)) {
       clearTimeout(entry.timer);
@@ -91,14 +76,9 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   return events;
 }
 
-/** Flush the microtask queue so pending rejections are processed before node:test checks. */
 async function flushMicrotasks(): Promise<void> {
   await new Promise<void>((resolve) => queueMicrotask(resolve));
 }
-
-// ---------------------------------------------------------------------------
-// provider.complete abort tests
-// ---------------------------------------------------------------------------
 
 test("provider.complete rejects immediately when AbortSignal.abort() is passed", async () => {
   const transport = new AbortTestTransport();
@@ -110,7 +90,6 @@ test("provider.complete rejects immediately when AbortSignal.abort() is passed",
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  // No frames should have been sent since abort was checked before transport I/O.
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
   await flushMicrotasks();
@@ -123,7 +102,6 @@ test("provider.complete rejects when signal is aborted during frame wait", async
 
   const completePromise = provider.complete({ ...REQUEST, options: { signal: controller.signal } });
 
-  // Allow the operation to start, then abort.
   await new Promise((resolve) => setTimeout(resolve, 5));
   controller.abort();
 
@@ -132,7 +110,6 @@ test("provider.complete rejects when signal is aborted during frame wait", async
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  // The initial envelope and the abort_request cancel should have been sent.
   assert.equal(transport.sent.length, 2);
   assert.equal(transport.sent[0]?.type, "complete_request");
   assert.equal(transport.sent[1]?.type, "abort_request");
@@ -143,8 +120,6 @@ test("provider.complete rejects when signal is aborted during frame wait", async
 test("provider.complete with AbortSignal.timeout aborts after timeout", async () => {
   const transport = new AbortTestTransport();
   const provider = createMakaiProviderApi(transport as never);
-  // Use manual AbortController + setTimeout instead of AbortSignal.timeout(5)
-  // to avoid the internal timer outliving the test boundary on Node 22 CI.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5);
   try {
@@ -159,10 +134,6 @@ test("provider.complete with AbortSignal.timeout aborts after timeout", async ()
     await flushMicrotasks();
   }
 });
-
-// ---------------------------------------------------------------------------
-// provider.stream abort tests
-// ---------------------------------------------------------------------------
 
 test("provider.stream rejects immediately when AbortSignal.abort() is passed", async () => {
   const transport = new AbortTestTransport();
@@ -180,7 +151,6 @@ test("provider.stream rejects immediately when AbortSignal.abort() is passed", a
 });
 
 test("provider.stream stops iteration when signal is aborted during streaming", async () => {
-  // Provide a few frames but not terminal — the stream should be interrupted.
   const transport = new AbortTestTransport([
     { type: "event", payload: { type: "message_start" } },
     { type: "event", payload: { type: "text_delta", delta: "hello" } },
@@ -192,7 +162,6 @@ test("provider.stream stops iteration when signal is aborted during streaming", 
   const streamPromise = (async () => {
     for await (const event of provider.stream({ ...REQUEST, options: { signal: controller.signal } })) {
       events.push(event);
-      // Abort after receiving the first event.
       controller.abort();
     }
   })();
@@ -202,7 +171,6 @@ test("provider.stream stops iteration when signal is aborted during streaming", 
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  // Should have received at least one event before abort.
   assert.ok(events.length >= 1, "expected at least one event before abort");
   transport.rejectAll();
   await flushMicrotasks();
@@ -225,10 +193,6 @@ test("provider.stream with AbortSignal.timeout aborts after timeout", async () =
     await flushMicrotasks();
   }
 });
-
-// ---------------------------------------------------------------------------
-// agent.run abort tests
-// ---------------------------------------------------------------------------
 
 test("agent.run rejects immediately when AbortSignal.abort() is passed", async () => {
   const transport = new AbortTestTransport();
@@ -260,7 +224,6 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  // The agent_start and the agent_stop cancel should have been sent.
   assert.equal(transport.sent.length, 2);
   assert.equal(transport.sent[0]?.type, "agent_start");
   assert.equal(transport.sent[0]?.sequence, 1);
@@ -271,12 +234,6 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
 });
 
 test("agent.run abort completes the sequence probe before the abort surfaces, so an immediate same-id retry is not agent_busy (#210 gap 7)", async () => {
-  // The message was ACCEPTED (server counter at 3) but its output never
-  // arrived, so the abort teardown is a two-state probe: stop@2 rejected
-  // correlated invalid_request, stop@3 accepted. Awaiting the teardown means
-  // the post-send stop is on the wire BEFORE the abort error reaches the
-  // caller — a fire-and-forget probe would let an immediate same-id retry's
-  // agent_start hit the still-registered session as agent_busy.
   const queue: StdioFrame[] = [];
   const sent: StdioFrame[] = [];
   const transport = {
@@ -286,9 +243,6 @@ test("agent.run abort completes the sequence probe before the abort surfaces, so
         queue.push({ type: "agent_started", session_id: frame.session_id, message_id: "m-started", sequence: 1, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { session_id: frame.session_id } });
       }
       if (frame.type === "agent_stop") {
-        // Real-server validation shape: the message was accepted, so the
-        // PRE-send stop is rejected correlated invalid_request and the
-        // post-send stop is accepted.
         if ((frame.sequence as number) < 3) {
           queue.push({ type: "agent_error", session_id: frame.session_id, message_id: "m-reject", sequence: 0, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: { code: "invalid_request", message: "invalid sequence" } });
         } else {
@@ -317,10 +271,6 @@ test("agent.run abort completes the sequence probe before the abort surfaces, so
     () => runPromise,
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
-  // Serialization proof: by the time the abort surfaces, the probe has run
-  // to completion — BOTH stops (the rejected pre-send 2 and the accepted
-  // post-send 3) are on the wire, so a same-id retry's agent_start cannot
-  // hit the still-registered session.
   assert.deepEqual(
     sent.map((frame) => `${frame.type}:${frame.sequence}`),
     ["agent_start:1", "agent_message:2", "agent_stop:2", "agent_stop:3"],
@@ -329,13 +279,6 @@ test("agent.run abort completes the sequence probe before the abort surfaces, so
 });
 
 test("agent.run abort cancels the abandoned session read instead of leaving it pending (#210 gap 7)", async () => {
-  // raceWithAbort rejecting is not enough: the abandoned transport read (a
-  // repliesOnly:false wait on the session route) must be ABORTED with the
-  // caller's signal — a read left pending for the response timeout could
-  // consume an immediate same-id retry's uncorrelated result or events.
-  // The fake holds each undeliverable read until its signal aborts or its
-  // timeout fires, mirroring the real transport; the assertion is that no
-  // read remains pending once the abort has surfaced.
   const queue: StdioFrame[] = [];
   let pendingReads = 0;
   const transport = {
@@ -385,10 +328,6 @@ test("agent.run abort cancels the abandoned session read instead of leaving it p
   assert.equal(pendingReads, 0, "the abandoned session read must be aborted with the caller's signal");
 });
 
-// ---------------------------------------------------------------------------
-// agent.stream abort tests
-// ---------------------------------------------------------------------------
-
 test("agent.stream rejects immediately when AbortSignal.abort() is passed", async () => {
   const transport = new AbortTestTransport();
   const agent = createMakaiAgentApi(transport as never);
@@ -416,7 +355,6 @@ test("agent.stream stops iteration when signal is aborted during streaming", asy
   const streamPromise = (async () => {
     for await (const event of agent.stream({ ...REQUEST, options: { signal: controller.signal } })) {
       events.push(event);
-      // Abort after receiving the first event.
       controller.abort();
     }
   })();
@@ -451,21 +389,15 @@ test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Resource cleanup: listener count verification
-// ---------------------------------------------------------------------------
-
 test("provider.complete removes abort listener after rejection", async () => {
   const transport = new AbortTestTransport();
   const provider = createMakaiProviderApi(transport as never);
   const controller = new AbortController();
   const signal = controller.signal;
 
-  // Count listeners before.
   const listenersBefore = listenerCount(signal);
 
   const completePromise = provider.complete({ ...REQUEST, options: { signal } });
-  // Give it time to register the listener.
   await new Promise((resolve) => setTimeout(resolve, 5));
   controller.abort();
 
@@ -474,7 +406,6 @@ test("provider.complete removes abort listener after rejection", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // After rejection, no lingering abort listeners.
   assert.equal(listenerCount(signal), listenersBefore);
   transport.rejectAll();
   await flushMicrotasks();
@@ -501,10 +432,6 @@ test("agent.stream removes abort listener after rejection", async () => {
   transport.rejectAll();
   await flushMicrotasks();
 });
-
-// ---------------------------------------------------------------------------
-// Already-aborted signal with pre-flushed transport
-// ---------------------------------------------------------------------------
 
 test("provider.stream with pre-aborted signal does not send envelope", async () => {
   const transport = new AbortTestTransport([
@@ -536,10 +463,6 @@ test("agent.run with pre-aborted signal does not send envelope", async () => {
   await flushMicrotasks();
 });
 
-// ---------------------------------------------------------------------------
-// AbortSignal does not interfere with normal completion
-// ---------------------------------------------------------------------------
-
 test("provider.complete succeeds when signal is not aborted", async () => {
   const transport = new AbortTestTransport([
     { type: "ack" },
@@ -568,10 +491,6 @@ test("provider.stream completes normally when signal is not aborted", async () =
   assert.equal(controller.signal.aborted, false);
 });
 
-// ---------------------------------------------------------------------------
-// AbortError is distinguishable from MakaiStreamError
-// ---------------------------------------------------------------------------
-
 test("abort rejection is a plain Error with name 'AbortError', not MakaiStreamError", async () => {
   const transport = new AbortTestTransport();
   const provider = createMakaiProviderApi(transport as never);
@@ -588,13 +507,7 @@ test("abort rejection is a plain Error with name 'AbortError', not MakaiStreamEr
   await flushMicrotasks();
 });
 
-// ---------------------------------------------------------------------------
-// Abort during withAuthRetry (auth_required + auto_once)
-// ---------------------------------------------------------------------------
-
 test("provider.complete withAuthRetry aborts before auth retry sends second envelope", async () => {
-  // Transport that yields an auth_required nack, then blocks (never resolves).
-  // The abort should cancel the retry without sending a second complete_request.
   const transport = new AbortTestTransport();
   transport.nextFrameForStream = async (streamId: string, _timeoutMs?: number) => {
     return {
@@ -626,13 +539,11 @@ test("provider.complete withAuthRetry aborts before auth retry sends second enve
     },
   };
   const controller = new AbortController();
-  // Abort before the retry attempt can proceed
   const completePromise = createMakaiProviderApi(transport as never, {
     auth,
     authRetryPolicy: "auto_once",
   }).complete({ ...REQUEST, options: { auth_retry_policy: "auto_once", signal: controller.signal } });
 
-  // Give time for the nack to be received and withAuthRetry to enter the login call
   await new Promise((resolve) => setTimeout(resolve, 5));
   controller.abort();
 
@@ -641,7 +552,6 @@ test("provider.complete withAuthRetry aborts before auth retry sends second enve
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Only the initial complete_request should have been sent; no retry envelope
   assert.equal(transport.sent.filter((f) => f.type === "complete_request").length, 1);
   assert.equal(auth.loginCalls, 1);
   transport.rejectAll();
@@ -693,31 +603,18 @@ test("agent.run withAuthRetry aborts before retry sends second agent_start", asy
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Only one agent_start should have been sent
   assert.equal(transport.sent.filter((f) => f.type === "agent_start").length, 1);
   assert.equal(auth.loginCalls, 1);
   transport.rejectAll();
   await flushMicrotasks();
 });
 
-// ---------------------------------------------------------------------------
-// Helper: count abort listeners on a signal
-// ---------------------------------------------------------------------------
-
 function listenerCount(signal: AbortSignal): number {
-  // Node.js AbortSignal exposes listener count via EventEmitter methods.
-  // Using the internal `_maxListeners` is fragile, so we just use the public
-  // `EventEmitter.listenerCount` if available, otherwise count manually.
   if ("listenerCount" in signal && typeof signal.listenerCount === "function") {
     return (signal as unknown as { listenerCount(event: string): number }).listenerCount("abort");
   }
-  // Fallback: no reliable way to count in all environments.
   return 0;
 }
-
-// ---------------------------------------------------------------------------
-// Cancel envelope verification tests
-// ---------------------------------------------------------------------------
 
 test("provider.complete sends abort_request cancel envelope on abort", async () => {
   const transport = new AbortTestTransport();
@@ -734,13 +631,11 @@ test("provider.complete sends abort_request cancel envelope on abort", async () 
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify abort_request was sent with correct fields
   const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
   assert.ok(cancelFrame, "expected abort_request frame");
   const payload = cancelFrame!.payload as Record<string, unknown>;
   assert.equal(typeof payload.target_stream_id, "string");
   assert.equal(payload.reason, "client aborted");
-  // target_stream_id should match the stream_id from the original complete_request
   const requestFrame = transport.sent.find((f) => f.type === "complete_request");
   assert.equal(payload.target_stream_id, requestFrame?.stream_id);
 
@@ -749,9 +644,6 @@ test("provider.complete sends abort_request cancel envelope on abort", async () 
 });
 
 test("provider.stream sends abort_request cancel envelope on abort", async () => {
-  // Use a transport that yields a start frame then a text_delta, giving time
-  // for abort to fire. The text_delta triggers a yield, then the next
-  // raceWithAbort catches the already-aborted signal.
   const transport = new AbortTestTransport();
   let frameCount = 0;
   transport.nextFrameForStream = async (streamId: string, _timeoutMs?: number) => {
@@ -759,8 +651,6 @@ test("provider.stream sends abort_request cancel envelope on abort", async () =>
     if (frameCount === 1) {
       return { stream_id: streamId, type: "event", payload: { type: "message_start" } };
     }
-    // Yield a text delta so the generator continues; abort was already called
-    // so the next raceWithAbort will catch it.
     return { stream_id: streamId, type: "event", payload: { type: "text_delta", delta: "hi" } };
   };
   const provider = createMakaiProviderApi(transport as never);
@@ -779,7 +669,6 @@ test("provider.stream sends abort_request cancel envelope on abort", async () =>
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify exactly one abort_request was sent (no triple-cancel)
   const cancelFrames = transport.sent.filter((f) => f.type === "abort_request");
   assert.equal(cancelFrames.length, 1, "expected exactly one abort_request frame");
   const payload = cancelFrames[0]!.payload as Record<string, unknown>;
@@ -806,12 +695,10 @@ test("agent.run sends agent_stop cancel envelope on abort", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify agent_stop was sent with correct fields
   const cancelFrame = transport.sent.find((f) => f.type === "agent_stop");
   assert.ok(cancelFrame, "expected agent_stop frame");
   const payload = cancelFrame!.payload as Record<string, unknown>;
   assert.equal(payload.reason, "client aborted");
-  // session_id should match the original agent_start
   const startFrame = transport.sent.find((f) => f.type === "agent_start");
   assert.equal(cancelFrame!.session_id, startFrame?.session_id);
 
@@ -820,8 +707,6 @@ test("agent.run sends agent_stop cancel envelope on abort", async () => {
 });
 
 test("agent.stream sends agent_stop cancel envelope on abort", async () => {
-  // Use a transport that yields agent_started then turn_start, giving time
-  // for abort to fire.
   const transport = new AbortTestTransport();
   let frameCount = 0;
   transport.nextFrameForSession = async (sessionId: string, _timeoutMs?: number) => {
@@ -829,7 +714,6 @@ test("agent.stream sends agent_stop cancel envelope on abort", async () => {
     if (frameCount === 1) {
       return { session_id: sessionId, type: "agent_started", payload: {} };
     }
-    // Return a non-terminal event so the generator continues
     return {
       session_id: sessionId,
       type: "agent_event",
@@ -852,7 +736,6 @@ test("agent.stream sends agent_stop cancel envelope on abort", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify exactly one agent_stop was sent (no triple-cancel)
   const cancelFrames = transport.sent.filter((f) => f.type === "agent_stop");
   assert.equal(cancelFrames.length, 1, "expected exactly one agent_stop frame");
   const payload = cancelFrames[0]!.payload as Record<string, unknown>;
@@ -871,7 +754,6 @@ test("cancel is not sent when abort occurs before transport I/O", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // No frames should have been sent (neither request nor cancel)
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
   await flushMicrotasks();
@@ -920,7 +802,6 @@ test("provider.complete withAuthRetry sends cancel on abort during auth login", 
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify abort_request was sent for the original stream
   const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
   assert.ok(cancelFrame, "expected abort_request frame from withAuthRetry onAbort");
   const payload = cancelFrame!.payload as Record<string, unknown>;
@@ -929,10 +810,6 @@ test("provider.complete withAuthRetry sends cancel on abort during auth login", 
   transport.rejectAll();
   await flushMicrotasks();
 });
-
-// ---------------------------------------------------------------------------
-// models cancel envelope verification
-// ---------------------------------------------------------------------------
 
 test("models.list sends abort_request cancel envelope on abort", async () => {
   const transport = new AbortTestTransport();
@@ -949,13 +826,11 @@ test("models.list sends abort_request cancel envelope on abort", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify abort_request was sent with correct fields
   const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
   assert.ok(cancelFrame, "expected abort_request frame");
   const payload = cancelFrame!.payload as Record<string, unknown>;
   assert.equal(typeof payload.target_stream_id, "string");
   assert.equal(payload.reason, "client aborted");
-  // target_stream_id should match the stream_id from the original models_request
   const requestFrame = transport.sent.find((f) => f.type === "models_request");
   assert.equal(payload.target_stream_id, requestFrame?.stream_id);
 

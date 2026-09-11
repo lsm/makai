@@ -63,8 +63,6 @@ fn cleanupStaleAuthTempFiles(auth_dir: std.Io.Dir) !void {
     var iter = iterable_dir.iterate();
     while (try iter.next(defaultIo())) |entry| {
         if (entry.kind == .file and isStaleAuthTempFile(entry.name, now_ms)) {
-            // Stale temp cleanup is best-effort: credential writes must not fail
-            // merely because an unrelated orphan is locked or owned by another UID.
             auth_dir.deleteFile(defaultIo(), entry.name) catch {};
         }
     }
@@ -106,8 +104,6 @@ fn atomicSaveCredentials(cwd: std.Io.Dir, dir_path: []const u8, file_path: []con
     try auth_dir.rename(tmp_name, auth_dir, auth_file_name, defaultIo());
     cleanup_tmp = false;
 
-    // Re-apply restrictive permissions after rename so the credential file is
-    // 0600 even on filesystems that do not preserve create-time permissions.
     var final_file = try compat.fs.openFile(cwd, file_path, .{ .mode = .write_only });
     defer final_file.close(defaultIo());
     final_file.setPermissions(defaultIo(), credential_file_permissions) catch |err| switch (err) {
@@ -138,7 +134,6 @@ pub const OAuthProvider = struct {
     get_api_key_fn: *const fn (credentials: Credentials, allocator: std.mem.Allocator) anyerror![]const u8,
 };
 
-/// Provider authentication storage
 pub const ProviderAuth = union(enum) {
     api_key: []const u8,
     oauth: Credentials,
@@ -188,9 +183,6 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
             const api_key = try allocator.dupe(u8, api_key_val.string);
             errdefer secureFree(allocator, api_key);
 
-            // Read region field if present (for providers like Kimi that need region-specific endpoints).
-            // `region` is only needed to build `provider_data` (which owns its own copy via
-            // allocPrint), so it is freed at the end of the scoped block below — never leaked.
             const provider_data: ?[]const u8 = blk: {
                 const r = if (provider_obj.get("region")) |region_val|
                     try allocator.dupe(u8, region_val.string)
@@ -201,8 +193,6 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
             };
             errdefer if (provider_data) |pd| allocator.free(pd);
 
-            // Store as api_key variant for pure API key auth (no region support)
-            // or as oauth with provider_data for region-aware providers like Kimi
             if (provider_data == null) {
                 try providers.put(provider_id, .{ .api_key = api_key });
             } else {
@@ -274,11 +264,9 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
                 try json_buf.appendSlice(allocator, "}");
             },
             .oauth => |creds| {
-                // Special case for API keys stored as oauth (for region support)
                 const is_api_key_style = creds.refresh.len == 0 and creds.expires == std.math.maxInt(i64);
                 var wrote_api_key_style = false;
                 if (is_api_key_style) if (creds.provider_data) |data| {
-                    // Parse region from provider_data (format: "region:<value>")
                     if (std.mem.startsWith(u8, data, "region:")) {
                         const region = data["region:".len..];
                         try json_buf.appendSlice(allocator, "{\"api_key\":");
@@ -290,7 +278,6 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
                     }
                 };
                 if (wrote_api_key_style) continue;
-                // Standard OAuth credential serialization
                 try json_buf.appendSlice(allocator, "{\"refresh\":");
                 try appendJsonString(allocator, &json_buf, creds.refresh);
                 try json_buf.appendSlice(allocator, ",\"access\":");
@@ -356,18 +343,12 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         data: ?*anyopaque,
     ) OSStatus;
     extern "c" fn CFRelease(cf: ?*const anyopaque) void;
-    /// Returns the user's default keychain (the login keychain on a standard
-    /// setup), which unlocks automatically at login. We target it explicitly so
-    /// credentials live in the login keychain rather than an arbitrary default.
     extern "c" fn SecKeychainCopyDefault(outKeychain: *?*const anyopaque) OSStatus;
 
     fn asUInt32(value: usize) !UInt32 {
         return std.math.cast(UInt32, value) orelse error.KeychainUnavailable;
     }
 
-    /// Obtain the default (login) keychain reference. The caller must CFRelease
-    /// the returned ref. Returns null (→ caller falls back to the search list)
-    /// if the keychain cannot be opened.
     fn defaultKeychain() ?*const anyopaque {
         var kc: ?*const anyopaque = null;
         const status = SecKeychainCopyDefault(&kc);
@@ -380,8 +361,6 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
-        // Target the login (default) keychain explicitly so reads come from the
-        // keychain that is already unlocked at login — avoiding a per-launch prompt.
         const kc = defaultKeychain();
         defer if (kc) |ref| CFRelease(ref);
 
@@ -411,8 +390,6 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
-        // Write to the login (default) keychain explicitly so the item lives in
-        // the keychain unlocked at login.
         const kc = defaultKeychain();
         defer if (kc) |ref| CFRelease(ref);
 
@@ -643,13 +620,11 @@ fn maybeImportCodexCliCredentials(storage: *AuthStorage) !void {
     try importCodexCliCredentials(storage, content);
 }
 
-/// Authentication storage for multiple providers
 pub const AuthStorage = struct {
     providers: std.StringHashMap(ProviderAuth),
     allocator: std.mem.Allocator,
     save_fn: ?SaveFn = null,
 
-    /// Load auth storage from ~/.makai/auth.json
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
         return loadFromFileWithSaveFn(allocator, null);
     }
@@ -666,7 +641,6 @@ pub const AuthStorage = struct {
         cleanupExistingAuthDirectory(cwd, dir_path);
 
         var file = compat.fs.openFile(cwd, path, .{}) catch {
-            // File doesn't exist, return empty storage
             return emptyStorage(allocator, save_fn);
         };
         file.close(defaultIo());
@@ -677,12 +651,6 @@ pub const AuthStorage = struct {
         return try parseAuthJson(allocator, content, save_fn);
     }
 
-    /// Load auth storage from the preferred secure backend.
-    ///
-    /// On macOS this prefers the user's Keychain and falls back to
-    /// ~/.makai/auth.json when Keychain is unavailable or does not have Makai
-    /// credentials yet. In tests and on non-macOS platforms this remains
-    /// file-backed to keep runs deterministic.
     pub fn loadDefault(allocator: std.mem.Allocator) !AuthStorage {
         if (shouldUseKeychain()) {
             switch (try loadFromKeychain(allocator)) {
@@ -705,11 +673,6 @@ pub const AuthStorage = struct {
         return storage;
     }
 
-    /// Load only Makai-owned auth storage, without importing Codex CLI
-    /// credentials from a separate keychain/file. Provider streams for plain
-    /// API-key providers only need entries saved by Makai itself; importing
-    /// unrelated Codex credentials can trigger keychain UI on background
-    /// threads before a provider request has even started.
     pub fn loadDefaultStoredOnly(allocator: std.mem.Allocator) !AuthStorage {
         if (shouldUseKeychain()) {
             switch (try loadFromKeychainWithCodexImport(allocator, false)) {
@@ -722,12 +685,6 @@ pub const AuthStorage = struct {
         return try loadFromFile(allocator);
     }
 
-    /// Save auth storage to ~/.makai/auth.json atomically.
-    ///
-    /// Atomicity: writes to a temp file (with 0o600 permissions set
-    /// *before* the rename) and then atomically renames over the target.
-    /// Concurrent readers will either see the old file or the new file —
-    /// never a partial write.
     pub fn saveToFile(self: *const AuthStorage) !void {
         const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return error.NoHomeDir;
         defer self.allocator.free(home);
@@ -784,7 +741,6 @@ pub const AuthStorage = struct {
 
         const removed = self.providers.fetchRemove(provider_id) orelse return error.AuthRequired;
         errdefer {
-            // Rollback: remove the new entry and restore the old one
             if (self.providers.fetchRemove(provider_id_copy)) |new_removed| {
                 self.allocator.free(new_removed.key);
                 new_removed.value.deinit(self.allocator);
@@ -803,8 +759,6 @@ pub const AuthStorage = struct {
         removed.value.deinit(self.allocator);
     }
 
-    /// Get API key for provider (refreshing if needed)
-    /// Note: Refresh logic requires oauth provider registry which is in parent module
     pub fn getApiKey(self: *AuthStorage, provider_id: []const u8, oauth_provider: ?OAuthProvider) !?[]const u8 {
         const auth = self.providers.get(provider_id) orelse return null;
 
@@ -826,7 +780,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Free all resources
     pub fn deinit(self: *AuthStorage) void {
         deinitProviderMap(self.allocator, &self.providers);
     }
@@ -846,13 +799,10 @@ test "AuthStorage - save and load" {
     };
     defer storage.deinit();
 
-    // Add API key auth
     const provider_id = try std.testing.allocator.dupe(u8, "test-provider");
     const api_key = try std.testing.allocator.dupe(u8, "test-key");
     try storage.providers.put(provider_id, .{ .api_key = api_key });
 
-    // Save would write to file (skipped in test)
-    // Real test would verify file contents and permissions
 }
 
 test "ProviderAuth - deinit api_key" {
@@ -937,13 +887,9 @@ test "codexKeychainAccountForHome uses Codex CLI account format" {
 }
 
 test "saveToFile writes atomically via temp file + rename" {
-    // Verify the atomic write path by writing to a temp directory
-    // and reading back the result. This tests the full cycle:
-    //   temp file → write → sync → rename → read
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Create a storage with known credentials
     var storage = AuthStorage{
         .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
         .allocator = std.testing.allocator,
@@ -965,13 +911,11 @@ test "saveToFile writes atomically via temp file + rename" {
         },
     });
 
-    // Build the JSON directly and write via temp+rename
     var json_buf = std.ArrayList(u8).empty;
     defer json_buf.deinit(std.testing.allocator);
 
     try json_buf.appendSlice(std.testing.allocator, "{\"test-provider\":{\"api_key\":\"sk-test-key-12345\"}}");
 
-    // Write via temp file + rename pattern (mirroring saveToFile)
     const tmp_path = ".auth_test.json.tmp";
     const final_path = ".auth_test.json";
 
@@ -981,7 +925,6 @@ test "saveToFile writes atomically via temp file + rename" {
     tmp_file.sync() catch {};
     try tmp_dir.dir.rename(tmp_path, final_path);
 
-    // Read back and verify
     const result_file = try tmp_dir.dir.openFile(final_path, .{});
     defer result_file.close();
     const content = try result_file.readToEndAlloc(std.testing.allocator, 1024);
@@ -1178,8 +1121,6 @@ test "oauth_storage_saveToFile_replaces_existing_file_without_requiring_temp_cle
     try std.testing.expectEqualStrings("active-writer", active_content);
 }
 
-// POSIX-only because Windows directory permission semantics do not model a
-// writable/searchable but non-readable directory in the same way.
 test "oauth_storage_saveToFile_does_not_require_directory_iteration" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 

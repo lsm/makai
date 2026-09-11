@@ -1,32 +1,21 @@
-//! Layer compositing system for z-ordered UI overlays.
-//! Manages a stack of rendered text layers and composites them
-//! into a single output with proper z-ordering and transparency.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const measure = @import("measure.zig");
 
-/// A single layer in the stack.
 pub const Layer = struct {
-    /// Rendered content string.
     content: []const u8,
-    /// X position (column offset).
     x: u16 = 0,
-    /// Y position (row offset).
     y: u16 = 0,
-    /// Z-index for ordering. Higher = on top.
     z: i16 = 0,
-    /// If true, space characters are transparent (show layer below).
     transparent: bool = true,
 };
 
-/// Composites multiple layers into a single rendered output.
 pub const LayerStack = struct {
     allocator: std.mem.Allocator,
     layers: std.array_list.Managed(Layer),
     width: u16 = 80,
     height: u16 = 24,
-    /// Background character for empty cells.
     background: u8 = ' ',
 
     pub fn init(allocator: std.mem.Allocator) LayerStack {
@@ -53,21 +42,16 @@ pub const LayerStack = struct {
         self.layers.clearRetainingCapacity();
     }
 
-    /// Composite all layers and return the final rendered string.
     pub fn render(self: *const LayerStack, allocator: std.mem.Allocator) []const u8 {
         const w: usize = self.width;
         const h: usize = self.height;
 
-        // Create cell buffer: each cell stores a byte slice (content) and ANSI state
-        // For simplicity, we use a 2D grid of cells that stores display characters
         const grid = allocator.alloc(Cell, w * h) catch return "";
 
-        // Fill with background
         for (grid) |*cell| {
             cell.* = .{ .char = self.background, .ansi_prefix = "" };
         }
 
-        // Sort layers by z-index
         const sorted = allocator.alloc(Layer, self.layers.items.len) catch return "";
         @memcpy(sorted, self.layers.items);
         std.mem.sort(Layer, sorted, {}, struct {
@@ -76,12 +60,10 @@ pub const LayerStack = struct {
             }
         }.lessThan);
 
-        // Paint each layer onto the grid
         for (sorted) |layer| {
             self.paintLayer(grid, w, h, layer);
         }
 
-        // Render grid to string
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
@@ -118,14 +100,12 @@ pub const LayerStack = struct {
                 continue;
             }
 
-            // Detect ANSI escape sequence
             if (content[i] == 0x1b and i + 1 < content.len and content[i + 1] == '[') {
                 const seq_start = i;
                 i += 2;
                 while (i < content.len and content[i] != 'm' and content[i] != 'H' and content[i] != 'J' and content[i] != 'K') : (i += 1) {}
                 if (i < content.len) {
                     i += 1;
-                    // Check if it's a reset sequence
                     if (content[seq_start + 2 .. i - 1].len == 1 and content[seq_start + 2] == '0') {
                         current_ansi = "";
                     } else {

@@ -13,8 +13,6 @@ export {
   type MakaiStdioClientOptions,
   type SessionFrameWaitOptions,
   type StdioFrame,
-  // Deprecated aliases retained under transport-specific names to avoid
-  // colliding with the unified high-level client factory options.
   type CreateMakaiClientOptions as DeprecatedCreateMakaiStdioClientOptions,
   type MakaiClientOptions as DeprecatedMakaiStdioClientOptions,
 } from "./stdio_client";
@@ -104,10 +102,6 @@ export {
 
 export {
   MakaiProtocolError,
-  // Note: `AuthStatus` and `ProviderId` are re-exported from `./auth_protocol`
-  // above. The structurally-identical aliases in `./models_types` are kept
-  // for internal use but intentionally not surfaced here to avoid duplicate
-  // member exports.
   type ApiId,
   type ListModelsRequest,
   type ListModelsResponse,

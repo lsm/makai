@@ -13,7 +13,6 @@ fn defaultIo() std.Io {
         std.Io.Threaded.global_single_threaded.io();
 }
 
-// Re-export types
 pub const AgentEvent = types.AgentEvent;
 pub const AgentEventStream = types.AgentEventStream;
 pub const AgentLoopResult = types.AgentLoopResult;
@@ -33,25 +32,19 @@ pub const GetApiKeyFn = types.GetApiKeyFn;
 pub const GetSteeringMessagesFn = types.GetSteeringMessagesFn;
 pub const GetFollowUpMessagesFn = types.GetFollowUpMessagesFn;
 
-/// Options for creating an Agent
 pub const AgentOptions = struct {
-    // Initial state
     initial_state: ?AgentState = null,
 
-    // Protocol client (required) - single interface to provider layer
     protocol: ProtocolClient,
 
-    // Message transformation
     convert_to_llm_fn: ?ConvertToLlmFn = null,
     convert_to_llm_ctx: ?*anyopaque = null,
     transform_context_fn: ?TransformContextFn = null,
     transform_context_ctx: ?*anyopaque = null,
 
-    // Queue modes
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
 
-    // Provider options
     session_id: ?[]const u8 = null,
     execute_tool_via_protocol_fn: ?types.ToolProtocolExecuteFn = null,
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
@@ -63,39 +56,30 @@ pub const AgentOptions = struct {
     permission_engine: ?*types.permission.PermissionEngine = null,
 };
 
-/// High-level Agent class that manages state, subscriptions, and message queues.
-/// Provides a stateful wrapper around the low-level agent loop.
 pub const Agent = struct {
     const ContinueRequest = struct {
         messages: []ai_types.Message,
         skip_steering: bool,
     };
 
-    // Internal state
     _state: AgentState,
     _allocator: std.mem.Allocator,
 
-    // Protocol client (single interface to provider layer)
     _protocol: ProtocolClient,
 
-    // Subscribers
     _listeners: std.ArrayList(Listener),
 
-    // Control
     _cancel_token: ?ai_types.CancelToken,
     _pending_cancel: std.atomic.Value(bool),
     _is_running: bool,
 
-    // Message queues
     _steering_queue: std.ArrayList(ai_types.Message),
     _follow_up_queue: std.ArrayList(ai_types.Message),
     _steering_mode: QueueMode,
     _follow_up_mode: QueueMode,
 
-    // Run context for skip flag (thread-safe per-agent)
     _skip_initial_steering_poll: bool,
 
-    // Configuration
     _convert_to_llm_fn: ?ConvertToLlmFn,
     _convert_to_llm_ctx: ?*anyopaque,
     _transform_context_fn: ?TransformContextFn,
@@ -111,14 +95,10 @@ pub const Agent = struct {
     _compact_tool_output: bool,
     _permission_engine: ?*types.permission.PermissionEngine,
 
-    // Async support
     _thread: ?std.Thread,
     _done_event: std.Io.Event,
     _mutex: std.Io.Mutex,
 
-    // === Lifecycle ===
-
-    /// Initialize a new Agent with the given options.
     pub fn init(allocator: std.mem.Allocator, options: AgentOptions) Agent {
         var initial_state = options.initial_state;
         if (initial_state == null) {
@@ -158,10 +138,7 @@ pub const Agent = struct {
         };
     }
 
-    /// Free all resources owned by the Agent.
-    /// Waits for any running operation to complete.
     pub fn deinit(self: *Agent) void {
-        // Wait for any running thread to complete
         if (self._thread != null) {
             self.waitForIdle();
         }
@@ -172,40 +149,30 @@ pub const Agent = struct {
             self._local_tool_protocol = null;
         }
 
-        // Clear queues
         self.clearAllQueues();
         self._steering_queue.deinit(self._allocator);
         self._follow_up_queue.deinit(self._allocator);
 
-        // Clear listeners
         self._listeners.deinit(self._allocator);
 
-        // Clear state
         self._state.deinit();
 
-        // Free session_id if owned
         if (self._session_id) |sid| {
             self._allocator.free(sid);
         }
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
-
-    // === Subscribe ===
 
     fn legacyListenerShim(ctx: ?*anyopaque, event: AgentEvent) void {
         const callback: *const fn (event: AgentEvent) void = @ptrCast(@alignCast(ctx.?));
         callback(event);
     }
 
-    /// Subscribe to agent events.
-    /// Returns a token that can be used to unsubscribe.
     pub fn subscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
         self.subscribeWithContext(@ptrCast(@constCast(callback)), legacyListenerShim);
     }
 
-    /// Subscribe to agent events with caller context.
     pub fn subscribeWithContext(
         self: *Agent,
         ctx: ?*anyopaque,
@@ -214,7 +181,6 @@ pub const Agent = struct {
         self._listeners.append(self._allocator, .{ .callback = callback, .ctx = ctx }) catch {};
     }
 
-    /// Unsubscribe from agent events.
     pub fn unsubscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
         for (self._listeners.items, 0..) |listener, i| {
             if (listener.callback == legacyListenerShim and listener.ctx == @as(?*anyopaque, @ptrCast(@constCast(callback)))) {
@@ -224,7 +190,6 @@ pub const Agent = struct {
         }
     }
 
-    /// Unsubscribe a contextual agent event listener.
     pub fn unsubscribeWithContext(self: *Agent, ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void) void {
         for (self._listeners.items, 0..) |listener, i| {
             if (listener.callback == callback and listener.ctx == ctx) {
@@ -234,14 +199,10 @@ pub const Agent = struct {
         }
     }
 
-    // === State Accessors ===
-
-    /// Get the current state (read-only view).
     pub fn state(self: Agent) AgentState {
         return self._state;
     }
 
-    /// Check if the agent is currently streaming.
     pub fn isStreaming(self: Agent) bool {
         return self._state.is_streaming;
     }
@@ -255,12 +216,10 @@ pub const Agent = struct {
         }
     };
 
-    /// Check if there are queued messages.
     pub fn hasQueuedMessages(self: Agent) bool {
         return self._steering_queue.items.len > 0 or self._follow_up_queue.items.len > 0;
     }
 
-    /// Return queued steering and follow-up counts.
     pub fn queuedCounts(self: *Agent) QueuedCounts {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -270,7 +229,6 @@ pub const Agent = struct {
         };
     }
 
-    /// Validate continueFromContext without mutating queues.
     pub fn validateContinueFromContext(self: *Agent) !void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -289,9 +247,6 @@ pub const Agent = struct {
         }
     }
 
-    // === State Mutators ===
-
-    /// Set the system prompt.
     pub fn setSystemPrompt(self: *Agent, system_prompt: []const u8) !void {
         if (self._state.system_prompt.len > 0) {
             self._allocator.free(self._state.system_prompt);
@@ -299,17 +254,14 @@ pub const Agent = struct {
         self._state.system_prompt = try self._allocator.dupe(u8, system_prompt);
     }
 
-    /// Set the model.
     pub fn setModel(self: *Agent, model: ai_types.Model) void {
         self._state.model = model;
     }
 
-    /// Set the thinking level.
     pub fn setThinkingLevel(self: *Agent, level: ai_types.ThinkingLevel) void {
         self._state.thinking_level = level;
     }
 
-    /// Set the tools.
     pub fn setTools(self: *Agent, tools: []const AgentTool) void {
         self._state.tools = tools;
     }
@@ -322,51 +274,41 @@ pub const Agent = struct {
         self._permission_engine = engine;
     }
 
-    /// Set the steering mode.
     pub fn setSteeringMode(self: *Agent, mode: QueueMode) void {
         self._steering_mode = mode;
     }
 
-    /// Get the steering mode.
     pub fn getSteeringMode(self: Agent) QueueMode {
         return self._steering_mode;
     }
 
-    /// Set the follow-up mode.
     pub fn setFollowUpMode(self: *Agent, mode: QueueMode) void {
         self._follow_up_mode = mode;
     }
 
-    /// Get the follow-up mode.
     pub fn getFollowUpMode(self: Agent) QueueMode {
         return self._follow_up_mode;
     }
 
-    /// Replace all messages with deep-cloned copies of the given slice.
     pub fn replaceMessages(self: *Agent, messages: []const ai_types.Message) !void {
-        // Clear existing messages
         for (self._state.messages.items) |*msg| {
             msg.deinit(self._allocator);
         }
         self._state.messages.clearRetainingCapacity();
 
-        // Add new messages (deep copy)
         for (messages) |msg| {
             try self._state.messages.append(self._allocator, try ai_types.cloneMessage(self._allocator, msg));
         }
     }
 
-    /// Compact older conversation history into a bounded summary message.
     pub fn compactMessages(self: *Agent) !ai_types.CompactMessagesResult {
         return try ai_types.compactMessageHistory(self._allocator, &self._state.messages);
     }
 
-    /// Append a message to the conversation.
     pub fn appendMessage(self: *Agent, message: ai_types.Message) !void {
         try self._state.messages.append(self._allocator, message);
     }
 
-    /// Clear all messages.
     pub fn clearMessages(self: *Agent) void {
         for (self._state.messages.items) |*msg| {
             msg.deinit(self._allocator);
@@ -374,27 +316,18 @@ pub const Agent = struct {
         self._state.messages.clearRetainingCapacity();
     }
 
-    // === Message Queues ===
-
-    /// Queue a steering message to interrupt the agent mid-run.
-    /// Delivered after current tool execution, skips remaining tools.
-    /// Thread-safe: can be called while agent is running.
     pub fn steer(self: *Agent, message: ai_types.Message) !void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
         try self._steering_queue.append(self._allocator, message);
     }
 
-    /// Queue a follow-up message to be processed after the agent finishes.
-    /// Delivered only when agent has no more tool calls or steering messages.
-    /// Thread-safe: can be called while agent is running.
     pub fn followUp(self: *Agent, message: ai_types.Message) !void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
         try self._follow_up_queue.append(self._allocator, message);
     }
 
-    /// Clear the steering queue.
     pub fn clearSteeringQueue(self: *Agent) void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -404,7 +337,6 @@ pub const Agent = struct {
         self._steering_queue.clearRetainingCapacity();
     }
 
-    /// Clear the follow-up queue.
     pub fn clearFollowUpQueue(self: *Agent) void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -414,7 +346,6 @@ pub const Agent = struct {
         self._follow_up_queue.clearRetainingCapacity();
     }
 
-    /// Clear all message queues.
     pub fn clearAllQueues(self: *Agent) void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -428,14 +359,6 @@ pub const Agent = struct {
         self._follow_up_queue.clearRetainingCapacity();
     }
 
-    // === Control Flow ===
-
-    /// Send a prompt to start a new conversation turn.
-    /// Accepts:
-    ///   - []const u8 (string) - creates a user message with text
-    ///   - []const ai_types.Message - array of messages
-    ///   - ai_types.Message - single message
-    /// Returns error if already streaming.
     pub fn prompt(self: *Agent, message_or_messages: anytype) !void {
         if (self._state.is_streaming) {
             return error.AgentAlreadyStreaming;
@@ -444,7 +367,6 @@ pub const Agent = struct {
         const T = @TypeOf(message_or_messages);
         const messages: []const ai_types.Message = switch (T) {
             []const u8, *const []const u8 => blk: {
-                // String input - create a user message
                 const text = if (T == *const []const u8) message_or_messages.* else message_or_messages;
                 const msg = ai_types.Message{
                     .user = .{
@@ -456,8 +378,6 @@ pub const Agent = struct {
             },
             []const ai_types.Message => message_or_messages,
             ai_types.Message => blk: {
-                // Single message - need to create a temporary array
-                // Note: caller retains ownership of the message
                 break :blk @as([]const ai_types.Message, &.{message_or_messages});
             },
             else => @compileError("prompt expects a string, Message, or []const Message"),
@@ -466,9 +386,6 @@ pub const Agent = struct {
         try self.runLoop(messages);
     }
 
-    /// Send a prompt with text and optional images.
-    /// Creates a user message with content parts (text + images).
-    /// Returns error if already streaming.
     pub fn promptWithImages(
         self: *Agent,
         text: []const u8,
@@ -478,16 +395,13 @@ pub const Agent = struct {
             return error.AgentAlreadyStreaming;
         }
 
-        // Build content parts
         var content_parts: std.ArrayList(ai_types.UserContentPart) = .empty;
         defer content_parts.deinit(self._allocator);
 
-        // Add text part
         try content_parts.append(self._allocator, .{
             .text = .{ .text = text },
         });
 
-        // Add image parts if provided
         if (images) |imgs| {
             for (imgs) |img| {
                 try content_parts.append(self._allocator, .{
@@ -506,7 +420,6 @@ pub const Agent = struct {
         try self.runLoop(&.{msg});
     }
 
-    /// Continue from current context (for retries and queued messages).
     pub fn continueFromContext(self: *Agent) !void {
         if (self._state.is_streaming) {
             return error.AgentAlreadyStreaming;
@@ -517,9 +430,7 @@ pub const Agent = struct {
             return error.NoMessagesToContinue;
         }
 
-        // Check if last message is from assistant
         if (messages[messages.len - 1] == .assistant) {
-            // First check steering queue
             if (self._steering_queue.items.len > 0) {
                 const steering = try self.dequeueSteeringMessages();
                 defer if (steering) |s| self._allocator.free(s);
@@ -532,7 +443,6 @@ pub const Agent = struct {
                 return;
             }
 
-            // Then check follow-up queue
             if (self._follow_up_queue.items.len > 0) {
                 const follow_up = try self.dequeueFollowUpMessages();
                 defer if (follow_up) |f| self._allocator.free(f);
@@ -552,7 +462,6 @@ pub const Agent = struct {
         try self.runLoopInternal(&run_messages, .{});
     }
 
-    /// Abort the current operation.
     pub fn abort(self: *Agent) void {
         self._pending_cancel.store(true, .release);
         if (self._cancel_token) |token| {
@@ -560,7 +469,6 @@ pub const Agent = struct {
         }
     }
 
-    /// Check if the agent is currently idle (not streaming).
     pub fn isIdle(self: *Agent) bool {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -590,8 +498,6 @@ pub const Agent = struct {
         return .{ .messages = try self._allocator.alloc(ai_types.Message, 0), .skip_steering = false };
     }
 
-    /// Continue from current context asynchronously.
-    /// Use waitForIdle() to block until completion.
     pub fn continueFromContextAsync(self: *Agent) !void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -620,9 +526,6 @@ pub const Agent = struct {
         self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, request.messages, request.skip_steering });
     }
 
-    /// Wait for the agent to become idle.
-    /// Blocks until the current operation completes.
-    /// Returns immediately if not streaming.
     pub fn waitForIdle(self: *Agent) void {
         self._mutex.lockUncancelable(defaultIo());
         const should_wait = self._state.is_streaming or self._thread != null;
@@ -632,7 +535,6 @@ pub const Agent = struct {
             return;
         }
 
-        // Wait for the done event (blocks until worker cleanup is complete).
         self._done_event.waitUncancelable(defaultIo());
 
         self._mutex.lockUncancelable(defaultIo());
@@ -645,9 +547,6 @@ pub const Agent = struct {
         }
     }
 
-    /// Send a prompt asynchronously. Returns immediately.
-    /// Use waitForIdle() to block until completion.
-    /// Returns error if already streaming.
     pub fn promptAsync(self: *Agent, message_or_messages: anytype) !void {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
@@ -659,16 +558,13 @@ pub const Agent = struct {
         const messages: []const ai_types.Message = switch (@TypeOf(message_or_messages)) {
             []const ai_types.Message => message_or_messages,
             ai_types.Message => blk: {
-                // Single message - need to create a temporary array
                 break :blk @as([]const ai_types.Message, &.{message_or_messages});
             },
             else => @compileError("promptAsync expects a Message or []const Message"),
         };
 
-        // Deep copy messages for thread ownership
         const owned_messages = try self.copyMessagesForThread(messages);
 
-        // Reset cancellation, done event, and streaming flag before spawning.
         self._pending_cancel.store(false, .release);
         self._cancel_token = .{ .cancelled = &self._pending_cancel };
         self._done_event.reset();
@@ -678,11 +574,9 @@ pub const Agent = struct {
             self._cancel_token = null;
         }
 
-        // Spawn thread
         self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, true });
     }
 
-    /// Deep copy messages for thread ownership
     fn copyMessagesForThread(self: *Agent, messages: []const ai_types.Message) ![]ai_types.Message {
         const owned = try self._allocator.alloc(ai_types.Message, messages.len);
         var initialized: usize = 0;
@@ -697,7 +591,6 @@ pub const Agent = struct {
         return owned;
     }
 
-    /// Clone a message with owned strings
     fn cloneMessage(self: *Agent, msg: ai_types.Message) !ai_types.Message {
         return switch (msg) {
             .user => |u| .{ .user = .{
@@ -855,7 +748,6 @@ pub const Agent = struct {
         };
     }
 
-    /// Thread entry point for async execution
     fn runLoopThread(self: *Agent, messages: []ai_types.Message, skip_steering: bool) void {
         var messages_owned = true;
         defer {
@@ -866,7 +758,6 @@ pub const Agent = struct {
             }
             self._allocator.free(messages);
 
-            // Finish worker-visible cleanup before waking waiters.
             self._mutex.lockUncancelable(defaultIo());
             self._state.is_streaming = false;
             self._mutex.unlock(defaultIo());
@@ -883,10 +774,6 @@ pub const Agent = struct {
             return;
         }
 
-        // Run the loop. runLoopInternal only clears run_messages after the
-        // prompt slice has been consumed successfully. If an error occurs before
-        // that transfer, messages_owned remains true and the thread cleanup
-        // frees the cloned payloads here.
         self.runLoopInternal(
             &run_messages,
             .{ .skip_initial_steering_poll = skip_steering },
@@ -894,7 +781,6 @@ pub const Agent = struct {
         messages_owned = run_messages != null;
     }
 
-    /// Reset all state (clear messages, queues, error).
     pub fn reset(self: *Agent) void {
         self.clearMessages();
         self.clearAllQueues();
@@ -904,8 +790,6 @@ pub const Agent = struct {
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
     }
-
-    // === Internal ===
 
     const RunLoopOptions = struct {
         skip_initial_steering_poll: bool = false,
@@ -923,8 +807,6 @@ pub const Agent = struct {
     ) !void {
         const model = self._state.model orelse return error.NoModelConfigured;
 
-        // Set up cancel token. promptAsync/continueFromContextAsync install this
-        // before spawning so immediate aborts reach provider options.
         if (self._cancel_token == null) {
             self._cancel_token = .{ .cancelled = &self._pending_cancel };
         }
@@ -938,19 +820,14 @@ pub const Agent = struct {
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
 
-        // Set skip flag for this run (stored in agent, not global)
         self._skip_initial_steering_poll = options.skip_initial_steering_poll;
 
-        // Build context
         var context = AgentContext.init(self._allocator);
         defer context.deinit();
 
         context.system_prompt = types.OwnedSlice(u8).initBorrowed(self._state.system_prompt);
         context.tools = self._state.tools;
 
-        // Copy existing state messages into the loop context. AgentContext owns
-        // its messages and frees them on deinit, while AgentState also owns its
-        // history, so context must receive independent clones.
         for (self._state.messages.items) |msg| {
             var cloned = try self.cloneMessage(msg);
             errdefer cloned.deinit(self._allocator);
@@ -969,7 +846,6 @@ pub const Agent = struct {
             }
         }
 
-        // Build config. Agent remains auth-agnostic; provider layer owns credentials.
         const config = agent_loop.AgentLoopConfig{
             .model = model,
             .protocol = self._protocol,
@@ -999,11 +875,8 @@ pub const Agent = struct {
             .get_api_key_ctx = self._get_api_key_ctx,
         };
 
-        // Track how many messages context has before the loop so we can tell
-        // whether any prompts were actually consumed.
         const initial_message_count = context.messages.items.len;
 
-        // Run loop
         const stream = if (messages.*) |msgs|
             try agent_loop.agentLoop(self._allocator, msgs, &context, config)
         else
@@ -1014,12 +887,10 @@ pub const Agent = struct {
             self._allocator.destroy(stream);
         }
 
-        // Process events
         while (stream.wait()) |event| {
             var owned_event = event;
             defer owned_event.deinit(self._allocator);
 
-            // Update internal state based on events
             switch (owned_event) {
                 .message_start => |e| {
                     try self.setStreamMessage(e.message);
@@ -1028,8 +899,6 @@ pub const Agent = struct {
                     try self.setStreamMessage(.{ .assistant = e.message });
                 },
                 .message_end => |e| {
-                    // Add an owned copy to Agent state; event payloads may be borrowed
-                    // from loop context/provider buffers and are freed elsewhere.
                     var cloned_message = try self.cloneMessage(e.message);
                     errdefer cloned_message.deinit(self._allocator);
                     try self._state.messages.append(self._allocator, cloned_message);
@@ -1054,23 +923,13 @@ pub const Agent = struct {
                 else => {},
             }
 
-            // Emit to listeners
             self.emit(owned_event);
         }
 
-        // Transfer ownership if any prompts were actually consumed (appended to
-        // context). This avoids a double-free when consumed prompts were
-        // shallow-copied into context, while still letting the caller clean up
-        // unconsumed prompts on early failure.
         if (context.messages.items.len > initial_message_count) {
             messages.* = null;
         }
 
-        // Surface background-loop errors so callers do not receive ok when the
-        // agent loop aborted. completeWithError sets err_msg; complete(result)
-        // with an error stop_reason is checked via getResult(); a completed
-        // stream with neither result nor error (e.g., OOM in completeWithError)
-        // is also treated as failure.
         if (stream.getError() != null) {
             self._state.is_streaming = false;
             self._cancel_token = null;
@@ -1152,13 +1011,10 @@ pub const Agent = struct {
         return try self.dequeueFollowUpMessagesLocked();
     }
 
-    // === Static Callbacks ===
-
     fn getSteeringMessages(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!?[]ai_types.Message {
-        _ = allocator; // Used by dequeueSteeringMessages internally
+        _ = allocator;
         const self: *Agent = @ptrCast(@alignCast(ctx));
 
-        // Check skip flag stored in agent instance (thread-safe per-agent)
         if (self._skip_initial_steering_poll) {
             self._skip_initial_steering_poll = false;
             return null;
@@ -1168,17 +1024,12 @@ pub const Agent = struct {
     }
 
     fn getFollowUpMessages(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!?[]ai_types.Message {
-        _ = allocator; // Used by dequeueFollowUpMessages
+        _ = allocator;
         const self: *Agent = @ptrCast(@alignCast(ctx));
         return self.dequeueFollowUpMessages();
     }
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-// Mock protocol for testing - just returns an error since we're testing state management
 fn mockStreamFn(
     ctx: ?*anyopaque,
     model: ai_types.Model,
@@ -1216,7 +1067,6 @@ test "Agent setSystemPrompt" {
     try agent.setSystemPrompt("You are helpful.");
     try std.testing.expectEqualStrings("You are helpful.", agent._state.system_prompt);
 
-    // Overwrite
     try agent.setSystemPrompt("New prompt");
     try std.testing.expectEqualStrings("New prompt", agent._state.system_prompt);
 }
@@ -1225,8 +1075,6 @@ test "Agent message queues" {
     var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
-    // Use owned strings since clearAllQueues will try to free them
-    // Create separate messages for each queue to avoid double-free
     const text1 = try std.testing.allocator.dupe(u8, "test1");
     const msg1 = ai_types.Message{
         .user = .{
@@ -1268,8 +1116,6 @@ test "Agent reset" {
     var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
-    // Use owned strings since reset will try to free them
-    // Create separate messages for each queue to avoid double-free
     const text1 = try std.testing.allocator.dupe(u8, "test1");
     const msg1 = ai_types.Message{
         .user = .{
@@ -1302,7 +1148,6 @@ test "Agent subscribe and unsubscribe" {
     const callback = struct {
         fn onEvent(event: AgentEvent) void {
             _ = event;
-            // Increment would need external state - this is just a compile check
         }
     }.onEvent;
 
@@ -1317,13 +1162,10 @@ test "Agent isIdle and waitForIdle" {
     var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
-    // Agent starts idle
     try std.testing.expect(agent.isIdle());
 
-    // waitForIdle should return immediately when idle
     agent.waitForIdle();
 
-    // Still idle after waitForIdle
     try std.testing.expect(agent.isIdle());
 }
 

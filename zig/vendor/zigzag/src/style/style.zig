@@ -1,5 +1,3 @@
-//! Style struct for terminal text styling (Lipgloss equivalent).
-//! Provides a builder pattern for composing styles.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -14,7 +12,6 @@ pub const Color = color_mod.Color;
 pub const BorderChars = border_mod.BorderChars;
 pub const Sides = border_mod.Sides;
 
-/// Padding/Margin specification
 pub const Spacing = struct {
     top: u16 = 0,
     right: u16 = 0,
@@ -38,21 +35,18 @@ pub const Spacing = struct {
     }
 };
 
-/// Text alignment
 pub const Align = enum {
     left,
     center,
     right,
 };
 
-/// Vertical alignment
 pub const VAlign = enum {
     top,
     middle,
     bottom,
 };
 
-/// Built-in text transform functions
 pub const transforms = struct {
     pub fn uppercase(allocator: std.mem.Allocator, text: []const u8) []const u8 {
         const result = allocator.alloc(u8, text.len) catch return text;
@@ -71,13 +65,10 @@ pub const transforms = struct {
     }
 };
 
-/// Style definition with builder pattern
 pub const Style = struct {
-    // Colors
     foreground: Color = .none,
     background: Color = .none,
 
-    // Text attributes (nullable for unset semantics)
     bold_attr: ?bool = null,
     dim_attr: ?bool = null,
     italic_attr: ?bool = null,
@@ -86,17 +77,14 @@ pub const Style = struct {
     reverse_attr: ?bool = null,
     strikethrough_attr: ?bool = null,
 
-    // Spacing
     padding_val: Spacing = .{},
     margin_val: Spacing = .{},
 
-    // Border
     border_style: BorderChars = .none,
     border_sides: Sides = .none,
     border_fg: Color = .none,
     border_bg: Color = .none,
 
-    // Per-side border colors
     border_top_fg: Color = .none,
     border_top_bg: Color = .none,
     border_right_fg: Color = .none,
@@ -106,39 +94,30 @@ pub const Style = struct {
     border_left_fg: Color = .none,
     border_left_bg: Color = .none,
 
-    // Margin background
     margin_bg: Color = .none,
 
-    // Tab width
     tab_width_val: ?u8 = null,
 
-    // Size constraints
     width_val: ?u16 = null,
     height_val: ?u16 = null,
     max_width_val: ?u16 = null,
     max_height_val: ?u16 = null,
 
-    // Alignment
     align_horizontal: Align = .left,
     align_vertical: VAlign = .top,
 
-    // Inline (no newlines)
     inline_mode: bool = false,
 
-    // Transform function
     transform_fn: ?*const fn (std.mem.Allocator, []const u8) []const u8 = null,
 
-    // Text overflow
     overflow_mode: Overflow = .visible,
 
-    // Whitespace formatting controls
     underline_spaces: bool = false,
     strikethrough_spaces: bool = false,
     color_whitespace: bool = true,
 
     const Self = @This();
 
-    // Color setters
     pub fn foreground_color(self: Self, c: Color) Self {
         var s = self;
         s.foreground = c;
@@ -159,7 +138,6 @@ pub const Style = struct {
         return self.background_color(c);
     }
 
-    // Text attribute setters
     pub fn bold(self: Self, v: bool) Self {
         var s = self;
         s.bold_attr = v;
@@ -202,7 +180,6 @@ pub const Style = struct {
         return s;
     }
 
-    // Unset methods
     pub fn unsetBold(self: Self) Self {
         var s = self;
         s.bold_attr = null;
@@ -310,7 +287,6 @@ pub const Style = struct {
         return s;
     }
 
-    // Spacing setters
     pub fn padding(self: Self, p: Spacing) Self {
         var s = self;
         s.padding_val = p;
@@ -379,7 +355,6 @@ pub const Style = struct {
         return s;
     }
 
-    // Border setters
     pub fn border(self: Self, chars: BorderChars, sides: Sides) Self {
         var s = self;
         s.border_style = chars;
@@ -463,7 +438,6 @@ pub const Style = struct {
         return s;
     }
 
-    // Size setters
     pub fn width(self: Self, w: u16) Self {
         var s = self;
         s.width_val = w;
@@ -488,14 +462,12 @@ pub const Style = struct {
         return s;
     }
 
-    // Overflow setter
     pub fn overflow(self: Self, mode: Overflow) Self {
         var s = self;
         s.overflow_mode = mode;
         return s;
     }
 
-    // Alignment setters
     pub fn alignH(self: Self, a: Align) Self {
         var s = self;
         s.align_horizontal = a;
@@ -508,21 +480,18 @@ pub const Style = struct {
         return s;
     }
 
-    // Inline mode
     pub fn inline_style(self: Self, v: bool) Self {
         var s = self;
         s.inline_mode = v;
         return s;
     }
 
-    // Transform setter
     pub fn transform(self: Self, func: *const fn (std.mem.Allocator, []const u8) []const u8) Self {
         var s = self;
         s.transform_fn = func;
         return s;
     }
 
-    // Whitespace formatting control setters
     pub fn setUnderlineSpaces(self: Self, v: bool) Self {
         var s = self;
         s.underline_spaces = v;
@@ -541,7 +510,6 @@ pub const Style = struct {
         return s;
     }
 
-    /// Inherit unset values from another style
     pub fn inherit(self: Self, other: Self) Self {
         var s = self;
         if (s.foreground == .none) s.foreground = other.foreground;
@@ -571,13 +539,10 @@ pub const Style = struct {
         return s;
     }
 
-    /// Render styled text
     pub fn render(self: Self, allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         defer result.deinit();
 
-        // Preprocess tabs if tab_width is set. Only allocate the scratch
-        // buffer when expansion is actually needed.
         var processed_text = text;
         if (self.tab_width_val) |tw| {
             var buf: Writer.Allocating = .init(allocator);
@@ -594,12 +559,10 @@ pub const Style = struct {
             processed_text = try buf.toOwnedSlice();
         }
 
-        // Apply transform function
         if (self.transform_fn) |tf| {
             processed_text = tf(allocator, processed_text);
         }
 
-        // Apply overflow policy before dimension calculation
         if (self.overflow_mode != .visible) {
             const ow = self.width_val orelse (self.max_width_val orelse 0);
             if (ow > 0) {
@@ -607,11 +570,9 @@ pub const Style = struct {
             }
         }
 
-        // Calculate content dimensions
         const content_width = measure.width(processed_text);
         const content_height = measure.height(processed_text);
 
-        // Apply size constraints
         var target_width = content_width;
         var target_height = content_height;
 
@@ -620,17 +581,14 @@ pub const Style = struct {
         if (self.max_width_val) |mw| target_width = @min(target_width, mw);
         if (self.max_height_val) |mh| target_height = @min(target_height, mh);
 
-        // Add padding to target dimensions
         target_width += self.padding_val.left + self.padding_val.right;
         target_height += self.padding_val.top + self.padding_val.bottom;
 
-        // Add border width
         if (self.border_sides.left) target_width += 1;
         if (self.border_sides.right) target_width += 1;
         if (self.border_sides.top) target_height += 1;
         if (self.border_sides.bottom) target_height += 1;
 
-        // Write margin top
         for (0..self.margin_val.top) |_| {
             try self.writeMarginLeft(&result.writer);
             if (!self.margin_bg.isNone()) {
@@ -644,10 +602,8 @@ pub const Style = struct {
             try result.writer.writeByte('\n');
         }
 
-        // Build styled content
         try self.writeStyledContent(&result.writer, processed_text, target_width, target_height);
 
-        // Write margin bottom
         for (0..self.margin_val.bottom) |_| {
             try result.writer.writeByte('\n');
             try self.writeMarginLeft(&result.writer);
@@ -683,10 +639,8 @@ pub const Style = struct {
 
         _ = inner_height;
 
-        // Start style
         try self.writeStyleStart(writer);
 
-        // Top border
         if (self.border_sides.top) {
             try self.writeMarginLeft(writer);
             try self.writeBorderColorSide(writer, .top);
@@ -700,23 +654,19 @@ pub const Style = struct {
             if (!self.inline_mode) try writer.writeByte('\n');
         }
 
-        // Padding top
         for (0..self.padding_val.top) |_| {
             try self.writeContentLine(writer, "", inner_width);
         }
 
-        // Content lines
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             try self.writeContentLine(writer, line, inner_width);
         }
 
-        // Padding bottom
         for (0..self.padding_val.bottom) |_| {
             try self.writeContentLine(writer, "", inner_width);
         }
 
-        // Bottom border
         if (self.border_sides.bottom) {
             try self.writeMarginLeft(writer);
             try self.writeBorderColorSide(writer, .bottom);
@@ -730,7 +680,6 @@ pub const Style = struct {
         }
     }
 
-    /// Check if whitespace-aware rendering is needed
     fn needsWhitespaceAwareRendering(self: Self) bool {
         return (!self.color_whitespace and !self.background.isNone()) or
             (self.underline_spaces and (self.underline_attr orelse false)) or
@@ -740,27 +689,22 @@ pub const Style = struct {
     fn writeContentLine(self: Self, writer: *Writer, line: []const u8, inner_width: usize) !void {
         try self.writeMarginLeft(writer);
 
-        // Left border
         if (self.border_sides.left) {
             try self.writeBorderColorSide(writer, .left);
             try writer.writeAll(self.border_style.vertical);
             try writer.writeAll(ansi.reset);
         }
 
-        // Start content style
         try self.writeStyleStart(writer);
 
-        // Left padding
         for (0..self.padding_val.left) |_| {
             try writer.writeByte(' ');
         }
 
-        // Content with alignment
         const line_width = measure.width(line);
         const content_pad = if (inner_width > line_width) inner_width - line_width else 0;
 
         if (self.needsWhitespaceAwareRendering()) {
-            // Whitespace-aware rendering: toggle attributes around spaces
             switch (self.align_horizontal) {
                 .left => {
                     try self.writeWithWhitespaceControl(writer, line);
@@ -806,22 +750,18 @@ pub const Style = struct {
             }
         }
 
-        // Right padding
         for (0..self.padding_val.right) |_| {
             try writer.writeByte(' ');
         }
 
-        // Reset style
         try writer.writeAll(ansi.reset);
 
-        // Right border
         if (self.border_sides.right) {
             try self.writeBorderColorSide(writer, .right);
             try writer.writeAll(self.border_style.vertical);
             try writer.writeAll(ansi.reset);
         }
 
-        // Right margin
         const total_content_width = inner_width + self.padding_val.left + self.padding_val.right +
             @as(usize, if (self.border_sides.left) 1 else 0) +
             @as(usize, if (self.border_sides.right) 1 else 0);
@@ -830,7 +770,6 @@ pub const Style = struct {
         if (!self.inline_mode) try writer.writeByte('\n');
     }
 
-    /// Write text with per-character whitespace attribute control
     fn writeWithWhitespaceControl(self: Self, writer: *Writer, text: []const u8) !void {
         var i: usize = 0;
         while (i < text.len) {
@@ -840,10 +779,8 @@ pub const Style = struct {
             const is_space = ch.len == 1 and ch[0] == ' ';
 
             if (is_space) {
-                // For spaces: conditionally disable/enable attributes
                 if (!self.color_whitespace and !self.background.isNone()) {
                     try writer.writeAll(ansi.reset);
-                    // Re-emit attributes that should apply to spaces
                     if (self.underline_spaces and (self.underline_attr orelse false)) {
                         try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.underline});
                     }
@@ -851,10 +788,8 @@ pub const Style = struct {
                         try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.strikethrough});
                     }
                     try writer.writeByte(' ');
-                    // Restore full style
                     try self.writeStyleStart(writer);
                 } else {
-                    // Color whitespace is on, but check underline/strikethrough
                     if (!self.underline_spaces and (self.underline_attr orelse false)) {
                         try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.no_underline});
                     }
@@ -862,7 +797,6 @@ pub const Style = struct {
                         try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.no_strikethrough});
                     }
                     try writer.writeByte(' ');
-                    // Restore
                     if (!self.underline_spaces and (self.underline_attr orelse false)) {
                         try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.underline});
                     }
@@ -878,7 +812,6 @@ pub const Style = struct {
         }
     }
 
-    /// Write N spaces with whitespace control
     fn writeSpacesWithControl(self: Self, writer: *Writer, count: usize) !void {
         if (count == 0) return;
         if (!self.color_whitespace and !self.background.isNone()) {
@@ -966,27 +899,23 @@ pub const Style = struct {
         try self.border_bg.writeBg(writer);
     }
 
-    /// Copy style
     pub fn copy(self: Self) Self {
         return self;
     }
 };
 
-/// Style range for applying different styles to byte ranges
 pub const StyleRange = struct {
     start: usize,
     end: usize,
     s: Style,
 };
 
-/// Render text with different styles applied to specific byte ranges
 pub fn renderWithRanges(allocator: std.mem.Allocator, text: []const u8, ranges: []const StyleRange) ![]const u8 {
     var result: Writer.Allocating = .init(allocator);
     const writer = &result.writer;
 
     var pos: usize = 0;
     while (pos < text.len) {
-        // Find if this position is in a range
         var found_range: ?StyleRange = null;
         for (ranges) |r| {
             if (pos >= r.start and pos < r.end) {
@@ -1002,7 +931,6 @@ pub fn renderWithRanges(allocator: std.mem.Allocator, text: []const u8, ranges: 
             try writer.writeAll(styled);
             pos = end;
         } else {
-            // Find next range start or end of text
             var next_start: usize = text.len;
             for (ranges) |r| {
                 if (r.start > pos and r.start < next_start) {
@@ -1017,7 +945,6 @@ pub fn renderWithRanges(allocator: std.mem.Allocator, text: []const u8, ranges: 
     return result.toOwnedSlice();
 }
 
-/// Render text with specific byte positions highlighted
 pub fn renderWithHighlights(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -1029,11 +956,10 @@ pub fn renderWithHighlights(
     const writer = &result.writer;
 
     var pos: usize = 0;
-    var pi: usize = 0; // position index
+    var pi: usize = 0;
 
     while (pos < text.len) {
         if (pi < positions.len and pos == positions[pi]) {
-            // Highlighted character
             const byte_len = std.unicode.utf8ByteSequenceLength(text[pos]) catch 1;
             const end = @min(pos + byte_len, text.len);
             const ch = text[pos..end];
@@ -1042,7 +968,6 @@ pub fn renderWithHighlights(
             pos = end;
             pi += 1;
         } else {
-            // Find next highlight position or end of text
             var next_pos: usize = text.len;
             if (pi < positions.len) {
                 next_pos = @min(positions[pi], text.len);

@@ -4,14 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main library module
     const zigzag_mod = b.addModule("zigzag", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Examples
     const examples = [_][]const u8{
         "hello_world",
         "counter",
@@ -88,7 +86,6 @@ pub fn build(b: *std.Build) void {
         run_step.dependOn(&run_cmd.step);
     }
 
-    // Tests
     const test_files = [_][]const u8{
         "tests/style_tests.zig",
         "tests/input_tests.zig",
@@ -117,11 +114,8 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    // The Zig package tarball contains the library sources but not the
-    // standalone tests listed above, so run the library tests below.
     _ = test_files;
 
-    // Also run tests on the main library
     const lib_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
@@ -132,7 +126,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
     test_step.dependOn(&run_lib_tests.step);
 
-    // WASM library build (for browser-based terminals)
     const wasm_step = b.step("wasm", "Build ZigZag as a WASM library");
 
     const wasm_target = b.resolveTargetQuery(.{

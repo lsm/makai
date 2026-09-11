@@ -1,23 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 
-/// Check if an AssistantMessage represents a context overflow error.
-///
-/// Provider-specific patterns to detect:
-/// - Anthropic: "prompt is too long"
-/// - OpenAI: "exceeds the context window"
-/// - Google: "input token count.*exceeds the maximum"
-/// - xAI: "maximum prompt length is"
-/// - Groq: "reduce the length"
-/// - OpenRouter: "maximum context length"
-/// - Cerebras/Mistral: "400/413 status code (no body)"
-/// - GitHub Copilot: "exceeds the limit"
-/// - llama.cpp: "exceeds the available context"
-/// - LM Studio: "greater than the context length"
-/// - MiniMax: "context window exceeds limit"
-/// - Kimi: "exceeded model token limit"
 pub fn isContextOverflow(message: ai_types.AssistantMessage, context_window: ?u64) bool {
-    // Case 1: Check error message patterns
     if (message.stop_reason == .@"error") {
         if (message.getErrorMessage()) |err_msg| {
             if (matchesOverflowPattern(err_msg)) {
@@ -26,7 +10,6 @@ pub fn isContextOverflow(message: ai_types.AssistantMessage, context_window: ?u6
         }
     }
 
-    // Case 2: Silent overflow (z.ai style) - successful but usage exceeds context
     if (context_window) |window| {
         if (message.stop_reason == .stop) {
             const input_tokens = message.usage.input + message.usage.cache_read;
@@ -39,69 +22,47 @@ pub fn isContextOverflow(message: ai_types.AssistantMessage, context_window: ?u6
     return false;
 }
 
-/// Check if error message matches known overflow patterns
 fn matchesOverflowPattern(err_msg: []const u8) bool {
-    // Use std.mem.findPosScalar for case-insensitive matching
-    // We use std.ascii.lower to do case-insensitive comparisons
 
-    // Anthropic: "prompt is too long"
     if (indexOfCaseInsensitive(err_msg, "prompt is too long")) |_| return true;
 
-    // Amazon Bedrock: "input is too long for requested model"
     if (indexOfCaseInsensitive(err_msg, "input is too long for requested model")) |_| return true;
 
-    // OpenAI: "exceeds the context window"
     if (indexOfCaseInsensitive(err_msg, "exceeds the context window")) |_| return true;
 
-    // Google: "input token count" + "exceeds the maximum"
     if (indexOfCaseInsensitive(err_msg, "input token count")) |_| {
         if (indexOfCaseInsensitive(err_msg, "exceeds the maximum")) |_| return true;
     }
 
-    // xAI: "maximum prompt length is"
     if (indexOfCaseInsensitive(err_msg, "maximum prompt length is")) |_| return true;
 
-    // Groq: "reduce the length of the messages"
     if (indexOfCaseInsensitive(err_msg, "reduce the length of the messages")) |_| return true;
 
-    // OpenRouter: "maximum context length is"
     if (indexOfCaseInsensitive(err_msg, "maximum context length is")) |_| return true;
 
-    // GitHub Copilot: "exceeds the limit of"
     if (indexOfCaseInsensitive(err_msg, "exceeds the limit of")) |_| return true;
 
-    // llama.cpp: "exceeds the available context size"
     if (indexOfCaseInsensitive(err_msg, "exceeds the available context size")) |_| return true;
 
-    // LM Studio: "greater than the context length"
     if (indexOfCaseInsensitive(err_msg, "greater than the context length")) |_| return true;
 
-    // MiniMax: "context window exceeds limit"
     if (indexOfCaseInsensitive(err_msg, "context window exceeds limit")) |_| return true;
 
-    // Kimi: "exceeded model token limit"
     if (indexOfCaseInsensitive(err_msg, "exceeded model token limit")) |_| return true;
 
-    // Generic fallbacks
-    // "context_length_exceeded" or "context length exceeded"
     if (indexOfCaseInsensitive(err_msg, "context_length_exceeded")) |_| return true;
     if (indexOfCaseInsensitive(err_msg, "context length exceeded")) |_| return true;
 
-    // "too many tokens"
     if (indexOfCaseInsensitive(err_msg, "too many tokens")) |_| return true;
 
-    // "token limit exceeded"
     if (indexOfCaseInsensitive(err_msg, "token limit exceeded")) |_| return true;
 
-    // Cerebras and Mistral return 400/413 with no body for context overflow
-    // Note: 429 is rate limiting, NOT context overflow
     if (matchesStatusNoBody(err_msg, "400")) return true;
     if (matchesStatusNoBody(err_msg, "413")) return true;
 
     return false;
 }
 
-/// Case-insensitive substring search
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len > haystack.len) return null;
 
@@ -119,11 +80,8 @@ fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-/// Check for "400/413 status code (no body)" pattern
 fn matchesStatusNoBody(err_msg: []const u8, status_code: []const u8) bool {
-    // Pattern: "400 (no body)" or "400 status code (no body)" or "413 (no body)"
     if (indexOfCaseInsensitive(err_msg, status_code)) |idx| {
-        // Check if followed by "(no body)" (possibly with "status code" in between)
         const rest = err_msg[idx + status_code.len ..];
         if (indexOfCaseInsensitive(rest, "(no body)")) |_| return true;
         if (indexOfCaseInsensitive(rest, "status code (no body)")) |_| return true;
@@ -267,19 +225,17 @@ test "isContextOverflow detects silent overflow with context_window" {
         .provider = "zai",
         .model = "model-x",
         .usage = .{ .input = 250000, .cache_read = 10000 },
-        .stop_reason = .stop, // Successful response
+        .stop_reason = .stop,
         .error_message = ai_types.OwnedSlice(u8).initBorrowed(""),
         .timestamp = 0,
     };
 
-    // Input + cache_read = 260000 > 200000 context window
     try std.testing.expect(isContextOverflow(message, 200000));
 }
 
 test "isContextOverflow returns false for normal errors" {
     const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "" } }};
 
-    // Rate limit error (429) - should NOT be detected as overflow
     const rate_limit_msg = ai_types.AssistantMessage{
         .content = &content,
         .api = "openai-completions",
@@ -287,12 +243,11 @@ test "isContextOverflow returns false for normal errors" {
         .model = "gpt-4o",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = ai_types.OwnedSlice(u8).initBorrowed("429 status code (no body)"), // Rate limiting
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("429 status code (no body)"),
         .timestamp = 0,
     };
     try std.testing.expect(!isContextOverflow(rate_limit_msg, null));
 
-    // Generic API error
     const api_error_msg = ai_types.AssistantMessage{
         .content = &content,
         .api = "anthropic-messages",
@@ -305,7 +260,6 @@ test "isContextOverflow returns false for normal errors" {
     };
     try std.testing.expect(!isContextOverflow(api_error_msg, null));
 
-    // Normal successful response within context window
     const success_msg = ai_types.AssistantMessage{
         .content = &content,
         .api = "openai-completions",
@@ -322,7 +276,6 @@ test "isContextOverflow returns false for normal errors" {
 test "isContextOverflow case insensitive matching" {
     const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "" } }};
 
-    // Test uppercase
     const uppercase_msg = ai_types.AssistantMessage{
         .content = &content,
         .api = "anthropic-messages",
@@ -335,7 +288,6 @@ test "isContextOverflow case insensitive matching" {
     };
     try std.testing.expect(isContextOverflow(uppercase_msg, null));
 
-    // Test mixed case
     const mixedcase_msg = ai_types.AssistantMessage{
         .content = &content,
         .api = "openai-completions",

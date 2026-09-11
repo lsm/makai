@@ -1,12 +1,9 @@
-//! Styled list component for rendering lists with various enumerators.
-//! Non-interactive rendering-only list with bullet, numbered, roman, alphabet enumerators.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 
-/// Enumerator type for list items
 pub const EnumeratorType = enum {
     bullet,
     arabic,
@@ -52,7 +49,6 @@ pub const StyledList = struct {
         self.items.deinit();
     }
 
-    /// Add an item at depth 0
     pub fn addItem(self: *StyledList, text: []const u8) !void {
         try self.items.append(.{
             .text = text,
@@ -61,7 +57,6 @@ pub const StyledList = struct {
         });
     }
 
-    /// Add an item at specified depth
     pub fn addItemNested(self: *StyledList, text: []const u8, depth: usize) !void {
         try self.items.append(.{
             .text = text,
@@ -70,40 +65,33 @@ pub const StyledList = struct {
         });
     }
 
-    /// Set the enumerator type
     pub fn setEnumerator(self: *StyledList, e: EnumeratorType) void {
         self.enumerator_type = e;
     }
 
-    /// Render the list
     pub fn view(self: *const StyledList, allocator: std.mem.Allocator) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Track counters per depth level
         var counters: [16]usize = @splat(0);
 
         for (self.items.items, 0..) |item, i| {
             if (i > 0) try writer.writeAll("\n");
 
-            // Reset deeper counters when going to a shallower depth
             const depth = @min(item.depth, 15);
             for (depth + 1..16) |d| {
                 counters[d] = 0;
             }
             counters[depth] += 1;
 
-            // Indent
             for (0..depth) |_| {
                 try writer.writeAll("  ");
             }
 
-            // Enumerator
             const enum_str = try self.formatEnumerator(allocator, counters[depth]);
             const styled_enum = try self.enumerator_style.render(allocator, enum_str);
             try writer.writeAll(styled_enum);
 
-            // Item text
             const active_style = item.style_override orelse self.item_style;
             const styled_text = try active_style.render(allocator, item.text);
             try writer.writeAll(styled_text);
@@ -131,7 +119,6 @@ pub const StyledList = struct {
     }
 };
 
-/// Convert number to Roman numerals
 pub fn toRoman(allocator: std.mem.Allocator, n: usize) ![]const u8 {
     if (n == 0) return try allocator.dupe(u8, "0");
 
@@ -151,7 +138,6 @@ pub fn toRoman(allocator: std.mem.Allocator, n: usize) ![]const u8 {
     return result.toOwnedSlice();
 }
 
-/// Convert number to alphabetical representation (1=a, 2=b, ..., 26=z, 27=aa)
 pub fn toAlpha(allocator: std.mem.Allocator, n: usize) ![]const u8 {
     if (n == 0) return try allocator.dupe(u8, "?");
 

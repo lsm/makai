@@ -181,17 +181,10 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
     if (parseRemoteTransport(transport_name)) |remote_transport| {
         result.transport = remote_transport;
     } else {
-        // Invalid hand-edited transport values must not fall back to stdio while
-        // remote remains enabled; that would bind the protocol to the TUI's own
-        // stdin/stdout. Fall back to local mode instead.
         result.transport = .stdio;
         result.mode = .local;
     }
 
-    // Stdio subprocess spawning and WebSocket are not wired up yet. If a
-    // hand-edited/legacy config enables either transport, gracefully fall back to
-    // local mode so the TUI launches instead of binding protocol I/O to the
-    // TUI's own stdio or aborting on an unsupported backend.
     if (result.transport == .stdio or result.transport == .websocket) {
         result.mode = .local;
     }
@@ -343,9 +336,6 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
     dropped_event_count: u64 = 0,
     dropped_since_warning: u64 = 0,
-    /// Monotonic generation counter incremented at the start of each turn. Events
-    /// are stamped with the current generation so the TUI can distinguish stale
-    /// events from a cancelled run from fresh events belonging to a new turn.
     current_generation: u32 = 0,
     backpressure_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     backpressure_status_active_emitted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -678,8 +668,6 @@ pub const TuiRuntime = struct {
                 self.remote_reconnect_attempted = false;
                 self.remote_sse_reconnect_needed = false;
                 self.pumpRemoteIncoming() catch |err| {
-                    // Cancel the WebSocket reader before closing the sender so the
-                    // close path cannot clear buffers while receive() is using them.
                     if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
                     if (self.remote_sender) |remote_sender| remote_sender.close();
                     if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
@@ -742,8 +730,6 @@ pub const TuiRuntime = struct {
                 self.driveRemoteStopProbe(client, sid);
                 client.removeSessionState(sid);
             }
-            // Cancel and join the WebSocket reader before closing the sender so
-            // the close path cannot clear buffers while receive() is using them.
             if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
             if (self.remote_sender) |sender| sender.close();
             if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
@@ -1146,17 +1132,11 @@ pub const TuiRuntime = struct {
         return &self.event_stream;
     }
 
-    /// Snapshot of backpressure state for UI polling. The UI calls this once
-    /// per frame after draining events so the status bar always reflects the
-    /// current runtime state without depending on event drain ordering.
     pub fn backpressureState(self: *TuiRuntime) struct { active: bool, dropped_count: u64 } {
         while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.backpressure_mutex.unlock();
         const active = self.backpressure_active.load(.acquire);
         const dropped_count = self.dropped_event_count;
-        // Auto-clear the internal flag when the ring has recovered, but return
-        // the pre-clear snapshot once so AppState can render the active
-        // backpressure frame before settling to drops-only on the next poll.
         if (active and !self.event_stream.isFull()) {
             self.backpressure_active.store(false, .release);
             self.backpressure_status_active_emitted.store(false, .release);
@@ -1219,8 +1199,6 @@ pub const TuiRuntime = struct {
         if (!self.stream_active or self.event_stream.isDone()) {
             self.event_stream.deinit();
             self.event_stream = TuiEventStream.init(self.allocator);
-            // The fresh stream belongs to a new turn/session; backpressure
-            // counters from the previous stream no longer apply to it.
             self.resetBackpressureState();
         }
         self.stream_active = true;
@@ -1265,9 +1243,6 @@ pub const TuiRuntime = struct {
     }
 
     fn push(self: *TuiRuntime, event: TuiEvent) void {
-        // Preserve the newest event (mainline TUI behavior) and count the
-        // evicted oldest event as the drop. Flush the warning after the real
-        // event so a pending warning cannot steal the only free slot.
         var mutable = event;
         mutable.setGeneration(self.current_generation);
         self.pushDroppingOldestCounted(mutable);
@@ -1275,10 +1250,6 @@ pub const TuiRuntime = struct {
     }
 
     fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
-        // Terminal events must not be dropped just because the projection queue
-        // is saturated. After queuing the terminal event, force any warning from
-        // terminal-path evictions into the stream too; there may be no later push
-        // before the stream completes.
         var mutable = event;
         mutable.setGeneration(self.current_generation);
         self.pushDroppingOldestCounted(mutable);
@@ -1288,10 +1259,6 @@ pub const TuiRuntime = struct {
     fn pushDroppingOldestCounted(self: *TuiRuntime, event: TuiEvent) void {
         while (true) {
             if (self.pushUncounted(event)) return;
-            // Stream was full when we attempted to enqueue. The UI consumer does
-            // not take backpressure_mutex while draining, so retry after taking
-            // the lock before evicting: a consumer may have freed a slot between
-            // the failed push and this point.
             while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
             if (self.event_stream.push(event)) {
                 self.backpressure_mutex.unlock();
@@ -1305,8 +1272,6 @@ pub const TuiRuntime = struct {
                     return;
                 },
             }
-            // Stream is still full. Evict the oldest pending event to make room
-            // for this event, counting only the confirmed eviction as a drop.
             if (self.event_stream.poll()) |dropped| {
                 self.dropped_event_count += 1;
                 self.dropped_since_warning += 1;
@@ -1747,9 +1712,6 @@ pub const TuiRuntime = struct {
         }
     }
 
-    /// Cancel and join the WebSocket reader thread, returning true if the thread
-    /// exited cleanly. On a timeout/detach the client reference is dropped to
-    /// avoid use-after-free by any dangling sender/receiver handles.
     fn shutdownWebSocketReader(self: *TuiRuntime) bool {
         if (self.websocket_handle) |handle| {
             self.websocket_handle = null;
@@ -1765,10 +1727,6 @@ pub const TuiRuntime = struct {
         return true;
     }
 
-    /// Detect an idle WebSocket disconnect before writing a turn. If the reader
-    /// thread has finished the byte stream, clear the stale session and reconnect
-    /// so the next send goes through a live socket. When `force` is true, reconnect
-    /// regardless of the current liveness heuristic (used after a write-side error).
     fn ensureRemoteWebSocketConnection(self: *TuiRuntime, force: bool) !void {
         if (!self.remote_config_websocket_owned) return;
         const disconnected = force or blk: {
@@ -1852,9 +1810,6 @@ pub const TuiRuntime = struct {
         while (client.popEvent()) |queued| {
             var q = queued;
             defer q.deinit(self.allocator);
-            // Drop events that belong to a different remote session. This prevents
-            // late deltas from a cancelled/deleted remote run from being stamped
-            // with the current turn's generation and leaking into the new session.
             if (expected_sid) |sid| {
                 if (!std.mem.eql(u8, q.session_id[0..], sid[0..])) continue;
             } else {
@@ -5954,31 +5909,26 @@ test "TuiRuntime counts dropped events and emits warning" {
     defer runtime.deinit();
     var tui_session = runtime.createSession();
 
-    // Fill the ring buffer to capacity.
     var i: usize = 0;
     while (i < TuiEventStream.usable_capacity) : (i += 1) {
         runtime.push(.{ .text_delta = .{ .content_index = i, .delta = OwnedSlice(u8).initBorrowed("x") } });
     }
     try std.testing.expect(runtime.event_stream.isFull());
 
-    // The next push must evict one queued event and count that eviction.
     runtime.push(.{ .text_delta = .{ .content_index = TuiEventStream.usable_capacity, .delta = OwnedSlice(u8).initBorrowed("after-full") } });
     try std.testing.expectEqual(@as(u64, 1), runtime.dropped_event_count);
     try std.testing.expect(runtime.backpressure_active.load(.acquire));
 
-    // While backpressure is active, polling backpressureState reports active=true.
     const bp_active = runtime.backpressureState();
     try std.testing.expect(bp_active.active);
     try std.testing.expectEqual(@as(u64, 1), bp_active.dropped_count);
 
-    // Make room so the warning and a subsequent event can both be emitted.
     for (0..2) |_| {
         var ev = runtime.event_stream.poll().?;
         defer ev.deinit(std.testing.allocator);
     }
     runtime.push(.{ .text_delta = .{ .content_index = 256, .delta = OwnedSlice(u8).initBorrowed("after") } });
 
-    // Drain events via the session to consume the warning.
     var saw_warning = false;
     while (tui_session.popEvent()) |event| {
         var ev = event;
@@ -5990,8 +5940,6 @@ test "TuiRuntime counts dropped events and emits warning" {
     }
     try std.testing.expect(saw_warning);
 
-    // The status bar reads state via backpressureState(), which returns one
-    // active frame after recovery before clearing the runtime flag.
     const bp_recovered = runtime.backpressureState();
     try std.testing.expect(bp_recovered.active);
     try std.testing.expectEqual(@as(u64, 1), bp_recovered.dropped_count);

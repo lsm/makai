@@ -18,9 +18,6 @@ import {
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
 const fixtureScript = path.join(sourceFixturesDir, "execution-server.js");
 
-// ---------------------------------------------------------------------------
-// Capturing logger — records all calls for assertions.
-// ---------------------------------------------------------------------------
 type LogEntry = { level: string; message: string; context?: Record<string, unknown> };
 
 function createCapturingLogger(): MakaiLogger & { entries: LogEntry[] } {
@@ -34,9 +31,6 @@ function createCapturingLogger(): MakaiLogger & { entries: LogEntry[] } {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 type Harness = {
   client: MakaiStdioClient;
   logger: ReturnType<typeof createCapturingLogger>;
@@ -77,17 +71,12 @@ function request() {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test("getNoopLogger returns a logger with all four methods", () => {
   const logger = getNoopLogger();
   assert.equal(typeof logger.debug, "function");
   assert.equal(typeof logger.info, "function");
   assert.equal(typeof logger.warn, "function");
   assert.equal(typeof logger.error, "function");
-  // Calling them should not throw
   logger.debug("test");
   logger.info("test");
   logger.warn("test");
@@ -108,7 +97,6 @@ test("stdio transport logs connect/handshake and close events", async () => {
   });
 
   await client.connect();
-  // Should log process spawn, handshake wait, and handshake complete
   const spawnLog = logger.entries.find((e) => e.message === "stdio: spawning process");
   assert.ok(spawnLog, "expected 'stdio: spawning process' log");
   assert.equal(spawnLog.context?.command, process.execPath);
@@ -134,7 +122,6 @@ test("stdio transport logs frame send and receive", async () => {
   });
 
   await client.connect();
-  // Clear handshake logs for clarity
   logger.entries.length = 0;
 
   client.send({ type: "stream_request", stream_id: "s1" });
@@ -161,8 +148,6 @@ test("stdio transport logs error frame during handshake", async () => {
     logger,
   });
 
-  // The error server sends a protocol error frame. This should be logged as a
-  // received frame before the handshake is rejected.
   await assert.rejects(() => client.connect());
   const receiveLog = logger.entries.find((e) => e.message === "stdio: received frame");
   assert.ok(receiveLog, "expected 'stdio: received frame' log");
@@ -292,7 +277,6 @@ test("agent stream logs start events", async () => {
 });
 
 test("no logger configured results in zero overhead (no crashes)", async () => {
-  // Create a client without a logger — should work exactly as before
   const client = new MakaiStdioClient({
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "ready-server.js")],
@@ -312,13 +296,11 @@ test("logger captures envelope type and stream_id in frame send context", async 
     const provider = createMakaiProviderApi(harness.client, { logger: harness.logger });
     await provider.complete(request());
 
-    // Check that send logs include the envelope type
     const sendLogs = harness.logger.entries.filter(
       (e) => e.message === "stdio: sending frame" && e.context?.type === "complete_request",
     );
     assert.ok(sendLogs.length >= 1, "expected at least one complete_request send log");
 
-    // Verify stream_id is present and is a ULID
     const streamId = sendLogs[0]!.context?.stream_id;
     assert.equal(typeof streamId, "string");
     assert.ok((streamId as string).length >= 10, "stream_id should be a ULID");
@@ -338,11 +320,9 @@ test("no-op logger skips context allocation on send hot path", async () => {
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "ready-server.js")],
     handshakeTimeoutMs: 5000,
-    // No logger — default no-op
   });
 
   await client.connect();
-  // Send should not allocate context objects with no-op logger
   client.send({ type: "stream_request", stream_id: "s1" });
   const frame = await client.nextFrame(5000);
   assert.ok(frame);
@@ -364,7 +344,6 @@ test("createMakaiAgentApiWithModels forwards logger to nested models API", async
     const agentWithModels = createMakaiAgentApiWithModels(client, { logger, responseTimeoutMs: 5000 });
     await agentWithModels.models.list();
 
-    // The models API should have logged via the provided logger
     const modelsLog = logger.entries.find((e) => e.message === "models: sending models_request");
     assert.ok(modelsLog, "expected models API to log via forwarded logger");
   } finally {

@@ -1,22 +1,3 @@
-//! Action / command registry — central source of truth for app actions.
-//!
-//! Inspired by Textual's action system. An `Action` couples a stable string
-//! ID, a human label, an optional key binding, and an optional category to a
-//! single registry. The same registry feeds:
-//!
-//!   * the keybinding matcher (key event → action id)
-//!   * the auto-footer (one-line key hint bar)
-//!   * the command palette (filterable list of all actions)
-//!   * the help screen
-//!
-//! The user's `update` function looks up the matching action by id, eg.:
-//!
-//!     if (registry.matchKey(key_event)) |action| {
-//!         return self.dispatch(action.id);
-//!     }
-//!
-//! and a `dispatch` switch on `action.id` calls the right handler. Optional
-//! `handler` callbacks are also supported for fire-and-forget actions.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -27,38 +8,23 @@ const Color = @import("../style/color.zig").Color;
 const measure = @import("../layout/measure.zig");
 const fuzzy = @import("fuzzy.zig");
 
-/// Optional callback shape. Receives the user-supplied context pointer the
-/// registry was created with — typically the app model.
 pub const Handler = *const fn (user_ctx: ?*anyopaque) void;
 
 pub const Action = struct {
-    /// Stable string identifier, eg. "app.quit", "file.save".
     id: []const u8,
-    /// User-facing label, eg. "Quit", "Save File".
     label: []const u8,
-    /// Longer description for palette / help.
     description: []const u8 = "",
-    /// Optional category for grouping in help / palette, eg. "File", "Edit".
     category: []const u8 = "",
-    /// Optional primary key binding. Other bindings can be added via
-    /// `addBinding` if you want chord-style or aliases.
     binding: ?KeyEvent = null,
-    /// Whether this action shows up in match/footer/palette.
     enabled: bool = true,
-    /// Whether this action is shown in the auto-footer hint bar.
     show_in_footer: bool = false,
-    /// Optional fire-and-forget callback. The registry calls this when the
-    /// matching key fires, in addition to returning the action so the user's
-    /// update function can switch on the id.
     handler: ?Handler = null,
 };
 
 pub const ActionRegistry = struct {
     allocator: std.mem.Allocator,
     actions: std.array_list.Managed(Action),
-    /// Optional aliases: extra key events that map to the same action.
     aliases: std.array_list.Managed(Alias),
-    /// Pointer passed to `Handler` callbacks. Typically the app model.
     user_ctx: ?*anyopaque,
 
     pub const Alias = struct {
@@ -85,14 +51,12 @@ pub const ActionRegistry = struct {
     }
 
     pub fn register(self: *ActionRegistry, action: Action) !void {
-        // Detect duplicate ids early — registry is a "single source of truth".
         for (self.actions.items) |existing| {
             if (std.mem.eql(u8, existing.id, action.id)) return error.DuplicateActionId;
         }
         try self.actions.append(action);
     }
 
-    /// Replace an action's binding by id. Returns true if the action existed.
     pub fn rebind(self: *ActionRegistry, id: []const u8, binding: ?KeyEvent) bool {
         for (self.actions.items) |*a| {
             if (std.mem.eql(u8, a.id, id)) {
@@ -113,9 +77,7 @@ pub const ActionRegistry = struct {
         return false;
     }
 
-    /// Add an additional key alias for an existing action.
     pub fn addAlias(self: *ActionRegistry, id: []const u8, binding: KeyEvent) !void {
-        // Validate the action exists.
         for (self.actions.items) |a| {
             if (std.mem.eql(u8, a.id, id)) {
                 try self.aliases.append(.{ .id = id, .binding = binding });
@@ -132,8 +94,6 @@ pub const ActionRegistry = struct {
         return null;
     }
 
-    /// Look up the action matching `event`. Returns null when no enabled
-    /// action is bound. Calls the action's handler if present.
     pub fn matchKey(self: *const ActionRegistry, event: KeyEvent) ?*const Action {
         for (self.actions.items) |*a| {
             if (!a.enabled) continue;
@@ -155,8 +115,6 @@ pub const ActionRegistry = struct {
         return null;
     }
 
-    /// Invoke the action's handler explicitly (eg. selected from the palette).
-    /// Returns true if the action exists and is enabled.
     pub fn invoke(self: *const ActionRegistry, id: []const u8) bool {
         const a = self.get(id) orelse return false;
         if (!a.enabled) return false;
@@ -164,8 +122,6 @@ pub const ActionRegistry = struct {
         return true;
     }
 
-    /// Iterate enabled actions matching a fuzzy query. Caller owns the
-    /// returned slice. Useful for feeding a CommandPalette.
     pub fn filter(self: *const ActionRegistry, allocator: std.mem.Allocator, query: []const u8) ![]const *const Action {
         var out = std.array_list.Managed(*const Action).init(allocator);
         errdefer out.deinit();
@@ -196,7 +152,6 @@ pub const ActionRegistry = struct {
         return out.toOwnedSlice();
     }
 
-    /// Format a key event for display: "ctrl+s", "esc", "enter", etc.
     pub fn formatKey(allocator: std.mem.Allocator, event: KeyEvent) ![]u8 {
         var out: Writer.Allocating = .init(allocator);
         const w = &out.writer;
@@ -224,9 +179,6 @@ pub const ActionRegistry = struct {
     }
 };
 
-/// Auto-rendered single-line footer that shows the bindings for actions
-/// flagged with `show_in_footer = true`. Useful as a persistent key hint
-/// bar at the bottom of the screen, kept in sync with the registry.
 pub const Footer = struct {
     registry: *const ActionRegistry,
     width: u16 = 80,
@@ -280,7 +232,6 @@ pub const Footer = struct {
             try w.writeAll(styled_label);
         }
 
-        // Pad / truncate to width and apply base background.
         const text = try inner.toOwnedSlice();
         defer allocator.free(text);
         const text_w = measure.width(text);
@@ -300,8 +251,6 @@ pub const Footer = struct {
         return out.toOwnedSlice();
     }
 };
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 

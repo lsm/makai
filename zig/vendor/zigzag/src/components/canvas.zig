@@ -1,4 +1,3 @@
-//! Plotting canvas with braille and cell-based markers.
 
 const std = @import("std");
 const charting = @import("charting.zig");

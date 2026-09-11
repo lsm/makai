@@ -4,7 +4,6 @@ const compat = @import("compat");
 
 const Allocator = std.mem.Allocator;
 
-/// Provider enum for tool call ID normalization
 pub const Provider = enum {
     anthropic,
     openai,
@@ -13,12 +12,10 @@ pub const Provider = enum {
     bedrock,
 };
 
-/// Check if a character is alphanumeric (a-z, A-Z, 0-9)
 fn isAlphanumeric(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
 }
 
-/// Check if a string consists entirely of alphanumeric characters
 fn isAlphanumericStr(s: []const u8) bool {
     for (s) |c| {
         if (!isAlphanumeric(c)) {
@@ -28,10 +25,6 @@ fn isAlphanumericStr(s: []const u8) bool {
     return true;
 }
 
-/// Normalize a tool call ID for a specific provider.
-/// Mistral requires exactly 9 alphanumeric characters.
-/// For other providers, returns a copy of the original ID.
-/// Caller owns returned memory.
 pub fn normalizeToolCallId(allocator: Allocator, id: []const u8, provider: Provider) ![]u8 {
     return switch (provider) {
         .mistral => try normalizeForMistral(allocator, id),
@@ -39,34 +32,22 @@ pub fn normalizeToolCallId(allocator: Allocator, id: []const u8, provider: Provi
     };
 }
 
-/// Normalize an ID for Mistral (exactly 9 alphanumeric characters).
-/// - If ID is already 9 alphanumeric chars, return as-is.
-/// - If ID is shorter, pad with hash-based alphanumeric chars.
-/// - If ID is longer, hash to 9 alphanumeric chars.
-/// - Uses consistent hashing so the same ID always maps to the same normalized ID.
 fn normalizeForMistral(allocator: Allocator, id: []const u8) ![]u8 {
     const target_len = 9;
 
-    // If ID is exactly 9 alphanumeric chars, return as-is
     if (id.len == target_len and isAlphanumericStr(id)) {
         return try allocator.dupe(u8, id);
     }
 
-    // Allocate result buffer
     var result = try allocator.alloc(u8, target_len);
     errdefer allocator.free(result);
 
-    // Use SHA-256 hash for consistent mapping
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(id, &hash, .{});
 
-    // Convert hash bytes to alphanumeric characters
-    // We'll use the hash to generate alphanumeric chars: a-z (26) + A-Z (26) + 0-9 (10) = 62 chars
     const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
     for (0..target_len) |i| {
-        // Use modulo to map hash byte to alphabet index
-        // Use multiple hash bytes for better distribution
         const hash_idx = i * 3 % hash.len;
         const combined = @as(u64, hash[hash_idx]) |
             (@as(u64, hash[(hash_idx + 1) % hash.len]) << 8) |
@@ -77,7 +58,6 @@ fn normalizeForMistral(allocator: Allocator, id: []const u8) ![]u8 {
     return result;
 }
 
-/// Check if a tool call ID is valid for a provider.
 pub fn isValidToolCallId(id: []const u8, provider: Provider) bool {
     return switch (provider) {
         .mistral => id.len == 9 and isAlphanumericStr(id),
@@ -102,14 +82,10 @@ fn generateMistralToolCallIdWithRandom(allocator: Allocator, fill_random: fn ([]
     return result;
 }
 
-/// Generate a Mistral-compatible tool call ID (9 alphanumeric chars).
-/// Uses ordinary random bytes for uniqueness; IDs are provider correlation
-/// handles, not authentication secrets.
 pub fn generateMistralToolCallId(allocator: Allocator) ![]u8 {
     return generateMistralToolCallIdWithRandom(allocator, compat.random.fillRandomBytes);
 }
 
-/// Create a mapping from original ID to normalized ID for round-trip conversion
 pub const ToolIdMapping = struct {
     original: []const u8,
     normalized: []const u8,
@@ -120,8 +96,6 @@ pub const ToolIdMapping = struct {
     }
 };
 
-/// Create tool ID mappings for a slice of assistant content.
-/// Caller owns returned slice and all strings within.
 pub fn createToolIdMappingsFromContent(
     allocator: Allocator,
     content: []const ai_types.AssistantContent,
@@ -135,14 +109,12 @@ pub fn createToolIdMappingsFromContent(
         mappings.deinit(allocator);
     }
 
-    // Track seen IDs to avoid duplicates
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
     for (content) |c| {
         switch (c) {
             .tool_call => |tool_block| {
-                // Skip if we've already seen this ID
                 if (seen.contains(tool_block.id)) {
                     continue;
                 }
@@ -167,7 +139,6 @@ pub fn createToolIdMappingsFromContent(
     return try mappings.toOwnedSlice(allocator);
 }
 
-/// Free a slice of ToolIdMapping
 pub fn freeToolIdMappings(allocator: Allocator, mappings: []ToolIdMapping) void {
     for (mappings) |*m| {
         m.deinit(allocator);
@@ -175,7 +146,6 @@ pub fn freeToolIdMappings(allocator: Allocator, mappings: []ToolIdMapping) void 
     allocator.free(mappings);
 }
 
-/// Look up the original ID from a normalized ID
 pub fn findOriginalId(mappings: []const ToolIdMapping, normalized_id: []const u8) ?[]const u8 {
     for (mappings) |m| {
         if (std.mem.eql(u8, m.normalized, normalized_id)) {
@@ -185,7 +155,6 @@ pub fn findOriginalId(mappings: []const ToolIdMapping, normalized_id: []const u8
     return null;
 }
 
-/// Look up the normalized ID from an original ID
 pub fn findNormalizedId(mappings: []const ToolIdMapping, original_id: []const u8) ?[]const u8 {
     for (mappings) |m| {
         if (std.mem.eql(u8, m.original, original_id)) {
@@ -194,8 +163,6 @@ pub fn findNormalizedId(mappings: []const ToolIdMapping, original_id: []const u8
     }
     return null;
 }
-
-// Tests
 
 test "normalizeToolCallId returns copy for non-Mistral providers" {
     const id = "tool_abc123";
@@ -218,21 +185,18 @@ test "normalizeToolCallId returns copy for non-Mistral providers" {
 }
 
 test "normalizeToolCallId for Mistral returns 9 alphanumeric chars" {
-    // Short ID
     const short_id = "abc";
     const result_short = try normalizeToolCallId(std.testing.allocator, short_id, .mistral);
     defer std.testing.allocator.free(result_short);
     try std.testing.expectEqual(@as(usize, 9), result_short.len);
     try std.testing.expect(isAlphanumericStr(result_short));
 
-    // Long ID
     const long_id = "this_is_a_very_long_tool_call_id_with_special_chars!@#$";
     const result_long = try normalizeToolCallId(std.testing.allocator, long_id, .mistral);
     defer std.testing.allocator.free(result_long);
     try std.testing.expectEqual(@as(usize, 9), result_long.len);
     try std.testing.expect(isAlphanumericStr(result_long));
 
-    // ID with special characters
     const special_id = "tool-123_abc!@#";
     const result_special = try normalizeToolCallId(std.testing.allocator, special_id, .mistral);
     defer std.testing.allocator.free(result_special);
@@ -258,13 +222,11 @@ test "normalizeToolCallId for Mistral preserves valid 9-char alphanumeric IDs" {
 }
 
 test "normalizeToolCallId for Mistral hashes 9-char non-alphanumeric IDs" {
-    // 9 chars but contains non-alphanumeric
     const non_alpha_id = "tool-123_";
     const result = try normalizeToolCallId(std.testing.allocator, non_alpha_id, .mistral);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 9), result.len);
     try std.testing.expect(isAlphanumericStr(result));
-    // Should NOT equal original because it had non-alphanumeric chars
     try std.testing.expect(!std.mem.eql(u8, non_alpha_id, result));
 }
 
@@ -294,28 +256,23 @@ test "normalizeToolCallId produces different results for different inputs" {
 }
 
 test "isValidToolCallId for Mistral" {
-    // Valid IDs
     try std.testing.expect(isValidToolCallId("AbCdEfGhI", .mistral));
     try std.testing.expect(isValidToolCallId("123456789", .mistral));
     try std.testing.expect(isValidToolCallId("aB9xY2zQ7", .mistral));
 
-    // Invalid - wrong length
     try std.testing.expect(!isValidToolCallId("short", .mistral));
     try std.testing.expect(!isValidToolCallId("tooLongId123", .mistral));
 
-    // Invalid - non-alphanumeric
     try std.testing.expect(!isValidToolCallId("tool-123", .mistral));
     try std.testing.expect(!isValidToolCallId("tool_123", .mistral));
     try std.testing.expect(!isValidToolCallId("tool 123", .mistral));
 }
 
 test "isValidToolCallId for other providers" {
-    // Any non-empty string is valid
     try std.testing.expect(isValidToolCallId("any_id", .anthropic));
     try std.testing.expect(isValidToolCallId("tool-123_abc!@#", .openai));
     try std.testing.expect(isValidToolCallId("x", .google));
 
-    // Empty string is invalid
     try std.testing.expect(!isValidToolCallId("", .anthropic));
     try std.testing.expect(!isValidToolCallId("", .openai));
 }
@@ -341,7 +298,6 @@ test "generateMistralToolCallId produces valid IDs" {
     try std.testing.expect(isAlphanumericStr(id2));
     try std.testing.expect(isValidToolCallId(id2, .mistral));
 
-    // Should be different (extremely unlikely to be same)
     try std.testing.expect(!std.mem.eql(u8, id1, id2));
 }
 
@@ -361,21 +317,18 @@ test "ToolIdMapping create and lookup from AssistantContent" {
         .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } },
         .{ .tool_call = .{ .id = "tool_2", .name = "read", .arguments_json = "{}" } },
         .{ .text = .{ .text = "some text" } },
-        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } }, // duplicate
+        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } },
     };
 
     const mappings = try createToolIdMappingsFromContent(std.testing.allocator, &content, .mistral);
     defer freeToolIdMappings(std.testing.allocator, mappings);
 
-    // Should have 2 unique tool IDs
     try std.testing.expectEqual(@as(usize, 2), mappings.len);
 
-    // All normalized IDs should be valid for Mistral
     for (mappings) |m| {
         try std.testing.expect(isValidToolCallId(m.normalized, .mistral));
     }
 
-    // Test lookup
     const orig = findOriginalId(mappings, mappings[0].normalized);
     try std.testing.expect(orig != null);
     try std.testing.expectEqualStrings(mappings[0].original, orig.?);
@@ -384,7 +337,6 @@ test "ToolIdMapping create and lookup from AssistantContent" {
     try std.testing.expect(norm != null);
     try std.testing.expectEqualStrings(mappings[1].normalized, norm.?);
 
-    // Non-existent lookup
     try std.testing.expect(findOriginalId(mappings, "nonexistent") == null);
     try std.testing.expect(findNormalizedId(mappings, "nonexistent") == null);
 }

@@ -1,17 +1,3 @@
-//! Split pane component.
-//!
-//! A two-pane container with a user-draggable divider. Stores the split ratio
-//! (0–1) and total size, and produces sizes for each pane. Rendering itself is
-//! delegated to the caller: a typical flow is
-//!
-//!   var split = SplitPane.init(.horizontal);
-//!   split.setSize(w, h);
-//!   const dims = split.dims();
-//!   const left = try renderLeft(dims.a);
-//!   const right = try renderRight(dims.b);
-//!   const view = try split.compose(alloc, left, right);
-//!
-//! The divider is a single cell between the two panes, styled like a border.
 
 const std = @import("std");
 const keys = @import("../input/keys.zig");
@@ -21,9 +7,7 @@ const join = @import("../layout/join.zig");
 const measure = @import("../layout/measure.zig");
 
 pub const Orientation = enum {
-    /// Panes sit side-by-side, divider is vertical.
     horizontal,
-    /// Panes stack, divider is horizontal.
     vertical,
 };
 
@@ -38,7 +22,6 @@ pub const SplitPane = struct {
     orientation: Orientation,
     width: u16,
     height: u16,
-    /// Ratio of total size given to pane A (0.0-1.0), before the divider.
     ratio: f32,
     min_size: u16,
     resize_step: u16,
@@ -82,7 +65,6 @@ pub const SplitPane = struct {
 
     fn horizontalDims(self: *const SplitPane) Dims {
         const total = self.width;
-        // Reserve one column for the divider when there's room for it.
         const available: u16 = if (total > 1) total - 1 else total;
         const a_raw: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * self.ratio);
         const min = @min(self.min_size, available / 2);
@@ -111,12 +93,10 @@ pub const SplitPane = struct {
         };
     }
 
-    /// Grow pane A by `resize_step` cells.
     pub fn growA(self: *SplitPane) void {
         self.adjust(@as(i32, self.resize_step));
     }
 
-    /// Grow pane B by `resize_step` cells.
     pub fn growB(self: *SplitPane) void {
         self.adjust(-@as(i32, self.resize_step));
     }
@@ -137,8 +117,6 @@ pub const SplitPane = struct {
         self.ratio = @as(f32, @floatFromInt(next)) / @as(f32, @floatFromInt(total));
     }
 
-    /// Handle arrow-key driven resize. Returns true when the event was
-    /// consumed.
     pub fn handleResize(self: *SplitPane, key: keys.KeyEvent) bool {
         switch (self.orientation) {
             .horizontal => switch (key.key) {
@@ -166,7 +144,6 @@ pub const SplitPane = struct {
         }
     }
 
-    /// Compose two pre-rendered pane strings with a divider between them.
     pub fn compose(self: *const SplitPane, allocator: std.mem.Allocator, pane_a: []const u8, pane_b: []const u8) ![]const u8 {
         return switch (self.orientation) {
             .horizontal => self.composeHorizontal(allocator, pane_a, pane_b),

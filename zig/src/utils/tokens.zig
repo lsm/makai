@@ -1,26 +1,11 @@
-//! Token estimation utilities for predicting API usage.
-//!
-//! Provides heuristic-based token counting to help users validate
-//! context limits before making API calls.
 
 const std = @import("std");
 const ai_types = @import("ai_types");
 
-/// Estimates token count for a list of messages using simple heuristic.
-///
-/// Approximation rules:
-/// - ~4 characters per token (English text)
-/// - ~5 tokens overhead per message (role, formatting)
-/// - ~850 tokens per image
-/// - JSON overhead for tool calls
-///
-/// For accurate counts, use provider-specific tokenization APIs.
-/// This is intentionally conservative to avoid underestimating.
 pub fn estimateTokens(messages: []const ai_types.Message) usize {
     var total: usize = 0;
 
     for (messages) |msg| {
-        // Role overhead (~5 tokens per message)
         total += 5;
 
         switch (msg) {
@@ -36,7 +21,7 @@ pub fn estimateTokens(messages: []const ai_types.Message) usize {
                                     total += t.text.len / 4;
                                 },
                                 .image => {
-                                    total += 850; // Approximate for image tokens
+                                    total += 850;
                                 },
                             }
                         }
@@ -50,7 +35,7 @@ pub fn estimateTokens(messages: []const ai_types.Message) usize {
                             total += t.text.len / 4;
                         },
                         .tool_call => |tc| {
-                            total += tc.arguments_json.len / 4 + 50; // JSON overhead
+                            total += tc.arguments_json.len / 4 + 50;
                             total += tc.name.len / 4;
                             total += tc.id.len / 4;
                         },
@@ -58,7 +43,7 @@ pub fn estimateTokens(messages: []const ai_types.Message) usize {
                             total += th.thinking.len / 4;
                         },
                         .image => {
-                            total += 850; // Approximate for image tokens
+                            total += 850;
                         },
                     }
                 }
@@ -74,7 +59,6 @@ pub fn estimateTokens(messages: []const ai_types.Message) usize {
                         },
                     }
                 }
-                // Tool call metadata
                 total += tool_result_msg.tool_call_id.len / 4;
                 total += tool_result_msg.tool_name.len / 4;
             },
@@ -91,7 +75,6 @@ test "token estimation - user message with text" {
     } };
 
     const estimated = estimateTokens(&[_]ai_types.Message{msg});
-    // 5 role overhead + ~3 content = ~8 tokens
     try std.testing.expect(estimated > 5 and estimated < 15);
 }
 
@@ -115,7 +98,6 @@ test "token estimation - assistant message with multiple content blocks" {
     } };
 
     const estimated = estimateTokens(&[_]ai_types.Message{msg});
-    // Should account for text + tool call + JSON overhead
     try std.testing.expect(estimated > 20);
 }
 
@@ -129,7 +111,6 @@ test "token estimation - user message with image" {
     } };
 
     const estimated = estimateTokens(&[_]ai_types.Message{msg});
-    // 5 role + 850 image = 855
     try std.testing.expect(estimated > 850 and estimated < 900);
 }
 
@@ -168,6 +149,5 @@ test "token estimation - conversation with tool result" {
     };
 
     const estimated = estimateTokens(&messages);
-    // 3 messages * 5 overhead + content = should be > 30
     try std.testing.expect(estimated > 30);
 }

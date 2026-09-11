@@ -1,9 +1,3 @@
-//! Status bar component.
-//!
-//! Renders a single-line bar with left, center, and right-aligned segments.
-//! Each segment may have its own style and is styled independently so the bar
-//! can show, for example, a mode indicator, the current file, and cursor
-//! position simultaneously.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -25,7 +19,6 @@ pub const StatusBar = struct {
 
     width: u16,
     separator: []const u8,
-    /// Style applied to the gap characters between segment groups.
     base_style: style_mod.Style,
 
     pub fn init(allocator: std.mem.Allocator) StatusBar {
@@ -81,7 +74,6 @@ pub const StatusBar = struct {
         self.right.clearRetainingCapacity();
     }
 
-    /// Replace all left segments with a single-segment string.
     pub fn setLeft(self: *StatusBar, text: []const u8, s: ?style_mod.Style) !void {
         self.left.clearRetainingCapacity();
         try self.left.append(.{ .text = text, .style = s });
@@ -97,7 +89,6 @@ pub const StatusBar = struct {
         try self.right.append(.{ .text = text, .style = s });
     }
 
-    /// Render the status bar to a single line padded to `width` columns.
     pub fn view(self: *const StatusBar, allocator: std.mem.Allocator) ![]const u8 {
         const left_str = try self.renderGroup(allocator, self.left.items);
         defer allocator.free(left_str);
@@ -115,8 +106,6 @@ pub const StatusBar = struct {
 
         try writer.writeAll(left_str);
 
-        // Center text: place it so its midpoint sits on width/2, but never
-        // overlap the left or right groups.
         if (cw > 0) {
             const target_start = (self.width -| cw) / 2;
             const start = @max(lw, target_start);
@@ -209,7 +198,6 @@ test "status bar tolerates narrow width" {
     try bar.setLeft("hello", null);
     try bar.setRight("world", null);
 
-    // Even with overflow, rendering must not crash.
     const out = try bar.view(allocator);
     defer allocator.free(out);
 }

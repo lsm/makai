@@ -1,4 +1,3 @@
-//! Bar chart widget with vertical and horizontal layouts.
 
 const std = @import("std");
 const charting = @import("charting.zig");

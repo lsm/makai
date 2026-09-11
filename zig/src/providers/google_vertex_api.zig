@@ -9,21 +9,14 @@ const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
 
-/// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
-    /// Google Cloud project ID (from GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT env var)
     project: ?[]const u8 = null,
-    /// Google Cloud region/location (from GOOGLE_CLOUD_LOCATION env var, e.g., "us-central1")
     location: ?[]const u8 = null,
-    /// API key for authentication (fallback if ADC not available)
     api_key: ?[]const u8 = null,
-    /// Temperature for generation
     temperature: ?f32 = null,
-    /// Maximum tokens to generate
     max_tokens: ?u32 = null,
 };
 
-/// Error types for Vertex API
 pub const VertexError = error{
     MissingProjectId,
     MissingLocation,
@@ -68,8 +61,6 @@ fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, proj
     return out;
 }
 
-/// Resolve project ID from options or environment variables
-/// Priority: options.project > GOOGLE_CLOUD_PROJECT > GCLOUD_PROJECT
 fn resolveProject(options: ?VertexOptions, allocator: std.mem.Allocator) VertexError!?[]u8 {
     if (options) |o| {
         if (o.project) |p| {
@@ -88,8 +79,6 @@ fn resolveProject(options: ?VertexOptions, allocator: std.mem.Allocator) VertexE
     return error.MissingProjectId;
 }
 
-/// Resolve location from options or environment variable
-/// Priority: options.location > GOOGLE_CLOUD_LOCATION
 fn resolveLocation(options: ?VertexOptions, allocator: std.mem.Allocator) VertexError!?[]u8 {
     if (options) |o| {
         if (o.location) |l| {
@@ -104,7 +93,6 @@ fn resolveLocation(options: ?VertexOptions, allocator: std.mem.Allocator) Vertex
     return error.MissingLocation;
 }
 
-/// Resolve API key from options or environment
 fn resolveApiKey(options: ?VertexOptions, allocator: std.mem.Allocator) VertexError!?[]u8 {
     if (options) |o| {
         if (o.api_key) |k| {
@@ -117,15 +105,12 @@ fn resolveApiKey(options: ?VertexOptions, allocator: std.mem.Allocator) VertexEr
     }
 
     if (env(allocator, "GOOGLE_APPLICATION_CREDENTIALS")) |creds_path| {
-        // For now, we don't implement full ADC (Application Default Credentials)
-        // Just log that we found the path but need API key fallback
         allocator.free(creds_path);
     }
 
     return error.MissingApiKey;
 }
 
-// Model detection helpers (shared with google_generative_api)
 fn isGemini3ProModel(model_id: []const u8) bool {
     return std.mem.find(u8, model_id, "3-pro") != null;
 }
@@ -142,7 +127,6 @@ fn isGemini25FlashModel(model_id: []const u8) bool {
     return std.mem.find(u8, model_id, "2.5-flash") != null;
 }
 
-/// Check if a thought signature is valid base64
 fn isValidThoughtSignature(sig: ?[]const u8) bool {
     if (sig == null) return false;
     if (sig.?.len == 0) return false;
@@ -154,7 +138,6 @@ fn isValidThoughtSignature(sig: ?[]const u8) bool {
     return true;
 }
 
-/// Map ThinkingLevel to Google thinking level string (for Gemini 3)
 fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model) []const u8 {
     if (isGemini3ProModel(model.id)) {
         return switch (level) {
@@ -172,7 +155,6 @@ fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model)
     };
 }
 
-/// Get default thinking budget for Gemini 2.5 models
 fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets, model_id: []const u8) i32 {
     if (level == .off) return 0;
 
@@ -214,13 +196,11 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
-    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
-    // synthetic tool results for orphaned calls, aborted message filtering
     var transformed = try pre_transform.preTransform(allocator, context.messages, .{
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = 64, // Google Vertex max tool call ID length
+        .max_tool_id_len = 64,
         .insert_synthetic_results = true,
         .tools = context.tools,
     });
@@ -369,7 +349,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     }
     try w.endObject();
 
-    // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
             try w.writeKey("tools");
@@ -389,7 +368,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
             try w.endObject();
             try w.endArray();
 
-            // Add tool_config if tool_choice is specified
             if (options.tool_choice) |tc| {
                 try w.writeKey("tool_config");
                 try w.beginObject();
@@ -412,7 +390,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         }
     }
 
-    // Add thinkingConfig if thinking is enabled and model supports reasoning
     if (options.thinking_enabled and model.reasoning) {
         try w.writeKey("thinkingConfig");
         try w.beginObject();
@@ -430,7 +407,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     return buf.toOwnedSlice(allocator);
 }
 
-/// Parsed part from a Google response
 const ParsedPart = union(enum) {
     text: struct {
         text: []const u8,
@@ -445,14 +421,12 @@ const ParsedPart = union(enum) {
     },
 };
 
-/// Parse result from a Google SSE event
 const GoogleParseResult = struct {
     parts: []const ParsedPart,
     usage: ai_types.Usage,
     finish_reason: ?[]const u8,
 };
 
-/// Stringify a std.json.Value to a buffer
 fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (value) {
         .null => try buf.appendSlice(allocator, "null"),
@@ -506,7 +480,6 @@ fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator:
     }
 }
 
-/// Parse a Google SSE event and extract parts with thinking info
 fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?GoogleParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
     defer parsed.deinit();
@@ -656,14 +629,12 @@ fn deinitGoogleParseResult(result: *const GoogleParseResult, allocator: std.mem.
     if (result.finish_reason) |fr| allocator.free(fr);
 }
 
-/// Current block type being streamed
 const CurrentBlock = enum {
     none,
     text,
     thinking,
 };
 
-/// Create a partial message for events
 fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     return ai_types.AssistantMessage{
         .content = &.{},
@@ -676,7 +647,6 @@ fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     };
 }
 
-/// Map Google finish reason to StopReason
 fn mapFinishReason(reason: ?[]const u8) ai_types.StopReason {
     if (reason) |r| {
         if (std.mem.eql(u8, r, "STOP")) return .stop;
@@ -700,7 +670,6 @@ const ThreadCtx = struct {
     cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
 
-    /// Clean up all owned resources (model, context, api_key, body, project, location, self).
     fn deinit(self: *ThreadCtx) void {
         self.allocator.free(self.project);
         self.allocator.free(self.location);
@@ -738,8 +707,6 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = compat.http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Vertex AI URL structure:
-    // https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
     const url = buildVertexStreamUrl(allocator, location, project, model.id) catch {
         ctx.deinit();
         stream.markThreadDone();
@@ -755,16 +722,11 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    // TODO: Vertex AI officially uses Authorization: Bearer via OAuth/ADC.
-    // x-goog-api-key works for now because resolveApiKey falls back to a
-    // placeholder when ADC is not set up, but this should become a proper
-    // Bearer token once ADC/OAuth integration is implemented.
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "x-goog-api-key", .value = api_key },
     };
 
-    // Retry configuration
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_opts) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
@@ -777,14 +739,12 @@ fn runThread(ctx: *ThreadCtx) void {
     defer if (req_initialized) req.deinit();
 
     while (true) {
-        // Deinit previous request if this is a retry
         if (req_initialized) {
             req.deinit();
             req_initialized = false;
         }
 
         req = client.openRequest(.POST, uri, .{ .extra_headers = &headers }) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, null)) {
@@ -804,7 +764,6 @@ fn runThread(ctx: *ThreadCtx) void {
         req_initialized = true;
 
         compat.http.sendRequest(&req, body) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, null)) {
@@ -823,7 +782,6 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         response = compat.http.receiveResponse(&req, &head_buf) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, null)) {
@@ -842,28 +800,19 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         if (response.head.status == .ok) {
-            // Success - break out of retry loop
             break;
         }
 
-        // Check if status is retryable
         const status_code: u16 = @intFromEnum(response.head.status);
         const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
 
         if (should_retry) {
-            // Note: We skip reading the error body here because the response state machine
-            // may not be in a valid state for body reading (e.g., after a redirect or when
-            // the connection has been reset). The error body is only used for optional retry
-            // delay hints, so we rely on status code and Retry-After header instead.
             const error_text: []const u8 = &.{};
 
-            // Check if error body indicates a retryable error
             const is_retryable_error = retry_util.isRetryableError(error_text);
 
-            // Calculate delay - prefer server-provided delay
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header (only if headers contain valid \r\n separator)
             if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
@@ -878,19 +827,16 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             }
 
-            // Check body for retry delay
             if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
                 if (body_delay <= max_delay_ms) {
                     delay = body_delay;
                 }
             }
 
-            // If not a retryable error message, don't retry
             if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
                 break;
             }
 
-            // Wait before retry
             if (!retry_util.sleepMs(delay, null)) {
                 ctx.deinit();
                 stream.markThreadDone();
@@ -902,11 +848,9 @@ fn runThread(ctx: *ThreadCtx) void {
             continue;
         }
 
-        // Non-retryable error or max retries reached
         break;
     }
 
-    // After retry loop, check final status
     if (response.head.status != .ok) {
         ctx.deinit();
         stream.markThreadDone();
@@ -937,16 +881,13 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_block: CurrentBlock = .none;
     var tool_call_counter: usize = 0;
 
-    // Ping tracking
     var last_ping_time: i64 = 0;
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
-    // Emit start event
     const partial_start = createPartialMessage(model);
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
-        // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
@@ -1205,7 +1146,6 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // Close final block if open
     if (current_block != .none) {
         switch (current_block) {
             .text => {
@@ -1260,8 +1200,6 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    // Dupe metadata strings BEFORE composing `out` so a mid-dupe OOM can cascade-free
-    // both content_slice and any prior successful dupes without leaking.
     const api_dup = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
@@ -1295,21 +1233,15 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
-        .is_owned = true, // Strings were duped above
+        .is_owned = true,
     };
 
-    // Do NOT push a .done event here — the same AssistantMessage would be
-    // referenced by both the event and complete(), causing a double-free when
-    // the consumer deinits either one.
-
-    // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();
 
     stream.markThreadDone();
     stream.complete(out);
 }
 
-/// Stream from Google Vertex AI with full authentication support
 pub fn streamGoogleVertex(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -1318,9 +1250,6 @@ pub fn streamGoogleVertex(
 ) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
-    // Resolve project and location from environment. If the request is already
-    // cancelled, use placeholder values so the stream can exercise the provider's
-    // pre-network cancellation path without requiring process-wide environment setup.
     const project = if (o.cancel_token) |ct| blk: {
         if (ct.isCancelled()) break :blk try allocator.dupe(u8, "cancelled-test-project");
         break :blk try resolveProject(null, allocator) orelse {
@@ -1345,12 +1274,8 @@ pub fn streamGoogleVertex(
     };
     errdefer allocator.free(location);
 
-    // Resolve API key (required for Vertex AI with API key auth)
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        // Read the vendor env key only for the canonical Google providers
-        // so a custom or routed base URL (MAKAI_BASE_URL) cannot receive a
-        // GOOGLE_API_KEY meant for Google's own endpoint.
         if (!std.mem.eql(u8, model.provider, "google") and !std.mem.eql(u8, model.provider, "google-vertex")) {
             std.log.err("Vertex AI requires an explicit api_key for non-Google providers.", .{});
             return error.MissingApiKey;
@@ -1362,14 +1287,12 @@ pub fn streamGoogleVertex(
     };
     errdefer allocator.free(api_key);
 
-    // Clone model to own the memory (background thread outlives caller's memory)
     const owned_model = ai_types.cloneModel(allocator, model) catch return error.OutOfMemory;
     errdefer {
         var mut_m = owned_model;
         mut_m.deinit(allocator);
     }
 
-    // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = ai_types.cloneContext(allocator, context) catch return error.OutOfMemory;
     errdefer {
         var mut_ctx = owned_context;
@@ -1410,7 +1333,6 @@ pub fn streamGoogleVertex(
     return s;
 }
 
-/// Stream from Google Vertex AI with simple options
 pub fn streamSimpleGoogleVertex(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -1419,7 +1341,6 @@ pub fn streamSimpleGoogleVertex(
 ) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
 
-    // Build thinking options based on reasoning level and model capabilities
     var thinking_enabled: bool = false;
     var thinking_budget_tokens: ?u32 = null;
     var thinking_effort: ?[]const u8 = null;
@@ -1456,7 +1377,6 @@ pub fn streamSimpleGoogleVertex(
     }, allocator);
 }
 
-/// Register the Google Vertex API provider
 pub fn registerGoogleVertexApiProvider(registry: *api_registry.ApiRegistry) !void {
     try registry.registerApiProvider(.{
         .api = "google-vertex",
@@ -1465,48 +1385,39 @@ pub fn registerGoogleVertexApiProvider(registry: *api_registry.ApiRegistry) !voi
     }, null);
 }
 
-// Tests
-
 test "resolveProject - from environment" {
     const allocator = std.testing.allocator;
 
-    // Test with explicit option
     const result1 = try resolveProject(.{ .project = "my-project" }, allocator);
     if (result1) |p| {
         defer allocator.free(p);
         try std.testing.expectEqualStrings("my-project", p);
     }
 
-    // Test without options (depends on env vars being set or not)
-    // This should return error.MissingProjectId if no env vars are set
     const result2 = resolveProject(null, allocator);
     if (result2) |maybe_p| {
         if (maybe_p) |p| {
             allocator.free(p);
         }
     } else |_| {
-        // Expected if no env vars set
     }
 }
 
 test "resolveLocation - from environment" {
     const allocator = std.testing.allocator;
 
-    // Test with explicit option
     const result1 = try resolveLocation(.{ .location = "us-central1" }, allocator);
     if (result1) |l| {
         defer allocator.free(l);
         try std.testing.expectEqualStrings("us-central1", l);
     }
 
-    // Test without options
     const result2 = resolveLocation(null, allocator);
     if (result2) |maybe_l| {
         if (maybe_l) |l| {
             allocator.free(l);
         }
     } else |_| {
-        // Expected if GOOGLE_CLOUD_LOCATION not set
     }
 }
 
@@ -1537,7 +1448,6 @@ test "VertexOptions with values" {
 }
 
 test "VertexError error types" {
-    // Verify error types exist and can be used
     const err: VertexError = error.MissingProjectId;
     try std.testing.expect(err == error.MissingProjectId);
 
@@ -1637,7 +1547,6 @@ test "mapFinishReason - Vertex finish reasons" {
     try std.testing.expectEqual(ai_types.StopReason.stop, mapFinishReason(null));
 }
 
-
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
     return .{
         .id = "regression-model",
@@ -1676,7 +1585,6 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
-
 
 test "provider_cancellation_vertex_cancel_before_request" {
     var cancelled = std.atomic.Value(bool).init(true);

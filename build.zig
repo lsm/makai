@@ -24,7 +24,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Update ai_types_mod to import event_stream (circular dependency)
     ai_types_mod.addImport("event_stream", event_stream_mod);
 
     const sse_parser_mod = b.createModule(.{
@@ -45,7 +44,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ai_types depends on OwnedSlice for selective ownership wrappers
     ai_types_mod.addImport("owned_slice", owned_slice_mod);
 
     const string_builder_mod = b.createModule(.{
@@ -69,9 +67,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Canonical provider base URL resolution shared by the CLI and the
-    // provider protocol server (empty client base URLs, env overrides,
-    // transparent-proxy compat).
     const provider_base_url_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/provider_base_url.zig"),
         .target = target,
@@ -120,13 +115,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     if (target.result.os.tag == .macos) {
-        // Explicit `-Dtarget=*-macos` builds skip Zig's native framework
-        // detection and fail with "unable to find framework 'Security'.
-        // searched paths: none" (#196). Resolve the macOS SDK explicitly:
-        // the framework search path finds Security/CoreFoundation, and the
-        // sysroot resolves their system-library dependencies (CoreFoundation
-        // re-exports /usr/lib/libobjc.A.dylib, which only exists as a .tbd
-        // inside the SDK on modern macOS).
         if (macOsSdkDir(b)) |sdk_dir| {
             b.sysroot = sdk_dir;
             const frameworks_dir = std.fs.path.join(
@@ -512,7 +500,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Standalone protocol helper modules (no runtime wiring in M-003 scope).
     const protocol_model_ref_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/model_ref.zig"),
         .target = target,
@@ -527,9 +514,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // =========================================================================
-    // Protocol Provider Modules (protocol/provider/)
-    // =========================================================================
     const content_partial_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/provider/content_partial.zig"),
         .target = target,
@@ -647,9 +631,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // =========================================================================
-    // Protocol Agent Modules (protocol/agent/)
-    // =========================================================================
     const protocol_agent_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/agent/types.zig"),
         .target = target,
@@ -710,9 +691,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // =========================================================================
-    // Protocol Auth Modules (protocol/auth/)
-    // =========================================================================
     const protocol_auth_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/auth/types.zig"),
         .target = target,
@@ -762,9 +740,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // =========================================================================
-    // Protocol Tool Modules (protocol/tool/)
-    // =========================================================================
     const protocol_tool_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/tool/types.zig"),
         .target = target,
@@ -807,7 +782,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Agent modules
     const agent_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/agent/types.zig"),
         .target = target,
@@ -1149,7 +1123,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Tests
     const owned_slice_test = b.addTest(.{ .root_module = owned_slice_mod });
     const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
     const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
@@ -1317,7 +1290,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Provider Protocol Fullstack E2E tests - Ollama
     const e2e_provider_protocol_fullstack_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/provider_protocol_fullstack_ollama.zig"),
@@ -1338,7 +1310,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Provider Protocol Fullstack E2E tests - GitHub Copilot
     const e2e_provider_protocol_fullstack_github_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/provider_protocol_fullstack_github.zig"),
@@ -1359,8 +1330,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Protocol E2E tests (mock-based, no real providers needed)
-    // Uses protocol_types as the root module to avoid conflict with server's local types.zig import
     const e2e_protocol_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/protocol.zig"),
@@ -1390,11 +1359,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // E2E: default base URL resolution on the stdio protocol path (#183).
-    // Mock providers, no API keys. Every base-URL env var is pinned for this
-    // binary (empty = unset) so the canonical-default and env-override
-    // assertions are deterministic on every machine; OPENAI_BASE_URL plus
-    // its proxy flag exercise the override and compat paths end-to-end.
     const e2e_provider_base_url_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/provider_base_url.zig"),
@@ -1419,8 +1383,6 @@ pub fn build(b: *std.Build) void {
     e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("KIMI_REGION", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL", "https://env-override.makai.test/openai");
-    // Clear every other proxy flag so inherited host settings cannot turn on
-    // compat for providers whose URLs the assertions expect to be untouched.
     e2e_provider_base_url_test_run.setEnvironmentVariable("MAKAI_BASE_URL_IS_PROXY", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL_IS_PROXY", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL_IS_PROXY", "");
@@ -1447,9 +1409,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
-    // The distributed fullstack test uses in-process threading + condition variables
-    // and currently matches the bridge test backend issue; LLVM handles it fine.
     e2e_distributed_fullstack_test.use_llvm = true;
 
     const e2e_distributed_fullstack_github_test = b.addTest(.{
@@ -1505,26 +1464,22 @@ pub fn build(b: *std.Build) void {
 
     const protocol_runtime_test = b.addTest(.{ .root_module = protocol_runtime_mod });
 
-    // Protocol Agent tests
     const protocol_agent_types_test = b.addTest(.{ .root_module = protocol_agent_types_mod });
     const protocol_agent_envelope_test = b.addTest(.{ .root_module = protocol_agent_envelope_mod });
     const protocol_agent_server_test = b.addTest(.{ .root_module = protocol_agent_server_mod });
     const protocol_agent_client_test = b.addTest(.{ .root_module = protocol_agent_client_mod });
     const protocol_agent_runtime_test = b.addTest(.{ .root_module = protocol_agent_runtime_mod });
 
-    // Protocol Auth tests
     const protocol_auth_types_test = b.addTest(.{ .root_module = protocol_auth_types_mod });
     const protocol_auth_envelope_test = b.addTest(.{ .root_module = protocol_auth_envelope_mod });
     const protocol_auth_server_test = b.addTest(.{ .root_module = protocol_auth_server_mod });
     const protocol_auth_runtime_test = b.addTest(.{ .root_module = protocol_auth_runtime_mod });
 
-    // Protocol Tool tests
     const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
     const protocol_tool_envelope_test = b.addTest(.{ .root_module = protocol_tool_envelope_mod });
     const protocol_tool_runtime_test = b.addTest(.{ .root_module = protocol_tool_runtime_mod });
     const protocol_tool_local_runtime_test = b.addTest(.{ .root_module = protocol_tool_local_runtime_mod });
 
-    // Agent tests
     const permission_test = b.addTest(.{ .root_module = permission_mod });
 
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
@@ -1569,9 +1524,6 @@ pub fn build(b: *std.Build) void {
     const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
     const tools_mcp_bridge_test = b.addTest(.{ .root_module = tools_mcp_bridge_mod });
     const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
-    // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
-    // The bridge test uses in-process threading + condition variables that trigger
-    // a known backend bug; LLVM handles it fine.
     agent_provider_protocol_bridge_test.use_llvm = true;
 
     const agent_test = b.addTest(.{
@@ -1611,11 +1563,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Auth CLI wrapper module — drives the auth protocol runtime in-process so
-    // `makai auth providers` and `makai auth login` are thin wrappers over the
-    // protocol layer (M-013). Lives separately from the CLI entry point so
-    // tests can exercise it with in-memory IO without dragging in the entire
-    // `makai.zig` surface.
     const auth_cli_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/tools/auth_cli.zig"),
         .target = target,
@@ -1841,7 +1788,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&auth_cli_test_run.step);
     test_step.dependOn(&makai_cli_test_run.step);
 
-    // Grouped unit test steps for parallel CI
     const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
     test_unit_core_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
@@ -2028,7 +1974,6 @@ pub fn build(b: *std.Build) void {
     const test_e2e_provider_protocol_fullstack_ollama_step = b.step("test-e2e-provider-protocol-fullstack-ollama", "Run Provider Protocol Fullstack E2E tests - Ollama");
     test_e2e_provider_protocol_fullstack_ollama_step.dependOn(&b.addRunArtifact(e2e_provider_protocol_fullstack_ollama_test).step);
 
-    // GitHub Copilot E2E tests
     const e2e_github_copilot_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/github_copilot_api.zig"),
@@ -2080,7 +2025,6 @@ pub fn build(b: *std.Build) void {
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
     test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
 
-    // Expose modules for consumers via `b.dependency("makai", .{}).module("...")`
     b.modules.put(b.allocator, b.dupe("ai_types"), ai_types_mod) catch @panic("OOM");
     b.modules.put(b.allocator, b.dupe("event_stream"), event_stream_mod) catch @panic("OOM");
     b.modules.put(b.allocator, b.dupe("stream"), stream_mod) catch @panic("OOM");
@@ -2091,19 +2035,12 @@ pub fn build(b: *std.Build) void {
     b.modules.put(b.allocator, b.dupe("agent"), agent_mod) catch @panic("OOM");
 }
 
-/// macOS SDK root directory, used as the build sysroot and framework search
-/// path base for macos targets. Resolved from `$SDKROOT` when set, otherwise
-/// from `xcrun --show-sdk-path` when the build host is macOS. Returns null
-/// when neither is available (e.g. cross-compiling to macOS from Linux, which
-/// needs a macOS SDK that hosted Linux runners do not have).
 fn macOsSdkDir(b: *std.Build) ?[]const u8 {
     if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
         if (sdkroot.len > 0) return sdkroot;
     }
     if (@import("builtin").os.tag != .macos) return null;
 
-    // Allocations come from the build's arena, which lives for the whole
-    // build, so nothing here needs freeing.
     const run_result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ "/usr/bin/xcrun", "--show-sdk-path" },
     }) catch return null;

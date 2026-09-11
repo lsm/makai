@@ -1,5 +1,3 @@
-//! Windows terminal implementation using Console API.
-//! Provides terminal control for Windows systems.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -15,13 +13,11 @@ pub const TerminalError = error{
     InvalidHandle,
 };
 
-/// Terminal size
 pub const Size = struct {
     rows: u16,
     cols: u16,
 };
 
-/// Console mode flags
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING: windows.DWORD = 0x0004;
 const ENABLE_VIRTUAL_TERMINAL_INPUT: windows.DWORD = 0x0200;
 const ENABLE_PROCESSED_INPUT: windows.DWORD = 0x0001;
@@ -39,7 +35,6 @@ const INFINITE: windows.DWORD = 0xFFFFFFFF;
 const WAIT_OBJECT_0: windows.DWORD = 0x00000000;
 const CP_UTF8: windows.UINT = 65001;
 
-/// Terminal state for Windows
 pub const State = struct {
     original_input_mode: windows.DWORD = 0,
     original_output_mode: windows.DWORD = 0,
@@ -59,7 +54,6 @@ pub const State = struct {
     }
 };
 
-/// External Windows API declarations
 extern "kernel32" fn GetConsoleMode(hConsole: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn SetConsoleMode(hConsole: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn GetConsoleScreenBufferInfo(hConsole: windows.HANDLE, lpInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
@@ -149,14 +143,12 @@ const KEY_EVENT_RECORD = extern struct {
     dwControlKeyState: windows.DWORD,
 };
 
-/// Check if a handle is valid
 pub fn isTty(handle: windows.HANDLE) bool {
     if (handle == windows.INVALID_HANDLE_VALUE) return false;
     var mode: windows.DWORD = 0;
     return GetConsoleMode(handle, &mode).toBool();
 }
 
-/// Get terminal size
 pub fn getSize(handle: windows.HANDLE) !Size {
     var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
     if (!GetConsoleScreenBufferInfo(handle, &info).toBool()) {
@@ -168,7 +160,6 @@ pub fn getSize(handle: windows.HANDLE) !Size {
     };
 }
 
-/// Enable raw mode
 pub fn enableRawMode(state: *State) !void {
     if (state.in_raw_mode) return;
 
@@ -178,7 +169,6 @@ pub fn enableRawMode(state: *State) !void {
         return TerminalError.InvalidHandle;
     }
 
-    // Save original modes
     if (!GetConsoleMode(state.stdin_handle, &state.original_input_mode).toBool()) {
         return TerminalError.GetConsoleFailed;
     }
@@ -186,23 +176,17 @@ pub fn enableRawMode(state: *State) !void {
         return TerminalError.GetConsoleFailed;
     }
 
-    // Set input mode for raw input with VT processing.
-    // Avoid WINDOW_INPUT because it can signal wait handles without producing bytes for ReadFile.
     const input_mode: windows.DWORD = ENABLE_VIRTUAL_TERMINAL_INPUT;
     if (!SetConsoleMode(state.stdin_handle, input_mode).toBool()) {
         return TerminalError.SetConsoleFailed;
     }
 
-    // Enable VT processing on output
     const output_mode: windows.DWORD = state.original_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     if (!SetConsoleMode(state.stdout_handle, output_mode).toBool()) {
-        // Restore input mode and fail
         _ = SetConsoleMode(state.stdin_handle, state.original_input_mode);
         return TerminalError.SetConsoleFailed;
     }
 
-    // Switch the console code pages to UTF-8 so multi-byte sequences (box-drawing,
-    // emoji, etc.) emitted by the renderer aren't reinterpreted as the OEM codepage.
     state.original_output_cp = GetConsoleOutputCP();
     state.original_input_cp = GetConsoleCP();
     _ = SetConsoleOutputCP(CP_UTF8);
@@ -211,7 +195,6 @@ pub fn enableRawMode(state: *State) !void {
     state.in_raw_mode = true;
 }
 
-/// Disable raw mode
 pub fn disableRawMode(state: *State) void {
     if (!state.in_raw_mode) return;
 
@@ -223,7 +206,6 @@ pub fn disableRawMode(state: *State) void {
     state.in_raw_mode = false;
 }
 
-/// Enter alternate screen buffer
 pub fn enterAltScreen(state: *State, writer: *Writer) !void {
     if (state.in_alt_screen) return;
 
@@ -231,7 +213,6 @@ pub fn enterAltScreen(state: *State, writer: *Writer) !void {
     state.in_alt_screen = true;
 }
 
-/// Exit alternate screen buffer
 pub fn exitAltScreen(state: *State, writer: *Writer) !void {
     if (!state.in_alt_screen) return;
 
@@ -239,11 +220,9 @@ pub fn exitAltScreen(state: *State, writer: *Writer) !void {
     state.in_alt_screen = false;
 }
 
-/// Enable mouse tracking
 pub fn enableMouse(state: *State, writer: *Writer) !void {
     if (state.mouse_enabled) return;
 
-    // Enable mouse input in console mode
     if (state.stdin_handle != windows.INVALID_HANDLE_VALUE) {
         var mode: windows.DWORD = 0;
         if (GetConsoleMode(state.stdin_handle, &mode).toBool()) {
@@ -251,12 +230,10 @@ pub fn enableMouse(state: *State, writer: *Writer) !void {
         }
     }
 
-    // Also send ANSI sequences for VT mode
     try writer.writeAll("\x1b[?1000h\x1b[?1006h");
     state.mouse_enabled = true;
 }
 
-/// Disable mouse tracking
 pub fn disableMouse(state: *State, writer: *Writer) !void {
     if (!state.mouse_enabled) return;
 
@@ -264,11 +241,9 @@ pub fn disableMouse(state: *State, writer: *Writer) !void {
     state.mouse_enabled = false;
 }
 
-/// Read available input (Windows uses std.Io)
 pub fn readInput(state: *State, buffer: []u8, timeout_ms: i32) !usize {
     if (state.stdin_handle == windows.INVALID_HANDLE_VALUE) return 0;
 
-    // Match POSIX behavior: wait up to timeout_ms for input, then return 0.
     const wait_ms: windows.DWORD = if (timeout_ms < 0)
         INFINITE
     else
@@ -278,7 +253,6 @@ pub fn readInput(state: *State, buffer: []u8, timeout_ms: i32) !usize {
 
     const file_type = GetFileType(state.stdin_handle);
 
-    // ConPTY/Windows Terminal can expose stdin as a pipe. Ensure there are bytes before reading.
     if (file_type == FILE_TYPE_PIPE) {
         var available: windows.DWORD = 0;
         if (!PeekNamedPipe(state.stdin_handle, null, 0, null, &available, null).toBool() or available == 0) {
@@ -286,12 +260,10 @@ pub fn readInput(state: *State, buffer: []u8, timeout_ms: i32) !usize {
         }
     }
 
-    // Console handles may wake due non-byte events (focus/menu/window-size). Drain those first.
     if (file_type == FILE_TYPE_CHAR and !hasReadableConsoleInput(state.stdin_handle)) {
         return 0;
     }
 
-    // Read from the configured stdin handle after it is signaled as readable.
     var bytes_read: windows.DWORD = 0;
     if (!ReadFile(state.stdin_handle, buffer.ptr, @intCast(buffer.len), &bytes_read, null).toBool()) return 0;
     return bytes_read;
@@ -327,20 +299,13 @@ fn hasReadableConsoleInput(handle: windows.HANDLE) bool {
     }
 }
 
-/// Flush output
 pub fn flush(handle: windows.HANDLE) void {
     _ = handle;
-    // Windows typically auto-flushes
 }
 
-/// Setup signal handlers (Windows uses console events differently)
 pub fn setupSignals() !void {
-    // Windows handles resize through WINDOW_BUFFER_SIZE_EVENT
-    // This is handled in the input loop
 }
 
-/// Check if resize was signaled
 pub fn checkResize() bool {
-    // On Windows, resize is handled through console events
     return false;
 }

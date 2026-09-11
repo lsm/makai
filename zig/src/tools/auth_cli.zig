@@ -1,13 +1,3 @@
-//! `makai auth` CLI as a thin wrapper over the auth protocol runtime.
-//!
-//! This module re-implements the user-facing `makai auth providers` and
-//! `makai auth login` commands as wrappers that drive the in-process auth
-//! protocol runtime (M-002) instead of duplicating OAuth orchestration in the
-//! CLI layer. Output shape matches the legacy CLI behavior so existing
-//! scripts/tooling continue to work.
-//!
-//! Spec: `docs/v1-sdk-agent-provider-spec.md §9` Phase C; integration plan
-//! Phase 5.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -22,7 +12,6 @@ pub const AuthProtocolServer = auth_server_mod.AuthProtocolServer;
 const AuthProtocolRuntime = auth_runtime_mod.AuthProtocolRuntime;
 const SerializedPipe = in_process.SerializedPipe;
 
-/// Idle pump sleep when the auth protocol runtime has no immediate work.
 const IDLE_SLEEP_NS = std.time.ns_per_ms;
 
 fn defaultIo() std.Io {
@@ -32,9 +21,6 @@ fn defaultIo() std.Io {
         std.Io.Threaded.global_single_threaded.io();
 }
 
-/// Hard upper bound on iterations spent waiting for terminal envelopes.
-/// 60_000 iterations × 1ms ≈ 60s per command. Real OAuth flows finish in well
-/// under a minute; the bound exists so a stuck flow still yields control.
 const MAX_IDLE_ITERATIONS: usize = 60_000;
 
 pub const AuthCliError = error{
@@ -44,8 +30,6 @@ pub const AuthCliError = error{
     AuthProtocolTimeout,
 };
 
-/// IO abstraction so the wrapper can be exercised both with real stdio in
-/// production and with in-memory buffers from unit tests.
 pub const AuthCliIo = struct {
     pub const VTable = struct {
         read_line: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
@@ -78,7 +62,6 @@ pub const LoginOptions = struct {
     json_mode: bool = false,
 };
 
-/// Run `makai auth providers` end-to-end through the auth protocol runtime.
 pub fn runProvidersCommand(
     allocator: std.mem.Allocator,
     io: AuthCliIo,
@@ -148,8 +131,6 @@ pub fn runProvidersCommand(
     return AuthCliError.AuthProtocolTimeout;
 }
 
-/// Run `makai auth login --provider <id>` end-to-end through the auth protocol
-/// runtime. Drives interactive prompts via the supplied IO interface.
 pub fn runLoginCommand(
     allocator: std.mem.Allocator,
     io: AuthCliIo,
@@ -320,8 +301,6 @@ fn handleAuthEvent(
             next_client_seq.* += 1;
         },
         .success => {
-            // Terminal status communicated via auth_login_result; success
-            // event is informational only.
         },
         .@"error" => |payload| {
             if (captured_error_code.* == null) {
@@ -463,10 +442,6 @@ fn emitProviders(
     response: auth_types.AuthProvidersResponse,
 ) !void {
     if (json_mode) {
-        // Backward-compatible shape: `{ "type": "providers", "providers":
-        // [{ "id", "name" }] }`. Auth status from the runtime is intentionally
-        // omitted from the wrapper output to avoid altering the output schema
-        // existing scripts depend on.
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{\"type\":\"providers\",\"providers\":[");
@@ -533,10 +508,6 @@ fn appendJsonStringField(
     try buf.append(allocator, ':');
     try buf.appendSlice(allocator, encoded_value);
 }
-
-// =============================================================================
-// File-backed IO (production CLI path)
-// =============================================================================
 
 pub const FileIo = struct {
     stdin: std.Io.File,
@@ -611,10 +582,6 @@ const file_io_vtable = AuthCliIo.VTable{
     .write_err = FileIo.writeErrFn,
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const TestIo = struct {
     inputs: std.ArrayList([]const u8),
     input_index: usize = 0,
@@ -683,7 +650,6 @@ test "runProvidersCommand plain mode emits provider ids one per line" {
 
     try runProvidersCommand(allocator, test_io.io(), test_server_options, .{ .json_mode = false });
 
-    // Expect at least the built-in provider ids on their own lines.
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "anthropic\n") != null);
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "github-copilot\n") != null);
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "test-fixture\n") != null);
@@ -709,9 +675,6 @@ test "runProvidersCommand json mode emits backward-compatible provider list shap
     var saw_anthropic = false;
     for (providers.items) |item| {
         const obj = item.object;
-        // Only the historical (id, name) fields must appear; auth-status is
-        // intentionally not part of the wrapper output to preserve existing
-        // script consumers.
         try std.testing.expect(obj.contains("id"));
         try std.testing.expect(obj.contains("name"));
         if (std.mem.eql(u8, obj.get("id").?.string, "anthropic")) saw_anthropic = true;
@@ -724,8 +687,6 @@ test "runLoginCommand routes through protocol runtime and completes test-fixture
     var test_io = TestIo.init(allocator);
     defer test_io.deinit();
 
-    // Test fixture rejects the first answer to exercise the prompt loop, then
-    // accepts the canonical "ok" response.
     try test_io.pushInput("bad-code");
     try test_io.pushInput("ok");
 
@@ -736,7 +697,6 @@ test "runLoginCommand routes through protocol runtime and completes test-fixture
 
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "https://example.invalid/makai-test-fixture-login") != null);
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "Enter code 'ok' to complete fixture login.") != null);
-    // Two prompts must have been issued (one for the rejected code, one for "ok").
     var prompt_count: usize = 0;
     var idx: usize = 0;
     while (std.mem.findPos(u8, test_io.out.items, idx, "Enter fixture code:")) |found| {
@@ -745,7 +705,6 @@ test "runLoginCommand routes through protocol runtime and completes test-fixture
     }
     try std.testing.expect(prompt_count >= 2);
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "Login successful.") != null);
-    // Tokens must never appear in the wrapper-visible output.
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "fixture-refresh-token") == null);
     try std.testing.expect(std.mem.find(u8, test_io.out.items, "fixture-access-token") == null);
     try std.testing.expect(std.mem.find(u8, test_io.err.items, "fixture-refresh-token") == null);

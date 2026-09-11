@@ -1,9 +1,6 @@
-//! Async task runner for background work in ZigZag.
-//! Spawns threads that execute functions and queue result messages.
 
 const std = @import("std");
 
-/// Thread-safe result queue for async tasks.
 pub fn AsyncRunner(comptime Msg: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -25,8 +22,6 @@ pub fn AsyncRunner(comptime Msg: type) type {
             self.results.deinit();
         }
 
-        /// Spawn a background task. The function runs on a new thread and
-        /// its return value is queued as a message for the next frame.
         pub fn spawn(self: *Self, func: *const fn () ?Msg) u32 {
             const id = self.next_id;
             self.next_id += 1;
@@ -42,7 +37,6 @@ pub fn AsyncRunner(comptime Msg: type) type {
             return id;
         }
 
-        /// Spawn with a context argument.
         pub fn spawnWithArg(self: *Self, comptime ArgT: type, arg: ArgT, func: *const fn (ArgT) ?Msg) u32 {
             const id = self.next_id;
             self.next_id += 1;
@@ -75,8 +69,6 @@ pub fn AsyncRunner(comptime Msg: type) type {
             return id;
         }
 
-        /// Poll for completed results. Returns messages from finished tasks.
-        /// Call this each frame to collect async results.
         pub fn poll(self: *Self) []Msg {
             while (!self.results_mutex.tryLock()) std.atomic.spinLoopHint();
             defer self.results_mutex.unlock();

@@ -224,7 +224,6 @@ fn handleModel(ctx: CommandContext, command: Command) !CommandResult {
         if (model) |m| try ctx.state.status.setModel(ctx.allocator, m.id, m.provider);
         return .{ .output = try std.fmt.allocPrint(ctx.allocator, "model switched to {s}", .{model_id}) };
     }
-    // No argument: open the interactive picker instead of dumping a list.
     return .{ .action = .open_model_picker };
 }
 
@@ -287,8 +286,6 @@ fn handleStatus(ctx: CommandContext, command: Command) !CommandResult {
 
 fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    // Sessions are loaded by App.loadSessions() before dispatch.
-    // Return the open_session_picker action so App can switch mode.
     if (ctx.state.sessions.items.len == 0) {
         return .{ .output = try ctx.allocator.dupe(u8, "no saved sessions") };
     }
@@ -404,7 +401,6 @@ fn handleClear(ctx: CommandContext, command: Command) !CommandResult {
 
 fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
     _ = ctx;
-    // The app stages the clipboard write and reports status itself, so no output.
     if (command.arg) |arg| {
         const trimmed = std.mem.trim(u8, arg, " \t");
         if (std.mem.eql(u8, trimmed, "all")) {
@@ -495,9 +491,6 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
             if (rest.len > 0) {
                 return .{ .output = try allocator.dupe(u8, "stdio transport uses the current process; no command argument is supported"), .is_error = true };
             }
-            // stdio remote would bind the agent protocol to the TUI's own
-            // stdin/stdout. Until subprocess spawning is wired up, persist the
-            // transport preference but do not enable remote mode.
             cfg.remote.enabled = false;
             restart_notice = true;
             try replaceRemoteString(allocator, &cfg.remote.transport, "stdio");
@@ -1248,8 +1241,6 @@ test "remote command sets stdio transport without enabling remote" {
 
     var loaded = try store.load();
     defer loaded.deinit(std.testing.allocator);
-    // stdio remote would hijack the TUI's own stdio; keep it disabled until
-    // subprocess spawning is implemented.
     try std.testing.expect(!loaded.remote.enabled);
     try std.testing.expectEqualStrings("stdio", loaded.remote.transport);
     try std.testing.expectEqualStrings("", loaded.remote.command);

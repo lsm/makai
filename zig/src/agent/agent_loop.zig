@@ -7,7 +7,6 @@ const permission = @import("permission");
 const json_writer = @import("json_writer");
 const owned_slice_mod = @import("owned_slice");
 
-// Re-export types needed by callers
 pub const AgentEvent = types.AgentEvent;
 pub const AgentEventStream = types.AgentEventStream;
 pub const AgentLoopConfig = types.AgentLoopConfig;
@@ -181,9 +180,6 @@ test "agent event push blocks instead of dropping ordered events" {
 
     const thread = try std.Thread.spawn(.{}, delayedAgentEventPush, .{&stream});
 
-    // Free one slot so the blocked producer can publish agent_end, then join
-    // before draining: the producer's pushBlocking retries on a 1ms cadence,
-    // so draining first could race it and miss the event entirely.
     const first = stream.poll() orelse return error.ExpectedEvent;
     thread.join();
 
@@ -250,7 +246,6 @@ fn measureToolResult(result: AgentToolResult) ToolResultUsage {
     };
 }
 
-/// Build tool definitions array for LLM request
 fn buildToolsArray(
     allocator: std.mem.Allocator,
     tools: ?[]const AgentTool,
@@ -265,7 +260,6 @@ fn buildToolsArray(
     return result;
 }
 
-/// Find a tool by name
 fn findTool(tools: ?[]const AgentTool, name: []const u8) ?AgentTool {
     const agent_tools = tools orelse return null;
     for (agent_tools) |tool| {
@@ -274,29 +268,17 @@ fn findTool(tools: ?[]const AgentTool, name: []const u8) ?AgentTool {
     return null;
 }
 
-/// Validate tool arguments against the tool's parameter schema.
-/// Currently a placeholder that passes through arguments unchanged.
-/// TODO: Implement JSON Schema validation when a suitable validator is available.
 fn validateToolArguments(
     allocator: std.mem.Allocator,
     tool: AgentTool,
     args_json: []const u8,
 ) ![]const u8 {
     _ = allocator;
-    _ = tool.parameters_schema_json; // Would be used for schema validation
-
-    // For now, pass through the arguments unchanged.
-    // In the future, this should:
-    // 1. Parse the JSON schema from tool.parameters_schema_json
-    // 2. Parse args_json
-    // 3. Validate args against schema
-    // 4. Return validated args (possibly with defaults filled in)
-    // 5. Return error.InvalidToolArguments if validation fails
+    _ = tool.parameters_schema_json;
 
     return args_json;
 }
 
-/// Create an error result for failed tool execution
 fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResult {
     const error_name = @errorName(err);
     const content = try allocator.alloc(ai_types.UserContentPart, 1);
@@ -327,7 +309,6 @@ fn rejectedToolResult(allocator: std.mem.Allocator) !AgentToolResult {
     };
 }
 
-/// Create a tool result message from execution result
 fn createToolResultMessage(
     allocator: std.mem.Allocator,
     tool_call: ai_types.ToolCall,
@@ -362,7 +343,6 @@ fn createToolResultMessage(
     };
 }
 
-/// Callback context for tool updates
 const ToolUpdateContext = struct {
     event_stream: *AgentEventStream,
     tool_call_id: []const u8,
@@ -370,7 +350,6 @@ const ToolUpdateContext = struct {
     args_json: []const u8,
 };
 
-/// Tool update callback implementation - pushes tool_execution_update events
 fn onToolUpdate(ctx: ?*anyopaque, tool_call_id: []const u8, tool_name: []const u8, partial_result_json: []const u8) void {
     const context: *ToolUpdateContext = @ptrCast(@alignCast(ctx));
 
@@ -382,9 +361,6 @@ fn onToolUpdate(ctx: ?*anyopaque, tool_call_id: []const u8, tool_name: []const u
     } }) catch {};
 }
 
-/// Skip a tool call due to steering message interrupt.
-/// Emits tool_execution_start/end events and returns a ToolResultMessage
-/// with an error indicating the tool was skipped.
 fn skipToolCall(
     allocator: std.mem.Allocator,
     tool_call: ai_types.ToolCall,
@@ -392,14 +368,12 @@ fn skipToolCall(
 ) !ai_types.ToolResultMessage {
     const skip_message = "Skipped due to queued user message.";
 
-    // Emit start event
     try pushAgentEvent(event_stream, .{ .tool_execution_start = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .args_json = tool_call.arguments_json,
     } });
 
-    // Emit end event with skip result
     try pushAgentEvent(event_stream, .{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
@@ -407,7 +381,6 @@ fn skipToolCall(
         .is_error = true,
     } });
 
-    // Create tool result message
     const content = try allocator.alloc(ai_types.UserContentPart, 1);
     content[0] = .{ .text = .{
         .text = try allocator.dupe(u8, skip_message),
@@ -512,7 +485,6 @@ fn runLegacyApproval(tool: AgentTool, approval_request: types.ToolApprovalReques
     return .approve;
 }
 
-/// Result from tool execution phase
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
     compact_args: [][]u8 = &.{},
@@ -561,7 +533,6 @@ test "ToolExecutionResult transferred cleanup frees compact args" {
     result.deinitAfterToolResultsTransferred(allocator);
 }
 
-/// Execute tool calls from assistant message
 fn supportsCompactToolOutput(allocator: std.mem.Allocator, tool: AgentTool) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool.parameters_schema_json, .{});
     defer parsed.deinit();
@@ -605,9 +576,6 @@ fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![
     defer parsed.deinit();
     if (parsed.value != .object) return try allocator.dupe(u8, args_json);
     if (parsed.value.object.contains("compact_output")) return try allocator.dupe(u8, args_json);
-    // Dynamic JSON values parsed by `parseFromSlice` own object-map storage
-    // through the parser arena. Grow the map with that same arena allocator;
-    // using the caller allocator can free arena-owned buckets and panic.
     try parsed.value.object.put(parsed.arena.allocator(), "compact_output", .{ .bool = true });
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
@@ -643,7 +611,6 @@ fn executeToolCalls(
     config: AgentLoopConfig,
     event_stream: *AgentEventStream,
 ) !ToolExecutionResult {
-    // Extract tool calls from assistant message
     var tool_calls: std.ArrayList(ai_types.ToolCall) = .empty;
     defer tool_calls.deinit(allocator);
 
@@ -663,10 +630,8 @@ fn executeToolCalls(
     var steering_messages: ?[]const ai_types.Message = null;
 
     for (tool_calls.items, 0..) |tool_call, index| {
-        // Find tool
         const tool = findTool(config.tools, tool_call.name);
 
-        // Emit start event
         try pushAgentEvent(event_stream, .{ .tool_execution_start = .{
             .tool_call_id = tool_call.id,
             .tool_name = tool_call.name,
@@ -678,7 +643,6 @@ fn executeToolCalls(
         var execution_args = tool_call.arguments_json;
 
         if (tool) |t| {
-            // Validate tool arguments against schema
             const validated_args = validateToolArguments(allocator, t, tool_call.arguments_json) catch |err| {
                 result = try createErrorResult(allocator, err);
                 is_error = true;
@@ -716,7 +680,6 @@ fn executeToolCalls(
                     try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                     continue;
                 }
-                // Skip legacy prompt when a persisted policy already allows the call
                 if (policy_decision != .allow) {
                     const legacy_decision = runLegacyApproval(t, approval_request, allocator);
                     if (legacy_decision == .reject or legacy_decision == .reject_always) {
@@ -729,7 +692,6 @@ fn executeToolCalls(
                         const call = permission.parseToolCall(allocator, tool_call.name, validated_args) catch null;
                         if (call) |parsed_call| {
                             defer permission.deinitParsedToolCall(allocator, parsed_call);
-                            // Best-effort persistence — I/O failure must not reject the approved tool
                             if (permission.canPersistDecision(parsed_call)) engine.persistDecision(parsed_call, .allow) catch {};
                         }
                     }
@@ -754,7 +716,6 @@ fn executeToolCalls(
                 }
             }
 
-            // Create context for tool update callback
             var update_ctx = ToolUpdateContext{
                 .event_stream = event_stream,
                 .tool_call_id = tool_call.id,
@@ -784,14 +745,12 @@ fn executeToolCalls(
 
         try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
 
-        // Check for steering messages - skip remaining tools if any
         if (config.get_steering_messages_fn) |get_steering| {
             if (try get_steering(config.get_steering_messages_ctx, allocator)) |msgs| {
                 if (msgs.len > 0) {
                     steering_messages = msgs;
                     has_steering = true;
 
-                    // Skip remaining tools - emit skip events for each
                     const remaining = tool_calls.items[index + 1 ..];
                     for (remaining) |skipped_call| {
                         const skipped_result = try skipToolCall(allocator, skipped_call, event_stream);
@@ -813,17 +772,14 @@ fn executeToolCalls(
     };
 }
 
-/// Stream assistant response from provider
 fn streamAssistantResponse(
     allocator: std.mem.Allocator,
     context: *AgentContext,
     config: AgentLoopConfig,
     event_stream: *AgentEventStream,
 ) !ai_types.AssistantMessage {
-    // Get messages to send to LLM
     var messages = context.messagesSlice();
 
-    // Apply context transformation if configured (works on Message[] level)
     var transformed_messages: ?[]const ai_types.Message = null;
     defer if (transformed_messages) |tm| allocator.free(tm);
 
@@ -832,7 +788,6 @@ fn streamAssistantResponse(
         messages = transformed_messages.?;
     }
 
-    // Convert to LLM-compatible messages if configured
     var llm_messages: ?[]const ai_types.Message = null;
     defer if (llm_messages) |_| allocator.free(llm_messages.?);
 
@@ -841,12 +796,10 @@ fn streamAssistantResponse(
         messages = llm_messages.?;
     }
 
-    // Build tools array for LLM
     var tools: ?[]ai_types.Tool = null;
     defer if (tools) |t| allocator.free(t);
     tools = try buildToolsArray(allocator, context.tools);
 
-    // Build LLM context
     const llm_context = ai_types.Context{
         .system_prompt = ai_types.OwnedSlice(u8).initBorrowed(context.getSystemPrompt() orelse ""),
         .messages = messages,
@@ -855,7 +808,6 @@ fn streamAssistantResponse(
     };
     try emitContextUsage(event_stream, llm_context);
 
-    // Build protocol options
     const options = ProtocolOptions{
         .api_key = config.api_key,
         .session_id = config.session_id,
@@ -867,7 +819,6 @@ fn streamAssistantResponse(
         .max_tokens = config.max_tokens,
     };
 
-    // Call protocol client to stream
     const provider_stream = try config.protocol.stream(
         config.model,
         llm_context,
@@ -879,7 +830,6 @@ fn streamAssistantResponse(
         allocator.destroy(provider_stream);
     }
 
-    // Forward events and collect final message
     var final_message: ?ai_types.AssistantMessage = null;
     var message_started = false;
 
@@ -891,7 +841,6 @@ fn streamAssistantResponse(
                     ai_types.deinitAssistantMessageEvent(allocator, &owned_start_event);
                 };
 
-                // Create a Message wrapper for the assistant message
                 const msg: ai_types.Message = .{ .assistant = .{
                     .content = &.{},
                     .api = config.model.api,
@@ -964,12 +913,10 @@ fn streamAssistantResponse(
                 final_transferred = true;
             },
             .keepalive => {
-                // Ignore keepalive events
             },
         }
     }
 
-    // Fallback for providers that don't emit .done (e.g. OpenAI Completions, Anthropic)
     if (final_message == null) {
         if (provider_stream.getResult()) |result| {
             var cloned = try ai_types.cloneAssistantMessage(allocator, result);
@@ -984,9 +931,6 @@ fn streamAssistantResponse(
 
     if (final_message == null) {
         if (provider_stream.getError()) |provider_error| {
-            // Preserve the provider's own error text (e.g. "auth_required",
-            // "invalid anthropic URL") verbatim so the turn_end event carries
-            // the root cause instead of a generic Zig error name.
             return try makeProviderErrorAssistantMessage(allocator, config.model, provider_error);
         }
     }
@@ -1019,7 +963,6 @@ fn makeProviderErrorAssistantMessage(
     };
 }
 
-/// Run state for the agent loop
 const LoopState = struct {
     messages: std.ArrayList(ai_types.Message),
     iterations: u32,
@@ -1057,8 +1000,6 @@ fn setFinalMessage(state: *LoopState, allocator: std.mem.Allocator, msg: ai_type
     state.final_message = cloned;
 }
 
-/// Run the agent loop with new prompt messages.
-/// This is the internal implementation used by both agentLoop and agentLoopContinue.
 fn runLoop(
     allocator: std.mem.Allocator,
     prompts: ?[]const ai_types.Message,
@@ -1073,12 +1014,10 @@ fn runLoop(
     };
     defer state.deinit(allocator);
 
-    // Add initial prompts to context
     if (prompts) |initial_prompts| {
         for (initial_prompts) |prompt| {
             try context.appendMessage(prompt);
 
-            // Emit message_start/message_end for each prompt
             try pushAgentEvent(event_stream, .{ .message_start = .{
                 .message = prompt,
             } });
@@ -1086,26 +1025,18 @@ fn runLoop(
                 .message = prompt,
             } });
 
-            // Track as an owned result message
             try appendClonedStateMessage(&state.messages, allocator, prompt);
         }
     }
 
-    // Emit agent_start
     try pushAgentEvent(event_stream, .agent_start);
 
     const max_iterations = config.max_iterations orelse 100;
 
-    // Set at every terminal exit (completion, error, cancellation). When the
-    // loop instead exits through its iteration-cap condition — including a
-    // capped tool_use turn, an unprocessed queued steering/follow-up message,
-    // or a zero-iteration run — the run terminated on max turns.
     var ended_before_cap = false;
     var cancelled_run = false;
 
-    // Outer loop: handles follow-up messages
     outer: while (state.iterations < max_iterations) {
-        // Check for cancellation
         if (config.cancel_token) |token| {
             if (token.isCancelled()) {
                 ended_before_cap = true;
@@ -1114,9 +1045,7 @@ fn runLoop(
             }
         }
 
-        // Inner loop: process tool calls and steering
         while (state.iterations < max_iterations) {
-            // Check for steering messages
             var steering_messages: ?[]const ai_types.Message = null;
             if (config.get_steering_messages_fn) |get_steering| {
                 steering_messages = try get_steering(config.get_steering_messages_ctx, allocator);
@@ -1124,7 +1053,6 @@ fn runLoop(
 
             if (steering_messages) |msgs| {
                 if (msgs.len > 0) {
-                    // Add steering messages to context
                     for (msgs) |steering_msg| {
                         try context.appendMessage(steering_msg);
                         try pushAgentEvent(event_stream, .{ .message_start = .{
@@ -1141,17 +1069,14 @@ fn runLoop(
                 }
             }
 
-            // Emit turn_start before streaming assistant response
             try pushAgentEvent(event_stream, .turn_start);
 
-            // Stream assistant response
             const assistant_message = streamAssistantResponse(
                 allocator,
                 context,
                 config,
                 event_stream,
             ) catch |err| {
-                // Create error message
                 const error_content = [_]ai_types.AssistantContent{.{
                     .text = .{ .text = "" },
                 }};
@@ -1169,7 +1094,6 @@ fn runLoop(
                 try setFinalMessage(&state, allocator, error_msg);
                 try appendClonedStateMessage(&state.messages, allocator, .{ .assistant = error_msg });
 
-                // Emit turn_end with error
                 const final_error_msg = state.final_message orelse error_msg;
                 try pushAgentEvent(event_stream, .{ .turn_end = .{
                     .message = final_error_msg,
@@ -1184,10 +1108,8 @@ fn runLoop(
             try setFinalMessage(&state, allocator, assistant_message);
             try appendClonedStateMessage(&state.messages, allocator, .{ .assistant = assistant_message });
 
-            // Check stop_reason
             switch (assistant_message.stop_reason) {
                 .@"error", .aborted => {
-                    // Emit turn_end and exit
                     const final_error_msg = state.final_message orelse assistant_message;
                     try pushAgentEvent(event_stream, .{ .turn_end = .{
                         .message = final_error_msg,
@@ -1201,17 +1123,13 @@ fn runLoop(
                     break :outer;
                 },
                 .stop, .length, .content_filter => {
-                    // Emit turn_end, check follow-up messages
                     try pushAgentEvent(event_stream, .{ .turn_end = .{
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
 
-                    // Add assistant message to context
                     try context.appendMessage(.{ .assistant = assistant_message });
 
-                    // Steering interrupts the next assistant call even when the
-                    // current response stopped without entering a tool phase.
                     if (config.get_steering_messages_fn) |get_steering| {
                         if (try get_steering(config.get_steering_messages_ctx, allocator)) |queued_steering| {
                             if (queued_steering.len > 0) {
@@ -1232,11 +1150,9 @@ fn runLoop(
                         }
                     }
 
-                    // Check for follow-up messages
                     if (config.get_follow_up_messages_fn) |get_follow_up| {
                         if (try get_follow_up(config.get_follow_up_messages_ctx, allocator)) |follow_ups| {
                             if (follow_ups.len > 0) {
-                                // Add follow-up messages and continue outer loop
                                 for (follow_ups) |follow_up| {
                                     try context.appendMessage(follow_up);
                                     try pushAgentEvent(event_stream, .{ .message_start = .{
@@ -1254,32 +1170,25 @@ fn runLoop(
                         }
                     }
 
-                    // No follow-up messages, we're done
                     ended_before_cap = true;
                     break :outer;
                 },
                 .tool_use => {
-                    // Execute tools
                     const tool_result = try executeToolCalls(
                         allocator,
                         assistant_message,
                         config,
                         event_stream,
                     );
-                    // Tool result messages are transferred to context below; the
-                    // wrapper still owns compact args and steering messages.
                     defer tool_result.deinitAfterToolResultsTransferred(allocator);
 
-                    // Emit turn_end with tool results
                     try pushAgentEvent(event_stream, .{ .turn_end = .{
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(tool_result.tool_results),
                     } });
 
-                    // Add assistant message to context
                     try context.appendMessage(.{ .assistant = assistant_message });
 
-                    // Add tool results to context with message_start/end events
                     for (tool_result.tool_results) |tool_result_msg| {
                         const msg: ai_types.Message = .{ .tool_result = tool_result_msg };
                         try pushAgentEvent(event_stream, .{ .message_start = .{
@@ -1292,21 +1201,13 @@ fn runLoop(
                         try appendClonedStateMessage(&state.messages, allocator, msg);
                     }
 
-                    // If steering messages arrived, they'll be picked up at the top of inner loop
-                    // Continue inner loop to get next assistant response
                 },
             }
         }
     }
 
-    // Build result and transfer ownership out of local loop state.
     const result_messages = try state.messages.toOwnedSlice(allocator);
 
-    // Exiting the loop without a terminal break means the iteration-cap
-    // condition ended the run: a capped tool_use turn, a queued steering or
-    // follow-up message that never ran, or a zero-iteration run. Cancellation
-    // is its own agent-level outcome so consumers never see a cancelled run
-    // reported through the previous turn's stop reason.
     const termination: ?types.AgentTermination = if (cancelled_run)
         .cancelled
     else if (!ended_before_cap)
@@ -1337,32 +1238,17 @@ fn runLoop(
         .termination = termination,
     };
 
-    // Emit agent_end
     try pushAgentEvent(event_stream, .{
         .agent_end = .{
-            .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
+            .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()),
             .termination = termination,
-            .final_message = result_final_message, // Borrowed view; ownership retained by result
+            .final_message = result_final_message,
         },
     });
 
-    // Complete the stream
     event_stream.complete(result);
 }
 
-/// Thread context for background agent loop execution.
-///
-/// Lifetime requirements on the caller:
-/// - `prompts` and the strings inside each Message must stay alive until the
-///   stream completes (they are shallow-copied into context.messages).
-/// - `config.model` string fields must stay alive until the stream completes.
-/// - `config.tools` slice and the string fields inside each AgentTool must stay
-///   alive until the stream completes.
-/// - All `config.*_ctx` callback context pointers must stay valid until the
-///   stream completes.
-/// - `api_key` and `session_id` are cloned into owned memory by agentLoop and
-///   freed automatically by the background thread; the caller may free its
-///   copies immediately after the call returns.
 const RunLoopThreadCtx = struct {
     allocator: std.mem.Allocator,
     prompts: ?[]const ai_types.Message,
@@ -1373,7 +1259,6 @@ const RunLoopThreadCtx = struct {
     owned_session_id: ?[]u8 = null,
 };
 
-/// Background thread entry point for the agent loop.
 fn runLoopThread(ctx: *RunLoopThreadCtx) void {
     const allocator = ctx.allocator;
     const stream = ctx.stream;
@@ -1389,7 +1274,6 @@ fn runLoopThread(ctx: *RunLoopThreadCtx) void {
     stream.markThreadDone();
 }
 
-/// Clone config string fields that are commonly borrowed by callers.
 fn cloneConfigStrings(
     allocator: std.mem.Allocator,
     config: AgentLoopConfig,
@@ -1408,18 +1292,6 @@ fn cloneConfigStrings(
     return cloned;
 }
 
-/// Start an agent loop with new prompt messages.
-/// Returns an event stream that emits events during execution.
-/// Caller owns the returned stream and must call deinit().
-///
-/// Lifetime: the caller must keep `prompts` and all borrowed fields inside
-/// `config` alive until the stream completes. Specifically:
-/// - `prompts` messages (shallow-copied into context)
-/// - `config.model` strings
-/// - `config.tools` slice and tool string fields
-/// - `config.*_ctx` callback context pointers
-/// `api_key` and `session_id` are cloned internally and may be freed by the
-/// caller immediately after this call returns.
 pub fn agentLoop(
     allocator: std.mem.Allocator,
     prompts: []const ai_types.Message,
@@ -1460,10 +1332,6 @@ pub fn agentLoop(
     return stream;
 }
 
-/// Continue an agent loop from the current context without adding new messages.
-/// Used for retries - context already has user message or tool results.
-///
-/// Lifetime: same borrowed-field rules as agentLoop apply.
 pub fn agentLoopContinue(
     allocator: std.mem.Allocator,
     context: *AgentContext,
@@ -1502,10 +1370,6 @@ pub fn agentLoopContinue(
 
     return stream;
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "findTool finds tool by name" {
     const tools = [_]AgentTool{
@@ -1918,8 +1782,6 @@ test "executeToolCalls skips legacy approval when policy already allows" {
     );
     defer tool_result.deinit(allocator);
 
-    // file_read of workspace-internal path is auto-allowed by policy (.read + inside workspace).
-    // Legacy approval callback should NOT fire.
     try std.testing.expectEqual(@as(usize, 0), approval.calls);
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
 }

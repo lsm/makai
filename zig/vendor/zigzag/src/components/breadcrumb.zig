@@ -1,8 +1,3 @@
-//! Breadcrumb navigation component.
-//!
-//! Renders a horizontal path like `root > users > profile` with the active
-//! (last) segment highlighted. Supports custom separators and truncation when
-//! the rendered path would exceed a max width.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -12,8 +7,6 @@ const measure = @import("../layout/measure.zig");
 
 pub const Crumb = struct {
     label: []const u8,
-    /// Optional user-defined id so consumers can identify which segment was
-    /// clicked or selected. Not used for rendering.
     id: ?[]const u8 = null,
 };
 
@@ -22,8 +15,6 @@ pub const Breadcrumb = struct {
     crumbs: std.array_list.Managed(Crumb),
 
     separator: []const u8,
-    /// If non-zero, the rendered breadcrumb is truncated to fit this many
-    /// columns, replacing the middle with an ellipsis segment.
     max_width: usize,
 
     segment_style: style_mod.Style,
@@ -80,7 +71,6 @@ pub const Breadcrumb = struct {
         self.max_width = w;
     }
 
-    /// Replace all crumbs with a single path built from labels.
     pub fn setPath(self: *Breadcrumb, labels: []const []const u8) !void {
         self.crumbs.clearRetainingCapacity();
         for (labels) |label| try self.crumbs.append(.{ .label = label });
@@ -92,7 +82,6 @@ pub const Breadcrumb = struct {
         var full = try self.renderCrumbs(allocator, self.crumbs.items);
         if (self.max_width == 0 or measure.width(full) <= self.max_width) return full;
 
-        // Truncate: keep first and last N crumbs, replace middle with ellipsis.
         allocator.free(full);
 
         const n = self.crumbs.items.len;
@@ -101,7 +90,6 @@ pub const Breadcrumb = struct {
             return full;
         }
 
-        // Start with [first, ..., last], then widen outward while fitting.
         var head_count: usize = 1;
         var tail_count: usize = 1;
         var best: ?[]u8 = null;
@@ -115,7 +103,6 @@ pub const Breadcrumb = struct {
             if (best) |b| allocator.free(b);
             best = candidate;
 
-            // Prefer growing the tail (most relevant to user's position).
             if (tail_count <= head_count) {
                 tail_count += 1;
             } else {
@@ -206,7 +193,6 @@ test "breadcrumb renders path with separators" {
     try bc.setPath(&.{ "root", "users", "profile" });
     const out = try bc.view(allocator);
     defer allocator.free(out);
-    // 3 labels (13 chars: root=4, users=5, profile=7) + 2 separators (each 3 cols = 6).
     try std.testing.expectEqual(@as(usize, 4 + 3 + 5 + 3 + 7), measure.width(out));
 }
 

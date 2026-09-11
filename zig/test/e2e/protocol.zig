@@ -19,11 +19,6 @@ fn fileFromPipeHandle(handle: std.Io.File.Handle) std.Io.File {
     return .{ .handle = handle, .flags = .{ .nonblocking = false } };
 }
 
-// =============================================================================
-// Mock Transport for Testing
-// =============================================================================
-
-/// Mock sender that captures written data for verification
 const MockSender = struct {
     captured: std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
@@ -60,7 +55,6 @@ const MockSender = struct {
     }
 };
 
-/// Mock receiver that provides pre-loaded data
 const MockReceiver = struct {
     data: []const []const u8,
     index: usize = 0,
@@ -72,7 +66,6 @@ const MockReceiver = struct {
         const stream = try allocator.create(transport.ByteStream);
         stream.* = transport.ByteStream.init(allocator);
 
-        // Push all data into the stream
         for (self.data) |item| {
             const data = try allocator.dupe(u8, item);
             try stream.push(.{ .data = data, .owned = true });
@@ -90,14 +83,9 @@ const MockReceiver = struct {
     }
 };
 
-// =============================================================================
-// Envelope Serialization Tests
-// =============================================================================
-
 test "Envelope serialization roundtrip with ping" {
     const allocator = testing.allocator;
 
-    // Create a minimal ping envelope using JSON
     const json =
         \\{
         \\  "type": "ping",
@@ -113,11 +101,9 @@ test "Envelope serialization roundtrip with ping" {
     var parsed = try envelope.deserializeEnvelope(json, allocator);
     defer parsed.deinit(allocator);
 
-    // Serialize back
     const serialized = try envelope.serializeEnvelope(parsed, allocator);
     defer allocator.free(serialized);
 
-    // Verify structure
     try testing.expect(std.mem.find(u8, serialized, "\"type\":\"ping\"") != null);
     try testing.expect(std.mem.find(u8, serialized, "\"sequence\":1") != null);
     try testing.expect(std.mem.find(u8, serialized, "\"timestamp\":1708234567890") != null);
@@ -281,33 +267,24 @@ test "Envelope roundtrip preserves goodbye" {
     try testing.expectEqualStrings("Client shutting down", parsed.payload.goodbye.getReason().?);
 }
 
-// =============================================================================
-// Stdio Transport Protocol Tests
-// =============================================================================
-
 test "Stdio transport frames messages correctly" {
-    // Create a pipe for testing
     const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = fileFromPipeHandle(pipe[0]);
     const write_file = fileFromPipeHandle(pipe[1]);
     defer read_file.close(defaultIo());
 
-    // Create sender with write end
     var stdio_sender = stdio.AsyncStdioSender.initWithFile(write_file);
     var sender = stdio_sender.sender();
 
-    // Write test messages
     const msg1 = "{\"type\":\"ping\"}";
     const msg2 = "{\"type\":\"start\",\"model\":\"test\"}";
     try sender.write(msg1);
     try sender.write(msg2);
     write_file.close(defaultIo());
 
-    // Create receiver with read end
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
     var handle = try async_receiver.receiveStreamWithHandle(testing.allocator);
 
-    // Read first message
     const stream = handle.getStream();
     if (stream.wait()) |chunk| {
         defer {
@@ -317,7 +294,6 @@ test "Stdio transport frames messages correctly" {
         try testing.expectEqualStrings(msg1, chunk.data);
     }
 
-    // Read second message
     if (stream.wait()) |chunk| {
         defer {
             var mutable = chunk;
@@ -326,7 +302,6 @@ test "Stdio transport frames messages correctly" {
         try testing.expectEqualStrings(msg2, chunk.data);
     }
 
-    // Clean up
     const exited = handle.deinit(5000);
     try testing.expect(exited);
 }
@@ -337,18 +312,15 @@ test "Stdio transport handles multi-line message splitting" {
     const write_file = fileFromPipeHandle(pipe[1]);
     defer read_file.close(defaultIo());
 
-    // Write multiple messages at once (with newlines)
     const combined = "{\"type\":\"ping\"}\n{\"type\":\"pong\"}\n{\"type\":\"ack\"}\n";
     try write_file.writeStreamingAll(defaultIo(), combined);
     write_file.close(defaultIo());
 
-    // Create receiver
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
     var handle = try async_receiver.receiveStreamWithHandle(testing.allocator);
 
     const stream = handle.getStream();
 
-    // Read all three messages
     var count: usize = 0;
     while (stream.wait()) |chunk| {
         defer {
@@ -370,23 +342,19 @@ test "Stdio transport handles multi-line message splitting" {
 test "Stdio transport sends and receives messages" {
     const allocator = testing.allocator;
 
-    // Create a pipe for testing
     const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = fileFromPipeHandle(pipe[0]);
     const write_file = fileFromPipeHandle(pipe[1]);
     defer read_file.close(defaultIo());
 
-    // Create a simple message
     const msg = "test-message-123";
 
-    // Send through stdio transport
     var stdio_sender = stdio.AsyncStdioSender.initWithFile(write_file);
     var sender = stdio_sender.sender();
     try sender.write(msg);
-    try sender.write("\n"); // Add newline terminator
+    try sender.write("\n");
     write_file.close(defaultIo());
 
-    // Receive through stdio transport
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
     var handle = try async_receiver.receiveStreamWithHandle(allocator);
 
@@ -403,10 +371,6 @@ test "Stdio transport sends and receives messages" {
     const exited = handle.deinit(5000);
     try testing.expect(exited);
 }
-
-// =============================================================================
-// Control Message Callback Tests
-// =============================================================================
 
 const TestControlContext = struct {
     received_ack: bool = false,
@@ -452,13 +416,11 @@ test "Control messages invoke callbacks" {
     var byte_stream = transport.ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push control messages
     try byte_stream.push(.{ .data = try allocator.dupe(u8, "{\"type\":\"ping\"}"), .owned = true });
     try byte_stream.push(.{ .data = try allocator.dupe(u8, "{\"type\":\"ack\",\"acknowledged_id\":\"msg-123\"}"), .owned = true });
     try byte_stream.push(.{ .data = try allocator.dupe(u8, "{\"type\":\"pong\"}"), .owned = true });
     try byte_stream.push(.{ .data = try allocator.dupe(u8, "{\"type\":\"nack\",\"rejected_id\":\"msg-456\",\"reason\":\"Test error\"}"), .owned = true });
 
-    // Push a result to end the stream
     const result_json = try transport.serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -487,7 +449,6 @@ test "Control messages invoke callbacks" {
         allocator,
     );
 
-    // Verify all control messages were received
     try testing.expect(test_ctx.received_ping);
     try testing.expect(test_ctx.received_pong);
     try testing.expect(test_ctx.received_ack);
@@ -500,17 +461,12 @@ test "Control messages invoke callbacks" {
     try testing.expect(msg_stream.isDone());
 }
 
-// =============================================================================
-// Event Streaming Tests
-// =============================================================================
-
 test "Event streaming through byte stream with envelope framing" {
     const allocator = testing.allocator;
 
     var byte_stream = transport.ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Ping control message
     const ping_json =
         \\{
         \\  "type": "ping",
@@ -524,7 +480,6 @@ test "Event streaming through byte stream with envelope framing" {
     ;
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
 
-    // Pong control message
     const pong_json =
         \\{
         \\  "type": "pong",
@@ -542,7 +497,6 @@ test "Event streaming through byte stream with envelope framing" {
 
     byte_stream.complete({});
 
-    // Read and verify events
     var event_count: usize = 0;
     while (byte_stream.wait()) |chunk| {
         defer {
@@ -559,10 +513,6 @@ test "Event streaming through byte stream with envelope framing" {
 
     try testing.expectEqual(@as(usize, 2), event_count);
 }
-
-// =============================================================================
-// Mock Transport Communication Tests
-// =============================================================================
 
 test "Mock sender captures messages correctly" {
     const allocator = testing.allocator;
@@ -598,7 +548,6 @@ test "Mock receiver provides pre-loaded data" {
         allocator.destroy(stream);
     }
 
-    // Read first message
     if (stream.wait()) |chunk| {
         defer {
             var mutable = chunk;
@@ -607,7 +556,6 @@ test "Mock receiver provides pre-loaded data" {
         try testing.expectEqualStrings("{\"type\":\"ping\"}", chunk.data);
     }
 
-    // Read second message
     if (stream.wait()) |chunk| {
         defer {
             var mutable = chunk;
@@ -617,27 +565,14 @@ test "Mock receiver provides pre-loaded data" {
     }
 }
 
-// =============================================================================
-// Error Handling Tests
-// =============================================================================
-
 test "Envelope deserialization handles invalid JSON gracefully" {
     const allocator = testing.allocator;
 
     const invalid_json = "not valid json";
 
     const result = envelope.deserializeEnvelope(invalid_json, allocator);
-    // The error can be either SyntaxError or InvalidCharacter depending on parsing stage
     try testing.expect(result == error.SyntaxError or result == error.InvalidCharacter);
 }
-
-// Note: Testing missing required fields is skipped because the current implementation
-// panics rather than returning an error. This should be fixed in the deserializer to
-// return FieldNotFound errors instead of using .? on optional values.
-
-// =============================================================================
-// Concurrent Access Tests (Basic)
-// =============================================================================
 
 test "ByteStream handles concurrent-like push and poll" {
     const allocator = testing.allocator;
@@ -645,7 +580,6 @@ test "ByteStream handles concurrent-like push and poll" {
     var byte_stream = transport.ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push multiple items rapidly
     for (0..10) |i| {
         const msg = try std.fmt.allocPrint(allocator, "message-{}", .{i});
         defer allocator.free(msg);
@@ -654,7 +588,6 @@ test "ByteStream handles concurrent-like push and poll" {
 
     byte_stream.complete({});
 
-    // Poll all items
     var count: usize = 0;
     while (byte_stream.wait()) |chunk| {
         defer {
@@ -673,7 +606,6 @@ test "EventStream handles event batch processing" {
     var event_str = event_stream.AssistantMessageEventStream.init(allocator);
     defer event_str.deinit();
 
-    // Push multiple events
     for (0..5) |_| {
         try event_str.push(.{ .start = .{
             .partial = .{
@@ -688,7 +620,6 @@ test "EventStream handles event batch processing" {
         } });
     }
 
-    // Poll events in batch
     var batch_count: usize = 0;
     var events_buf: [10]ai_types.AssistantMessageEvent = undefined;
     const count = event_str.pollBatch(&events_buf);
@@ -696,7 +627,6 @@ test "EventStream handles event batch processing" {
 
     try testing.expectEqual(@as(usize, 5), batch_count);
 
-    // Complete the stream
     event_str.complete(.{
         .content = &.{},
         .api = "test-api",
@@ -709,10 +639,6 @@ test "EventStream handles event batch processing" {
 
     try testing.expect(event_str.isDone());
 }
-
-// =============================================================================
-// Version Handling Tests
-// =============================================================================
 
 test "Envelope defaults version to 1 when not specified" {
     const allocator = testing.allocator;
@@ -755,10 +681,6 @@ test "Envelope preserves explicit version" {
     try testing.expectEqual(@as(u8, 2), parsed.version);
 }
 
-// =============================================================================
-// In-Reply-To Tests
-// =============================================================================
-
 test "Envelope preserves in_reply_to field" {
     const allocator = testing.allocator;
 
@@ -782,7 +704,6 @@ test "Envelope preserves in_reply_to field" {
 
     try testing.expect(parsed.in_reply_to != null);
 
-    // Serialize and verify in_reply_to is preserved
     const serialized = try envelope.serializeEnvelope(parsed, allocator);
     defer allocator.free(serialized);
 

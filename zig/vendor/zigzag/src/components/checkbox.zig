@@ -1,5 +1,3 @@
-//! Checkbox and CheckboxGroup components.
-//! Standalone boolean toggle and multi-select checkbox group.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -7,18 +5,15 @@ const keys = @import("../input/keys.zig");
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 
-/// Standalone checkbox - a single boolean toggle.
 pub const Checkbox = struct {
     label: []const u8,
     checked: bool,
     enabled: bool,
     focused: bool,
 
-    // Symbols
     checked_symbol: []const u8,
     unchecked_symbol: []const u8,
 
-    // Styling
     label_style: style_mod.Style,
     checked_style: style_mod.Style,
     unchecked_style: style_mod.Style,
@@ -127,32 +122,25 @@ pub const Checkbox = struct {
     }
 };
 
-/// Multi-select checkbox group.
 pub fn CheckboxGroup(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
 
-        // Items
         items: std.array_list.Managed(Item),
 
-        // Navigation
         cursor: usize,
         height: u16,
         y_offset: usize,
 
-        // Focus
         focused: bool,
 
-        // Constraints
         min_selected: usize,
         max_selected: ?usize,
 
-        // Symbols
         cursor_symbol: []const u8,
         checked_symbol: []const u8,
         unchecked_symbol: []const u8,
 
-        // Styling
         item_style: style_mod.Style,
         checked_style: style_mod.Style,
         cursor_style: style_mod.Style,
@@ -237,11 +225,9 @@ pub fn CheckboxGroup(comptime T: type) type {
             if (!item.enabled) return;
 
             if (item.checked) {
-                // Check min constraint
                 if (self.checkedCount() <= self.min_selected) return;
                 item.checked = false;
             } else {
-                // Check max constraint
                 if (self.max_selected) |max| {
                     if (self.checkedCount() >= max) return;
                 }
@@ -283,7 +269,6 @@ pub fn CheckboxGroup(comptime T: type) type {
             return result.toOwnedSlice();
         }
 
-        // Focus protocol
         pub fn focus(self: *Self) void {
             self.focused = true;
         }
@@ -388,7 +373,6 @@ pub fn CheckboxGroup(comptime T: type) type {
 
                 const item = self.items.items[idx];
 
-                // Cursor
                 if (idx == self.cursor and self.focused) {
                     const styled = try self.cursor_style.render(allocator, self.cursor_symbol);
                     try writer.writeAll(styled);
@@ -398,7 +382,6 @@ pub fn CheckboxGroup(comptime T: type) type {
                     }
                 }
 
-                // Check symbol
                 const check_sym = if (item.checked) self.checked_symbol else self.unchecked_symbol;
                 const check_s = if (!item.enabled)
                     self.disabled_style
@@ -409,7 +392,6 @@ pub fn CheckboxGroup(comptime T: type) type {
                 const styled_check = try check_s.render(allocator, check_sym);
                 try writer.writeAll(styled_check);
 
-                // Label
                 const lbl_style = if (!item.enabled)
                     self.disabled_style
                 else if (idx == self.cursor and self.focused)
@@ -421,7 +403,6 @@ pub fn CheckboxGroup(comptime T: type) type {
                 const styled_label = try lbl_style.render(allocator, item.label);
                 try writer.writeAll(styled_label);
 
-                // Description
                 if (item.description.len > 0) {
                     try writer.writeAll(" - ");
                     try writer.writeAll(item.description);

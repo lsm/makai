@@ -8,15 +8,12 @@ pub const SSEEvent = struct {
         if (self.event_type) |et| allocator.free(et);
         allocator.free(self.data);
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 };
 
 pub const Limits = struct {
-    /// Largest accepted physical SSE line, excluding its line ending.
     line_bytes: usize = 1024 * 1024,
-    /// Largest returned event, including type, data, and inserted data newlines.
     event_bytes: usize = 4 * 1024 * 1024,
 };
 
@@ -60,14 +57,10 @@ pub const SSEParser = struct {
         }
         self.pending_events.deinit(self.allocator);
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 
-    /// Feed a chunk of data, returns completed events
-    /// Caller must copy event data if needed beyond next feed() call
     pub fn feed(self: *SSEParser, chunk: []const u8) ![]SSEEvent {
-        // Clear previous pending events
         for (self.pending_events.items) |*event| {
             event.deinit(self.allocator);
         }
@@ -94,7 +87,6 @@ pub const SSEParser = struct {
         return self.pending_events.items;
     }
 
-    /// Reset parser state
     pub fn reset(self: *SSEParser) void {
         self.line_buffer.clearRetainingCapacity();
         self.pending_cr = false;
@@ -113,14 +105,12 @@ pub const SSEParser = struct {
     fn processLine(self: *SSEParser, line: []const u8) !void {
         if (line.len == 0) return;
 
-        // Comments start with ":"
         if (line[0] == ':') return;
 
         const colon_pos = std.mem.findScalar(u8, line, ':');
         const field = if (colon_pos) |pos| line[0..pos] else line;
         var value: []const u8 = if (colon_pos) |pos| line[pos + 1 ..] else "";
 
-        // Skip leading space in value
         if (value.len > 0 and value[0] == ' ') {
             value = value[1..];
         }
@@ -130,7 +120,6 @@ pub const SSEParser = struct {
         } else if (std.mem.eql(u8, field, "data")) {
             try self.appendEventData(value);
         }
-        // Other fields are ignored
     }
 
     fn finishLine(self: *SSEParser) !void {
@@ -143,7 +132,6 @@ pub const SSEParser = struct {
     }
 
     fn finalizeEvent(self: *SSEParser) !void {
-        // Only create event if we have data
         if (!self.has_data_field) return;
 
         const event = SSEEvent{
@@ -153,7 +141,6 @@ pub const SSEParser = struct {
 
         try self.pending_events.append(self.allocator, event);
 
-        // Reset current state
         self.current_event_type = null;
         self.current_data.clearRetainingCapacity();
         self.has_data_field = false;
@@ -229,7 +216,6 @@ pub fn errorMessage(err: anyerror) []const u8 {
     };
 }
 
-// Tests
 test "SSEParser - basic single event" {
     const allocator = std.testing.allocator;
     var parser = SSEParser.init(allocator);
@@ -274,7 +260,6 @@ test "SSEParser - partial chunks" {
     var parser = SSEParser.init(allocator);
     defer parser.deinit();
 
-    // Feed data in parts
     var events = try parser.feed("data: hel");
     try std.testing.expectEqual(@as(usize, 0), events.len);
 
@@ -354,7 +339,6 @@ test "SSEParser - empty lines between events" {
     const chunk = "data: first\n\n\n\ndata: second\n\n";
     const events = try parser.feed(chunk);
 
-    // Extra empty lines should not create empty events
     try std.testing.expectEqual(@as(usize, 2), events.len);
     try std.testing.expectEqualStrings("first", events[0].data);
     try std.testing.expectEqualStrings("second", events[1].data);

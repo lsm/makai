@@ -1,5 +1,3 @@
-//! Single-line text input component.
-//! Provides cursor navigation, text editing, and optional validation.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -10,30 +8,24 @@ const Color = @import("../style/color.zig").Color;
 pub const TextInput = struct {
     allocator: std.mem.Allocator,
 
-    // Content
     value: std.array_list.Managed(u8),
     cursor: usize,
 
-    // Appearance
     placeholder: []const u8,
     prompt: []const u8,
     width: ?u16,
     char_limit: ?usize,
     echo_mode: EchoMode,
 
-    // Styling
     text_style: style.Style,
     placeholder_style: style.Style,
     cursor_style: style.Style,
     prompt_style: style.Style,
 
-    // State
     focused: bool,
 
-    // Validation
     validate_fn: ?*const fn ([]const u8) bool,
 
-    // Suggestions/autocomplete
     suggestions: []const []const u8,
     current_suggestion_idx: usize,
     show_suggestions: bool,
@@ -95,59 +87,48 @@ pub const TextInput = struct {
         self.value.deinit();
     }
 
-    /// Set the input value
     pub fn setValue(self: *TextInput, text: []const u8) !void {
         self.value.clearRetainingCapacity();
         try self.value.appendSlice(text);
         self.cursor = @min(self.cursor, self.value.items.len);
     }
 
-    /// Get the current value
     pub fn getValue(self: *const TextInput) []const u8 {
         return self.value.items;
     }
 
-    /// Set placeholder text
     pub fn setPlaceholder(self: *TextInput, text: []const u8) void {
         self.placeholder = text;
     }
 
-    /// Set prompt text
     pub fn setPrompt(self: *TextInput, text: []const u8) void {
         self.prompt = text;
     }
 
-    /// Set width limit
     pub fn setWidth(self: *TextInput, w: u16) void {
         self.width = w;
     }
 
-    /// Set character limit
     pub fn setCharLimit(self: *TextInput, limit: usize) void {
         self.char_limit = limit;
     }
 
-    /// Set echo mode
     pub fn setEchoMode(self: *TextInput, mode: EchoMode) void {
         self.echo_mode = mode;
     }
 
-    /// Set validation function
     pub fn setValidation(self: *TextInput, validate: *const fn ([]const u8) bool) void {
         self.validate_fn = validate;
     }
 
-    /// Focus the input
     pub fn focus(self: *TextInput) void {
         self.focused = true;
     }
 
-    /// Blur the input
     pub fn blur(self: *TextInput) void {
         self.focused = false;
     }
 
-    /// Check if input is valid
     pub fn isValid(self: *const TextInput) bool {
         if (self.validate_fn) |validate| {
             return validate(self.value.items);
@@ -155,13 +136,11 @@ pub const TextInput = struct {
         return true;
     }
 
-    /// Set suggestion list
     pub fn setSuggestions(self: *TextInput, list: []const []const u8) void {
         self.suggestions = list;
         self.current_suggestion_idx = 0;
     }
 
-    /// Get current matching suggestion
     pub fn currentSuggestion(self: *const TextInput) ?[]const u8 {
         if (self.suggestions.len == 0 or self.value.items.len == 0) return null;
         const val = self.value.items;
@@ -177,11 +156,9 @@ pub const TextInput = struct {
         return null;
     }
 
-    /// Handle a key event
     pub fn handleKey(self: *TextInput, key: keys.KeyEvent) void {
         if (!self.focused) return;
 
-        // Alt+arrow for word movement
         if (key.modifiers.alt) {
             switch (key.key) {
                 .left => {
@@ -199,15 +176,15 @@ pub const TextInput = struct {
         if (key.modifiers.ctrl) {
             switch (key.key) {
                 .char => |c| switch (c) {
-                    'a' => self.cursor = 0, // Home
-                    'e' => self.cursor = self.value.items.len, // End
-                    'k' => self.value.shrinkRetainingCapacity(self.cursor), // Kill to end
-                    'u' => { // Kill to start
+                    'a' => self.cursor = 0,
+                    'e' => self.cursor = self.value.items.len,
+                    'k' => self.value.shrinkRetainingCapacity(self.cursor),
+                    'u' => {
                         std.mem.copyForwards(u8, self.value.items[0..], self.value.items[self.cursor..]);
                         self.value.shrinkRetainingCapacity(self.value.items.len - self.cursor);
                         self.cursor = 0;
                     },
-                    'w' => self.deleteWordBackward(), // Delete word backward
+                    'w' => self.deleteWordBackward(),
                     else => {},
                 },
                 else => {},
@@ -225,7 +202,6 @@ pub const TextInput = struct {
             .home => self.cursor = 0,
             .end => self.cursor = self.value.items.len,
             .tab => {
-                // Accept current suggestion
                 if (self.currentSuggestion()) |suggestion| {
                     self.value.clearRetainingCapacity();
                     self.value.appendSlice(suggestion) catch {};
@@ -237,7 +213,6 @@ pub const TextInput = struct {
     }
 
     fn insertChar(self: *TextInput, c: u21) void {
-        // Check char limit
         if (self.char_limit) |limit| {
             if (self.charCount() >= limit) return;
         }
@@ -245,7 +220,6 @@ pub const TextInput = struct {
         var buf: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(c, &buf) catch return;
 
-        // Insert at cursor position
         self.value.insertSlice(self.cursor, buf[0..len]) catch return;
         self.cursor += len;
     }
@@ -282,7 +256,6 @@ pub const TextInput = struct {
     fn deleteBackward(self: *TextInput) void {
         if (self.cursor == 0) return;
 
-        // Find start of previous character
         var start = self.cursor - 1;
         while (start > 0 and (self.value.items[start] & 0xC0) == 0x80) {
             start -= 1;
@@ -301,7 +274,6 @@ pub const TextInput = struct {
     fn deleteForward(self: *TextInput) void {
         if (self.cursor >= self.value.items.len) return;
 
-        // Find length of current character
         const byte_len = std.unicode.utf8ByteSequenceLength(self.value.items[self.cursor]) catch 1;
 
         for (0..byte_len) |_| {
@@ -314,12 +286,10 @@ pub const TextInput = struct {
     fn deleteWordBackward(self: *TextInput) void {
         if (self.cursor == 0) return;
 
-        // Skip trailing spaces
         while (self.cursor > 0 and self.value.items[self.cursor - 1] == ' ') {
             self.deleteBackward();
         }
 
-        // Delete until space or start
         while (self.cursor > 0 and self.value.items[self.cursor - 1] != ' ') {
             self.deleteBackward();
         }
@@ -343,11 +313,9 @@ pub const TextInput = struct {
 
     fn moveCursorWordLeft(self: *TextInput) void {
         if (self.cursor == 0) return;
-        // Skip whitespace
         while (self.cursor > 0 and self.value.items[self.cursor - 1] == ' ') {
             self.cursor -= 1;
         }
-        // Skip word chars
         while (self.cursor > 0 and self.value.items[self.cursor - 1] != ' ') {
             self.cursor -= 1;
         }
@@ -355,11 +323,9 @@ pub const TextInput = struct {
 
     fn moveCursorWordRight(self: *TextInput) void {
         if (self.cursor >= self.value.items.len) return;
-        // Skip word chars
         while (self.cursor < self.value.items.len and self.value.items[self.cursor] != ' ') {
             self.cursor += 1;
         }
-        // Skip whitespace
         while (self.cursor < self.value.items.len and self.value.items[self.cursor] == ' ') {
             self.cursor += 1;
         }
@@ -376,29 +342,23 @@ pub const TextInput = struct {
         return count;
     }
 
-    /// Render the input to a string
     pub fn view(self: *const TextInput, allocator: std.mem.Allocator) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Write prompt
         if (self.prompt.len > 0) {
             const rendered_prompt = try self.prompt_style.render(allocator, self.prompt);
             try writer.writeAll(rendered_prompt);
         }
 
-        // Get display text
         if (self.value.items.len == 0) {
-            // Show placeholder
             if (self.placeholder.len > 0) {
                 const rendered = try self.placeholder_style.render(allocator, self.placeholder);
                 try writer.writeAll(rendered);
             }
         } else {
-            // Show value (possibly masked)
             switch (self.echo_mode) {
                 .normal => {
-                    // Render with cursor
                     if (self.focused) {
                         try self.renderWithCursor(writer, allocator);
                     } else {
@@ -407,7 +367,6 @@ pub const TextInput = struct {
                     }
                 },
                 .password => {
-                    // Show asterisks
                     const char_count = self.charCount();
                     const masked = try allocator.alloc(u8, char_count);
                     @memset(masked, '*');
@@ -415,7 +374,6 @@ pub const TextInput = struct {
                     try writer.writeAll(rendered);
                 },
                 .none => {
-                    // Show nothing
                 },
             }
         }
@@ -424,31 +382,26 @@ pub const TextInput = struct {
     }
 
     fn renderWithCursor(self: *const TextInput, writer: *Writer, allocator: std.mem.Allocator) !void {
-        // Text before cursor
         if (self.cursor > 0) {
             const before = try self.text_style.render(allocator, self.value.items[0..self.cursor]);
             try writer.writeAll(before);
         }
 
-        // Cursor character
         if (self.cursor < self.value.items.len) {
             const byte_len = std.unicode.utf8ByteSequenceLength(self.value.items[self.cursor]) catch 1;
             const cursor_char = self.value.items[self.cursor..][0..byte_len];
             const cursor_rendered = try self.cursor_style.render(allocator, cursor_char);
             try writer.writeAll(cursor_rendered);
 
-            // Text after cursor
             if (self.cursor + byte_len < self.value.items.len) {
                 const after = try self.text_style.render(allocator, self.value.items[self.cursor + byte_len ..]);
                 try writer.writeAll(after);
             }
         } else {
-            // Cursor at end - show cursor on space
             const cursor_rendered = try self.cursor_style.render(allocator, " ");
             try writer.writeAll(cursor_rendered);
         }
 
-        // Show ghost text for current suggestion
         if (self.show_suggestions) {
             if (self.currentSuggestion()) |suggestion| {
                 if (suggestion.len > self.value.items.len) {

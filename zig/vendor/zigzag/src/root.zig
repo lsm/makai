@@ -1,53 +1,6 @@
-//! ZigZag - A TUI library for Zig inspired by Bubble Tea and Lipgloss
-//!
-//! ZigZag provides a framework for building terminal user interfaces using
-//! the Elm architecture (Model-Update-View pattern).
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! const std = @import("std");
-//! const zz = @import("zigzag");
-//!
-//! const Model = struct {
-//!     count: i32,
-//!
-//!     pub const Msg = union(enum) {
-//!         key: zz.KeyEvent,
-//!     };
-//!
-//!     pub fn init(self: *Model, _: *zz.Context) zz.Cmd(Msg) {
-//!         self.* = .{ .count = 0 };
-//!         return .none;
-//!     }
-//!
-//!     pub fn update(self: *Model, msg: Msg, _: *zz.Context) zz.Cmd(Msg) {
-//!         switch (msg) {
-//!             .key => |k| switch (k.key) {
-//!                 .char => |c| if (c == 'q') return .quit,
-//!                 .up => self.count += 1,
-//!                 .down => self.count -= 1,
-//!                 else => {},
-//!             },
-//!         }
-//!         return .none;
-//!     }
-//!
-//!     pub fn view(self: *const Model, ctx: *const zz.Context) []const u8 {
-//!         return std.fmt.allocPrint(ctx.allocator, "Count: {d}\n\nPress q to quit", .{self.count}) catch "Error";
-//!     }
-//! };
-//!
-//! pub fn main(init: std.process.Init) !void {
-//!     var program = zz.Program(Model).init(init.gpa, init.io, init.environ_map);
-//!     defer program.deinit();
-//!     try program.run();
-//! }
-//! ```
 
 const std = @import("std");
 
-// Core
 pub const program = @import("core/program.zig");
 pub const Program = program.Program;
 pub const Cmd = program.Cmd;
@@ -81,13 +34,11 @@ pub const Easing = animation.Easing;
 pub const tweenColor = animation.tweenColor;
 pub const lerp = animation.lerp;
 
-// Terminal
 pub const terminal = @import("terminal/terminal.zig");
 pub const Terminal = terminal.Terminal;
 pub const ansi = terminal.ansi;
 pub const screen = terminal.screen;
 
-// Input
 pub const input = struct {
     pub const keyboard = @import("input/keyboard.zig");
     pub const mouse = @import("input/mouse.zig");
@@ -104,7 +55,6 @@ pub const HitBox = hitbox.HitBox;
 pub const MouseState = hitbox.MouseState;
 pub const MouseInteraction = hitbox.Interaction;
 
-// Style
 pub const style = @import("style/style.zig");
 pub const Style = style.Style;
 pub const color = @import("style/color.zig");
@@ -117,7 +67,6 @@ pub const Palette = theme.Palette;
 pub const AdaptivePalette = theme.AdaptivePalette;
 pub const ThemeManager = theme.ThemeManager;
 
-// Layout
 pub const layout = @import("layout/layout.zig");
 pub const measure = @import("layout/measure.zig");
 pub const join = @import("layout/join.zig");
@@ -129,23 +78,19 @@ pub const FlexItem = flex.Item;
 pub const FlexOptions = flex.FlexOptions;
 pub const FlexRect = flex.Rect;
 
-// Accessibility
 pub const accessibility = @import("accessibility.zig");
 pub const a11y = accessibility;
 pub const ContrastLevel = accessibility.ContrastLevel;
 pub const AccessibleLabel = accessibility.AccessibleLabel;
 
-// Unicode
 pub const unicode = @import("unicode.zig");
 
-// Testing utilities
 pub const testing = struct {
     pub const snapshot = @import("testing/snapshot.zig");
     pub const expectSnapshot = snapshot.expectSnapshot;
     pub const expectSnapshotOpts = snapshot.expectSnapshotOpts;
 };
 
-// Components
 pub const components = struct {
     pub const TextInput = @import("components/text_input.zig").TextInput;
     pub const TextArea = @import("components/text_area.zig").TextArea;
@@ -236,7 +181,6 @@ pub const components = struct {
     pub const RichLogEntry = rich_log.Entry;
 };
 
-// Re-export commonly used components at top level
 pub const TextInput = components.TextInput;
 pub const TextArea = components.TextArea;
 pub const List = components.List;
@@ -287,7 +231,6 @@ pub const RichLog = components.RichLog;
 pub const RichLogLevel = components.RichLogLevel;
 pub const Command = components.Command;
 
-// Focus management
 pub const FocusGroup = components.focus.FocusGroup;
 pub const FocusStyle = components.focus.FocusStyle;
 pub const KeyBind = components.focus.KeyBind;
@@ -297,12 +240,10 @@ pub const TabChangeReason = components.tab_group.ChangeReason;
 pub const TabKeyResult = components.tab_group.KeyResult;
 pub const TabKeyBind = components.tab_group.KeyBind;
 
-// Keybinding management
 pub const keybinding = @import("components/keybinding.zig");
 pub const KeyBinding = keybinding.KeyBinding;
 pub const KeyMap = keybinding.KeyMap;
 
-// Utility functions
 pub fn joinHorizontal(allocator: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
     return join.horizontal(allocator, .top, parts);
 }
@@ -331,7 +272,6 @@ pub fn placeFloat(allocator: std.mem.Allocator, w: usize, h: usize, hpos: f32, v
     return place.placeFloat(allocator, w, h, hpos, vpos, content);
 }
 
-// Image types
 pub const ImageFile = command.ImageFile;
 pub const ImageData = command.ImageData;
 pub const ImagePlacement = command.ImagePlacement;
@@ -349,16 +289,13 @@ pub const Osc52WriteOptions = terminal.Osc52WriteOptions;
 pub const Osc52ReadOptions = terminal.Osc52ReadOptions;
 pub const OscTerminator = terminal.ansi.OscTerminator;
 
-// Color utilities
 pub const ColorProfile = color.ColorProfile;
 pub const AdaptiveColor = color.AdaptiveColor;
 pub const CompleteColor = color.CompleteColor;
 pub const CompleteAdaptiveColor = color.CompleteAdaptiveColor;
 
-// Overflow
 pub const Overflow = style.Overflow;
 
-// Style utilities
 pub const StyleRange = style.StyleRange;
 pub const renderWithRanges = style.renderWithRanges;
 pub const renderWithHighlights = style.renderWithHighlights;
@@ -367,7 +304,6 @@ pub const compress = @import("style/compress.zig");
 pub const StyleState = compress.StyleState;
 pub const compressAnsi = compress.compressAnsi;
 
-// Progress helpers
 pub const interpolateColor = @import("components/progress.zig").interpolateColor;
 pub const PlotPoint = components.charting.Point;
 pub const PlotRange = components.charting.DataRange;

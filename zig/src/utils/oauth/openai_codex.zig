@@ -1,9 +1,3 @@
-//! OpenAI Codex OAuth (Authorization Code flow with PKCE, manual paste UX).
-//!
-//! Mirrors the callback shape of `oauth/anthropic.zig` so the TUI login bridge
-//! can drive all providers uniformly: the flow shows an authorization URL via
-//! `onAuth`, blocks on `onPrompt` for the pasted redirect URL/code, then
-//! exchanges the code for tokens.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -164,7 +158,6 @@ fn buildAuthUrl(allocator: std.mem.Allocator, challenge: []const u8, state: []co
     return try url.toOwnedSlice(allocator);
 }
 
-/// OpenAI Codex OAuth login (manual code flow with PKCE).
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     const pkce = try pkce_mod.generate(allocator);
     defer pkce.deinit(allocator);
@@ -201,7 +194,6 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     return try buildCredentials(allocator, refresh_token, token_response.access_token, expires, token_response.provider_data);
 }
 
-/// Refresh OpenAI Codex OAuth token.
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
     const body = try std.json.Stringify.valueAlloc(allocator, .{
         .client_id = client_id,
@@ -217,7 +209,6 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     return try credentialsFromRefreshResponse(credentials, token_response, expires, allocator);
 }
 
-/// Get API key from credentials (access token IS the API key).
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
 }
@@ -227,13 +218,9 @@ const ParsedAuth = struct {
     state: []const u8,
 };
 
-/// Parse code and state from manual input (a redirect URL, "code#state", or
-/// just "code").
 fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
 
-    // An empty paste means the user dismissed the prompt: treat it as a
-    // cancellation rather than attempting a doomed exchange with a blank code.
     if (trimmed.len == 0) return error.OAuthCancelled;
 
     if (std.mem.find(u8, trimmed, "?code=") orelse std.mem.find(u8, trimmed, "&code=")) |idx| {

@@ -1,10 +1,7 @@
-//! ANSI escape sequence generation for terminal control.
-//! Provides functions to generate standard terminal control sequences.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 
-/// ANSI escape codes
 pub const ESC = "\x1b";
 pub const CSI = ESC ++ "[";
 pub const OSC = ESC ++ "]";
@@ -23,14 +20,12 @@ pub const Osc52Passthrough = enum {
     dcs,
 };
 
-// Cursor control
 pub const cursor_hide = CSI ++ "?25l";
 pub const cursor_show = CSI ++ "?25h";
 pub const cursor_save = CSI ++ "s";
 pub const cursor_restore = CSI ++ "u";
 pub const cursor_home = CSI ++ "H";
 
-// Screen control
 pub const screen_clear = CSI ++ "2J";
 pub const screen_clear_below = CSI ++ "J";
 pub const screen_clear_above = CSI ++ "1J";
@@ -38,113 +33,90 @@ pub const line_clear = CSI ++ "2K";
 pub const line_clear_right = CSI ++ "K";
 pub const line_clear_left = CSI ++ "1K";
 
-// Alternate screen buffer
 pub const alt_screen_enter = CSI ++ "?1049h";
 pub const alt_screen_exit = CSI ++ "?1049l";
 
-// Text attributes reset
 pub const reset = CSI ++ "0m";
 
-// Bracketed paste mode
 pub const bracketed_paste_enable = CSI ++ "?2004h";
 pub const bracketed_paste_disable = CSI ++ "?2004l";
 
-// Synchronized output (prevents tearing)
 pub const sync_start = CSI ++ "?2026h";
 pub const sync_end = CSI ++ "?2026l";
 
-// Unicode width mode (DECRQM/DECSET private mode 2027)
 pub const unicode_width_mode_query = CSI ++ "?2027$p";
 pub const unicode_width_mode_enable = CSI ++ "?2027h";
 pub const unicode_width_mode_disable = CSI ++ "?2027l";
 
-// Kitty keyboard protocol
 pub const kitty_keyboard_enable = CSI ++ ">1u";
 pub const kitty_keyboard_disable = CSI ++ "<u";
 pub const kitty_keyboard_disable_all = CSI ++ "<10u";
 pub const kitty_keyboard_reset = CSI ++ "=0u";
 
-/// Move cursor to position (1-indexed)
 pub fn cursorTo(writer: *Writer, row: u16, col: u16) !void {
     try writer.print(CSI ++ "{d};{d}H", .{ row, col });
 }
 
-/// Move cursor to position (0-indexed)
 pub fn cursorTo0(writer: *Writer, row: u16, col: u16) !void {
     try writer.print(CSI ++ "{d};{d}H", .{ row + 1, col + 1 });
 }
 
-/// Move cursor up
 pub fn cursorUp(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}A", .{n});
 }
 
-/// Move cursor down
 pub fn cursorDown(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}B", .{n});
 }
 
-/// Move cursor forward (right)
 pub fn cursorForward(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}C", .{n});
 }
 
-/// Move cursor backward (left)
 pub fn cursorBack(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}D", .{n});
 }
 
-/// Move cursor to column (1-indexed)
 pub fn cursorToCol(writer: *Writer, col: u16) !void {
     try writer.print(CSI ++ "{d}G", .{col});
 }
 
-/// Move cursor to column (0-indexed)
 pub fn cursorToCol0(writer: *Writer, col: u16) !void {
     try writer.print(CSI ++ "{d}G", .{col + 1});
 }
 
-/// Request cursor position (response: ESC[row;colR)
 pub fn requestCursorPos(writer: *Writer) !void {
     try writer.writeAll(CSI ++ "6n");
 }
 
-/// Set scrolling region
 pub fn setScrollRegion(writer: *Writer, top: u16, bottom: u16) !void {
     try writer.print(CSI ++ "{d};{d}r", .{ top, bottom });
 }
 
-/// Reset scrolling region
 pub fn resetScrollRegion(writer: *Writer) !void {
     try writer.writeAll(CSI ++ "r");
 }
 
-/// Scroll up (content moves up, blank lines at bottom)
 pub fn scrollUp(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}S", .{n});
 }
 
-/// Scroll down (content moves down, blank lines at top)
 pub fn scrollDown(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}T", .{n});
 }
 
-/// Erase n characters from cursor position
 pub fn eraseChars(writer: *Writer, n: u16) !void {
     try writer.print(CSI ++ "{d}X", .{n});
 }
 
-/// Insert n blank lines at cursor position
 pub fn insertLines(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}L", .{n});
 }
 
-/// Delete n lines at cursor position
 pub fn deleteLines(writer: *Writer, n: u16) !void {
     if (n > 0) try writer.print(CSI ++ "{d}M", .{n});
 }
 
-/// Set window title
 pub fn setTitle(writer: *Writer, title: []const u8) !void {
     try writer.print(OSC ++ "0;{s}\x07", .{title});
 }
@@ -173,8 +145,6 @@ fn writeEscapedForDcs(writer: *Writer, bytes: []const u8) !void {
     }
 }
 
-/// Start an OSC 52 sequence and write the fixed header:
-/// `OSC 52 ; <target> ;`
 pub fn osc52Start(
     writer: *Writer,
     target: []const u8,
@@ -201,7 +171,6 @@ pub fn osc52Start(
     }
 }
 
-/// Finish an OSC 52 sequence started by `osc52Start`.
 pub fn osc52End(writer: *Writer, terminator: OscTerminator, passthrough: Osc52Passthrough) !void {
     switch (passthrough) {
         .none => try writeOscTerminator(writer, terminator),
@@ -215,7 +184,6 @@ pub fn osc52End(writer: *Writer, terminator: OscTerminator, passthrough: Osc52Pa
     }
 }
 
-/// Write a complete OSC 52 sequence with a pre-encoded base64 payload.
 pub fn osc52Encoded(
     writer: *Writer,
     target: []const u8,
@@ -228,7 +196,6 @@ pub fn osc52Encoded(
     try osc52End(writer, terminator, passthrough);
 }
 
-/// SGR (Select Graphic Rendition) codes
 pub const SGR = struct {
     pub const reset = 0;
     pub const bold = 1;
@@ -249,7 +216,6 @@ pub const SGR = struct {
     pub const no_hidden = 28;
     pub const no_strikethrough = 29;
 
-    // Foreground colors
     pub const fg_black = 30;
     pub const fg_red = 31;
     pub const fg_green = 32;
@@ -260,7 +226,6 @@ pub const SGR = struct {
     pub const fg_white = 37;
     pub const fg_default = 39;
 
-    // Background colors
     pub const bg_black = 40;
     pub const bg_red = 41;
     pub const bg_green = 42;
@@ -271,7 +236,6 @@ pub const SGR = struct {
     pub const bg_white = 47;
     pub const bg_default = 49;
 
-    // Bright foreground colors
     pub const fg_bright_black = 90;
     pub const fg_bright_red = 91;
     pub const fg_bright_green = 92;
@@ -281,7 +245,6 @@ pub const SGR = struct {
     pub const fg_bright_cyan = 96;
     pub const fg_bright_white = 97;
 
-    // Bright background colors
     pub const bg_bright_black = 100;
     pub const bg_bright_red = 101;
     pub const bg_bright_green = 102;
@@ -292,7 +255,6 @@ pub const SGR = struct {
     pub const bg_bright_white = 107;
 };
 
-/// Generate SGR sequence
 pub fn sgr(writer: *Writer, codes: []const u8) !void {
     try writer.writeAll(CSI);
     for (codes, 0..) |code, i| {
@@ -302,32 +264,26 @@ pub fn sgr(writer: *Writer, codes: []const u8) !void {
     try writer.writeByte('m');
 }
 
-/// Generate 256-color foreground
 pub fn fg256(writer: *Writer, color: u8) !void {
     try writer.print(CSI ++ "38;5;{d}m", .{color});
 }
 
-/// Generate 256-color background
 pub fn bg256(writer: *Writer, color: u8) !void {
     try writer.print(CSI ++ "48;5;{d}m", .{color});
 }
 
-/// Generate true color (24-bit) foreground
 pub fn fgRgb(writer: *Writer, r: u8, g: u8, b: u8) !void {
     try writer.print(CSI ++ "38;2;{d};{d};{d}m", .{ r, g, b });
 }
 
-/// Generate true color (24-bit) background
 pub fn bgRgb(writer: *Writer, r: u8, g: u8, b: u8) !void {
     try writer.print(CSI ++ "48;2;{d};{d};{d}m", .{ r, g, b });
 }
 
-/// Hyperlink (OSC 8)
 pub fn hyperlink(writer: *Writer, url: []const u8, text: []const u8) !void {
     try writer.print(OSC ++ "8;;{s}\x07{s}" ++ OSC ++ "8;;\x07", .{ url, text });
 }
 
-/// Kitty graphics protocol command (APC G ... ST)
 pub fn kittyGraphics(writer: *Writer, params: []const u8, payload: []const u8) !void {
     try writer.writeAll(APC ++ "G");
     try writer.writeAll(params);
@@ -336,7 +292,6 @@ pub fn kittyGraphics(writer: *Writer, params: []const u8, payload: []const u8) !
     try writer.writeAll(ST);
 }
 
-/// iTerm2 inline image command (OSC 1337;File=...:... BEL)
 pub fn iterm2InlineImage(writer: *Writer, params: []const u8, payload: []const u8) !void {
     try writer.writeAll(OSC ++ "1337;File=");
     try writer.writeAll(params);

@@ -1,5 +1,3 @@
-//! Code viewer with syntax highlighting.
-//! Provides keyword-based highlighting for common languages.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -11,15 +9,10 @@ pub const CodeView = struct {
     language: Language = .zig,
     show_line_numbers: bool = true,
     start_line: usize = 1,
-    /// Highlight specific line (1-indexed, 0 = none).
     highlight_line: usize = 0,
-    /// Line number width (number of digits, 0 = auto).
     line_number_width: u8 = 4,
-    /// Separator between line numbers and code.
     line_separator: []const u8 = "\xe2\x94\x82",
-    /// Tab display width.
     tab_width: u8 = 4,
-    /// Operator style.
     operator_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.fg(.white);
@@ -27,7 +20,6 @@ pub const CodeView = struct {
         break :blk s;
     },
 
-    // Styles
     keyword_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.fg(.magenta);
@@ -102,16 +94,13 @@ pub const CodeView = struct {
             if (!first) writer.writeByte('\n') catch {};
             first = false;
 
-            // Line number
             if (self.show_line_numbers) {
                 const num_str = std.fmt.allocPrint(allocator, "{d:>4} {s} ", .{ line_num, self.line_separator }) catch "   ? | ";
                 writer.writeAll(self.line_number_style.render(allocator, num_str) catch num_str) catch {};
             }
 
-            // Highlight line background
             const is_highlighted = (self.highlight_line > 0 and line_num == self.highlight_line);
 
-            // Syntax highlight the line
             const highlighted = self.highlightLine(allocator, line, &in_multiline_comment);
             if (is_highlighted) {
                 writer.writeAll(self.highlight_bg.render(allocator, highlighted) catch highlighted) catch {};
@@ -133,7 +122,6 @@ pub const CodeView = struct {
 
         var i: usize = 0;
         while (i < line.len) {
-            // Multi-line comment continuation
             if (in_multiline.*) {
                 if (i + 1 < line.len and line[i] == '*' and line[i + 1] == '/') {
                     writer.writeAll(self.comment_style.render(allocator, "*/") catch "*/") catch {};
@@ -146,13 +134,11 @@ pub const CodeView = struct {
                 continue;
             }
 
-            // Line comments
             if (isLineComment(self.language, line, i)) {
                 writer.writeAll(self.comment_style.render(allocator, line[i..]) catch line[i..]) catch {};
                 break;
             }
 
-            // Multi-line comment start
             if (i + 1 < line.len and line[i] == '/' and line[i + 1] == '*') {
                 in_multiline.* = true;
                 writer.writeAll(self.comment_style.render(allocator, "/*") catch "/*") catch {};
@@ -160,21 +146,19 @@ pub const CodeView = struct {
                 continue;
             }
 
-            // Strings
             if (line[i] == '"' or line[i] == '\'') {
                 const quote = line[i];
                 const str_start = i;
                 i += 1;
                 while (i < line.len and line[i] != quote) {
-                    if (line[i] == '\\') i += 1; // skip escape
+                    if (line[i] == '\\') i += 1;
                     i += 1;
                 }
-                if (i < line.len) i += 1; // closing quote
+                if (i < line.len) i += 1;
                 writer.writeAll(self.string_style.render(allocator, line[str_start..i]) catch line[str_start..i]) catch {};
                 continue;
             }
 
-            // Builtins (Zig @-prefixed)
             if (self.language == .zig and line[i] == '@' and i + 1 < line.len and std.ascii.isAlphabetic(line[i + 1])) {
                 const start = i;
                 i += 1;
@@ -183,7 +167,6 @@ pub const CodeView = struct {
                 continue;
             }
 
-            // Numbers
             if (std.ascii.isDigit(line[i])) {
                 const start = i;
                 while (i < line.len and (std.ascii.isDigit(line[i]) or line[i] == '.' or line[i] == 'x' or line[i] == '_')) : (i += 1) {}
@@ -191,7 +174,6 @@ pub const CodeView = struct {
                 continue;
             }
 
-            // Identifiers / keywords
             if (std.ascii.isAlphabetic(line[i]) or line[i] == '_') {
                 const start = i;
                 while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_')) : (i += 1) {}
@@ -207,7 +189,6 @@ pub const CodeView = struct {
                 continue;
             }
 
-            // Other characters
             writer.writeByte(line[i]) catch {};
             i += 1;
         }

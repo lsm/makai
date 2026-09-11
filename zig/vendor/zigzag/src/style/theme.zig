@@ -1,42 +1,31 @@
-//! Theming system for ZigZag.
-//! Provides centralized color palettes and component-specific themes.
 
 const std = @import("std");
 const Color = @import("color.zig").Color;
 const style_mod = @import("style.zig");
 
-/// Semantic color palette. Defines named colors for a theme.
 pub const Palette = struct {
-    // Primary colors
     primary: Color,
     secondary: Color,
     accent: Color,
 
-    // Surfaces
     background: Color,
     surface: Color,
     overlay: Color,
 
-    // Text
     foreground: Color,
     muted: Color,
     subtle: Color,
 
-    // Feedback
     success: Color,
     warning: Color,
     danger: Color,
     info: Color,
 
-    // Borders
     border_color: Color,
     border_focus: Color,
 
-    // Highlight
     highlight: Color,
     highlight_text: Color,
-
-    // ── Built-in presets ──────────────────────────────
 
     pub const default_dark = Palette{
         .primary = .cyan,
@@ -79,83 +68,83 @@ pub const Palette = struct {
     };
 
     pub const catppuccin_mocha = Palette{
-        .primary = .fromRgb(137, 180, 250), // blue
-        .secondary = .fromRgb(203, 166, 247), // mauve
-        .accent = .fromRgb(249, 226, 175), // yellow
-        .background = .fromRgb(30, 30, 46), // base
-        .surface = .fromRgb(49, 50, 68), // surface0
-        .overlay = .fromRgb(69, 71, 90), // surface1
-        .foreground = .fromRgb(205, 214, 244), // text
-        .muted = .fromRgb(166, 173, 200), // subtext0
-        .subtle = .fromRgb(127, 132, 156), // overlay1
-        .success = .fromRgb(166, 227, 161), // green
-        .warning = .fromRgb(249, 226, 175), // yellow
-        .danger = .fromRgb(243, 139, 168), // red
-        .info = .fromRgb(137, 180, 250), // blue
-        .border_color = .fromRgb(88, 91, 112), // overlay0
-        .border_focus = .fromRgb(137, 180, 250), // blue
-        .highlight = .fromRgb(49, 50, 68), // surface0
-        .highlight_text = .fromRgb(205, 214, 244), // text
+        .primary = .fromRgb(137, 180, 250),
+        .secondary = .fromRgb(203, 166, 247),
+        .accent = .fromRgb(249, 226, 175),
+        .background = .fromRgb(30, 30, 46),
+        .surface = .fromRgb(49, 50, 68),
+        .overlay = .fromRgb(69, 71, 90),
+        .foreground = .fromRgb(205, 214, 244),
+        .muted = .fromRgb(166, 173, 200),
+        .subtle = .fromRgb(127, 132, 156),
+        .success = .fromRgb(166, 227, 161),
+        .warning = .fromRgb(249, 226, 175),
+        .danger = .fromRgb(243, 139, 168),
+        .info = .fromRgb(137, 180, 250),
+        .border_color = .fromRgb(88, 91, 112),
+        .border_focus = .fromRgb(137, 180, 250),
+        .highlight = .fromRgb(49, 50, 68),
+        .highlight_text = .fromRgb(205, 214, 244),
     };
 
     pub const catppuccin_latte = Palette{
-        .primary = .fromRgb(30, 102, 245), // blue
-        .secondary = .fromRgb(136, 57, 239), // mauve
-        .accent = .fromRgb(223, 142, 29), // yellow
-        .background = .fromRgb(239, 241, 245), // base
-        .surface = .fromRgb(204, 208, 218), // surface0
-        .overlay = .fromRgb(188, 192, 204), // surface1
-        .foreground = .fromRgb(76, 79, 105), // text
-        .muted = .fromRgb(108, 111, 133), // subtext0
-        .subtle = .fromRgb(140, 143, 161), // overlay1
-        .success = .fromRgb(64, 160, 43), // green
-        .warning = .fromRgb(223, 142, 29), // yellow
-        .danger = .fromRgb(210, 15, 57), // red
-        .info = .fromRgb(30, 102, 245), // blue
-        .border_color = .fromRgb(156, 160, 176), // overlay0
-        .border_focus = .fromRgb(30, 102, 245), // blue
-        .highlight = .fromRgb(204, 208, 218), // surface0
-        .highlight_text = .fromRgb(76, 79, 105), // text
+        .primary = .fromRgb(30, 102, 245),
+        .secondary = .fromRgb(136, 57, 239),
+        .accent = .fromRgb(223, 142, 29),
+        .background = .fromRgb(239, 241, 245),
+        .surface = .fromRgb(204, 208, 218),
+        .overlay = .fromRgb(188, 192, 204),
+        .foreground = .fromRgb(76, 79, 105),
+        .muted = .fromRgb(108, 111, 133),
+        .subtle = .fromRgb(140, 143, 161),
+        .success = .fromRgb(64, 160, 43),
+        .warning = .fromRgb(223, 142, 29),
+        .danger = .fromRgb(210, 15, 57),
+        .info = .fromRgb(30, 102, 245),
+        .border_color = .fromRgb(156, 160, 176),
+        .border_focus = .fromRgb(30, 102, 245),
+        .highlight = .fromRgb(204, 208, 218),
+        .highlight_text = .fromRgb(76, 79, 105),
     };
 
     pub const dracula = Palette{
-        .primary = .fromRgb(189, 147, 249), // purple
-        .secondary = .fromRgb(255, 121, 198), // pink
-        .accent = .fromRgb(241, 250, 140), // yellow
-        .background = .fromRgb(40, 42, 54), // background
-        .surface = .fromRgb(68, 71, 90), // current line
-        .overlay = .fromRgb(68, 71, 90), // current line
-        .foreground = .fromRgb(248, 248, 242), // foreground
-        .muted = .fromRgb(98, 114, 164), // comment
-        .subtle = .fromRgb(98, 114, 164), // comment
-        .success = .fromRgb(80, 250, 123), // green
-        .warning = .fromRgb(255, 184, 108), // orange
-        .danger = .fromRgb(255, 85, 85), // red
-        .info = .fromRgb(139, 233, 253), // cyan
-        .border_color = .fromRgb(98, 114, 164), // comment
-        .border_focus = .fromRgb(189, 147, 249), // purple
-        .highlight = .fromRgb(68, 71, 90), // current line
-        .highlight_text = .fromRgb(248, 248, 242), // foreground
+        .primary = .fromRgb(189, 147, 249),
+        .secondary = .fromRgb(255, 121, 198),
+        .accent = .fromRgb(241, 250, 140),
+        .background = .fromRgb(40, 42, 54),
+        .surface = .fromRgb(68, 71, 90),
+        .overlay = .fromRgb(68, 71, 90),
+        .foreground = .fromRgb(248, 248, 242),
+        .muted = .fromRgb(98, 114, 164),
+        .subtle = .fromRgb(98, 114, 164),
+        .success = .fromRgb(80, 250, 123),
+        .warning = .fromRgb(255, 184, 108),
+        .danger = .fromRgb(255, 85, 85),
+        .info = .fromRgb(139, 233, 253),
+        .border_color = .fromRgb(98, 114, 164),
+        .border_focus = .fromRgb(189, 147, 249),
+        .highlight = .fromRgb(68, 71, 90),
+        .highlight_text = .fromRgb(248, 248, 242),
     };
 
     pub const nord = Palette{
-        .primary = .fromRgb(136, 192, 208), // nord8 frost
-        .secondary = .fromRgb(129, 161, 193), // nord9
-        .accent = .fromRgb(235, 203, 139), // nord13 aurora yellow
-        .background = .fromRgb(46, 52, 64), // nord0 polar night
-        .surface = .fromRgb(59, 66, 82), // nord1
-        .overlay = .fromRgb(67, 76, 94), // nord2
-        .foreground = .fromRgb(236, 239, 244), // nord6 snow storm
-        .muted = .fromRgb(216, 222, 233), // nord4
-        .subtle = .fromRgb(76, 86, 106), // nord3
-        .success = .fromRgb(163, 190, 140), // nord14 aurora green
-        .warning = .fromRgb(235, 203, 139), // nord13
-        .danger = .fromRgb(191, 97, 106), // nord11 aurora red
-        .info = .fromRgb(136, 192, 208), // nord8
-        .border_color = .fromRgb(76, 86, 106), // nord3
-        .border_focus = .fromRgb(136, 192, 208), // nord8
-        .highlight = .fromRgb(59, 66, 82), // nord1
-        .highlight_text = .fromRgb(236, 239, 244), // nord6
+        .primary = .fromRgb(136, 192, 208),
+        .secondary = .fromRgb(129, 161, 193),
+        .accent = .fromRgb(235, 203, 139),
+        .background = .fromRgb(46, 52, 64),
+        .surface = .fromRgb(59, 66, 82),
+        .overlay = .fromRgb(67, 76, 94),
+        .foreground = .fromRgb(236, 239, 244),
+        .muted = .fromRgb(216, 222, 233),
+        .subtle = .fromRgb(76, 86, 106),
+        .success = .fromRgb(163, 190, 140),
+        .warning = .fromRgb(235, 203, 139),
+        .danger = .fromRgb(191, 97, 106),
+        .info = .fromRgb(136, 192, 208),
+        .border_color = .fromRgb(76, 86, 106),
+        .border_focus = .fromRgb(136, 192, 208),
+        .highlight = .fromRgb(59, 66, 82),
+        .highlight_text = .fromRgb(236, 239, 244),
     };
 
     pub const high_contrast = Palette{
@@ -179,19 +168,19 @@ pub const Palette = struct {
     };
 
     pub const tokyo_night = Palette{
-        .primary = .fromRgb(122, 162, 247), // blue
-        .secondary = .fromRgb(187, 154, 247), // purple
-        .accent = .fromRgb(224, 175, 104), // yellow
-        .background = .fromRgb(26, 27, 38), // bg
-        .surface = .fromRgb(36, 40, 59), // bg_highlight
-        .overlay = .fromRgb(41, 46, 66), // terminal_black
-        .foreground = .fromRgb(192, 202, 245), // fg
-        .muted = .fromRgb(144, 153, 191), // comment
-        .subtle = .fromRgb(86, 95, 137), // dark5
-        .success = .fromRgb(158, 206, 106), // green
-        .warning = .fromRgb(224, 175, 104), // yellow
-        .danger = .fromRgb(247, 118, 142), // red
-        .info = .fromRgb(125, 207, 255), // cyan
+        .primary = .fromRgb(122, 162, 247),
+        .secondary = .fromRgb(187, 154, 247),
+        .accent = .fromRgb(224, 175, 104),
+        .background = .fromRgb(26, 27, 38),
+        .surface = .fromRgb(36, 40, 59),
+        .overlay = .fromRgb(41, 46, 66),
+        .foreground = .fromRgb(192, 202, 245),
+        .muted = .fromRgb(144, 153, 191),
+        .subtle = .fromRgb(86, 95, 137),
+        .success = .fromRgb(158, 206, 106),
+        .warning = .fromRgb(224, 175, 104),
+        .danger = .fromRgb(247, 118, 142),
+        .info = .fromRgb(125, 207, 255),
         .border_color = .fromRgb(41, 46, 66),
         .border_focus = .fromRgb(122, 162, 247),
         .highlight = .fromRgb(41, 46, 66),
@@ -199,19 +188,19 @@ pub const Palette = struct {
     };
 
     pub const gruvbox_dark = Palette{
-        .primary = .fromRgb(131, 165, 152), // aqua
-        .secondary = .fromRgb(211, 134, 155), // purple
-        .accent = .fromRgb(250, 189, 47), // yellow
-        .background = .fromRgb(40, 40, 40), // bg
-        .surface = .fromRgb(60, 56, 54), // bg1
-        .overlay = .fromRgb(80, 73, 69), // bg2
-        .foreground = .fromRgb(235, 219, 178), // fg
-        .muted = .fromRgb(168, 153, 132), // gray
-        .subtle = .fromRgb(124, 111, 100), // bg4
-        .success = .fromRgb(184, 187, 38), // green
-        .warning = .fromRgb(250, 189, 47), // yellow
-        .danger = .fromRgb(251, 73, 52), // red
-        .info = .fromRgb(131, 165, 152), // aqua
+        .primary = .fromRgb(131, 165, 152),
+        .secondary = .fromRgb(211, 134, 155),
+        .accent = .fromRgb(250, 189, 47),
+        .background = .fromRgb(40, 40, 40),
+        .surface = .fromRgb(60, 56, 54),
+        .overlay = .fromRgb(80, 73, 69),
+        .foreground = .fromRgb(235, 219, 178),
+        .muted = .fromRgb(168, 153, 132),
+        .subtle = .fromRgb(124, 111, 100),
+        .success = .fromRgb(184, 187, 38),
+        .warning = .fromRgb(250, 189, 47),
+        .danger = .fromRgb(251, 73, 52),
+        .info = .fromRgb(131, 165, 152),
         .border_color = .fromRgb(80, 73, 69),
         .border_focus = .fromRgb(131, 165, 152),
         .highlight = .fromRgb(80, 73, 69),
@@ -219,19 +208,19 @@ pub const Palette = struct {
     };
 
     pub const solarized_dark = Palette{
-        .primary = .fromRgb(38, 139, 210), // blue
-        .secondary = .fromRgb(108, 113, 196), // violet
-        .accent = .fromRgb(181, 137, 0), // yellow
-        .background = .fromRgb(0, 43, 54), // base03
-        .surface = .fromRgb(7, 54, 66), // base02
-        .overlay = .fromRgb(88, 110, 117), // base01
-        .foreground = .fromRgb(131, 148, 150), // base0
-        .muted = .fromRgb(101, 123, 131), // base00
-        .subtle = .fromRgb(88, 110, 117), // base01
-        .success = .fromRgb(133, 153, 0), // green
-        .warning = .fromRgb(181, 137, 0), // yellow
-        .danger = .fromRgb(220, 50, 47), // red
-        .info = .fromRgb(42, 161, 152), // cyan
+        .primary = .fromRgb(38, 139, 210),
+        .secondary = .fromRgb(108, 113, 196),
+        .accent = .fromRgb(181, 137, 0),
+        .background = .fromRgb(0, 43, 54),
+        .surface = .fromRgb(7, 54, 66),
+        .overlay = .fromRgb(88, 110, 117),
+        .foreground = .fromRgb(131, 148, 150),
+        .muted = .fromRgb(101, 123, 131),
+        .subtle = .fromRgb(88, 110, 117),
+        .success = .fromRgb(133, 153, 0),
+        .warning = .fromRgb(181, 137, 0),
+        .danger = .fromRgb(220, 50, 47),
+        .info = .fromRgb(42, 161, 152),
         .border_color = .fromRgb(88, 110, 117),
         .border_focus = .fromRgb(38, 139, 210),
         .highlight = .fromRgb(7, 54, 66),
@@ -239,26 +228,25 @@ pub const Palette = struct {
     };
 
     pub const solarized_light = Palette{
-        .primary = .fromRgb(38, 139, 210), // blue
-        .secondary = .fromRgb(108, 113, 196), // violet
-        .accent = .fromRgb(181, 137, 0), // yellow
-        .background = .fromRgb(253, 246, 227), // base3
-        .surface = .fromRgb(238, 232, 213), // base2
-        .overlay = .fromRgb(147, 161, 161), // base1
-        .foreground = .fromRgb(101, 123, 131), // base00
-        .muted = .fromRgb(131, 148, 150), // base0
-        .subtle = .fromRgb(147, 161, 161), // base1
-        .success = .fromRgb(133, 153, 0), // green
-        .warning = .fromRgb(181, 137, 0), // yellow
-        .danger = .fromRgb(220, 50, 47), // red
-        .info = .fromRgb(42, 161, 152), // cyan
+        .primary = .fromRgb(38, 139, 210),
+        .secondary = .fromRgb(108, 113, 196),
+        .accent = .fromRgb(181, 137, 0),
+        .background = .fromRgb(253, 246, 227),
+        .surface = .fromRgb(238, 232, 213),
+        .overlay = .fromRgb(147, 161, 161),
+        .foreground = .fromRgb(101, 123, 131),
+        .muted = .fromRgb(131, 148, 150),
+        .subtle = .fromRgb(147, 161, 161),
+        .success = .fromRgb(133, 153, 0),
+        .warning = .fromRgb(181, 137, 0),
+        .danger = .fromRgb(220, 50, 47),
+        .info = .fromRgb(42, 161, 152),
         .border_color = .fromRgb(147, 161, 161),
         .border_focus = .fromRgb(38, 139, 210),
         .highlight = .fromRgb(238, 232, 213),
         .highlight_text = .fromRgb(88, 110, 117),
     };
 
-    /// List of all built-in palette names for iteration.
     pub const builtins = [_]struct { name: []const u8, palette: Palette }{
         .{ .name = "Default Dark", .palette = default_dark },
         .{ .name = "Default Light", .palette = default_light },
@@ -274,7 +262,6 @@ pub const Palette = struct {
     };
 };
 
-/// Adaptive palette that resolves based on dark/light background.
 pub const AdaptivePalette = struct {
     light: Palette,
     dark: Palette,
@@ -299,14 +286,11 @@ pub const AdaptivePalette = struct {
     };
 };
 
-/// Manages the active theme at runtime.
-/// Holds a current theme and provides methods to switch between palettes.
 pub const ThemeManager = struct {
     current: Theme,
     is_dark: bool,
     palette_index: usize,
 
-    /// Initialize with the dark/light background detected at startup.
     pub fn init(is_dark: bool) ThemeManager {
         const palette = AdaptivePalette.default.resolve(is_dark);
         return .{
@@ -316,7 +300,6 @@ pub const ThemeManager = struct {
         };
     }
 
-    /// Initialize with a specific palette and the dark/light background detected at startup.
     pub fn initWithPalette(is_dark: bool, palette: Palette) ThemeManager {
         return .{
             .current = .fromPalette(palette),
@@ -325,12 +308,10 @@ pub const ThemeManager = struct {
         };
     }
 
-    /// Switch to a specific palette.
     pub fn setPalette(self: *ThemeManager, palette: Palette) void {
         self.current = .fromPalette(palette);
     }
 
-    /// Switch to a named built-in palette by index.
     pub fn setBuiltinByIndex(self: *ThemeManager, index: usize) void {
         if (index < Palette.builtins.len) {
             self.palette_index = index;
@@ -338,34 +319,28 @@ pub const ThemeManager = struct {
         }
     }
 
-    /// Cycle to the next built-in palette.
     pub fn nextBuiltin(self: *ThemeManager) void {
         self.palette_index = (self.palette_index + 1) % Palette.builtins.len;
         self.current = .fromPalette(Palette.builtins[self.palette_index].palette);
     }
 
-    /// Cycle to the previous built-in palette.
     pub fn prevBuiltin(self: *ThemeManager) void {
         self.palette_index = if (self.palette_index == 0) Palette.builtins.len - 1 else self.palette_index - 1;
         self.current = .fromPalette(Palette.builtins[self.palette_index].palette);
     }
 
-    /// Get the name of the current built-in palette.
     pub fn currentName(self: *const ThemeManager) []const u8 {
         return Palette.builtins[self.palette_index].name;
     }
 
-    /// Get the total number of built-in palettes.
     pub fn builtinCount() usize {
         return Palette.builtins.len;
     }
 };
 
-/// Theme contains a palette and derived component styles.
 pub const Theme = struct {
     palette: Palette,
 
-    // Derived styles for components
     text: TextTheme,
     list: ListTheme,
     progress: ProgressTheme,
@@ -416,7 +391,6 @@ pub const Theme = struct {
         inactive_fg: Color,
     };
 
-    /// Create a Theme from a Palette with sensible defaults.
     pub fn fromPalette(p: Palette) Theme {
         return .{
             .palette = p,
@@ -460,7 +434,6 @@ pub const Theme = struct {
         };
     }
 
-    /// Helper to create a Style with foreground color from the theme.
     pub fn styleWith(fg: Color) style_mod.Style {
         var s = style_mod.Style{};
         s = s.fg(fg);
@@ -468,7 +441,6 @@ pub const Theme = struct {
         return s;
     }
 
-    /// Helper to create a bold Style with foreground color.
     pub fn boldStyleWith(fg: Color) style_mod.Style {
         var s = style_mod.Style{};
         s = s.fg(fg);

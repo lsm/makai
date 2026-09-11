@@ -1,9 +1,3 @@
-//! Distributed Fullstack E2E (GitHub Copilot, non-mock provider)
-//!
-//! Verifies end-to-end distributed wiring with a real provider path:
-//!   - agent loop
-//!   - provider protocol bridge
-//!   - tool protocol runtime (remote tool execution callback path)
 
 const std = @import("std");
 const compat = @import("compat");

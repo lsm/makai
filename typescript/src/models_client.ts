@@ -1,23 +1,3 @@
-/**
- * High-level `client.models.*` API on top of the stdio protocol transport.
- *
- * Spec: docs/v1-sdk-agent-provider-spec.md §3 / §3.5 / §5.
- *
- * Wire mapping:
- * - `list(request)` → `models_request` envelope; reply is `ack` then
- *   `models_response`, or `nack` on failure.
- * - `resolve({ provider_id, model_id, api? })` → same `models_request` envelope
- *   with the exact `model_id` filter set (spec §3.5: V1 reuses the same
- *   envelope, no separate resolve type).
- *
- * Defensive client-side checks for resolve (per task acceptance criteria):
- * - 0 results → throw `invalid_request` "model not found".
- * - >1 results → throw `invalid_request` ambiguous match.
- *
- * Cache semantics (spec §2.3):
- * - `fetched_at_ms` and `cache_max_age_ms` are surfaced on the response.
- * - If the runtime omits `cache_max_age_ms` (non-conformant), default to 5 min.
- */
 
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
@@ -46,7 +26,7 @@ import {
 } from "./timeout_diagnostics";
 
 const ENVELOPE_VERSION = 1;
-const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omits
+const DEFAULT_CACHE_MAX_AGE_MS = 300_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_ID_LENGTH = 256;
 const MAX_MODEL_ID_LENGTH = 256;
@@ -92,31 +72,11 @@ const KNOWN_REASONING_LEVELS: ReadonlySet<string> = new Set([
   "xhigh",
 ]);
 
-/** Options for {@link createMakaiModelsApi}. */
 export interface ModelsApiOptions {
-  /** How long `list` / `resolve` waits for a terminal response frame. */
   responseTimeoutMs?: number;
-  /** Optional structured logger for models API diagnostics. */
   logger?: MakaiLogger;
 }
 
-/**
- * Build a {@link MakaiModelsApi} bound to an already-connected
- * {@link MakaiStdioClient}.
- *
- * The transport is shared, so do not interleave concurrent calls without
- * external synchronization — V1 frame correlation is sequential per stream.
- *
- * @param client Connected stdio client used to exchange model-discovery frames.
- * @param options Response timeout configuration.
- * @returns A models API facade bound to the supplied transport.
- *
- * @example
- * ```ts
- * const models = createMakaiModelsApi(transport);
- * const { models: available } = await models.list();
- * ```
- */
 export function createMakaiModelsApi(
   client: MakaiStdioClient,
   options: ModelsApiOptions = {},
@@ -276,8 +236,6 @@ class StdioModelsApi implements MakaiModelsApi {
     } catch (error) {
       if (isAbortError(error)) {
         bestEffortCancelStream(this.client, streamId);
-        // Fire-and-forget: avoids blocking behind withStreamReadLock held by
-        // the aborted nextFrameForStream call.
         drainStreamFrames(this.client, streamId);
       }
       throw error;
@@ -333,7 +291,6 @@ function parseModelsResponse(frame: StdioFrame): ListModelsResponse {
     throw malformedResponseError("models_response missing numeric 'fetched_at_ms'");
   }
 
-  // Spec §2.3: clients should default to 300_000ms when the server omits it.
   const cacheMaxAgeMs =
     typeof payload.cache_max_age_ms === "number" && Number.isFinite(payload.cache_max_age_ms)
       ? payload.cache_max_age_ms
@@ -384,9 +341,6 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
       );
     }
     if (!KNOWN_CAPABILITIES.has(cap)) {
-      // Spec §9: unknown fields/values are not fatal — but capability values
-      // are an enum on the wire. Surface as protocol error so we do not
-      // silently accept future capabilities as the closed TS union.
       throw malformedResponseError(
         `models[${idx}].capabilities[${capIdx}] has unknown value: ${cap}`,
       );

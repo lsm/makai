@@ -1,12 +1,8 @@
-//! Unicode utilities for display width calculation.
 
 const std = @import("std");
 
 pub const display_width = @import("unicode/display_width.zig");
 
-/// Runtime width strategy.
-/// - legacy_wcwidth: conservative fallback for terminals without negotiated width support.
-/// - unicode: full Unicode table behavior.
 pub const WidthStrategy = enum(u8) {
     legacy_wcwidth,
     unicode,
@@ -72,7 +68,6 @@ fn charWidthLegacy(codepoint: u21) usize {
     return w;
 }
 
-/// Legacy terminals often render many BMP symbol/emoji codepoints as narrow.
 fn isLegacyAmbiguousWide(codepoint: u21) bool {
     return (codepoint >= 0x2300 and codepoint <= 0x23FF) or
         (codepoint >= 0x2600 and codepoint <= 0x27BF) or
@@ -86,7 +81,7 @@ test {
 test "legacy strategy narrows ambiguous bmp symbols" {
     setWidthStrategy(.legacy_wcwidth);
     defer setWidthStrategy(.unicode);
-    try std.testing.expectEqual(@as(usize, 1), charWidth(0x2764)); // Heart
+    try std.testing.expectEqual(@as(usize, 1), charWidth(0x2764));
 }
 
 test "unicode strategy keeps full table behavior" {

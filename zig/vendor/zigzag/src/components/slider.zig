@@ -1,5 +1,3 @@
-//! Slider component.
-//! Interactive numeric range input with keyboard control.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -9,14 +7,12 @@ const Color = @import("../style/color.zig").Color;
 const progress_mod = @import("progress.zig");
 
 pub const Slider = struct {
-    // Value
     value: f64,
     min: f64,
     max: f64,
     step: f64,
     large_step: f64,
 
-    // Display
     width: u16,
     precision: u8,
     show_value: bool,
@@ -24,23 +20,19 @@ pub const Slider = struct {
     show_percent: bool,
     label: []const u8,
 
-    // Characters
     track_char: []const u8,
     thumb_char: []const u8,
     filled_char: []const u8,
 
-    // Styling
     track_style: style_mod.Style,
     filled_style: style_mod.Style,
     thumb_style: style_mod.Style,
     label_style: style_mod.Style,
     value_style: style_mod.Style,
 
-    // Gradient
     gradient_start: ?Color,
     gradient_end: ?Color,
 
-    // Focus
     focused: bool,
 
     pub fn init(min: f64, max: f64) Slider {
@@ -130,7 +122,6 @@ pub const Slider = struct {
         self.gradient_end = end;
     }
 
-    // Focus protocol
     pub fn focus(self: *Slider) void {
         self.focused = true;
     }
@@ -174,21 +165,18 @@ pub const Slider = struct {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Label
         if (self.label.len > 0) {
             const styled = try self.label_style.render(allocator, self.label);
             try writer.writeAll(styled);
             try writer.writeAll(" ");
         }
 
-        // Bounds (left)
         if (self.show_bounds) {
             const min_str = try self.formatValue(allocator, self.min);
             try writer.writeAll(min_str);
             try writer.writeAll(" ");
         }
 
-        // Track
         const range = self.max - self.min;
         const ratio: f64 = if (range > 0) (self.value - self.min) / range else 0;
         const track_width = self.width;
@@ -196,11 +184,9 @@ pub const Slider = struct {
 
         for (0..track_width) |i| {
             if (i == thumb_pos) {
-                // Thumb
                 const styled = try self.thumb_style.render(allocator, self.thumb_char);
                 try writer.writeAll(styled);
             } else if (i < thumb_pos) {
-                // Filled portion
                 if (self.gradient_start != null and self.gradient_end != null and thumb_pos > 0) {
                     const t: f64 = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(1, thumb_pos)));
                     const col = progress_mod.interpolateColor(self.gradient_start.?, self.gradient_end.?, t);
@@ -214,20 +200,17 @@ pub const Slider = struct {
                     try writer.writeAll(styled);
                 }
             } else {
-                // Empty track
                 const styled = try self.track_style.render(allocator, self.track_char);
                 try writer.writeAll(styled);
             }
         }
 
-        // Bounds (right)
         if (self.show_bounds) {
             try writer.writeAll(" ");
             const max_str = try self.formatValue(allocator, self.max);
             try writer.writeAll(max_str);
         }
 
-        // Value display
         if (self.show_value) {
             try writer.writeAll(" ");
             const val_str = try self.formatValue(allocator, self.value);
@@ -235,7 +218,6 @@ pub const Slider = struct {
             try writer.writeAll(styled);
         }
 
-        // Percentage
         if (self.show_percent) {
             const pct = self.percent();
             const pct_str = try std.fmt.allocPrint(allocator, " ({d:.0}%)", .{pct});
@@ -255,7 +237,6 @@ pub const Slider = struct {
     }
 };
 
-/// Slider style presets
 pub const SliderStyle = struct {
     pub fn block() Slider {
         var s = Slider.init(0, 100);

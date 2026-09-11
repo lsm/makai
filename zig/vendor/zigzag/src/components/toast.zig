@@ -1,5 +1,3 @@
-//! Enhanced Toast/Snackbar notification system.
-//! Supports positioning, stacking, icons, borders, and auto-dismiss with countdown.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -41,26 +39,22 @@ pub const Toast = struct {
     allocator: std.mem.Allocator,
     messages: std.array_list.Managed(ToastMessage),
 
-    // Layout
     max_visible: usize,
     position: Position,
     stack_order: StackOrder,
     min_width: u16,
     max_width: u16,
 
-    // Visual
     show_icons: bool,
     show_border: bool,
     show_countdown: bool,
     border_chars: border_mod.BorderChars,
 
-    // Icons per level
     info_icon: []const u8,
     success_icon: []const u8,
     warning_icon: []const u8,
     err_icon: []const u8,
 
-    // Styling per level
     info_style: style_mod.Style,
     success_style: style_mod.Style,
     warning_style: style_mod.Style,
@@ -125,7 +119,6 @@ pub const Toast = struct {
         self.messages.deinit();
     }
 
-    /// Push a notification.
     pub fn push(self: *Toast, text: []const u8, level: Level, duration_ms: u64, current_ns: u64) !void {
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
@@ -139,7 +132,6 @@ pub const Toast = struct {
         });
     }
 
-    /// Push a persistent notification (no auto-dismiss).
     pub fn pushPersistent(self: *Toast, text: []const u8, level: Level, current_ns: u64) !void {
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
@@ -148,12 +140,11 @@ pub const Toast = struct {
             .text = owned_text,
             .level = level,
             .created_ns = current_ns,
-            .duration_ms = 0, // 0 = no auto-dismiss
+            .duration_ms = 0,
             .dismissable = true,
         });
     }
 
-    /// Dismiss the most recent notification.
     pub fn dismiss(self: *Toast) void {
         if (self.messages.items.len > 0) {
             const msg = self.messages.pop().?;
@@ -161,14 +152,12 @@ pub const Toast = struct {
         }
     }
 
-    /// Dismiss the oldest notification.
     pub fn dismissOldest(self: *Toast) void {
         if (self.messages.items.len > 0) {
             self.removeAt(0);
         }
     }
 
-    /// Dismiss all notifications.
     pub fn dismissAll(self: *Toast) void {
         for (self.messages.items) |msg| {
             self.freeMessage(msg);
@@ -176,13 +165,11 @@ pub const Toast = struct {
         self.messages.clearRetainingCapacity();
     }
 
-    /// Remove expired notifications.
     pub fn update(self: *Toast, current_ns: u64) void {
         var i: usize = 0;
         while (i < self.messages.items.len) {
             const msg = self.messages.items[i];
             if (msg.duration_ms == 0) {
-                // Persistent - don't auto-dismiss
                 i += 1;
                 continue;
             }
@@ -195,17 +182,14 @@ pub const Toast = struct {
         }
     }
 
-    /// Check if there are any active notifications.
     pub fn hasMessages(self: *const Toast) bool {
         return self.messages.items.len > 0;
     }
 
-    /// Count of active messages.
     pub fn count(self: *const Toast) usize {
         return self.messages.items.len;
     }
 
-    /// Render notifications as a vertical stack.
     pub fn view(self: *const Toast, allocator: std.mem.Allocator, current_ns: u64) ![]const u8 {
         if (self.messages.items.len == 0) {
             return try allocator.dupe(u8, "");
@@ -234,7 +218,6 @@ pub const Toast = struct {
             try writer.writeAll(toast_str);
         }
 
-        // Show overflow indicator
         if (total > self.max_visible) {
             try writer.writeByte('\n');
             const overflow_text = try std.fmt.allocPrint(allocator, "  +{d} more", .{total - self.max_visible});
@@ -250,7 +233,6 @@ pub const Toast = struct {
         return result.toOwnedSlice();
     }
 
-    /// Render for positioned display within a terminal.
     pub fn viewPositioned(self: *const Toast, allocator: std.mem.Allocator, term_width: usize, term_height: usize, current_ns: u64) ![]const u8 {
         const toast_content = try self.view(allocator, current_ns);
         if (toast_content.len == 0) return toast_content;
@@ -313,19 +295,16 @@ pub const Toast = struct {
             try allocator.dupe(u8, msg.text);
         defer allocator.free(display_text);
 
-        // Icon
         if (self.show_icons) {
             const styled_icon = try active_style.render(allocator, icon);
             defer allocator.free(styled_icon);
             try lw.writeAll(styled_icon);
         }
 
-        // Text
         const styled_text = try active_style.render(allocator, display_text);
         defer allocator.free(styled_text);
         try lw.writeAll(styled_text);
 
-        // Countdown
         if (countdown_text.len > 0) {
             var dim_style = style_mod.Style{};
             dim_style = dim_style.fg(.gray(10));
@@ -343,7 +322,6 @@ pub const Toast = struct {
 
         const target_inner_width = @max(self.minInnerWidth(), measure.width(line_content));
 
-        // Wrap in border
         var box_style = style_mod.Style{};
         box_style = box_style.borderAll(self.border_chars);
         box_style = box_style.borderForeground(self.borderColorForLevel(msg.level));
@@ -384,7 +362,7 @@ pub const Toast = struct {
 
     fn toastChromeWidth(self: *const Toast) usize {
         if (!self.show_border) return 0;
-        return 4; // 2 border columns + 2 horizontal padding columns
+        return 4;
     }
 
     fn minInnerWidth(self: *const Toast) usize {

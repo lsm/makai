@@ -1,12 +1,9 @@
 const std = @import("std");
 
-/// StreamingJsonAccumulator accumulates partial JSON strings during tool call streaming.
-/// It allows appending delta chunks and provides access to the accumulated buffer.
 pub const StreamingJsonAccumulator = struct {
     buffer: std.ArrayList(u8),
     allocator: std.mem.Allocator,
 
-    /// Initialize a new StreamingJsonAccumulator with the given allocator.
     pub fn init(allocator: std.mem.Allocator) StreamingJsonAccumulator {
         return .{
             .buffer = .empty,
@@ -14,31 +11,25 @@ pub const StreamingJsonAccumulator = struct {
         };
     }
 
-    /// Free all allocated memory.
     pub fn deinit(self: *StreamingJsonAccumulator) void {
         self.buffer.deinit(self.allocator);
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 
-    /// Append a delta chunk to the accumulated buffer.
     pub fn append(self: *StreamingJsonAccumulator, delta: []const u8) !void {
         try self.buffer.appendSlice(self.allocator, delta);
     }
 
-    /// Get the current accumulated string.
     pub fn getBuffer(self: StreamingJsonAccumulator) []const u8 {
         return self.buffer.items;
     }
 
-    /// Reset the buffer for reuse, retaining capacity.
     pub fn clearRetainingCapacity(self: *StreamingJsonAccumulator) void {
         self.buffer.clearRetainingCapacity();
     }
 };
 
-/// Parsed contains the result of attempting to parse JSON into type T.
 pub fn Parsed(comptime T: type) type {
     return struct {
         value: T,
@@ -50,9 +41,6 @@ pub fn Parsed(comptime T: type) type {
     };
 }
 
-/// Attempt to parse the accumulated buffer as JSON into type T.
-/// Returns null if parsing fails (incomplete or invalid JSON).
-/// Caller owns the returned memory and must call deinit().
 pub fn parse(comptime T: type, allocator: std.mem.Allocator, buffer: []const u8) ?Parsed(T) {
     if (buffer.len == 0) return null;
 
@@ -63,7 +51,6 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, buffer: []const u8)
         .ignore_unknown_fields = true,
         .max_value_len = null,
     }) catch {
-        // arena is cleaned up by errdefer
         return null;
     };
 
@@ -73,9 +60,6 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, buffer: []const u8)
     };
 }
 
-/// Attempt to parse the accumulated buffer as a generic JSON value.
-/// Returns null if parsing fails (incomplete or invalid JSON).
-/// Caller owns the returned memory and must call deinit().
 pub fn parseValue(allocator: std.mem.Allocator, buffer: []const u8) ?std.json.Parsed(std.json.Value) {
     if (buffer.len == 0) return null;
 
@@ -84,10 +68,6 @@ pub fn parseValue(allocator: std.mem.Allocator, buffer: []const u8) ?std.json.Pa
         .max_value_len = null,
     }) catch null;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "StreamingJsonAccumulator - append multiple deltas" {
     const allocator = std.testing.allocator;
@@ -139,8 +119,6 @@ test "parse - complete JSON succeeds" {
 }
 
 test "parse - incomplete JSON returns null" {
-    // Use a fixed buffer allocator to avoid false positive leak reports
-    // when the JSON parser allocates before failing
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
@@ -149,7 +127,6 @@ test "parse - incomplete JSON returns null" {
         value: i32,
     };
 
-    // Incomplete JSON - missing closing brace
     const incomplete = "{\"name\": \"test\", \"value\":";
     const result = parse(TestStruct, fba.allocator(), incomplete);
     try std.testing.expect(result == null);
@@ -167,7 +144,6 @@ test "parse - empty buffer returns null" {
 }
 
 test "parse - invalid JSON returns null" {
-    // Use a fixed buffer allocator to avoid false positive leak reports
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
@@ -175,7 +151,6 @@ test "parse - invalid JSON returns null" {
         name: []const u8,
     };
 
-    // Invalid JSON - malformed
     const invalid = "{name: test}";
     const result = parse(TestStruct, fba.allocator(), invalid);
     try std.testing.expect(result == null);
@@ -199,11 +174,9 @@ test "parseValue - complete JSON succeeds" {
 }
 
 test "parseValue - incomplete JSON returns null" {
-    // Use a fixed buffer allocator to avoid false positive leak reports
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    // Incomplete JSON - missing closing brace and value
     const incomplete = "{\"key\":";
     const result = parseValue(fba.allocator(), incomplete);
     try std.testing.expect(result == null);
@@ -232,7 +205,6 @@ test "StreamingJsonAccumulator - simulate tool call streaming" {
     var acc = StreamingJsonAccumulator.init(allocator);
     defer acc.deinit();
 
-    // Simulate streaming deltas for a tool call input
     const deltas = [_][]const u8{
         "{\"comman",
         "d\": \"ls\", \"arg",

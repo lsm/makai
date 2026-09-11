@@ -1,5 +1,3 @@
-//! Selectable list component.
-//! Displays a list of items with selection and optional filtering.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -12,41 +10,32 @@ pub fn List(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
 
-        // Items
         items: std.array_list.Managed(Item),
         filtered_indices: std.array_list.Managed(usize),
 
-        // Selection
         cursor: usize,
         selected: std.AutoHashMap(usize, void),
 
-        // Filtering
         filter_text: std.array_list.Managed(u8),
         filter_enabled: bool,
 
-        // Appearance
         height: u16,
         y_offset: usize,
 
-        // Styling
         item_style: style_mod.Style,
         selected_style: style_mod.Style,
         cursor_style: style_mod.Style,
         filter_style: style_mod.Style,
 
-        // Symbols
         cursor_symbol: []const u8,
         selected_symbol: []const u8,
         unselected_symbol: []const u8,
 
-        // Focus
         focused: bool,
 
-        // Behavior
         multi_select: bool,
         wrap_around: bool,
 
-        // Status
         status_message: ?[]const u8,
         show_item_count: bool,
 
@@ -130,19 +119,16 @@ pub fn List(comptime T: type) type {
             self.filter_text.deinit();
         }
 
-        /// Add an item to the list
         pub fn addItem(self: *Self, item: Item) !void {
             try self.items.append(item);
             try self.updateFilter();
         }
 
-        /// Add multiple items
         pub fn addItems(self: *Self, items: []const Item) !void {
             try self.items.appendSlice(items);
             try self.updateFilter();
         }
 
-        /// Set items (replaces all)
         pub fn setItems(self: *Self, items: []const Item) !void {
             self.items.clearRetainingCapacity();
             try self.items.appendSlice(items);
@@ -151,7 +137,6 @@ pub fn List(comptime T: type) type {
             try self.updateFilter();
         }
 
-        /// Clear all items
         pub fn clear(self: *Self) void {
             self.items.clearRetainingCapacity();
             self.filtered_indices.clearRetainingCapacity();
@@ -160,7 +145,6 @@ pub fn List(comptime T: type) type {
             self.y_offset = 0;
         }
 
-        /// Get selected item
         pub fn selectedItem(self: *const Self) ?*const Item {
             const visible = self.visibleItems();
             if (self.cursor < visible.len) {
@@ -170,7 +154,6 @@ pub fn List(comptime T: type) type {
             return null;
         }
 
-        /// Get selected value
         pub fn selectedValue(self: *const Self) ?T {
             if (self.selectedItem()) |item| {
                 return item.value;
@@ -178,7 +161,6 @@ pub fn List(comptime T: type) type {
             return null;
         }
 
-        /// Get all selected items (for multi-select)
         pub fn selectedItems(self: *const Self, allocator: std.mem.Allocator) ![]const *const Item {
             var result = std.array_list.Managed(*const Item).init(allocator);
             var iter = self.selected.keyIterator();
@@ -190,7 +172,6 @@ pub fn List(comptime T: type) type {
             return result.toOwnedSlice();
         }
 
-        /// Move cursor up
         pub fn cursorUp(self: *Self) void {
             const visible = self.visibleItems();
             if (visible.len == 0) return;
@@ -204,7 +185,6 @@ pub fn List(comptime T: type) type {
             self.ensureVisible();
         }
 
-        /// Move cursor down
         pub fn cursorDown(self: *Self) void {
             const visible = self.visibleItems();
             if (visible.len == 0) return;
@@ -218,7 +198,6 @@ pub fn List(comptime T: type) type {
             self.ensureVisible();
         }
 
-        /// Page up
         pub fn pageUp(self: *Self) void {
             if (self.cursor >= self.height) {
                 self.cursor -= self.height;
@@ -228,7 +207,6 @@ pub fn List(comptime T: type) type {
             self.ensureVisible();
         }
 
-        /// Page down
         pub fn pageDown(self: *Self) void {
             const visible = self.visibleItems();
             if (self.cursor + self.height < visible.len) {
@@ -239,13 +217,11 @@ pub fn List(comptime T: type) type {
             self.ensureVisible();
         }
 
-        /// Go to first item
         pub fn gotoFirst(self: *Self) void {
             self.cursor = 0;
             self.y_offset = 0;
         }
 
-        /// Go to last item
         pub fn gotoLast(self: *Self) void {
             const visible = self.visibleItems();
             if (visible.len > 0) {
@@ -254,7 +230,6 @@ pub fn List(comptime T: type) type {
             }
         }
 
-        /// Toggle selection of current item
         pub fn toggleSelection(self: *Self) void {
             const visible = self.visibleItems();
             if (self.cursor >= visible.len) return;
@@ -273,7 +248,6 @@ pub fn List(comptime T: type) type {
             }
         }
 
-        /// Select current item
         pub fn selectCurrent(self: *Self) void {
             const visible = self.visibleItems();
             if (self.cursor >= visible.len) return;
@@ -285,40 +259,33 @@ pub fn List(comptime T: type) type {
             self.selected.put(idx, {}) catch {};
         }
 
-        /// Enable filtering
         pub fn enableFilter(self: *Self) void {
             self.filter_enabled = true;
         }
 
-        /// Disable filtering
         pub fn disableFilter(self: *Self) void {
             self.filter_enabled = false;
             self.filter_text.clearRetainingCapacity();
             self.updateFilter() catch {};
         }
 
-        /// Set filter text
         pub fn setFilter(self: *Self, text: []const u8) !void {
             self.filter_text.clearRetainingCapacity();
             try self.filter_text.appendSlice(text);
             try self.updateFilter();
         }
 
-        /// Set focused state (for use with FocusGroup).
         pub fn focus(self: *Self) void {
             self.focused = true;
         }
 
-        /// Clear focused state (for use with FocusGroup).
         pub fn blur(self: *Self) void {
             self.focused = false;
         }
 
-        /// Handle key event
         pub fn handleKey(self: *Self, key: keys.KeyEvent) void {
             if (!self.focused) return;
             if (self.filter_enabled and key.key == .char and !key.modifiers.ctrl) {
-                // Add to filter
                 const c = key.key.char;
                 var buf: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(c, &buf) catch return;
@@ -404,12 +371,10 @@ pub fn List(comptime T: type) type {
             }
         }
 
-        /// Render the list
         pub fn view(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
             var result: Writer.Allocating = .init(allocator);
             const writer = &result.writer;
 
-            // Filter line
             if (self.filter_enabled) {
                 const filter_line = try std.fmt.allocPrint(allocator, "Filter: {s}", .{self.filter_text.items});
                 const styled = try self.filter_style.render(allocator, filter_line);
@@ -419,7 +384,6 @@ pub fn List(comptime T: type) type {
 
             const visible = self.visibleItems();
 
-            // Render visible items
             var rendered: usize = 0;
             while (rendered < self.height) : (rendered += 1) {
                 if (rendered > 0) try writer.writeByte('\n');
@@ -429,7 +393,6 @@ pub fn List(comptime T: type) type {
                     const item_idx = visible[idx];
                     const item = self.items.items[item_idx];
 
-                    // Cursor
                     if (idx == self.cursor) {
                         const cursor_styled = try self.cursor_style.render(allocator, self.cursor_symbol);
                         try writer.writeAll(cursor_styled);
@@ -439,7 +402,6 @@ pub fn List(comptime T: type) type {
                         }
                     }
 
-                    // Selection indicator (multi-select)
                     if (self.multi_select) {
                         if (self.selected.contains(item_idx)) {
                             const sel_styled = try self.selected_style.render(allocator, self.selected_symbol);
@@ -449,7 +411,6 @@ pub fn List(comptime T: type) type {
                         }
                     }
 
-                    // Item text
                     const item_rendered = if (idx == self.cursor)
                         try self.cursor_style.render(allocator, item.title)
                     else if (self.selected.contains(item_idx))
@@ -459,7 +420,6 @@ pub fn List(comptime T: type) type {
 
                     try writer.writeAll(item_rendered);
 
-                    // Description
                     if (item.description.len > 0) {
                         try writer.writeAll(" - ");
                         try writer.writeAll(item.description);
@@ -467,7 +427,6 @@ pub fn List(comptime T: type) type {
                 }
             }
 
-            // Status bar
             if (self.show_item_count or self.status_message != null) {
                 try writer.writeAll("\n");
                 if (self.show_item_count) {

@@ -6,12 +6,8 @@ const owned_slice_mod = @import("owned_slice");
 
 const OwnedSlice = owned_slice_mod.OwnedSlice;
 
-// --- Async byte stream types ---
-
-/// A chunk of bytes with ownership semantics
 pub const ByteChunk = struct {
     data: []const u8,
-    /// If true, caller owns the data and must free it
     owned: bool = true,
 
     pub fn deinit(self: *ByteChunk, allocator: std.mem.Allocator) void {
@@ -21,12 +17,8 @@ pub const ByteChunk = struct {
     }
 };
 
-/// Stream of byte chunks with void result
 pub const ByteStream = event_stream.EventStream(ByteChunk, void);
 
-// --- Wire message type ---
-
-/// Control messages as defined in PROTOCOL.md Section 3.2
 pub const ControlMessage = union(enum) {
     ack: struct {
         acknowledged_id: OwnedSlice(u8),
@@ -38,12 +30,12 @@ pub const ControlMessage = union(enum) {
     },
     ping: void,
     pong: void,
-    goodbye: OwnedSlice(u8), // empty means no reason
+    goodbye: OwnedSlice(u8),
     sync_request: void,
     sync: struct {
         stream_id: OwnedSlice(u8),
         sequence: u64,
-        partial: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), // JSON snapshot
+        partial: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     },
 };
 
@@ -54,13 +46,7 @@ pub const MessageOrControl = union(enum) {
     control: ControlMessage,
 };
 
-/// Callback type for handling control messages
-/// The callback receives the control message and an optional context pointer.
-/// IMPORTANT: The callback must copy any string slices it needs (via `.slice()`)
-/// before returning, as owned strings will be freed after the callback returns.
 pub const ControlMessageCallback = *const fn (ctrl: ControlMessage, ctx: ?*anyopaque) void;
-
-// --- Transport interfaces ---
 
 pub const Sender = struct {
     context: *anyopaque,
@@ -86,7 +72,6 @@ pub const Receiver = struct {
     read_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8,
     close_fn: ?*const fn (ctx: *anyopaque) void = null,
 
-    /// Optional callback for handling control messages
     control_callback: ?ControlMessageCallback = null,
     control_callback_ctx: ?*anyopaque = null,
 
@@ -98,15 +83,11 @@ pub const Receiver = struct {
         if (self.close_fn) |f| f(self.context);
     }
 
-    /// Set a callback to be invoked when control messages are received.
-    /// The callback receives the control message and the provided context.
     pub fn setControlCallback(self: *Receiver, callback: ControlMessageCallback, ctx: ?*anyopaque) void {
         self.control_callback = callback;
         self.control_callback_ctx = ctx;
     }
 };
-
-// --- Async transport interfaces ---
 
 pub const AsyncSender = struct {
     context: *anyopaque,
@@ -130,13 +111,11 @@ pub const AsyncSender = struct {
 pub const AsyncReceiver = struct {
     context: *anyopaque,
 
-    /// Create a new byte stream for receiving data
     receive_stream_fn: *const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
     ) anyerror!*ByteStream,
 
-    /// Optional: synchronous read for backward compatibility
     read_fn: ?*const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -158,9 +137,6 @@ pub const AsyncReceiver = struct {
     }
 };
 
-// --- Generic adapters ---
-
-/// Forward all events from a stream to a Sender. Blocks until stream is complete.
 pub fn forwardStream(
     stream: *event_stream.AssistantMessageStream,
     sender: *const Sender,
@@ -190,8 +166,6 @@ pub fn forwardStream(
     try sender.flush();
 }
 
-/// Receive from a Receiver and push into a local stream. Blocks until done.
-/// If receiver.control_callback is set, it will be invoked for control messages.
 pub fn receiveStream(
     receiver: *const Receiver,
     stream: *event_stream.AssistantMessageStream,
@@ -213,7 +187,6 @@ pub fn receiveStream(
                 return;
             },
             .control => |ctrl| {
-                // Invoke callback if set, then free strings
                 if (receiver.control_callback) |cb| {
                     cb(ctrl, receiver.control_callback_ctx);
                 }
@@ -224,17 +197,6 @@ pub fn receiveStream(
     stream.completeWithError("Transport closed unexpectedly");
 }
 
-// --- Async stream bridge functions ---
-
-/// Free all strings owned by an event.
-///
-/// Memory Ownership Model:
-/// - Events own their strings. When an event is created, any string fields
-///   (delta, content, etc.) are deep copies allocated by the caller.
-/// - The `partial` field in streaming events contains a snapshot of the
-///   accumulated message state. If `partial.is_owned` is true, the
-///   partial owns its content and must be freed.
-/// - Call this function when done with an event to prevent memory leaks.
 pub fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
     switch (ev) {
         .start => |e| {
@@ -322,7 +284,6 @@ pub fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.A
     }
 }
 
-/// Free allocated strings in a control message
 pub fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
     switch (ctrl) {
         .ack => |a| {
@@ -354,7 +315,6 @@ pub fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) vo
     }
 }
 
-/// Free allocated strings in a MessageOrControl
 pub fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
     switch (msg) {
         .event => |ev| freeEventStrings(ev, allocator),
@@ -370,8 +330,6 @@ pub fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.All
     }
 }
 
-/// Receive from a ByteStream and push into an AssistantMessageStream
-/// Control messages are discarded. Use receiveStreamFromByteStreamWithControl for control message handling.
 pub fn receiveStreamFromByteStream(
     byte_stream: *ByteStream,
     msg_stream: *event_stream.AssistantMessageStream,
@@ -380,8 +338,6 @@ pub fn receiveStreamFromByteStream(
     receiveStreamFromByteStreamWithControl(byte_stream, msg_stream, null, null, allocator);
 }
 
-/// Receive from a ByteStream and push into an AssistantMessageStream with control message callback.
-/// If control_callback is provided, it will be invoked for control messages before they are freed.
 pub fn receiveStreamFromByteStreamWithControl(
     byte_stream: *ByteStream,
     msg_stream: *event_stream.AssistantMessageStream,
@@ -421,7 +377,6 @@ pub fn receiveStreamFromByteStreamWithControl(
                 return;
             },
             .control => |ctrl| {
-                // Invoke callback if set, then free strings
                 if (control_callback) |cb| {
                     cb(ctrl, control_callback_ctx);
                 }
@@ -437,7 +392,6 @@ pub fn receiveStreamFromByteStreamWithControl(
     }
 }
 
-/// Context for spawnReceiver thread
 const ReceiverThreadContext = struct {
     byte_stream: *ByteStream,
     msg_stream: *event_stream.AssistantMessageStream,
@@ -459,8 +413,6 @@ const ReceiverThreadContext = struct {
     }
 };
 
-/// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream
-/// Control messages are discarded. Use spawnReceiverWithControl for control message handling.
 pub fn spawnReceiver(
     receiver: *const AsyncReceiver,
     msg_stream: *event_stream.AssistantMessageStream,
@@ -469,8 +421,6 @@ pub fn spawnReceiver(
     return spawnReceiverWithControl(receiver, msg_stream, null, null, allocator);
 }
 
-/// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream with control callback.
-/// If control_callback is provided, it will be invoked for control messages.
 pub fn spawnReceiverWithControl(
     receiver: *const AsyncReceiver,
     msg_stream: *event_stream.AssistantMessageStream,
@@ -491,8 +441,6 @@ pub fn spawnReceiverWithControl(
 
     return std.Thread.spawn(.{}, ReceiverThreadContext.run, .{ctx});
 }
-
-// --- Serialization ---
 
 pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
@@ -557,7 +505,6 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
             try w.writeStringField("type", "done");
             try w.writeStringField("reason", @tagName(d.reason));
 
-            // Nest message fields under "message" key
             try w.writeKey("message");
             try w.beginObject();
             try w.writeStringField("role", "assistant");
@@ -567,7 +514,6 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
             try w.writeStringField("provider", d.message.provider);
             try w.writeIntField("timestamp", d.message.timestamp);
 
-            // Nest usage fields under "usage" key
             try w.writeKey("usage");
             try w.beginObject();
             try w.writeIntField("input", d.message.usage.input);
@@ -614,9 +560,6 @@ pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.All
     return serializeResultWithStopReason(result, @tagName(result.stop_reason), allocator);
 }
 
-/// Like serializeResult, but reports `stop_reason` from an explicit override.
-/// Used for agent runs whose agent-level termination (e.g. the iteration cap)
-/// differs from the final turn's own stop reason.
 pub fn serializeResultWithStopReason(result: ai_types.AssistantMessage, stop_reason: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
@@ -641,8 +584,6 @@ pub fn serializeResultWithStopReason(result: ai_types.AssistantMessage, stop_rea
     }
     try w.endArray();
 
-    // Errors otherwise leave the process invisibly: the catch path in the
-    // agent loop stores the Zig error name here with empty content.
     if (result.error_message.slice().len > 0) {
         try w.writeStringField("error_message", result.error_message.slice());
     }
@@ -704,8 +645,6 @@ pub fn serializeAssistantContent(w: *json_writer.JsonWriter, content: ai_types.A
     try w.endObject();
 }
 
-// --- Deserialization ---
-
 pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrControl {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
@@ -721,7 +660,6 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
         return .{ .stream_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, msg)) };
     }
 
-    // Handle control messages
     if (std.mem.eql(u8, type_str, "ack")) {
         const acknowledged_id = if (obj.get("acknowledged_id")) |id|
             OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
@@ -805,12 +743,6 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     return .{ .event = try parseAssistantMessageEvent(type_str, obj, allocator) };
 }
 
-/// Parse the lightweight partial object from protocol events (include_partial: true)
-/// Returns an AssistantMessage with content populated from the partial fields.
-/// According to PROTOCOL.md:
-/// - Text events: { "current_text": "accumulated text" }
-/// - Thinking events: { "current_thinking": "accumulated thinking" }
-/// - Tool call events: { "current_arguments_json": "..." }
 fn parsePartialFromEvent(
     partial_obj: ?std.json.Value,
     content_index: usize,
@@ -820,12 +752,10 @@ fn parsePartialFromEvent(
 
     const obj = partial_obj.?.object;
 
-    // Check for text partial
     if (obj.get("current_text")) |ct| {
         const text = try allocator.dupe(u8, ct.string);
         errdefer allocator.free(text);
 
-        // Create content array with text at content_index
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
         errdefer allocator.free(content);
         @memset(content, .{ .text = .{ .text = "" } });
@@ -843,12 +773,10 @@ fn parsePartialFromEvent(
         };
     }
 
-    // Check for thinking partial
     if (obj.get("current_thinking")) |ct| {
         const thinking = try allocator.dupe(u8, ct.string);
         errdefer allocator.free(thinking);
 
-        // Create content array with thinking at content_index
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
         errdefer allocator.free(content);
         @memset(content, .{ .text = .{ .text = "" } });
@@ -866,12 +794,10 @@ fn parsePartialFromEvent(
         };
     }
 
-    // Check for tool call arguments partial
     if (obj.get("current_arguments_json")) |ca| {
         const args_json = try allocator.dupe(u8, ca.string);
         errdefer allocator.free(args_json);
 
-        // Create content array with tool_call at content_index
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
         errdefer allocator.free(content);
         @memset(content, .{ .text = .{ .text = "" } });
@@ -901,7 +827,6 @@ pub fn parseAssistantMessageEvent(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessageEvent {
-    // Create a minimal partial message for events (used when no partial field present)
     const empty_partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -922,7 +847,6 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "text_start")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -938,7 +862,6 @@ pub fn parseAssistantMessageEvent(
         const delta = try allocator.dupe(u8, obj.get("delta").?.string);
         errdefer allocator.free(delta);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -953,7 +876,6 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "text_end")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -968,7 +890,6 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "thinking_start")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -984,7 +905,6 @@ pub fn parseAssistantMessageEvent(
         const delta = try allocator.dupe(u8, obj.get("delta").?.string);
         errdefer allocator.free(delta);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -999,7 +919,6 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "thinking_end")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -1014,13 +933,11 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "toolcall_start")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // Parse id and name - these are now required fields
         const id = try allocator.dupe(u8, obj.get("id").?.string);
         errdefer allocator.free(id);
         const name = try allocator.dupe(u8, obj.get("name").?.string);
         errdefer allocator.free(name);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -1038,7 +955,6 @@ pub fn parseAssistantMessageEvent(
         const delta = try allocator.dupe(u8, obj.get("delta").?.string);
         errdefer allocator.free(delta);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -1065,7 +981,6 @@ pub fn parseAssistantMessageEvent(
         const arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string);
         errdefer allocator.free(arguments_json);
 
-        // Parse partial if present
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
         else
@@ -1094,12 +1009,10 @@ pub fn parseAssistantMessageEvent(
         var err_msg = empty_partial;
         err_msg.is_owned = true;
 
-        // Parse optional error_message
         if (obj.get("error_message")) |em| {
             err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
         }
 
-        // Parse optional usage object
         if (obj.get("usage")) |usage_obj| {
             if (usage_obj == .object) {
                 const u = usage_obj.object;
@@ -1128,7 +1041,6 @@ pub fn parseAssistantMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {
-    // Content field is optional - done events don't include it
     var content: []ai_types.AssistantContent = &.{};
     if (obj.get("content")) |content_val| {
         if (content_val == .array) {
@@ -1136,7 +1048,6 @@ pub fn parseAssistantMessage(
             content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
             var parsed_count: usize = 0;
             errdefer {
-                // Free any successfully parsed content items before freeing the slice
                 for (content[0..parsed_count]) |c| {
                     freeAssistantContent(c, allocator);
                 }
@@ -1149,7 +1060,6 @@ pub fn parseAssistantMessage(
         }
     }
 
-    // Parse usage - support both nested object format and flat fields for backward compatibility
     var usage: ai_types.Usage = .{};
     if (obj.get("usage")) |usage_val| {
         if (usage_val == .object) {
@@ -1162,7 +1072,6 @@ pub fn parseAssistantMessage(
             };
         }
     } else {
-        // Fall back to flat fields for backward compatibility
         usage = .{
             .input = if (obj.get("input")) |v| @intCast(v.integer) else 0,
             .output = if (obj.get("output")) |v| @intCast(v.integer) else 0,
@@ -1171,9 +1080,6 @@ pub fn parseAssistantMessage(
         };
     }
 
-    // Note: role field is optional and ignored (validated as "assistant" if present)
-
-    // Build result with errdefer for each allocation to avoid leaks on OOM
     var result: ai_types.AssistantMessage = undefined;
     result.content = content;
     errdefer {
@@ -1194,8 +1100,6 @@ pub fn parseAssistantMessage(
     result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
     errdefer allocator.free(result.provider);
 
-    // Parse optional error_message (emitted by serializeResult when the run
-    // failed; absent for successful results)
     if (obj.get("error_message")) |em| {
         if (em == .string and em.string.len > 0) {
             result.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
@@ -1213,7 +1117,6 @@ pub fn parseAssistantMessage(
     return result;
 }
 
-/// Free allocated strings in a single AssistantContent item
 fn freeAssistantContent(content: ai_types.AssistantContent, allocator: std.mem.Allocator) void {
     switch (content) {
         .text => |t| {
@@ -1295,13 +1198,10 @@ fn parseStopReason(str: []const u8) ai_types.StopReason {
     return .@"error";
 }
 
-// Custom error set
 pub const TransportError = error{
     UnknownEventType,
     UnknownContentBlockType,
 };
-
-// --- Tests ---
 
 test "serialize and deserialize start event" {
     const allocator = std.testing.allocator;
@@ -1322,7 +1222,6 @@ test "serialize and deserialize start event" {
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .start);
-    // Clean up partial message
     var mutable_partial = msg.event.start.partial;
     mutable_partial.deinit(allocator);
 }
@@ -1394,7 +1293,6 @@ test "serialize and deserialize done event" {
 test "serialize and deserialize toolcall_start event with id and name" {
     const allocator = std.testing.allocator;
 
-    // Create a simple partial (empty content is fine, id/name are now in the event directly)
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -1414,7 +1312,6 @@ test "serialize and deserialize toolcall_start event with id and name" {
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
-    // Verify the serialized JSON contains id and name
     try std.testing.expect(std.mem.find(u8, json, "\"id\":\"toolu_abc\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"calculator\"") != null);
 
@@ -1423,11 +1320,9 @@ test "serialize and deserialize toolcall_start event with id and name" {
     try std.testing.expect(msg.event == .toolcall_start);
     try std.testing.expectEqual(@as(usize, 0), msg.event.toolcall_start.content_index);
 
-    // Verify id and name are accessible directly in the event
     try std.testing.expectEqualStrings("toolu_abc", msg.event.toolcall_start.id);
     try std.testing.expectEqualStrings("calculator", msg.event.toolcall_start.name);
 
-    // Free the duped id and name strings
     allocator.free(msg.event.toolcall_start.id);
     allocator.free(msg.event.toolcall_start.name);
 }
@@ -1505,7 +1400,6 @@ test "serialize and deserialize error event" {
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
-    // Verify JSON contains the new fields
     try std.testing.expect(std.mem.find(u8, json, "\"error_message\":\"API rate limit exceeded\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"input\":100") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"output\":50") != null);
@@ -1515,17 +1409,14 @@ test "serialize and deserialize error event" {
     try std.testing.expect(msg.event == .@"error");
     try std.testing.expectEqual(ai_types.StopReason.@"error", msg.event.@"error".reason);
 
-    // Verify usage is properly deserialized
     try std.testing.expectEqual(@as(u64, 100), msg.event.@"error".err.usage.input);
     try std.testing.expectEqual(@as(u64, 50), msg.event.@"error".err.usage.output);
     try std.testing.expectEqual(@as(u64, 20), msg.event.@"error".err.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 10), msg.event.@"error".err.usage.cache_write);
 
-    // Verify error_message is properly deserialized
     try std.testing.expect(msg.event.@"error".err.getErrorMessage() != null);
     try std.testing.expectEqualStrings("API rate limit exceeded", msg.event.@"error".err.getErrorMessage().?);
 
-    // Cleanup
     var mutable_err = msg.event.@"error".err;
     mutable_err.deinit(allocator);
 }
@@ -1724,20 +1615,16 @@ test "serialize and deserialize tool_call with thought_signature" {
     mutable_result4.deinit(allocator);
 }
 
-// --- Async interface tests ---
-
 test "ByteChunk creation and deinit" {
     const allocator = std.testing.allocator;
 
-    // Test owned chunk
     const data = try allocator.dupe(u8, "hello world");
     var chunk = ByteChunk{ .data = data, .owned = true };
     chunk.deinit(allocator);
 
-    // Test non-owned chunk (should not free)
     const static_data = "static data";
     var chunk2 = ByteChunk{ .data = static_data, .owned = false };
-    chunk2.deinit(allocator); // Should be safe
+    chunk2.deinit(allocator);
 }
 
 test "ByteStream basic operations" {
@@ -1776,7 +1663,6 @@ test "AsyncReceiver mock implementation" {
             const stream = try allocator.create(ByteStream);
             stream.* = ByteStream.init(allocator);
 
-            // Push all data into the stream
             for (self.data) |item| {
                 const data = try allocator.dupe(u8, item);
                 try stream.push(.{ .data = data, .owned = true });
@@ -1802,7 +1688,6 @@ test "AsyncReceiver mock implementation" {
         allocator.destroy(byte_stream);
     }
 
-    // Read all chunks
     var count: usize = 0;
     while (byte_stream.wait()) |chunk| {
         defer {
@@ -1817,11 +1702,9 @@ test "AsyncReceiver mock implementation" {
 test "receiveStreamFromByteStream bridge" {
     const allocator = std.testing.allocator;
 
-    // Create a ByteStream with serialized events
     var byte_stream = ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Empty partial for event construction
     const empty_partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -1832,14 +1715,12 @@ test "receiveStreamFromByteStream bridge" {
         .timestamp = 0,
     };
 
-    // Push a text_delta event
     const event_json = try serializeEvent(.{
         .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = empty_partial },
     }, allocator);
     defer allocator.free(event_json);
     try byte_stream.push(.{ .data = try allocator.dupe(u8, event_json), .owned = true });
 
-    // Push a result
     const result_json = try serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -1854,25 +1735,19 @@ test "receiveStreamFromByteStream bridge" {
 
     byte_stream.complete({});
 
-    // Create the message stream
     var msg_stream = event_stream.AssistantMessageStream.init(allocator);
     defer msg_stream.deinit();
 
-    // Bridge the streams
     receiveStreamFromByteStream(&byte_stream, &msg_stream, allocator);
 
-    // Poll the text_delta event
     const event = msg_stream.poll();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .text_delta);
     try std.testing.expectEqualStrings("Hello", event.?.text_delta.delta);
     allocator.free(event.?.text_delta.delta);
 
-    // Stream should be done
     try std.testing.expect(msg_stream.isDone());
 }
-
-// --- Control message callback tests ---
 
 const ControlTestContext = struct {
     received_ping: bool = false,
@@ -1892,12 +1767,10 @@ const ControlTestContext = struct {
             },
             .ack => |a| {
                 self.ack_count += 1;
-                // Free previous allocation if any
                 if (self.last_ack_id.len > 0) {
                     self.allocator.free(self.last_ack_id);
                     self.last_ack_id = "";
                 }
-                // Must copy the string since it will be freed after callback returns
                 self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id.slice()) catch "";
             },
             else => {},
@@ -1917,11 +1790,9 @@ test "receiveStreamFromByteStreamWithControl invokes callback for ping" {
     var byte_stream = ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push a ping control message
     const ping_json = "{\"type\":\"ping\"}";
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
 
-    // Push a result to end the stream
     const result_json = try serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -1960,11 +1831,9 @@ test "receiveStreamFromByteStreamWithControl invokes callback for ack with strin
     var byte_stream = ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push an ack control message
     const ack_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-12345\"}";
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ack_json), .owned = true });
 
-    // Push a result to end the stream
     const result_json = try serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -2004,7 +1873,6 @@ test "receiveStreamFromByteStreamWithControl handles multiple control messages" 
     var byte_stream = ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push multiple control messages
     const ping_json = "{\"type\":\"ping\"}";
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
 
@@ -2017,7 +1885,6 @@ test "receiveStreamFromByteStreamWithControl handles multiple control messages" 
     const ack2_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-2\"}";
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ack2_json), .owned = true });
 
-    // Push a result to end the stream
     const result_json = try serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -2059,11 +1926,9 @@ test "receiveStreamFromByteStreamWithControl handles null callback (no-op)" {
     var byte_stream = ByteStream.init(allocator);
     defer byte_stream.deinit();
 
-    // Push a ping control message
     const ping_json = "{\"type\":\"ping\"}";
     try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
 
-    // Push a result to end the stream
     const result_json = try serializeResult(.{
         .content = &.{},
         .usage = .{},
@@ -2081,7 +1946,6 @@ test "receiveStreamFromByteStreamWithControl handles null callback (no-op)" {
     var msg_stream = event_stream.AssistantMessageStream.init(allocator);
     defer msg_stream.deinit();
 
-    // Call with null callback - should not crash
     receiveStreamFromByteStreamWithControl(
         &byte_stream,
         &msg_stream,

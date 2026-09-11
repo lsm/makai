@@ -3,24 +3,16 @@ const streaming_json = @import("streaming_json");
 const ai_types = @import("ai_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Tracks tool calls being accumulated during streaming
 pub const ToolCallTracker = struct {
     allocator: std.mem.Allocator,
-    /// Map from API index (from provider events) to InProgressToolCall
     calls: std.AutoHashMap(usize, InProgressToolCall),
 
     pub const InProgressToolCall = struct {
-        /// Content index in the final message's content array
         content_index: usize,
-        /// API-provided index for tracking (varies by provider)
         api_index: usize,
-        /// Tool call ID (e.g., "toolu_01..." for Anthropic, "call_..." for OpenAI)
         id: OwnedSlice(u8),
-        /// Tool name
         name: OwnedSlice(u8),
-        /// Accumulated JSON arguments
         json_accumulator: streaming_json.StreamingJsonAccumulator,
-        /// Encrypted reasoning detail for round-trip (OpenAI reasoning_details)
         thought_signature: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     };
 
@@ -44,12 +36,9 @@ pub const ToolCallTracker = struct {
         }
         self.calls.deinit();
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 
-    /// Start tracking a new tool call. Returns the content index.
-    /// id and name are copied into the tracker.
     pub fn startCall(self: *Self, api_index: usize, content_index: usize, id: []const u8, name: []const u8) !usize {
         const duped_id = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(duped_id);
@@ -69,14 +58,12 @@ pub const ToolCallTracker = struct {
         return content_index;
     }
 
-    /// Append a JSON delta to an existing tool call
     pub fn appendDelta(self: *Self, api_index: usize, delta: []const u8) !void {
         if (self.calls.getPtr(api_index)) |call| {
             try call.json_accumulator.append(delta);
         }
     }
 
-    /// Get the current accumulated JSON for a tool call
     pub fn getJsonBuffer(self: Self, api_index: usize) ?[]const u8 {
         if (self.calls.get(api_index)) |call| {
             return call.json_accumulator.getBuffer();
@@ -84,7 +71,6 @@ pub const ToolCallTracker = struct {
         return null;
     }
 
-    /// Get the content index for a tool call by API index
     pub fn getContentIndex(self: Self, api_index: usize) ?usize {
         if (self.calls.get(api_index)) |call| {
             return call.content_index;
@@ -92,8 +78,6 @@ pub const ToolCallTracker = struct {
         return null;
     }
 
-    /// Set thought_signature on a tool call by its ID.
-    /// Used for OpenAI reasoning_details round-trip.
     pub fn setThoughtSignatureById(self: *Self, tool_call_id: []const u8, signature: []const u8) !void {
         var iter = self.calls.iterator();
         while (iter.next()) |entry| {
@@ -105,8 +89,6 @@ pub const ToolCallTracker = struct {
         }
     }
 
-    /// Complete a tool call and return it. Returns null if not found.
-    /// The returned ToolCall owns its strings (id, name, arguments_json, thought_signature are duped).
     pub fn completeCall(self: *Self, api_index: usize, allocator: std.mem.Allocator) ?ai_types.ToolCall {
         if (self.calls.fetchRemove(api_index)) |removed| {
             var call = removed.value;
@@ -174,20 +156,14 @@ pub const ToolCallTracker = struct {
         return null;
     }
 
-    /// Check if we have a tool call at the given API index
     pub fn hasCall(self: Self, api_index: usize) bool {
         return self.calls.contains(api_index);
     }
 
-    /// Get number of active tool calls
     pub fn count(self: Self) usize {
         return self.calls.count();
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "ToolCallTracker - start and complete a tool call" {
     const allocator = std.testing.allocator;
@@ -248,7 +224,6 @@ test "ToolCallTracker - multiple concurrent tool calls" {
     var tracker = ToolCallTracker.init(allocator);
     defer tracker.deinit();
 
-    // Start two tool calls with different API indices
     _ = try tracker.startCall(0, 0, "tool_0", "bash");
     _ = try tracker.startCall(1, 1, "tool_1", "read");
 
@@ -256,14 +231,12 @@ test "ToolCallTracker - multiple concurrent tool calls" {
     try std.testing.expect(tracker.hasCall(0));
     try std.testing.expect(tracker.hasCall(1));
 
-    // Append deltas to each independently
     try tracker.appendDelta(0, "{\"cmd\":");
     try tracker.appendDelta(1, "{\"file\":");
 
     try tracker.appendDelta(0, " \"ls\"}");
     try tracker.appendDelta(1, " \"/tmp\"}");
 
-    // Complete first call
     const tc0 = tracker.completeCall(0, allocator).?;
     defer {
         allocator.free(tc0.id);
@@ -278,7 +251,6 @@ test "ToolCallTracker - multiple concurrent tool calls" {
     try std.testing.expect(!tracker.hasCall(0));
     try std.testing.expect(tracker.hasCall(1));
 
-    // Complete second call
     const tc1 = tracker.completeCall(1, allocator).?;
     defer {
         allocator.free(tc1.id);
@@ -303,7 +275,6 @@ test "ToolCallTracker - complete non-existent call returns null" {
     const result = tracker.completeCall(99, allocator);
     try std.testing.expect(result == null);
 
-    // Original call should still be present
     try std.testing.expect(tracker.hasCall(0));
 }
 
@@ -312,7 +283,6 @@ test "ToolCallTracker - memory cleanup in deinit for incomplete calls" {
 
     var tracker = ToolCallTracker.init(allocator);
 
-    // Start multiple calls but don't complete them
     _ = try tracker.startCall(0, 0, "tool_0", "bash");
     try tracker.appendDelta(0, "{\"cmd\": \"ls\"}");
 
@@ -321,7 +291,6 @@ test "ToolCallTracker - memory cleanup in deinit for incomplete calls" {
 
     _ = try tracker.startCall(2, 2, "tool_2", "write");
 
-    // deinit should clean up all allocated memory without leaks
     tracker.deinit();
 }
 
@@ -356,10 +325,8 @@ test "ToolCallTracker - setThoughtSignatureById sets signature on matching tool 
 
     _ = try tracker.startCall(0, 0, "call_abc123", "bash");
 
-    // Set thought_signature by tool call ID
     try tracker.setThoughtSignatureById("call_abc123", "{\"type\":\"reasoning.encrypted\",\"id\":\"call_abc123\",\"data\":\"test\"}");
 
-    // Complete and verify thought_signature is preserved
     const tc = tracker.completeCall(0, allocator).?;
     defer {
         allocator.free(tc.id);
@@ -380,10 +347,8 @@ test "ToolCallTracker - setThoughtSignatureById does nothing for non-existent ID
 
     _ = try tracker.startCall(0, 0, "call_abc123", "bash");
 
-    // Try to set signature on non-existent tool call ID
     try tracker.setThoughtSignatureById("nonexistent_id", "{\"type\":\"reasoning.encrypted\"}");
 
-    // Complete and verify thought_signature is still null
     const tc = tracker.completeCall(0, allocator).?;
     defer {
         allocator.free(tc.id);
@@ -403,6 +368,5 @@ test "ToolCallTracker - thought_signature is freed in deinit for incomplete call
     _ = try tracker.startCall(0, 0, "call_abc123", "bash");
     try tracker.setThoughtSignatureById("call_abc123", "{\"type\":\"reasoning.encrypted\"}");
 
-    // deinit should clean up thought_signature memory without leaks
     tracker.deinit();
 }

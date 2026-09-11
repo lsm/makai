@@ -1,8 +1,3 @@
-//! Stepper (wizard) component.
-//!
-//! Renders a numbered sequence of steps with state indicators: completed,
-//! current, and pending. Supports horizontal and vertical orientations and
-//! exposes methods for navigating through the flow.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -29,7 +24,6 @@ pub const Stepper = struct {
     completed_marker: []const u8,
     current_marker: []const u8,
     pending_marker: []const u8,
-    /// Horizontal connector drawn between steps in horizontal layout.
     connector: []const u8,
 
     completed_style: style_mod.Style,
@@ -228,7 +222,7 @@ test "stepper step state transitions" {
     try std.testing.expectEqual(StepState.current, s.stateOf(1));
 
     s.next();
-    s.next(); // clamped
+    s.next();
     try std.testing.expect(s.isComplete());
 }
 

@@ -1,5 +1,3 @@
-//! Heatmap component for 2D data visualization.
-//! Displays data as a colored grid with configurable color scales.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -8,67 +6,47 @@ const Color = @import("../style/color.zig").Color;
 
 pub const Heatmap = struct {
     allocator: std.mem.Allocator,
-    /// 2D data stored row-major.
     data: []const f64 = &.{},
     rows: usize = 0,
     cols: usize = 0,
-    /// Row labels (optional).
     row_labels: []const []const u8 = &.{},
-    /// Column labels (optional).
     col_labels: []const []const u8 = &.{},
-    /// Color scale.
     color_scale: ColorScale = .green_scale,
-    /// Cell width in characters.
     cell_width: u8 = 2,
-    /// Manual min/max (auto-detect if null).
     min_val: ?f64 = null,
     max_val: ?f64 = null,
-    /// Show legend.
     show_legend: bool = true,
-    /// Show values in cells.
     show_values: bool = false,
-    /// Title.
     title: []const u8 = "",
-    /// Cell height in rows (1 = single line).
     cell_height: u8 = 1,
-    /// Title style.
     title_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.bold(true);
         s = s.inline_style(true);
         break :blk s;
     },
-    /// Row label style.
     row_label_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.inline_style(true);
         break :blk s;
     },
-    /// Column label style.
     col_label_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.inline_style(true);
         break :blk s;
     },
-    /// Legend label style.
     legend_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.inline_style(true);
         break :blk s;
     },
-    /// Number of steps in the legend gradient.
     legend_steps: usize = 10,
-    /// Empty cell character (used when value is zero/min).
     empty_char: []const u8 = " ",
 
     pub const ColorScale = enum {
-        /// Dark green to bright green (GitHub contributions style).
         green_scale,
-        /// Blue to cyan to green to yellow to red.
         cool_to_hot,
-        /// Black to white.
         grayscale,
-        /// Blue to red.
         blue_red,
     };
 
@@ -76,7 +54,6 @@ pub const Heatmap = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Set data as a flat array with dimensions.
     pub fn setData(self: *Heatmap, r: usize, c: usize, d: []const f64) void {
         self.rows = r;
         self.cols = c;
@@ -143,15 +120,12 @@ pub const Heatmap = struct {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Title
         if (self.title.len > 0) {
             writer.writeAll(self.title_style.render(allocator, self.title) catch self.title) catch {};
             writer.writeByte('\n') catch {};
         }
 
-        // Column labels
         if (self.col_labels.len > 0) {
-            // Padding for row labels
             const label_pad: usize = if (self.row_labels.len > 0) maxLabelWidth(self.row_labels) + 1 else 0;
             for (0..label_pad) |_| writer.writeByte(' ') catch {};
 
@@ -168,13 +142,10 @@ pub const Heatmap = struct {
             writer.writeByte('\n') catch {};
         }
 
-        // Data rows
         for (0..self.rows) |r| {
-            // Row label
             if (r < self.row_labels.len) {
                 const max_lw = maxLabelWidth(self.row_labels);
                 const label = self.row_labels[r];
-                // Right-align
                 if (label.len < max_lw) {
                     for (0..max_lw - label.len) |_| writer.writeByte(' ') catch {};
                 }
@@ -182,7 +153,6 @@ pub const Heatmap = struct {
                 writer.writeByte(' ') catch {};
             }
 
-            // Cells
             for (0..self.cols) |c| {
                 const idx = r * self.cols + c;
                 const val = if (idx < self.data.len) self.data[idx] else 0;
@@ -196,7 +166,6 @@ pub const Heatmap = struct {
                 if (self.show_values and self.cell_width >= 3) {
                     const val_str = std.fmt.allocPrint(allocator, "{d:.0}", .{val}) catch " ";
                     const padded = padCenter(allocator, val_str, self.cell_width);
-                    // Choose foreground for contrast
                     cs = cs.fg(if (t > 0.5) .black else .white);
                     writer.writeAll(cs.render(allocator, padded) catch padded) catch {};
                 } else {
@@ -209,7 +178,6 @@ pub const Heatmap = struct {
             if (r < self.rows - 1) writer.writeByte('\n') catch {};
         }
 
-        // Legend
         if (self.show_legend) {
             writer.writeAll("\n\n") catch {};
             const steps: usize = 10;

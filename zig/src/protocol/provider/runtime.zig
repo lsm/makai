@@ -10,9 +10,6 @@ const ProtocolClient = protocol_client.ProtocolClient;
 const protocol_types = envelope.protocol_types;
 const PipeTransport = in_process.SerializedPipe;
 
-/// Runtime pump for provider protocol client/server message forwarding.
-///
-/// This is the production counterpart of the old test-only protocol pump helper.
 pub const ProviderProtocolRuntime = struct {
     server: *ProtocolServer,
     pipe: *PipeTransport,
@@ -21,8 +18,6 @@ pub const ProviderProtocolRuntime = struct {
 
     const Self = @This();
 
-    /// Forward events from all active provider streams to the client.
-    /// Returns number of envelopes sent.
     pub fn pumpProviderEvents(self: *Self) !usize {
         return self.pumpProviderEventsLimited(std.math.maxInt(usize), null);
     }
@@ -32,8 +27,6 @@ pub const ProviderProtocolRuntime = struct {
         var events_forwarded: usize = 0;
         const active_stream_count = self.server.activeStreamCount();
         if (active_stream_count == 0) return 0;
-        // Reserve a share for every active stream so one hot producer cannot
-        // monopolize the downstream queue on every pump iteration.
         const per_stream_limit = @max(@as(usize, 1), max_events / active_stream_count);
 
         const start_offset = self.next_stream_offset % active_stream_count;
@@ -58,9 +51,6 @@ pub const ProviderProtocolRuntime = struct {
 
         self.next_stream_offset = (start_offset + streams_visited) % active_stream_count;
 
-        // The first pass guarantees every stream its fair share. Revisit the
-        // streams afterward so busy producers can use capacity left behind by
-        // idle streams instead of waiting for another pump iteration.
         if (events_forwarded < max_events) {
             iter = self.server.activeStreamIterator();
             for (0..start_offset) |_| _ = iter.next();
@@ -101,7 +91,6 @@ pub const ProviderProtocolRuntime = struct {
         const event_limit = @min(per_stream_limit, remaining_events);
         var stream_events_forwarded: usize = 0;
 
-        // Forward pending stream events first.
         while (stream_events_forwarded < event_limit) {
             const event = active_stream.event_stream.poll() orelse break;
             var event_cleanup = event;
@@ -128,7 +117,6 @@ pub const ProviderProtocolRuntime = struct {
             stream_events_forwarded += 1;
         }
 
-        // If stream finished, forward terminal result/error envelope.
         if (allow_terminal and
             stream_events_forwarded < remaining_events and
             !active_stream.event_stream.hasPending() and
@@ -179,7 +167,6 @@ pub const ProviderProtocolRuntime = struct {
         return stream_events_forwarded;
     }
 
-    /// Process pending client->server envelopes and write server replies.
     pub fn pumpClientMessages(self: *Self) !void {
         var receiver = self.pipe.serverReceiver();
         while (try receiver.readLine(self.allocator)) |line| {
@@ -207,9 +194,6 @@ pub const ProviderProtocolRuntime = struct {
         }
     }
 
-    /// Attempt to send a NACK for an oversized envelope that failed deserialization.
-    /// Best-effort: extracts stream_id/message_id from raw JSON to construct the NACK.
-    /// If parsing fails, silently skips — the client will time out regardless.
     fn sendNackForOversizedInput(self: *Self, raw_json: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
         defer parsed.deinit();
@@ -224,7 +208,6 @@ pub const ProviderProtocolRuntime = struct {
         if (message_id_str != .string) return;
         const message_id = protocol_types.parseUlid(message_id_str.string) orelse return;
 
-        // Construct a minimal envelope for the NACK
         const dummy_envelope = protocol_types.Envelope{
             .stream_id = stream_id,
             .message_id = message_id,
@@ -267,12 +250,8 @@ pub const ProviderProtocolRuntime = struct {
         return count;
     }
 
-    /// Process pending server->client envelopes through ProtocolClient.
     pub fn pumpServerMessagesIntoClient(self: *Self, client: *ProtocolClient) !void {
         var receiver = self.pipe.clientReceiver();
-        // Stop before the destination queue fills so the caller can drain it and
-        // resume pumping. Reading the entire buffered burst here would otherwise
-        // turn normal consumer backpressure into EventStream.QueueFull.
         while (client.eventDeliveryCapacity() > 0) {
             const line = try receiver.readLine(self.allocator) orelse break;
             defer self.allocator.free(line);
@@ -284,14 +263,9 @@ pub const ProviderProtocolRuntime = struct {
         }
     }
 
-    /// Run one full pump iteration:
-    /// client->server, provider events->client, server->client processing.
     pub fn pumpOnce(self: *Self, client: *ProtocolClient) !usize {
         try self.pumpClientMessages();
         var forwarded = try self.pumpServerOutbox();
-        // Consume existing serialized messages before forwarding more provider
-        // events, then limit forwarding to what the selected client queue(s)
-        // can accept. This carries backpressure across the serialization layer.
         try self.pumpServerMessagesIntoClient(client);
         forwarded += try self.pumpProviderEventsLimited(client.eventDeliveryCapacity(), client);
         try self.pumpServerMessagesIntoClient(client);

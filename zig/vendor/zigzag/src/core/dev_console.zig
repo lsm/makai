@@ -1,20 +1,3 @@
-//! Dev console — log streamer to a separate viewer.
-//!
-//! Solves a fundamental TUI debugging problem: stdout is owned by the
-//! renderer, so `std.debug.print` would garble the screen. This module
-//! routes structured log events to a separate sink so a developer can run
-//! the TUI in one terminal and `tail -f` (or `nc`) the log stream in
-//! another.
-//!
-//! Sinks supported:
-//!
-//!   * `.file`   — append to a log file. Pair with `tail -f path.log`.
-//!   * `.tcp`    — listen on a TCP port. Pair with `nc localhost 9999`.
-//!   * `.stderr` — write to stderr. Useful when stderr is redirected.
-//!   * `.multi`  — fan-out to several sinks at once.
-//!
-//! Each event has a level (trace/debug/info/warn/err) and a timestamp.
-//! The console is safe to call from any thread; writes are mutex-guarded.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -48,15 +31,11 @@ pub const Level = enum {
 };
 
 pub const SinkConfig = union(enum) {
-    /// Append-mode log file at this path.
     file: []const u8,
-    /// TCP listener on the given host:port. The dev console writes to *all*
-    /// currently-connected clients; new connections receive future events.
     tcp: struct {
         host: []const u8 = "127.0.0.1",
         port: u16,
     },
-    /// Write to stderr (file descriptor 2).
     stderr,
 };
 
@@ -65,18 +44,12 @@ pub const DevConsole = struct {
     io: std.Io,
     sinks: std.array_list.Managed(Sink),
     mutex: std.Io.Mutex,
-    /// Filter: events below this level are dropped.
     min_level: Level,
-    /// Whether to prefix each line with a timestamp.
     show_timestamps: bool,
 
     const Sink = union(enum) {
         file: struct {
             file: std.Io.File,
-            /// Append cursor. Only advanced after a successful flush — a failed
-            /// write leaves it pointing at the truncated record's start, so the
-            /// next entry overwrites the partial one. Not safe under concurrent
-            /// writers to the same file.
             end_pos: u64,
         },
         tcp: *TcpSink,
@@ -91,7 +64,6 @@ pub const DevConsole = struct {
         thread: std.Thread,
         connections: std.array_list.Managed(std.Io.net.Stream),
         mutex: std.Io.Mutex,
-        /// Set to true to signal the accept thread to stop.
         stopping: std.atomic.Value(bool),
     };
 
@@ -113,7 +85,6 @@ pub const DevConsole = struct {
                 .file => |*f| f.file.close(io),
                 .tcp => |tcp| {
                     tcp.stopping.store(true, .seq_cst);
-                    // Wake the listener by connecting once.
                     if (tcp.listen_address.connect(io, .{ .mode = .stream })) |conn| {
                         conn.close(io);
                     } else |_| {}
@@ -189,7 +160,6 @@ pub const DevConsole = struct {
     pub fn log(self: *DevConsole, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (level.rank() < self.min_level.rank()) return;
 
-        // Build the line in a stack buffer (or heap-fall-back) once.
         var stack_buf: [4096]u8 = undefined;
         const line = self.format(stack_buf[0..], level, fmt, args) catch return;
 
@@ -225,7 +195,6 @@ pub const DevConsole = struct {
                             } else |_| {}
                         } else |_| {}
                     }
-                    // Drop dead connections.
                     if (keep.items.len != tcp.connections.items.len) {
                         for (tcp.connections.items) |conn| {
                             var still_alive = false;
@@ -263,7 +232,6 @@ pub const DevConsole = struct {
         return writer.buffered();
     }
 
-    // Convenience wrappers.
     pub fn trace(self: *DevConsole, comptime fmt: []const u8, args: anytype) void {
         self.log(.trace, fmt, args);
     }
@@ -280,8 +248,6 @@ pub const DevConsole = struct {
         self.log(.err, fmt, args);
     }
 };
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 

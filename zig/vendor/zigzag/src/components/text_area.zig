@@ -1,5 +1,3 @@
-//! Multi-line text area component.
-//! Provides text editing with multiple lines, cursor navigation, and scrolling.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -11,34 +9,27 @@ const unicode = @import("../unicode.zig");
 pub const TextArea = struct {
     allocator: std.mem.Allocator,
 
-    // Content
     lines: std.array_list.Managed(std.array_list.Managed(u8)),
 
-    // Cursor position
     cursor_row: usize,
     cursor_col: usize,
 
-    // Viewport
     viewport_row: usize,
     viewport_col: usize,
     width: u16,
     height: u16,
 
-    // Appearance
     placeholder: []const u8,
     line_numbers: bool,
     word_wrap: bool,
 
-    // Styling
     text_style: style_mod.Style,
     cursor_style: style_mod.Style,
     line_number_style: style_mod.Style,
     placeholder_style: style_mod.Style,
 
-    // State
     focused: bool,
 
-    // Limits
     max_lines: ?usize,
     max_cols: ?usize,
     char_limit: ?usize,
@@ -116,15 +107,12 @@ pub const TextArea = struct {
         self.lines.deinit();
     }
 
-    /// Set the content
     pub fn setValue(self: *TextArea, text: []const u8) !void {
-        // Clear existing lines
         for (self.lines.items) |*line| {
             line.deinit();
         }
         self.lines.clearRetainingCapacity();
 
-        // Parse lines
         var iter = std.mem.splitScalar(u8, text, '\n');
         while (iter.next()) |line_text| {
             var line = std.array_list.Managed(u8).init(self.allocator);
@@ -136,13 +124,11 @@ pub const TextArea = struct {
             try self.lines.append(std.array_list.Managed(u8).init(self.allocator));
         }
 
-        // Reset cursor
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.viewport_row = 0;
     }
 
-    /// Get the content as a string
     pub fn getValue(self: *const TextArea, allocator: std.mem.Allocator) ![]const u8 {
         var result: std.array_list.Managed(u8) = .init(allocator);
 
@@ -154,50 +140,44 @@ pub const TextArea = struct {
         return result.toOwnedSlice();
     }
 
-    /// Get total character count
     pub fn charCount(self: *const TextArea) usize {
         var count: usize = 0;
         for (self.lines.items, 0..) |line, i| {
-            if (i > 0) count += 1; // Newline
+            if (i > 0) count += 1;
             count += line.items.len;
         }
         return count;
     }
 
-    /// Get line count
     pub fn lineCount(self: *const TextArea) usize {
         return self.lines.items.len;
     }
 
-    /// Set dimensions
     pub fn setSize(self: *TextArea, width: u16, height: u16) void {
         self.width = width;
         self.height = height;
         self.ensureVisible();
     }
 
-    /// Focus the text area
     pub fn focus(self: *TextArea) void {
         self.focused = true;
     }
 
-    /// Blur the text area
     pub fn blur(self: *TextArea) void {
         self.focused = false;
     }
 
-    /// Handle key event
     pub fn handleKey(self: *TextArea, key: keys.KeyEvent) void {
         if (!self.focused) return;
 
         if (key.modifiers.ctrl) {
             switch (key.key) {
                 .char => |c| switch (c) {
-                    'a' => self.cursor_col = 0, // Home
-                    'e' => self.cursor_col = self.currentLine().items.len, // End
-                    'k' => self.killToEndOfLine(), // Kill line
-                    'u' => self.killToStartOfLine(), // Kill to start
-                    'd' => self.deleteLine(), // Delete line
+                    'a' => self.cursor_col = 0,
+                    'e' => self.cursor_col = self.currentLine().items.len,
+                    'k' => self.killToEndOfLine(),
+                    'u' => self.killToStartOfLine(),
+                    'd' => self.deleteLine(),
                     else => {},
                 },
                 else => {},
@@ -231,7 +211,6 @@ pub const TextArea = struct {
     }
 
     fn insertChar(self: *TextArea, c: u21) void {
-        // Check char limit
         if (self.char_limit) |limit| {
             if (self.charCount() >= limit) return;
         }
@@ -290,14 +269,11 @@ pub const TextArea = struct {
         const line = self.currentLine();
         const rest = line.items[self.cursor_col..];
 
-        // Create new line with rest of content
         var new_line = std.array_list.Managed(u8).init(self.allocator);
         new_line.appendSlice(rest) catch return;
 
-        // Truncate current line
         line.shrinkRetainingCapacity(self.cursor_col);
 
-        // Insert new line
         self.lines.insert(self.cursor_row + 1, new_line) catch return;
 
         self.cursor_row += 1;
@@ -305,7 +281,6 @@ pub const TextArea = struct {
     }
 
     fn insertTab(self: *TextArea) void {
-        // Insert spaces for tab
         for (0..4) |_| {
             self.insertChar(' ');
         }
@@ -313,11 +288,9 @@ pub const TextArea = struct {
 
     fn deleteBackward(self: *TextArea) void {
         if (self.cursor_col > 0) {
-            // Delete character before cursor
             const line = self.currentLine();
             var pos = self.cursor_col - 1;
 
-            // Find start of UTF-8 sequence
             while (pos > 0 and (line.items[pos] & 0xC0) == 0x80) {
                 pos -= 1;
             }
@@ -328,7 +301,6 @@ pub const TextArea = struct {
             }
             self.cursor_col = pos;
         } else if (self.cursor_row > 0) {
-            // Join with previous line
             const current = self.lines.orderedRemove(self.cursor_row);
             self.cursor_row -= 1;
             const prev_line = self.currentLine();
@@ -342,7 +314,6 @@ pub const TextArea = struct {
         const line = self.currentLine();
         self.clampCursorToLineBoundary();
         if (self.cursor_col < line.items.len) {
-            // Delete character at cursor
             const byte_len = std.unicode.utf8ByteSequenceLength(line.items[self.cursor_col]) catch 1;
             for (0..byte_len) |_| {
                 if (self.cursor_col < line.items.len) {
@@ -350,7 +321,6 @@ pub const TextArea = struct {
                 }
             }
         } else if (self.cursor_row < self.lines.items.len - 1) {
-            // Join with next line
             const next = self.lines.orderedRemove(self.cursor_row + 1);
             line.appendSlice(next.items) catch {};
             @constCast(&next).deinit();
@@ -449,7 +419,6 @@ pub const TextArea = struct {
         self.clampCursorToLineBoundary();
         if (self.cursor_col > 0) {
             self.cursor_col -= 1;
-            // Handle UTF-8 continuation bytes
             const line = self.currentLine();
             while (self.cursor_col > 0 and (line.items[self.cursor_col] & 0xC0) == 0x80) {
                 self.cursor_col -= 1;
@@ -520,14 +489,12 @@ pub const TextArea = struct {
             return;
         }
 
-        // Vertical scrolling
         if (self.cursor_row < self.viewport_row) {
             self.viewport_row = self.cursor_row;
         } else if (self.cursor_row >= self.viewport_row + visible_rows) {
             self.viewport_row = self.cursor_row - visible_rows + 1;
         }
 
-        // Horizontal scrolling using display columns
         const effective_width = self.width -| (if (self.line_numbers) @as(u16, 5) else 0);
         const display_col = self.cursorDisplayCol();
         if (display_col < self.viewport_col) {
@@ -537,12 +504,10 @@ pub const TextArea = struct {
         }
     }
 
-    /// Cursor column in terminal cells (display width), 0-indexed.
     pub fn cursorDisplayColumn(self: *const TextArea) usize {
         return self.cursorDisplayCol();
     }
 
-    /// Render the text area
     pub fn view(self: *const TextArea, allocator: std.mem.Allocator) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
@@ -550,7 +515,6 @@ pub const TextArea = struct {
         const line_num_width: usize = if (self.line_numbers) 5 else 0;
         const text_width = self.width -| @as(u16, @intCast(line_num_width));
 
-        // Check for empty content
         const is_empty = self.lines.items.len == 1 and self.lines.items[0].items.len == 0;
 
         if (self.word_wrap) {
@@ -560,7 +524,6 @@ pub const TextArea = struct {
                 const visual_row = self.viewport_row + row;
                 const wrapped_row = self.wrappedRowAt(visual_row, text_width);
 
-                // Line numbers (only on first wrapped segment of a physical line)
                 if (self.line_numbers) {
                     if (wrapped_row) |r| {
                         if (r.is_first_segment) {
@@ -580,7 +543,6 @@ pub const TextArea = struct {
                 if (wrapped_row) |r| {
                     const line = self.lines.items[r.line_idx];
 
-                    // Show placeholder on first empty line
                     if (is_empty and r.line_idx == 0 and r.is_first_segment and self.placeholder.len > 0) {
                         try self.renderPlaceholder(writer, allocator, text_width);
                         continue;
@@ -610,7 +572,6 @@ pub const TextArea = struct {
 
             const line_idx = self.viewport_row + row;
 
-            // Line numbers
             if (self.line_numbers) {
                 if (line_idx < self.lines.items.len) {
                     const num_str = try std.fmt.allocPrint(allocator, "{d:>4} ", .{line_idx + 1});
@@ -626,16 +587,13 @@ pub const TextArea = struct {
             if (line_idx < self.lines.items.len) {
                 const line = self.lines.items[line_idx];
 
-                // Show placeholder on first empty line
                 if (is_empty and line_idx == 0 and self.placeholder.len > 0) {
                     try self.renderPlaceholder(writer, allocator, text_width);
                     continue;
                 }
 
-                // Render line content with cursor
                 try self.renderLine(writer, allocator, line.items, line_idx, text_width);
             } else {
-                // Pad empty rows to full width
                 var i: usize = 0;
                 while (i < text_width) : (i += 1) {
                     try writer.writeByte(' ');
@@ -724,7 +682,6 @@ pub const TextArea = struct {
             rendered_width += cw;
         }
 
-        // Cursor at segment end
         if (is_cursor_line and self.focused and self.cursor_col == end and end == line.len and rendered_width < width_limit) {
             const styled = try self.cursor_style.render(allocator, " ");
             defer allocator.free(styled);
@@ -741,11 +698,9 @@ pub const TextArea = struct {
     fn renderLine(self: *const TextArea, writer: *Writer, allocator: std.mem.Allocator, line: []const u8, line_idx: usize, max_width: u16) !void {
         const is_cursor_line = line_idx == self.cursor_row;
 
-        // Apply horizontal scroll
         var col: usize = 0;
         var byte_idx: usize = 0;
 
-        // Skip to viewport_col (using display columns)
         while (col < self.viewport_col and byte_idx < line.len) {
             const byte_len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
             if (byte_idx + byte_len <= line.len) {
@@ -759,7 +714,6 @@ pub const TextArea = struct {
             byte_idx += byte_len;
         }
 
-        // Render visible portion
         var rendered_width: usize = 0;
         while (byte_idx < line.len and rendered_width < max_width) {
             const is_cursor = is_cursor_line and self.focused and byte_idx == self.cursor_col;
@@ -775,7 +729,6 @@ pub const TextArea = struct {
             };
             const cw = unicode.charWidth(cp);
 
-            // Wide char won't fit — stop
             if (rendered_width + cw > max_width) break;
 
             if (is_cursor) {
@@ -793,7 +746,6 @@ pub const TextArea = struct {
             rendered_width += cw;
         }
 
-        // Cursor at end of line
         if (is_cursor_line and self.focused and byte_idx == self.cursor_col and rendered_width < max_width) {
             const styled = try self.cursor_style.render(allocator, " ");
             defer allocator.free(styled);
@@ -801,14 +753,12 @@ pub const TextArea = struct {
             rendered_width += 1;
         }
 
-        // Pad remaining width
         while (rendered_width < max_width) {
             try writer.writeByte(' ');
             rendered_width += 1;
         }
     }
 
-    /// Convert byte-offset cursor_col to display column width.
     fn cursorDisplayCol(self: *const TextArea) usize {
         const line = self.lines.items[self.cursor_row];
         var display_col: usize = 0;
