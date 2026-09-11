@@ -1135,10 +1135,14 @@ Rules:
   counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
-  silently). The pending-record lifecycle and stale-reply guards, and the
-  bounded stop probe for unknown outcomes (§13.4.1), are landed; the TUI
-  teardown integration remains in the series
-  (`[in progress — #210 gap 7 re-sliced from #213]`).
+  silently). The pending-record lifecycle and stale-reply guards, the
+  bounded stop probe for unknown outcomes (§13.4.1), and the TUI teardown
+  integration — drain-before-sync in the remote pump, the exclusive-id
+  registration whose admission is the §6.1 evidence that lets the bounded
+  teardown driver pump an in-flight stop probe to settlement, the
+  ambiguous-write reconciliation that stops the old registration instead of
+  resending it, and the session-gone identity clear — are landed
+  (`[current — #210 gap 7 re-sliced from #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
