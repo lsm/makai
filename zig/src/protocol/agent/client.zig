@@ -930,6 +930,8 @@ pub const AgentProtocolClient = struct {
             _ = self.stop_revert_bound_by_session.remove(session_id);
             _ = self.tracker_epoch_by_session.remove(session_id);
             self.clearSessionControlState(session_id);
+        } else {
+            self.retireStopProbe(session_id);
         }
         return true;
     }
