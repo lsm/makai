@@ -2411,12 +2411,6 @@ test("concurrent client.agent.run on one session id: duplicate is rejected promp
   // its agent_busy rejection immediately instead of surfacing the response
   // timeout after the established run finishes, and the established run is
   // unaffected (neither consuming the rejection nor losing its own reply).
-  // "Promptly" is asserted deterministically, not by a wall-clock budget:
-  // only a correlated delivery can settle the duplicate with agent_busy
-  // before the response timeout — a duplicate that waited out the timeout
-  // rejects with the timeout error and fails the reason assertion below. A
-  // fixed latency budget on top of that flaked under CI runner contention
-  // (delivery legitimately slowed past it while still correlated).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
@@ -2444,9 +2438,6 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
   // Same scenario with the real agent server's rejection flavor: the
   // duplicate start is refused with an agent_error frame (not a nack); the
   // correlated delivery must route it to the duplicate regardless of frame
-  // type. Promptness is carried by the reason assertion (only a correlated
-  // delivery settles the duplicate with agent_busy before the response
-  // timeout), not a wall-clock budget.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_BUSY_AS_ERROR: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
@@ -2468,9 +2459,6 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
 });
 
 test("concurrent client.agent.stream on one session id: duplicate is rejected promptly, established stream completes", async () => {
-  // Same promptness stance as the run variant above: the reason assertion
-  // (agent_busy by correlated delivery, not the response-timeout error)
-  // carries the invariant; no wall-clock budget.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
