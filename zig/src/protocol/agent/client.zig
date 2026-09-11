@@ -1110,16 +1110,10 @@ pub const AgentProtocolClient = struct {
             rejected_revert_bound = if (existing_revert) |e| @min(e, prior_bound) else prior_bound;
             try self.stop_revert_bound_by_session.put(session_id, rejected_revert_bound);
         }
-        _ = list.orderedRemove(index);
-        // A rejected MESSAGE may have been the SOURCE of other records'
-        // retry provenance (`resend_of_pending` was recorded when the
-        // rejected send was still pending): with the source now PROVEN
-        // never-admitted, the chain below it must re-derive — see
-        // `rederiveProvenanceAt` for the directional, transitive, and
-        // competing-payload-gated rules (#210 gap 7).
-        if (rejected.kind == .message) {
-            self.rederiveProvenanceAt(session_id, rejected.sequence);
-        }
+        // Every FALLIBLE floor note below runs BEFORE the matched record
+        // leaves the list, for the same reason as the bound store above:
+        // a failure must leave the envelope retryable, not stranded with
+        // the optimistic state the rejection refutes (#210 gap 7).
         // A rejected STOP never floors the tracker below proven bounds —
         // stops never advance the counter (§13.1), so the rejection itself
         // carries no counter evidence. The undo below applies ONLY to a
@@ -1139,6 +1133,7 @@ pub const AgentProtocolClient = struct {
                 // No resync happened — retain the current value, subject
                 // to the proven floor (a stop's own duplicate_sequence
                 // step included) (#210 gap 7).
+                _ = list.orderedRemove(index);
                 if (self.peekNextSequence(session_id) < self.provenFloor(session_id)) {
                     self.setTrackerValue(session_id, self.provenFloor(session_id)) catch {};
                 }
@@ -1184,16 +1179,20 @@ pub const AgentProtocolClient = struct {
                 var undo = pending_floor;
                 undo = @max(undo, self.provenFloor(session_id));
                 try self.noteProvenFloor(session_id, undo);
+                _ = list.orderedRemove(index);
                 try self.setTrackerValue(session_id, undo);
-            } else if (self.peekNextSequence(session_id) < self.provenFloor(session_id)) {
-                // The undo can be skipped for good reason — a live mirror
-                // owns the current value, or a later write moved the
-                // tracker — but the proven floor is monotone evidence: a
-                // tracker sitting below it (e.g. below the step the stop's
-                // own duplicate_sequence answer just proved) is stale
-                // wherever it came from, and a pending mirror can only
-                // explain values ABOVE the floor. Raise it (#210 gap 7).
-                self.setTrackerValue(session_id, self.provenFloor(session_id)) catch {};
+            } else {
+                _ = list.orderedRemove(index);
+                if (self.peekNextSequence(session_id) < self.provenFloor(session_id)) {
+                    // The undo can be skipped for good reason — a live mirror
+                    // owns the current value, or a later write moved the
+                    // tracker — but the proven floor is monotone evidence: a
+                    // tracker sitting below it (e.g. below the step the stop's
+                    // own duplicate_sequence answer just proved) is stale
+                    // wherever it came from, and a pending mirror can only
+                    // explain values ABOVE the floor. Raise it (#210 gap 7).
+                    self.setTrackerValue(session_id, self.provenFloor(session_id)) catch {};
+                }
             }
             return;
         }
@@ -1211,6 +1210,12 @@ pub const AgentProtocolClient = struct {
         if (busy) {
             const parity = @max(rejected.sequence, self.provenFloor(session_id));
             try self.noteProvenFloor(session_id, parity);
+            _ = list.orderedRemove(index);
+            // A rejected MESSAGE may have been the SOURCE of other records'
+            // retry provenance — with the send now PROVEN never-run, the
+            // chain below it re-derives (see `rederiveProvenanceAt`)
+            // (#210 gap 7).
+            if (rejected.kind == .message) self.rederiveProvenanceAt(session_id, rejected.sequence);
             try self.setTrackerValue(session_id, parity);
             return;
         }
@@ -1243,8 +1248,11 @@ pub const AgentProtocolClient = struct {
         // eviction clears the records entirely) — the start's own floor
         // is refuted by the very evidence triggering this rollback, and
         // honoring it would drag every rejection on an unresolved start
-        // down to the start's sequence (#210 gap 7).
-        for (list.items) |pending| {
+        // down to the start's sequence (#210 gap 7). The matched record
+        // is still IN the list at this point; its own terms entered via
+        // `base` above, so the loop skips it (#210 gap 7).
+        for (list.items, 0..) |pending, i| {
+            if (i == index) continue;
             if (pending.kind == .message) {
                 floor = @min(floor, pending.prior_tracker);
                 floor = @min(floor, pending.sequence);
@@ -1277,6 +1285,14 @@ pub const AgentProtocolClient = struct {
         // would replay consumed sequences (#210 gap 7).
         floor = @max(floor, self.provenFloor(session_id));
         try self.noteProvenFloor(session_id, floor);
+        _ = list.orderedRemove(index);
+        // A rejected MESSAGE may have been the SOURCE of other records'
+        // retry provenance — with the send now PROVEN never-admitted, the
+        // chain below it re-derives (see `rederiveProvenanceAt`)
+        // (#210 gap 7).
+        if (rejected.kind == .message) {
+            self.rederiveProvenanceAt(session_id, rejected.sequence);
+        }
         try self.setTrackerValue(session_id, floor);
     }
 

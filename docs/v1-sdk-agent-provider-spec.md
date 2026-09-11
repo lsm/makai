@@ -1123,7 +1123,10 @@ Rules:
   dropped once its envelope has been accepted for processing, since a
   forgotten floor can wedge the tracker on a consumed sequence; the
   tracker's own rise to the floor stays best-effort, healing through
-  duplicate evidence. An accepted start additionally INVALIDATES
+  duplicate evidence — and each reconciliation's floor is stored BEFORE the
+  matched pending record retires, so a storage failure leaves the
+  envelope retryable instead of stranded with the refuted optimistic
+  state). An accepted start additionally INVALIDATES
   pending message records below its seeded floor: the start
   demonstrably consumed those sequences, so no same-payload source
   could have run — records sent before the started reply was processed
