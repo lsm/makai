@@ -1,5 +1,3 @@
-//! File picker component for file system navigation.
-//! Allows browsing directories and selecting files.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -13,16 +11,13 @@ const Dir = std.Io.Dir;
 pub const FilePicker = struct {
     allocator: std.mem.Allocator,
 
-    // State
     current_path: std.array_list.Managed(u8),
     entries: std.array_list.Managed(Entry),
     cursor: usize,
     y_offset: usize,
 
-    // Selection
     selected_path: ?[]const u8,
 
-    // Options
     height: u16,
     show_hidden: bool,
     show_size: bool,
@@ -32,17 +27,14 @@ pub const FilePicker = struct {
     allowed_extensions: ?[]const []const u8,
     home_path: []const u8,
 
-    // Styling
     dir_style: style_mod.Style,
     file_style: style_mod.Style,
     cursor_style: style_mod.Style,
     size_style: style_mod.Style,
     path_style: style_mod.Style,
 
-    // Focus
     focused: bool,
 
-    // Symbols
     dir_icon: []const u8,
     file_icon: []const u8,
     link_icon: []const u8,
@@ -129,19 +121,15 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Navigate to a directory
     pub fn navigate(self: *FilePicker, io: std.Io, path: []const u8) !void {
-        // Update current path
         self.current_path.clearRetainingCapacity();
         try self.current_path.appendSlice(path);
 
-        // Clear old entries
         for (self.entries.items) |entry| {
             self.allocator.free(entry.name);
         }
         self.entries.clearRetainingCapacity();
 
-        // Add parent directory entry
         if (!std.mem.eql(u8, path, "/")) {
             const parent_name = try self.allocator.dupe(u8, "..");
             try self.entries.append(.{
@@ -152,7 +140,6 @@ pub const FilePicker = struct {
             });
         }
 
-        // Read directory
         var dir = Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch {
             return;
         };
@@ -160,17 +147,13 @@ pub const FilePicker = struct {
 
         var iter = dir.iterate();
         while (iter.next(io) catch null) |entry| {
-            // Skip hidden files if not showing them
             const is_hidden = entry.name.len > 0 and entry.name[0] == '.';
             if (is_hidden and !self.show_hidden) continue;
 
-            // Skip files if dir_only
             if (self.dir_only and entry.kind != .directory) continue;
 
-            // Skip directories if file_only
             if (self.file_only and entry.kind == .directory) continue;
 
-            // Check extensions if specified
             if (self.allowed_extensions) |exts| {
                 if (entry.kind != .directory) {
                     const ext = std.fs.path.extension(entry.name);
@@ -185,7 +168,6 @@ pub const FilePicker = struct {
                 }
             }
 
-            // Get file size
             var size: u64 = 0;
             if (entry.kind == .file) {
                 const stat = dir.statFile(io, entry.name, .{}) catch null;
@@ -207,18 +189,14 @@ pub const FilePicker = struct {
             });
         }
 
-        // Sort entries (directories first, then alphabetically)
         std.mem.sort(Entry, self.entries.items, {}, struct {
             fn lessThan(_: void, a: Entry, b: Entry) bool {
-                // Parent always first
                 if (a.entry_type == .parent) return true;
                 if (b.entry_type == .parent) return false;
 
-                // Directories before files
                 if (a.entry_type == .directory and b.entry_type != .directory) return true;
                 if (b.entry_type == .directory and a.entry_type != .directory) return false;
 
-                // Alphabetical
                 return std.mem.lessThan(u8, a.name, b.name);
             }
         }.lessThan);
@@ -231,12 +209,10 @@ pub const FilePicker = struct {
         self.home_path = if (home_path.len > 0) home_path else defaultHomePath();
     }
 
-    /// Navigate to the configured home directory.
     pub fn navigateHome(self: *FilePicker, io: std.Io) !void {
         try self.navigate(io, self.home_path);
     }
 
-    /// Move cursor up
     pub fn cursorUp(self: *FilePicker) void {
         if (self.cursor > 0) {
             self.cursor -= 1;
@@ -244,7 +220,6 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Move cursor down
     pub fn cursorDown(self: *FilePicker) void {
         if (self.cursor < self.entries.items.len -| 1) {
             self.cursor += 1;
@@ -252,14 +227,12 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Select current entry
     pub fn selectCurrent(self: *FilePicker, io: std.Io) !bool {
         if (self.cursor >= self.entries.items.len) return false;
 
         const entry = self.entries.items[self.cursor];
 
         if (entry.entry_type == .directory or entry.entry_type == .parent) {
-            // Navigate into directory
             if (entry.entry_type == .parent) {
                 const parent = std.fs.path.dirname(self.current_path.items) orelse "/";
                 const parent_copy = try self.allocator.dupe(u8, parent);
@@ -272,7 +245,6 @@ pub const FilePicker = struct {
             }
             return false;
         } else {
-            // Select file
             if (self.selected_path) |path| {
                 self.allocator.free(path);
             }
@@ -281,17 +253,14 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Set focused state (for use with FocusGroup).
     pub fn focus(self: *FilePicker) void {
         self.focused = true;
     }
 
-    /// Clear focused state (for use with FocusGroup).
     pub fn blur(self: *FilePicker) void {
         self.focused = false;
     }
 
-    /// Handle key event
     pub fn handleKey(
         self: *FilePicker,
         io: std.Io,
@@ -341,12 +310,10 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Get selected path
     pub fn getSelected(self: *const FilePicker) ?[]const u8 {
         return self.selected_path;
     }
 
-    /// Format file size for display
     fn formatSize(self: *const FilePicker, allocator: std.mem.Allocator, size: u64) ![]const u8 {
         _ = self;
         if (size < 1024) {
@@ -360,18 +327,15 @@ pub const FilePicker = struct {
         }
     }
 
-    /// Render the file picker
     pub fn view(self: *const FilePicker, allocator: std.mem.Allocator) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Current path header
         const path_styled = try self.path_style.render(allocator, self.current_path.items);
         try writer.writeAll(path_styled);
         try writer.writeByte('\n');
         try writer.writeByte('\n');
 
-        // Entries
         var rendered: usize = 0;
         while (rendered < self.height -| 2) : (rendered += 1) {
             if (rendered > 0) try writer.writeByte('\n');
@@ -382,14 +346,12 @@ pub const FilePicker = struct {
             const entry = self.entries.items[idx];
             const is_selected = idx == self.cursor;
 
-            // Cursor indicator
             if (is_selected) {
                 try writer.writeAll("> ");
             } else {
                 try writer.writeAll("  ");
             }
 
-            // Icon
             const icon = switch (entry.entry_type) {
                 .directory => self.dir_icon,
                 .parent => self.parent_icon,
@@ -398,7 +360,6 @@ pub const FilePicker = struct {
             };
             try writer.writeAll(icon);
 
-            // Name
             const name_style = if (is_selected)
                 self.cursor_style
             else switch (entry.entry_type) {
@@ -408,7 +369,6 @@ pub const FilePicker = struct {
             const name_styled = try name_style.render(allocator, entry.name);
             try writer.writeAll(name_styled);
 
-            // Size (for files)
             if (self.show_size and entry.entry_type == .file) {
                 const size_str = try self.formatSize(allocator, entry.size);
                 try writer.writeAll("  ");

@@ -49,9 +49,6 @@ pub const TranscriptVisibilityMode = enum {
     }
 };
 
-/// How (or whether) message timestamps appear in the transcript header.
-/// Off hides the clock entirely; clock renders `HH:MM`; full renders the
-/// date alongside the time, scaling down on narrow terminals.
 pub const TimestampDisplay = enum {
     off,
     clock,
@@ -97,8 +94,6 @@ pub const PreviewKind = enum {
 pub const TranscriptEntry = struct {
     kind: TranscriptKind,
     text: std.ArrayList(u8) = .empty,
-    /// Wall-clock time (epoch ms) the entry was created, for chat-style
-    /// timestamps in the transcript header.
     timestamp_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8) !TranscriptEntry {
@@ -514,14 +509,9 @@ pub const AppState = struct {
     preview: PreviewState = .{},
     transcript_mode: TranscriptVisibilityMode = .balanced,
     show_thinking: bool = true,
-    /// Controls whether message timestamps render in the transcript header
-    /// (off / time / date+time). Default matches the original `HH:MM` behavior.
     timestamp_display: TimestampDisplay = .clock,
     thinking_level: ai_types.ThinkingLevel = .low,
     login_input_secret: bool = false,
-    /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
-    /// spinner frames and other time-based effects from this so animation stays
-    /// in lockstep with the render loop without each view tracking its own clock.
     anim_tick: u64 = 0,
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
@@ -537,15 +527,8 @@ pub const AppState = struct {
     focus_pane: FocusPane = .composer,
     selected_message_index: ?usize = null,
     selected_tool_index: ?usize = null,
-    /// When true, the next transcript render should scroll to keep
-    /// `selected_message_index` in view. Set true on selection move / pane
-    /// focus, cleared by the view after applying (or by manual paging) so
-    /// PageUp/PageDown are not overridden on subsequent frames.
     follow_selection: bool = false,
     manual_transcript_paging: bool = false,
-    /// Set when the user aborts the active turn. Lifecycle events from the
-    /// cancelled turn that are drained afterwards must not flip the status bar
-    /// back to streaming.
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
     backpressure_active: bool = false,
@@ -605,8 +588,6 @@ pub const AppState = struct {
         self.clearActiveTranscriptEntries();
     }
 
-    /// Borrowed text of the most recent assistant reply, or null if none exists.
-    /// Valid until the transcript is next mutated.
     pub fn lastAssistantText(self: *const AppState) ?[]const u8 {
         var i = self.transcript.items.len;
         while (i > 0) {
@@ -618,8 +599,6 @@ pub const AppState = struct {
         return null;
     }
 
-    /// Render the whole transcript as plain text with role prefixes. Caller owns
-    /// the returned slice.
     pub fn transcriptToText(self: *const AppState, allocator: std.mem.Allocator) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -1098,8 +1077,6 @@ pub const AppState = struct {
         self.approval.status = if (approved) .approved else .rejected;
         self.approval.always = always;
         self.mode = .normal;
-        // Return focus to the composer so follow-up typing isn't swallowed by a
-        // stale transcript/tools focus after the approval modal closes.
         self.focus_pane = .composer;
     }
 
@@ -2928,10 +2905,8 @@ test "AppState selection clamps around hidden thinking entries" {
 
     state.focus_pane = .transcript;
     state.moveSelection(-1);
-    // should select the last visible entry (assistant, transcript index 2)
     try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
     state.moveSelection(-1);
-    // should move to previous visible entry (user, transcript index 0), skipping hidden thinking
     try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
 }
 

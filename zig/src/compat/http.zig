@@ -15,20 +15,9 @@ pub const RequestOptions = struct {
     extra_headers: []const std.http.Header = &.{},
     keep_alive: bool = true,
     accept_encoding: ?[]const u8 = null,
-    /// Overrides the client's default `user-agent` header. Must be used instead
-    /// of appending `user-agent` via `extra_headers`, which would collide with
-    /// the client's built-in default (`user-agent: zig/...`) and produce a
-    /// duplicate header. Some upstreams (e.g. Kimi's WAF) reject requests whose
-    /// user-agent is not the expected value.
     user_agent: ?[]const u8 = null,
 };
 
-/// Thin HTTP client wrapper for the Zig 0.16 I/O migration seam.
-///
-/// Zig 0.16 mapping: construct `std.http.Client` with the Makai-owned default
-/// I/O context (`std.Io.Threaded`/dispatch as required internally) while keeping
-/// `std.Io` out of public signatures. Provider/OAuth rollout will add streaming
-/// response helpers on this boundary without changing provider behavior here.
 pub const HttpClient = struct {
     client: std.http.Client,
 
@@ -57,44 +46,36 @@ pub const HttpClient = struct {
     }
 };
 
-/// Send a request body and complete the outbound request.
 pub fn sendRequest(request: *Request, body: []const u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
     try request.sendBodyComplete(@constCast(body));
 }
 
-/// Send a request without an outbound body.
 pub fn sendBodilessRequest(request: *Request) !void {
     try request.sendBodiless();
 }
 
-/// Receive the response headers/body metadata for a request.
 pub fn receiveResponse(request: *Request, redirect_buffer: []u8) !Response {
     return request.receiveHead(redirect_buffer);
 }
 
-/// Reader wrapper for streaming response bodies without exposing raw `std.Io`.
 pub const ResponseReader = opaque {};
 
-/// Read bytes from a response body reader.
 pub fn readResponse(reader: *ResponseReader, buffer: []u8) !usize {
     const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
     return inner.readSliceShort(buffer);
 }
 
-/// Read exactly `buffer.len` bytes from a response body reader.
 pub fn readAllResponse(reader: *ResponseReader, buffer: []u8) !void {
     const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
     try inner.readSliceAll(buffer);
 }
 
-/// Allocate and read the remaining response body up to `max_bytes`.
 pub fn allocRemainingResponse(allocator: std.mem.Allocator, reader: *ResponseReader, max_bytes: usize) ![]u8 {
     const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
     return inner.allocRemaining(allocator, std.Io.Limit.limited(max_bytes));
 }
 
-/// Return a streaming reader for a response body.
 pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
     return @ptrCast(@alignCast(response.reader(transfer_buf)));
 }
@@ -110,7 +91,6 @@ test "compat http request options default to no extra headers" {
     try std.testing.expect(options.keep_alive);
     try std.testing.expect(options.accept_encoding == null);
 }
-
 
 test "compat http request options can override accept encoding" {
     const options = RequestOptions{ .accept_encoding = "identity" };

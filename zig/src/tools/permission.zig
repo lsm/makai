@@ -132,8 +132,6 @@ pub const PermissionEngine = struct {
         return engine;
     }
 
-    /// Initialize engine without loading persisted file.
-    /// Use when on-disk permissions are corrupt or unreadable.
     pub fn initEmpty(allocator: std.mem.Allocator, options: PermissionEngineOptions) !Self {
         const workspace_root = try allocator.dupe(u8, options.workspace_root);
         errdefer allocator.free(workspace_root);

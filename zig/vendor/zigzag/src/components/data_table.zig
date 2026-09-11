@@ -1,14 +1,3 @@
-//! DataTable — table with cell-level cursor, frozen columns, and horizontal
-//! scroll.
-//!
-//! Distinct from the existing `Table` (compile-time column count, row-only
-//! cursor) and `SortableTable` (sorting and styling). DataTable targets the
-//! "spreadsheet view" use case: many columns, navigable cell-by-cell,
-//! leftmost columns pinned so they stay visible while the rest of the grid
-//! scrolls horizontally.
-//!
-//! The column count is runtime, so it's a good fit for dynamic schemas
-//! (database results, log fields, CSV files).
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -22,8 +11,6 @@ pub const Align = enum { left, center, right };
 
 pub const Column = struct {
     header: []const u8,
-    /// Fixed display width in cells. Required (we don't auto-fit since the
-    /// row store may be huge or lazy-loaded).
     width: u16,
     @"align": Align = .left,
 };
@@ -32,27 +19,19 @@ pub const DataTable = struct {
     allocator: std.mem.Allocator,
 
     columns: std.array_list.Managed(Column),
-    /// Row store: each row is a slice of cell strings, length must match
-    /// columns.len. The DataTable does not own these strings; the caller
-    /// guarantees they live as long as the table is rendered.
     rows: std.array_list.Managed([]const []const u8),
 
     cursor_row: usize,
     cursor_col: usize,
-    /// Leftmost N columns never scroll out of view.
     frozen_columns: usize,
 
-    /// Display config.
     width: u16,
     height: u16,
     show_header: bool,
     show_borders: bool,
-    /// Horizontal scroll offset in *columns* (not cells), excluding frozen.
     col_x_offset: usize,
-    /// Vertical scroll offset in rows.
     y_offset: usize,
 
-    /// Styling.
     header_style: style_mod.Style,
     cell_style: style_mod.Style,
     cursor_cell_style: style_mod.Style,
@@ -143,7 +122,6 @@ pub const DataTable = struct {
     pub fn setFrozenColumns(self: *DataTable, n: usize) void {
         self.frozen_columns = @min(n, self.columns.items.len);
         if (self.cursor_col < self.frozen_columns) {
-            // Frozen cells are still cursorable.
         }
         self.col_x_offset = 0;
     }
@@ -223,9 +201,8 @@ pub const DataTable = struct {
         }
     }
 
-    /// Number of data rows that fit in the viewport (excluding header).
     fn dataRowsAvailable(self: *const DataTable) usize {
-        const header_lines: usize = if (self.show_header) 2 else 0; // header + separator
+        const header_lines: usize = if (self.show_header) 2 else 0;
         return @as(usize, self.height) -| header_lines;
     }
 
@@ -240,21 +217,17 @@ pub const DataTable = struct {
     }
 
     fn ensureCursorVisible(self: *DataTable) void {
-        // Frozen cursors don't scroll.
         if (self.cursor_col < self.frozen_columns) {
             self.col_x_offset = 0;
             return;
         }
 
-        // Compute non-frozen visible width.
         const frozen_w = self.frozenWidth();
         const avail: usize = @as(usize, self.width) -| frozen_w;
 
-        // Walk from col_x_offset to find which non-frozen columns fit.
         const total_non_frozen = self.columns.items.len - self.frozen_columns;
         const cursor_idx = self.cursor_col - self.frozen_columns;
 
-        // First, scroll right if cursor is past visible.
         var off = self.col_x_offset;
         while (off < total_non_frozen) {
             var used: usize = 0;
@@ -263,7 +236,7 @@ pub const DataTable = struct {
             while (i < total_non_frozen) : (i += 1) {
                 const col_w = self.columns.items[self.frozen_columns + i].width;
                 if (used + col_w > avail) break;
-                used += col_w + 1; // 1 for column gap
+                used += col_w + 1;
                 if (i == cursor_idx) {
                     found = true;
                     break;
@@ -286,7 +259,7 @@ pub const DataTable = struct {
             if (i + 1 < self.frozen_columns) sum += 1;
         }
         if (self.frozen_columns > 0 and self.frozen_columns < self.columns.items.len) {
-            sum += 2; // separator " │ "
+            sum += 2;
         }
         return sum;
     }
@@ -318,8 +291,6 @@ pub const DataTable = struct {
         return out.toOwnedSlice();
     }
 
-    /// Indices of columns to render: all frozen + a slice of non-frozen
-    /// starting at col_x_offset that fits in the remaining width.
     fn computeVisibleColumns(self: *const DataTable, allocator: std.mem.Allocator) ![]usize {
         var list = std.array_list.Managed(usize).init(allocator);
         errdefer list.deinit();
@@ -343,7 +314,6 @@ pub const DataTable = struct {
 
     fn renderRow(self: *const DataTable, allocator: std.mem.Allocator, writer: *Writer, row_idx: ?usize, visible_cols: []const usize, is_header: bool) !void {
         for (visible_cols, 0..) |col_idx, i| {
-            // Frozen separator.
             if (self.frozen_columns > 0 and i == self.frozen_columns) {
                 const sep = try self.frozen_separator_style.render(allocator, " │ ");
                 defer allocator.free(sep);
@@ -389,7 +359,7 @@ pub const DataTable = struct {
                 try writer.writeAll("─");
             }
             const col = self.columns.items[col_idx];
-            const dashes = try allocator.alloc(u8, col.width * 3); // up to 3 bytes per UTF-8 dash
+            const dashes = try allocator.alloc(u8, col.width * 3);
             defer allocator.free(dashes);
             const dash = "─";
             var written: usize = 0;
@@ -410,7 +380,6 @@ fn formatCell(allocator: std.mem.Allocator, text: []const u8, width: u16, align_
     if (w == width) return allocator.dupe(u8, text);
     if (w > width) {
         const truncated = try measure.truncate(allocator, text, width);
-        // Always cast away const since we ultimately return `[]u8`.
         return @constCast(truncated);
     }
     const padding = width - w;
@@ -429,14 +398,10 @@ fn formatCell(allocator: std.mem.Allocator, text: []const u8, width: u16, align_
     };
 }
 
-// `measure.padRight` and `padLeft` return `[]const u8`; cast for callers
-// expecting `[]u8`.
 fn padOwned(allocator: std.mem.Allocator, text: []const u8, w: usize, left: bool) ![]u8 {
     const r = if (left) try measure.padLeft(allocator, text, w) else try measure.padRight(allocator, text, w);
     return @constCast(r);
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -481,7 +446,7 @@ test "frozen columns stay at zero offset" {
     t.moveLeft();
     t.moveLeft();
     t.moveLeft();
-    t.moveLeft(); // back to col 0 (frozen)
+    t.moveLeft();
     try testing.expectEqual(@as(usize, 0), t.cursor_col);
     try testing.expectEqual(@as(usize, 0), t.col_x_offset);
 }

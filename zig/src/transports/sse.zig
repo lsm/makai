@@ -15,8 +15,6 @@ fn fileFromPipeHandle(handle: std.Io.File.Handle) std.Io.File {
     return .{ .handle = handle, .flags = .{ .nonblocking = false } };
 }
 
-/// SSE Sender — writes events in Server-Sent Events wire format.
-/// Each write becomes: "data: <json>\n\n"
 pub const SseSender = struct {
     file: std.Io.File,
 
@@ -39,13 +37,10 @@ pub const SseSender = struct {
     }
 };
 
-/// SSE Receiver — reads from a byte source, feeds into SSEParser,
-/// and yields one data payload per read() call.
 pub const SseReceiver = struct {
     parser: sse_parser.SSEParser,
     file: std.Io.File,
     read_buf: [4096]u8 = undefined,
-    /// Pending events from last parser.feed() — stored as duped data strings
     pending: std.ArrayList([]u8),
     pending_index: usize = 0,
     allocator: std.mem.Allocator,
@@ -79,12 +74,10 @@ pub const SseReceiver = struct {
         const self: *SseReceiver = @ptrCast(@alignCast(ctx));
 
         while (true) {
-            // Drain any pending events
             if (self.pending_index < self.pending.items.len) {
                 const data = self.pending.items[self.pending_index];
                 self.pending_index += 1;
 
-                // If caller allocator differs from internal, re-dupe; otherwise transfer ownership
                 if (allocator.ptr == self.allocator.ptr) {
                     return data;
                 } else {
@@ -94,18 +87,14 @@ pub const SseReceiver = struct {
                 }
             }
 
-            // All pending consumed — clear for next batch
             self.pending.clearRetainingCapacity();
             self.pending_index = 0;
 
-            // Read more bytes from the source
             const bytes_read = self.file.readStreaming(defaultIo(), &.{&self.read_buf}) catch return null;
-            if (bytes_read == 0) return null; // EOF
+            if (bytes_read == 0) return null;
 
-            // Feed to parser — parser returns slice of SSEEvent
             const events = try self.parser.feed(self.read_buf[0..bytes_read]);
 
-            // Dupe the data strings before next feed() invalidates them
             for (events) |event| {
                 const duped = try self.allocator.dupe(u8, event.data);
                 try self.pending.append(self.allocator, duped);
@@ -489,9 +478,6 @@ fn hasHeaderValue(headers: []const u8, name: []const u8, value: []const u8) bool
     return false;
 }
 
-// --- Async implementations ---
-
-/// Async SSE Sender — writes events in Server-Sent Events wire format.
 pub const AsyncSseSender = struct {
     file: std.Io.File,
 
@@ -514,8 +500,6 @@ pub const AsyncSseSender = struct {
     }
 };
 
-/// Async SSE Receiver — produces ByteStream with parsed SSE data payloads.
-/// Caller must call deinit() to join the thread and free resources.
 pub const AsyncSseReceiver = struct {
     file: std.Io.File,
     thread: ?std.Thread = null,
@@ -529,29 +513,21 @@ pub const AsyncSseReceiver = struct {
         return .{ .file = file };
     }
 
-    /// Signal cancellation and join the thread with a timeout.
-    /// Returns true if the thread exited cleanly, false if timeout was reached.
     pub fn deinit(self: *Self) bool {
-        // Signal cancellation if we have a cancel token
         if (self.cancel_token) |token| {
             token.store(true, .release);
         }
 
-        // Join thread with timeout
         if (self.thread) |t| {
-            // Use stream's waitForThread for timeout-based waiting
             const thread_exited = if (self.stream) |s| s.waitForThread(5000) else false;
 
-            // Always join the thread (blocking if it didn't exit)
             t.join();
             self.thread = null;
 
             if (!thread_exited) {
-                // Thread didn't exit in time, but we still joined
             }
         }
 
-        // Free cancel token
         if (self.cancel_token) |token| {
             if (self.allocator) |alloc| {
                 alloc.destroy(token);
@@ -559,7 +535,6 @@ pub const AsyncSseReceiver = struct {
             self.cancel_token = null;
         }
 
-        // Free stream
         if (self.stream) |s| {
             s.deinit();
             if (self.allocator) |alloc| {
@@ -592,7 +567,6 @@ pub const AsyncSseReceiver = struct {
     fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
         const self: *Self = @ptrCast(@alignCast(ctx));
 
-        // Guard against double-call
         if (self.stream != null) return error.StreamAlreadyActive;
 
         const stream = try allocator.create(transport.ByteStream);
@@ -610,33 +584,27 @@ pub const AsyncSseReceiver = struct {
             .cancel_token = cancel_token,
         };
 
-        // Store for deinit
         self.stream = stream;
         self.cancel_token = cancel_token;
         self.allocator = allocator;
 
         const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
         self.thread = thread;
-        // Don't detach - we need to join in deinit
 
         return stream;
     }
 
     fn producerThread(ctx: *ProducerContext) void {
-        // Save pointers before defer block since we need to call markThreadDone
-        // AFTER freeing ctx (to avoid race with waitForThread)
         const stream = ctx.stream;
         const allocator = ctx.allocator;
 
         defer {
             ctx.parser.deinit();
             allocator.destroy(ctx);
-            // Mark thread done AFTER all cleanup so waitForThread guarantees memory is freed
             stream.markThreadDone();
         }
 
         while (true) {
-            // Check for cancellation
             if (ctx.cancel_token) |token| {
                 if (token.load(.acquire)) {
                     ctx.stream.completeWithError("Cancelled");
@@ -644,25 +612,21 @@ pub const AsyncSseReceiver = struct {
                 }
             }
 
-            // Read more bytes from the source
             const bytes_read = ctx.file.readStreaming(defaultIo(), &.{&ctx.read_buf}) catch {
                 ctx.stream.completeWithError("Read error");
                 return;
             };
 
             if (bytes_read == 0) {
-                // EOF
                 ctx.stream.complete({});
                 return;
             }
 
-            // Feed to parser
             const events = ctx.parser.feed(ctx.read_buf[0..bytes_read]) catch |err| {
                 ctx.stream.completeWithError(sse_parser.errorMessage(err));
                 return;
             };
 
-            // Push each event as a ByteChunk
             for (events) |event| {
                 const data = ctx.allocator.dupe(u8, event.data) catch {
                     ctx.stream.completeWithError("Out of memory");
@@ -680,7 +644,6 @@ pub const AsyncSseReceiver = struct {
         }
     }
 
-    // Keep backward-compatible blocking read
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
         var parser = sse_parser.SSEParser.init(allocator);
@@ -696,25 +659,20 @@ pub const AsyncSseReceiver = struct {
         var pending_index: usize = 0;
 
         while (true) {
-            // Drain any pending events
             if (pending_index < pending.items.len) {
                 const data = pending.items[pending_index];
                 pending_index += 1;
-                return data; // Transfer ownership
+                return data;
             }
 
-            // All pending consumed — clear for next batch
             pending.clearRetainingCapacity();
             pending_index = 0;
 
-            // Read more bytes from the source
             const bytes_read = self.file.readStreaming(defaultIo(), &.{&read_buf}) catch return null;
-            if (bytes_read == 0) return null; // EOF
+            if (bytes_read == 0) return null;
 
-            // Feed to parser
             const events = try parser.feed(read_buf[0..bytes_read]);
 
-            // Dupe the data strings
             for (events) |event| {
                 const duped = try allocator.dupe(u8, event.data);
                 try pending.append(allocator, duped);
@@ -722,8 +680,6 @@ pub const AsyncSseReceiver = struct {
         }
     }
 };
-
-// Tests
 
 const MockHttpSseServer = struct {
     server: compat.net.Server,
@@ -824,7 +780,6 @@ test "SseHttpClient dechunks HTTP body before SSE parsing" {
 }
 
 test "SseSender writes SSE format" {
-    // Create a pipe
     const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = fileFromPipeHandle(pipe[0]);
     const write_file = fileFromPipeHandle(pipe[1]);
@@ -837,7 +792,6 @@ test "SseSender writes SSE format" {
     try s.write("{\"type\":\"start\",\"model\":\"test\"}");
     write_file.close(defaultIo());
 
-    // Read raw bytes and verify SSE format
     var buf: [1024]u8 = undefined;
     const n = try read_file.readStreaming(defaultIo(), &.{&buf});
     const output = buf[0..n];
@@ -849,13 +803,11 @@ test "SseSender writes SSE format" {
 test "SseReceiver parses SSE format" {
     const allocator = std.testing.allocator;
 
-    // Create a pipe
     const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = fileFromPipeHandle(pipe[0]);
     const write_file = fileFromPipeHandle(pipe[1]);
     defer read_file.close(defaultIo());
 
-    // Write SSE-formatted data
     try write_file.writeStreamingAll(defaultIo(), "data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"start\",\"model\":\"test\"}\n\n");
     write_file.close(defaultIo());
 
@@ -880,13 +832,11 @@ test "SseReceiver parses SSE format" {
 test "SseSender and SseReceiver round-trip with transport" {
     const allocator = std.testing.allocator;
 
-    // Create a pipe
     const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = fileFromPipeHandle(pipe[0]);
     const write_file = fileFromPipeHandle(pipe[1]);
     defer read_file.close(defaultIo());
 
-    // Serialize a real event through SseSender
     var sse_sender = SseSender.init(write_file);
     var s = sse_sender.sender();
 
@@ -921,7 +871,6 @@ test "SseSender and SseReceiver round-trip with transport" {
 
     write_file.close(defaultIo());
 
-    // Read back through SseReceiver + deserialize
     var sse_recv = SseReceiver.init(read_file, allocator);
     defer sse_recv.deinit();
     var r = sse_recv.receiver();

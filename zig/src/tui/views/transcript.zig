@@ -61,10 +61,6 @@ pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) 
     var current_line: usize = 0;
     for (visible_entries.items, 0..) |*entry, i| {
         if (i > 0) {
-            // The "\n\n" separator ends the previous entry and inserts one
-            // blank spacer line; the previous entry's lines are already
-            // accounted for, so only the single blank spacer advances the
-            // row counter.
             try all_writer.writeAll("\n\n");
             current_line += 1;
         }
@@ -478,11 +474,6 @@ fn truncateForSummary(allocator: std.mem.Allocator, text: []const u8, max_bytes:
     return out.toOwnedSlice();
 }
 
-/// Bottom-anchor content inside the transcript area: if content has fewer
-/// lines than `height`, prepend blank lines so the latest line sits at the
-/// bottom edge (right above the composer). This is how chat TUIs are
-/// expected to behave — the welcome message hovering at the top of an
-/// otherwise empty pane reads as broken layout.
 fn padTopToHeight(allocator: std.mem.Allocator, text: []const u8, height: usize) ![]const u8 {
     if (height == 0) return allocator.dupe(u8, "");
     const lines = tui_text.lineCount(text);
@@ -496,7 +487,6 @@ fn padTopToHeight(allocator: std.mem.Allocator, text: []const u8, height: usize)
     return out.toOwnedSlice();
 }
 
-/// Return scroll percentage: 100 = at top, 0 = at bottom.
 fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
     if (total_lines <= view_height) return 0;
     const max_scroll = total_lines - view_height;
@@ -504,16 +494,10 @@ fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
     return clamped * 100 / max_scroll;
 }
 
-// Chat-bubble palette. User messages sit in a light-blue bubble with dark
-// text (like an outgoing iMessage); assistant replies use a dark neutral
-// surface so markdown accents and command highlights pop without tinting the
-// whole answer. System, thinking, and error entries remain role-colored cards.
-// Tool entries are rendered as plain rows so copying transcript text does not
-// include box drawing around command metadata.
-const user_bg = zz.Color.color256(111); // soft periwinkle blue
-const user_fg = zz.Color.color256(235); // near-black ink for contrast
-const assistant_bg = zz.Color.fromRgb(42, 44, 52); // dark graphite
-const assistant_fg = zz.Color.fromRgb(238, 241, 247); // high-contrast cool white
+const user_bg = zz.Color.color256(111);
+const user_fg = zz.Color.color256(235);
+const assistant_bg = zz.Color.fromRgb(42, 44, 52);
+const assistant_fg = zz.Color.fromRgb(238, 241, 247);
 const assistant_code_bg = zz.Color.fromRgb(28, 30, 36);
 
 const chat_max_column: usize = 108;
@@ -523,10 +507,6 @@ const EntryLayout = struct {
     width: usize,
 };
 
-/// Render one transcript entry as a header line (role + time) followed by a
-/// bubble, plain tool row, or bordered card. When `selected` is true, the
-/// normal render is produced first and then a selection background is overlaid
-/// so assistant markdown and role colors stay intact.
 fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, ts_mode: TimestampDisplay, selected: bool) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -564,7 +544,6 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     };
     const body = try indentBlock(arena, body_inner, body_layout.left);
 
-    // Compose header + body, then hand a single owned copy back to the caller.
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
@@ -580,8 +559,6 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     return highlighted;
 }
 
-/// Wrap each line of an already-rendered entry in the selection style so the
-/// entire selected row is highlighted without discarding the original content.
 fn applySelectionToLines(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -612,7 +589,7 @@ fn entryBodyLayout(kind: TranscriptKind, width: usize) EntryLayout {
     if (width <= 24) return .{ .left = 0, .width = width };
 
     const user_gutter: usize = if (width >= 100) 4 else 2;
-    const label_text_left: usize = 3; // edge gutter + role glyph + following space
+    const label_text_left: usize = 3;
     const left_edge_right_gutter: usize = 1;
     const user_available = width -| (user_gutter * 2);
     const left_available = width -| label_text_left -| left_edge_right_gutter;
@@ -654,8 +631,6 @@ fn renderToolRow(allocator: std.mem.Allocator, tool_name: []const u8, text: []co
     return styled;
 }
 
-/// "❯ You · 14:32" — role glyph + name in the role color, dim timestamp.
-/// Right-aligned for the user so it sits above their right-side bubble.
 fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize, ts_mode: TimestampDisplay) ![]u8 {
     const name = if (kind == .tool and title.len > 0) title else roleName(kind);
     const raw_label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(kind), name });
@@ -681,14 +656,9 @@ fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: [
     return out.toOwnedSlice();
 }
 
-/// Render filled-bubble body lines. `content` may carry inline ANSI (markdown);
-/// any embedded SGR reset would punch a hole in the background, so we re-assert
-/// the bubble's fg/bg right after each reset. Bubbles hug their content width
-/// and are right-aligned for the user.
 fn renderBubble(allocator: std.mem.Allocator, content: []const u8, open: []const u8, align_right: bool, width: usize) ![]u8 {
     if (content.len == 0) return allocator.dupe(u8, "");
 
-    // Keep the bubble's background intact across inline resets.
     const needle = "\x1b[0m";
     const repl = try std.fmt.allocPrint(allocator, "{s}{s}", .{ needle, open });
     const reasserted = try std.mem.replaceOwned(u8, allocator, content, needle, repl);
@@ -714,7 +684,7 @@ fn renderBubble(allocator: std.mem.Allocator, content: []const u8, open: []const
         try writer.writeAll(open);
         try writer.writeByte(' ');
         try writer.writeAll(line);
-        try writer.writeAll(open); // re-assert before padding so trailing fill stays colored
+        try writer.writeAll(open);
         const pad = content_w -| tui_text.visibleWidth(line);
         try writeSpaces(writer, pad);
         try writer.writeByte(' ');
@@ -723,11 +693,8 @@ fn renderBubble(allocator: std.mem.Allocator, content: []const u8, open: []const
     return out.toOwnedSlice();
 }
 
-/// Render system/tool/thinking/error entries as a rounded card framed in the
-/// role color. Body lines are truncated (not word-wrapped) so command output
-/// and tool args keep their original whitespace and indentation.
 fn renderCard(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, text: []const u8, width: usize) ![]const u8 {
-    const content_width = @max(width -| 4, 8); // 2 border + 2 padding
+    const content_width = @max(width -| 4, 8);
     const truncated = try tui_text.truncateLinesToWidth(allocator, text, content_width, std.math.maxInt(usize));
     const body_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolBody(tool_name) else tui_theme.bodyStyle(kind);
     const styled = try styleEachLine(allocator, body_style, truncated);
@@ -737,9 +704,6 @@ fn renderCard(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []c
     return card.render(allocator, styled);
 }
 
-/// Apply an inline style to each newline-separated line individually, then
-/// rejoin with `\n`. Necessary because zigzag's inline_style mode drops
-/// the inter-line newlines when given multi-line input.
 fn styleEachLine(allocator: std.mem.Allocator, style: zz.Style, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -757,7 +721,6 @@ fn styleEachLine(allocator: std.mem.Allocator, style: zz.Style, text: []const u8
     return out.toOwnedSlice();
 }
 
-/// Concatenated foreground + background SGR for a bubble fill.
 fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -766,10 +729,6 @@ fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Format an epoch-millisecond timestamp for the transcript header. Returns
-/// an empty string when timestamps are disabled or the entry has no clock.
-/// `width` lets `.full` mode shed the date on narrow terminals so the role
-/// label and clock fit on a single line.
 fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64, mode: TimestampDisplay, width: usize) ![]u8 {
     if (ts_ms <= 0) return allocator.dupe(u8, "");
     const secs: u64 = @intCast(@divFloor(ts_ms, 1000));
@@ -781,10 +740,6 @@ fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64, mode: TimestampDisp
     return switch (mode) {
         .off => allocator.dupe(u8, ""),
         .clock => std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm }),
-        // Wide terminals get the full `YYYY-MM-DD HH:MM:SS`; medium terminals
-        // drop the year (`MM-DD HH:MM`); very narrow terminals fall back to
-        // the clock-only form so the timestamp never wraps or shoves the role
-        // label off-screen.
         .full => blk: {
             if (width < 28) {
                 break :blk try std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm });
@@ -926,7 +881,7 @@ test "transcript renders chat-style alignment and cards" {
     try state.appendTranscript(.system, "system notice");
     try state.appendTranscript(.assistant, "assistant reply");
     try state.appendUserMessage("user reply");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000; // 01:02
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 48, .height = 14 });
     defer std.testing.allocator.free(text);
@@ -935,7 +890,7 @@ test "transcript renders chat-style alignment and cards" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Makai") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "You") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "01:02") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") != null); // rounded card top-left
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") != null);
 
     const assistant_line = renderedLineContaining(text, "assistant reply").?;
     try std.testing.expect(std.mem.startsWith(u8, assistant_line, "   "));
@@ -966,7 +921,6 @@ test "transcript renders date and time in full timestamp mode" {
     defer state.deinit();
     state.timestamp_display = .full;
     try state.appendUserMessage("hello");
-    // 2026-05-28 14:32:00 UTC → epoch seconds 1779978720.
     for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
@@ -980,7 +934,7 @@ test "transcript timestamp hidden in off mode" {
     defer state.deinit();
     state.timestamp_display = .off;
     try state.appendUserMessage("hello");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000; // 01:02
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 60, .height = 8 });
     defer std.testing.allocator.free(text);
@@ -1338,13 +1292,12 @@ test "transcript preserves non-assistant whitespace" {
 test "transcript shows scroll indicator when scrolled up" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    // Add more lines than fit in the viewport
     for (0..20) |i| {
         const msg = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
         defer std.testing.allocator.free(msg);
         try state.appendTranscript(.assistant, msg);
     }
-    state.transcript_scroll = 5; // scrolled up
+    state.transcript_scroll = 5;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
@@ -1360,7 +1313,7 @@ test "transcript hides scroll indicator when at bottom" {
         defer std.testing.allocator.free(msg);
         try state.appendTranscript(.assistant, msg);
     }
-    state.transcript_scroll = 0; // at bottom
+    state.transcript_scroll = 0;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
@@ -1414,7 +1367,6 @@ test "transcript scroll follows selected message" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
 
-    // Scrolled up so the first (selected) entry is visible.
     try std.testing.expect(state.transcript_scroll > 0);
 }
 
@@ -1428,7 +1380,6 @@ test "transcript keeps selection visible when focus is not transcript" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
 
-    // No highlight style applied when composer is focused.
     try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") == null);
 }
 
@@ -1519,9 +1470,7 @@ test "transcript renders inline LaTeX math as Unicode" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    // Greek/symbol substitution reaches the rendered bubble.
     try std.testing.expect(std.mem.indexOf(u8, text, "E = mc²") != null);
-    // Raw LaTeX source markers must not leak through.
     try std.testing.expect(std.mem.indexOf(u8, text, "$E") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "^2$") == null);
 }
@@ -1537,7 +1486,6 @@ test "transcript renders block LaTeX math inside assistant bubble" {
     try std.testing.expect(std.mem.indexOf(u8, text, "∫") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "∞") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "$$") == null);
-    // Surrounding prose survives.
     try std.testing.expect(std.mem.indexOf(u8, text, "Integral") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "done") != null);
 }
@@ -1551,10 +1499,7 @@ test "transcript labels Mermaid diagrams and quotes raw source" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid diagram: flowchart") != null);
-    // Raw diagram source remains available (in quoted form) so the user can
-    // still read/copy the original spec.
     try std.testing.expect(std.mem.indexOf(u8, text, "A --> B") != null);
-    // Fenced fence markers themselves are stripped.
     try std.testing.expect(std.mem.indexOf(u8, text, "```mermaid") == null);
 }
 
@@ -1566,8 +1511,6 @@ test "transcript leaves non-mermaid fenced code blocks untouched by math pass" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
     defer std.testing.allocator.free(text);
 
-    // Code block still renders with its border — the mermaid pass did not
-    // transform it.
     try std.testing.expect(std.mem.indexOf(u8, text, "const x") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid") == null);
 }
@@ -1580,8 +1523,6 @@ test "transcript math falls back to raw for unknown LaTeX commands" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    // Unknown command preserved verbatim with backslash so user sees source.
     try std.testing.expect(std.mem.indexOf(u8, text, "\\zztop") != null);
-    // Math delimiters consumed.
     try std.testing.expect(std.mem.indexOf(u8, text, "$\\") == null);
 }

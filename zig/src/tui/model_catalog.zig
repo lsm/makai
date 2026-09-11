@@ -90,15 +90,12 @@ pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     return models;
 }
 
-/// Public entry point that loads ONLY Kimi models (no network fetch). Used by
-/// the non-interactive `-p` print mode to avoid the OpenAI Codex catalog fetch
-/// (which can block on the network and masks Kimi-specific streaming bugs).
 pub fn loadKimiModelsPublic(allocator: std.mem.Allocator) ![]ai_types.Model {
     return loadKimiModels(allocator);
 }
 
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    var region: []const u8 = "china"; // Default to China region
+    var region: []const u8 = "china";
     if (builtin.is_test) {
         if (!test_force_kimi_model) return emptyModels(allocator);
     } else {
@@ -106,7 +103,6 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
         defer storage.deinit();
         if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
 
-        // Extract region from stored credentials
         if (storage.providers.get(kimi_provider_id)) |auth| {
             if (auth == .oauth) {
                 if (auth.oauth.provider_data) |provider_data| region = kimiRegionFromProviderData(provider_data);
@@ -163,8 +159,6 @@ fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     const provider = try allocator.dupe(u8, kimi_provider_id);
     errdefer allocator.free(provider);
 
-    // Select base_url based on region (OpenAI-compatible endpoints)
-    // openai-completions appends /v1/chat/completions
     const base_url_str = if (use_global)
         kimi_global_base_url
     else

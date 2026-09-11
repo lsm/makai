@@ -1,4 +1,3 @@
-//! Sparkline component with configurable aggregation and styling.
 
 const std = @import("std");
 const Writer = std.Io.Writer;

@@ -1,5 +1,3 @@
-//! Sortable and filterable table component.
-//! Extends basic table with column sorting and text filtering.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -14,32 +12,26 @@ pub fn SortableTable(comptime num_cols: usize) type {
         allocator: std.mem.Allocator,
         headers: [num_cols][]const u8,
         rows: std.array_list.Managed([num_cols][]const u8),
-        /// Indices into rows for display order (sorted/filtered view).
         view_indices: std.array_list.Managed(usize),
 
-        // Sort state
         sort_column: ?usize = null,
         sort_ascending: bool = true,
 
-        // Filter
         filter_text: std.array_list.Managed(u8),
-        filter_column: ?usize = null, // null = search all columns
+        filter_column: ?usize = null,
         filter_active: bool = false,
 
-        // Display
         col_widths: [num_cols]?u16 = @splat(null),
         col_aligns: [num_cols]Align = @splat(.left),
         show_header: bool = true,
         show_border: bool = true,
         border_chars: border_mod.BorderChars = .normal,
 
-        // Interactive
         cursor_row: usize = 0,
         y_offset: usize = 0,
         visible_rows: u16 = 20,
         focused: bool = true,
 
-        // Styling
         header_style: style_mod.Style = blk: {
             var s = style_mod.Style{};
             s = s.bold(true);
@@ -164,7 +156,6 @@ pub fn SortableTable(comptime num_cols: usize) type {
                 try self.view_indices.append(i);
             }
 
-            // Sort using bubble sort (simple, avoids comptime context issues)
             if (self.sort_column) |col| {
                 const indices = self.view_indices.items;
                 const rws = self.rows.items;
@@ -203,11 +194,10 @@ pub fn SortableTable(comptime num_cols: usize) type {
             var result: Writer.Allocating = .init(allocator);
             const writer = &result.writer;
 
-            // Compute column widths
             var widths: [num_cols]usize = undefined;
             for (0..num_cols) |c| {
                 widths[c] = if (self.col_widths[c]) |w| w else blk: {
-                    var max_w: usize = self.headers[c].len + 2; // room for sort indicator
+                    var max_w: usize = self.headers[c].len + 2;
                     for (self.rows.items) |row| {
                         max_w = @max(max_w, row[c].len);
                     }
@@ -215,14 +205,12 @@ pub fn SortableTable(comptime num_cols: usize) type {
                 };
             }
 
-            // Header
             if (self.show_header) {
                 for (0..num_cols) |c| {
                     if (c > 0) writer.writeAll(" \xe2\x94\x82 ") catch {};
                     const hdr = self.headers[c];
                     writer.writeAll(self.header_style.render(allocator, hdr) catch hdr) catch {};
 
-                    // Sort indicator
                     if (self.sort_column == c) {
                         if (self.sort_ascending) {
                             writer.writeAll(self.sort_indicator_asc) catch {};
@@ -241,7 +229,6 @@ pub fn SortableTable(comptime num_cols: usize) type {
                 }
                 writer.writeByte('\n') catch {};
 
-                // Separator
                 for (0..num_cols) |c| {
                     if (c > 0) writer.writeAll("\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80") catch {};
                     for (0..widths[c]) |_| writer.writeAll("\xe2\x94\x80") catch {};
@@ -249,7 +236,6 @@ pub fn SortableTable(comptime num_cols: usize) type {
                 writer.writeByte('\n') catch {};
             }
 
-            // Rows
             const end = @min(self.y_offset + self.visible_rows, self.view_indices.items.len);
             for (self.y_offset..end) |vi| {
                 if (vi > self.y_offset) writer.writeByte('\n') catch {};
@@ -266,14 +252,12 @@ pub fn SortableTable(comptime num_cols: usize) type {
                 }
             }
 
-            // Filter bar
             if (self.filter_active or self.filter_text.items.len > 0) {
                 writer.writeAll("\n\nFilter: ") catch {};
                 writer.writeAll(self.filter_text.items) catch {};
                 if (self.filter_active) writer.writeByte('_') catch {};
             }
 
-            // Count
             writer.writeByte('\n') catch {};
             const count = std.fmt.allocPrint(allocator, " {d}/{d} rows", .{ self.view_indices.items.len, self.rows.items.len }) catch "";
             var cs = style_mod.Style{};

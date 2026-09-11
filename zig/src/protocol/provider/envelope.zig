@@ -8,7 +8,6 @@ const transport = @import("transport");
 const OpenAICompatMaxTokensField = @TypeOf((ai_types.OpenAICompatOptions{}).max_tokens_field);
 const OpenAICompatThinkingFormat = @TypeOf((ai_types.OpenAICompatOptions{}).thinking_format);
 
-/// Serialize envelope to JSON
 pub fn serializeEnvelope(
     envelope: protocol_types.Envelope,
     allocator: std.mem.Allocator,
@@ -19,54 +18,42 @@ pub fn serializeEnvelope(
 
     try w.beginObject();
 
-    // Write type field - for events, use the event's type at top level
     try w.writeKey("type");
     if (envelope.payload == .event) {
-        // For events, serialize the event type at the top level per PROTOCOL.md
         try w.writeString(@tagName(envelope.payload.event));
     } else {
         const payload_type = @tagName(envelope.payload);
         try w.writeString(payload_type);
     }
 
-    // Write stream_id
     var stream_id_buffer: [26]u8 = undefined;
     const stream_id_str = protocol_types.ulidToBuffer(envelope.stream_id, &stream_id_buffer);
     try w.writeStringField("stream_id", stream_id_str);
 
-    // Write message_id
     var message_id_buffer: [26]u8 = undefined;
     const message_id_str = protocol_types.ulidToBuffer(envelope.message_id, &message_id_buffer);
     try w.writeStringField("message_id", message_id_str);
 
-    // Write sequence
     try w.writeIntField("sequence", envelope.sequence);
 
-    // Write timestamp
     try w.writeIntField("timestamp", envelope.timestamp);
 
-    // Write version
     try w.writeIntField("version", envelope.version);
 
-    // Write in_reply_to if present
     if (envelope.in_reply_to) |reply_to| {
         var reply_to_buffer: [26]u8 = undefined;
         const reply_to_str = protocol_types.ulidToBuffer(reply_to, &reply_to_buffer);
         try w.writeStringField("in_reply_to", reply_to_str);
     }
 
-    // Write payload
     try w.writeKey("payload");
     try serializePayload(&w, envelope.payload, allocator);
 
     try w.endObject();
 
-    // Transfer the completed buffer to the caller; serializeEnvelope's contract
-    // already requires the caller to free the returned slice with `allocator`.
     return buffer.toOwnedSlice(allocator);
 }
 
-/// Serialize payload based on its type
 fn serializePayload(
     w: *json_writer.JsonWriter,
     payload: protocol_types.Payload,
@@ -76,7 +63,6 @@ fn serializePayload(
 
     switch (payload) {
         .ping => {
-            // Empty payload for ping
         },
         .pong => |pong| {
             try w.writeStringField("ping_id", pong.ping_id.slice());
@@ -101,31 +87,25 @@ fn serializePayload(
             }
         },
         .stream_request => |req| {
-            // Nest model fields inside a "model" object per PROTOCOL.md
             try w.writeKey("model");
             try serializeModel(w, req.model);
             try w.writeBoolField("include_partial", req.include_partial);
 
-            // Serialize context
             try w.writeKey("context");
             try serializeContext(w, req.context, allocator);
 
-            // Serialize options if present
             if (req.options) |opts| {
                 try w.writeKey("options");
                 try serializeStreamOptions(w, opts, allocator);
             }
         },
         .complete_request => |req| {
-            // Nest model fields inside a "model" object per PROTOCOL.md
             try w.writeKey("model");
             try serializeModel(w, req.model);
 
-            // Serialize context
             try w.writeKey("context");
             try serializeContext(w, req.context, allocator);
 
-            // Serialize options if present
             if (req.options) |opts| {
                 try w.writeKey("options");
                 try serializeStreamOptions(w, opts, allocator);
@@ -299,7 +279,6 @@ fn serializeOpenAICompatOptions(
     try w.endObject();
 }
 
-/// Serialize context
 fn serializeContext(
     w: *json_writer.JsonWriter,
     context: ai_types.Context,
@@ -311,7 +290,6 @@ fn serializeContext(
         try w.writeStringField("system_prompt", prompt);
     }
 
-    // Serialize messages
     try w.writeKey("messages");
     try w.beginArray();
     for (context.messages) |msg| {
@@ -319,7 +297,6 @@ fn serializeContext(
     }
     try w.endArray();
 
-    // Serialize tools if present
     if (context.tools) |tools| {
         try w.writeKey("tools");
         try w.beginArray();
@@ -332,7 +309,6 @@ fn serializeContext(
     try w.endObject();
 }
 
-/// Serialize a message
 fn serializeMessage(
     w: *json_writer.JsonWriter,
     msg: ai_types.Message,
@@ -393,7 +369,6 @@ fn serializeMessage(
     try w.endObject();
 }
 
-/// Serialize user content
 fn serializeUserContent(
     w: *json_writer.JsonWriter,
     content: ai_types.UserContent,
@@ -413,7 +388,6 @@ fn serializeUserContent(
     }
 }
 
-/// Serialize user content part
 fn serializeUserContentPart(
     w: *json_writer.JsonWriter,
     part: ai_types.UserContentPart,
@@ -436,7 +410,6 @@ fn serializeUserContentPart(
     try w.endObject();
 }
 
-/// Serialize tool
 fn serializeTool(w: *json_writer.JsonWriter, tool: ai_types.Tool) !void {
     try w.beginObject();
     try w.writeStringField("name", tool.name);
@@ -446,7 +419,6 @@ fn serializeTool(w: *json_writer.JsonWriter, tool: ai_types.Tool) !void {
     try w.endObject();
 }
 
-/// Serialize stream options
 fn serializeStreamOptions(
     w: *json_writer.JsonWriter,
     opts: ai_types.StreamOptions,
@@ -518,12 +490,10 @@ fn serializeStreamOptions(
         try w.writeIntField("ping_interval_ms", interval);
     }
 
-    // Serialize headers if present
     if (opts.headers) |headers| {
         try serializeHeaderPairs(w, headers);
     }
 
-    // Retry config
     if (opts.retry.max_retry_delay_ms) |delay| {
         try w.writeKey("retry");
         try w.beginObject();
@@ -534,41 +504,34 @@ fn serializeStreamOptions(
     try w.endObject();
 }
 
-/// Serialize event payload (without "type" field - type is at envelope top level)
 fn serializeEventPayload(
     w: *json_writer.JsonWriter,
     event: ai_types.AssistantMessageEvent,
     allocator: std.mem.Allocator,
 ) !void {
-    // Use the transport serializeEvent and extract fields
     const event_json = try transport.serializeEvent(event, allocator);
     defer allocator.free(event_json);
 
-    // Parse the event JSON and copy fields (excluding "type" which is at top level)
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, event_json, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
     var iter = obj.iterator();
     while (iter.next()) |entry| {
-        // Skip "type" field - it's already at the envelope top level per PROTOCOL.md
         if (std.mem.eql(u8, entry.key_ptr.*, "type")) continue;
         try w.writeKey(entry.key_ptr.*);
         try writeJsonValue(w, entry.value_ptr.*, allocator);
     }
 }
 
-/// Serialize result payload
 fn serializeResultPayload(
     w: *json_writer.JsonWriter,
     result: ai_types.AssistantMessage,
     allocator: std.mem.Allocator,
 ) !void {
-    // Use the transport serializeResult and extract fields
     const result_json = try transport.serializeResult(result, allocator);
     defer allocator.free(result_json);
 
-    // Parse the result JSON and copy fields
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer parsed.deinit();
 
@@ -626,7 +589,6 @@ fn serializeModelDescriptor(
     try w.endObject();
 }
 
-/// Write a json.Value to JsonWriter
 fn writeJsonValue(
     w: *json_writer.JsonWriter,
     value: std.json.Value,
@@ -637,7 +599,6 @@ fn writeJsonValue(
         .bool => |b| try w.writeBool(b),
         .integer => |i| try w.writeInt(i),
         .float => |f| {
-            // Float formatting
             try w.buffer.print(allocator, "{d}", .{f});
             w.needs_comma = true;
         },
@@ -665,7 +626,6 @@ fn writeJsonValue(
     }
 }
 
-/// Deserialize envelope from JSON
 pub fn deserializeEnvelope(
     data: []const u8,
     allocator: std.mem.Allocator,
@@ -675,36 +635,28 @@ pub fn deserializeEnvelope(
 
     const obj = parsed.value.object;
 
-    // Parse version
     const version: u8 = if (obj.get("version")) |v|
         @intCast(v.integer)
     else
         1;
 
-    // Parse stream_id
     const stream_id_str = obj.get("stream_id").?.string;
     const stream_id = protocol_types.parseUlid(stream_id_str) orelse return error.InvalidUlid;
 
-    // Parse message_id
     const message_id_str = obj.get("message_id").?.string;
     const message_id = protocol_types.parseUlid(message_id_str) orelse return error.InvalidUlid;
 
-    // Parse sequence
     const sequence: u64 = @intCast(obj.get("sequence").?.integer);
 
-    // Parse timestamp
     const timestamp: i64 = obj.get("timestamp").?.integer;
 
-    // Parse in_reply_to if present
     var in_reply_to: ?protocol_types.Ulid = null;
     if (obj.get("in_reply_to")) |reply_val| {
         in_reply_to = protocol_types.parseUlid(reply_val.string) orelse return error.InvalidUlid;
     }
 
-    // Parse type
     const type_str = obj.get("type").?.string;
 
-    // Parse payload
     const payload_obj = obj.get("payload").?.object;
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
@@ -719,7 +671,6 @@ pub fn deserializeEnvelope(
     };
 }
 
-/// Deserialize payload based on type
 fn deserializePayload(
     type_str: []const u8,
     obj: std.json.ObjectMap,
@@ -769,7 +720,6 @@ fn deserializePayload(
         return .{ .models_response = try deserializeModelsResponse(obj, allocator) };
     }
 
-    // Check if type_str is an event type - the type is at top level per PROTOCOL.md
     if (isEventType(type_str)) {
         const event = try transport.parseAssistantMessageEvent(type_str, obj, allocator);
         return .{ .event = event };
@@ -778,7 +728,6 @@ fn deserializePayload(
     return error.UnknownPayloadType;
 }
 
-/// Check if a string is a known event type
 fn isEventType(type_str: []const u8) bool {
     const event_types = [_][]const u8{
         "start",
@@ -1029,12 +978,10 @@ fn parseThinkingFormat(str: []const u8) error{InvalidEnumValue}!OpenAICompatThin
     return error.InvalidEnumValue;
 }
 
-/// Deserialize stream request
 fn deserializeStreamRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamRequest {
-    // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
@@ -1073,12 +1020,10 @@ fn deserializeStreamRequest(
     };
 }
 
-/// Deserialize complete request
 fn deserializeCompleteRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.CompleteRequest {
-    // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
@@ -1111,7 +1056,6 @@ fn deserializeCompleteRequest(
     };
 }
 
-/// Deserialize abort request
 fn deserializeAbortRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1296,7 +1240,6 @@ fn deserializeModelDescriptor(
     };
 }
 
-/// Deserialize ack
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
     const acknowledged_id_str = obj.get("acknowledged_id").?.string;
     const acknowledged_id = protocol_types.parseUlid(acknowledged_id_str) orelse return error.InvalidUlid;
@@ -1306,7 +1249,6 @@ fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
     };
 }
 
-/// Deserialize nack
 fn deserializeNack(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1349,7 +1291,6 @@ fn deserializeNack(
     };
 }
 
-/// Deserialize stream error
 fn deserializeStreamError(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1365,7 +1306,6 @@ fn deserializeStreamError(
     };
 }
 
-/// Deserialize pong
 fn deserializePong(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1374,7 +1314,6 @@ fn deserializePong(
     return .{ .ping_id = ping_id };
 }
 
-/// Deserialize goodbye
 fn deserializeGoodbye(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1387,7 +1326,6 @@ fn deserializeGoodbye(
     return .{ .reason = reason };
 }
 
-/// Deserialize sync_request
 fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
     const target_str = obj.get("target_stream_id").?.string;
     const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
@@ -1395,7 +1333,6 @@ fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
     return .{ .target_stream_id = target_id };
 }
 
-/// Deserialize sync
 fn deserializeSync(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1459,7 +1396,6 @@ fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!protocol_types.R
     return error.InvalidEnumValue;
 }
 
-/// Parse error code from string
 fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "invalid_request")) return .invalid_request;
     if (std.mem.eql(u8, str, "model_not_found")) return .model_not_found;
@@ -1480,7 +1416,6 @@ fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     return .internal_error;
 }
 
-/// Deserialize context
 fn deserializeContext(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1522,11 +1457,10 @@ fn deserializeContext(
         .system_prompt = system_prompt,
         .messages = messages,
         .tools = tools,
-        .is_owned = true, // Mark as owned since we allocated all strings/arrays
+        .is_owned = true,
     };
 }
 
-/// Deserialize message
 fn deserializeMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1577,7 +1511,6 @@ fn deserializeMessage(
     return error.UnknownMessageRole;
 }
 
-/// Deserialize user content
 fn deserializeUserContent(
     value: std.json.Value,
     allocator: std.mem.Allocator,
@@ -1595,7 +1528,6 @@ fn deserializeUserContent(
     }
 }
 
-/// Deserialize user content part
 fn deserializeUserContentPart(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1620,7 +1552,6 @@ fn deserializeUserContentPart(
     return error.UnknownContentPartType;
 }
 
-/// Deserialize tool
 fn deserializeTool(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1628,8 +1559,6 @@ fn deserializeTool(
     const name = try allocator.dupe(u8, obj.get("name").?.string);
     const description = try allocator.dupe(u8, obj.get("description").?.string);
 
-    // Get parameters_schema_json - it should be a string already in the protocol
-    // If it's a JSON object, we need to serialize it
     const schema_json = if (obj.get("parameters_schema_json")) |schema| switch (schema) {
         .string => |s| try allocator.dupe(u8, s),
         else => blk: {
@@ -1648,7 +1577,6 @@ fn deserializeTool(
     };
 }
 
-/// Deserialize stream options
 fn deserializeStreamOptions(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -1736,7 +1664,6 @@ fn deserializeStreamOptions(
     return opts;
 }
 
-/// Parse cache retention from string
 fn parseCacheRetention(str: []const u8) ?ai_types.CacheRetention {
     if (std.mem.eql(u8, str, "none")) return .none;
     if (std.mem.eql(u8, str, "short")) return .short;
@@ -1744,7 +1671,6 @@ fn parseCacheRetention(str: []const u8) ?ai_types.CacheRetention {
     return null;
 }
 
-/// Parse service tier from string
 fn parseServiceTier(str: []const u8) ?ai_types.ServiceTier {
     if (std.mem.eql(u8, str, "default")) return .default;
     if (std.mem.eql(u8, str, "flex")) return .flex;
@@ -1752,14 +1678,13 @@ fn parseServiceTier(str: []const u8) ?ai_types.ServiceTier {
     return null;
 }
 
-/// Create a new envelope with auto-generated IDs and timestamp
 pub fn createEnvelope(
     stream_id: protocol_types.Ulid,
     sequence: u64,
     payload: protocol_types.Payload,
     allocator: std.mem.Allocator,
 ) protocol_types.Envelope {
-    _ = allocator; // Not needed for basic envelope creation
+    _ = allocator;
     return .{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -1769,7 +1694,6 @@ pub fn createEnvelope(
     };
 }
 
-/// Create a reply envelope (sets in_reply_to)
 pub fn createReply(
     original: protocol_types.Envelope,
     payload: protocol_types.Payload,
@@ -1786,7 +1710,6 @@ pub fn createReply(
     };
 }
 
-/// Create an ack envelope
 pub fn createAck(
     original: protocol_types.Envelope,
     allocator: std.mem.Allocator,
@@ -1804,7 +1727,6 @@ pub fn createAck(
     };
 }
 
-/// Create a nack envelope
 pub fn createNack(
     original: protocol_types.Envelope,
     reason: []const u8,
@@ -1826,7 +1748,6 @@ pub fn createNack(
     };
 }
 
-/// Create a version-mismatch nack envelope that includes supported versions.
 pub fn createVersionMismatchNack(
     original: protocol_types.Envelope,
     allocator: std.mem.Allocator,
@@ -1862,7 +1783,6 @@ pub fn createVersionMismatchNack(
     };
 }
 
-// Custom error set
 pub const EnvelopeError = error{
     InvalidUlid,
     UnknownPayloadType,
@@ -1874,27 +1794,17 @@ pub const EnvelopeError = error{
     InputTooLong,
 };
 
-/// Maximum allowed length for user-supplied provider_id and model_id strings.
-/// Client-side TS SDK enforces the same 256-char cap.
 pub const MAX_IDENTIFIER_LENGTH: usize = 256;
 
-/// Maximum allowed length for user-supplied model fields in stream/complete requests.
-/// These come from client-side model_ref parsing and carry similar size constraints.
 pub const MAX_MODEL_FIELD_LENGTH: usize = 512;
 
-/// Maximum allowed length for provider request header names.
 pub const MAX_HEADER_NAME_LENGTH: usize = 256;
 
-/// Maximum allowed length for provider request header values.
 pub const MAX_HEADER_VALUE_LENGTH: usize = 8192;
 
-/// Validate that a string slice does not exceed the given maximum length.
-/// Returns an error if the input is too long.
 fn validateLength(slice: []const u8, max_len: usize) EnvelopeError!void {
     if (slice.len > max_len) return error.InputTooLong;
 }
-
-// Tests
 
 test "serializeEnvelope with ping payload" {
     const allocator = std.testing.allocator;
@@ -1910,7 +1820,6 @@ test "serializeEnvelope with ping payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    // Check that the JSON contains expected fields
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"ping\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"sequence\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"timestamp\":1708234567890") != null);
@@ -1921,7 +1830,6 @@ test "serializeEnvelope with pong payload" {
     const allocator = std.testing.allocator;
 
     const ping_id = try allocator.dupe(u8, "test-ping-123");
-    // Note: ping_id ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -1979,7 +1887,6 @@ test "serializeEnvelope with stream_request payload" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"stream_request\"") != null);
-    // Check for nested model object format per PROTOCOL.md
     try std.testing.expect(std.mem.find(u8, json, "\"model\":{") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"id\":\"gpt-4\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"GPT-4\"") != null);
@@ -2218,7 +2125,6 @@ test "deserializeEnvelope parses valid JSON" {
     try std.testing.expect(envelope.timestamp == 1708234567890);
     try std.testing.expect(envelope.payload == .ping);
 
-    // Verify stream_id
     const expected_stream_id: protocol_types.Ulid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
     try std.testing.expectEqualSlices(u8, &expected_stream_id, &envelope.stream_id);
 }
@@ -2298,7 +2204,6 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
 
     const rejected_id = protocol_types.generateUlid();
     const reason = try allocator.dupe(u8, "Test error reason");
-    // Note: reason ownership is transferred to original, will be freed by original.deinit
 
     var original = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -2437,7 +2342,6 @@ test "serializeEnvelope with abort_request payload" {
     const allocator = std.testing.allocator;
 
     const reason = try allocator.dupe(u8, "User cancelled");
-    // Note: reason ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -2464,7 +2368,6 @@ test "serializeEnvelope with stream_error payload" {
     const allocator = std.testing.allocator;
 
     const msg = try allocator.dupe(u8, "Connection timeout");
-    // Note: msg ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -2504,7 +2407,6 @@ test "deserializeEnvelope with version field defaults to 1" {
     var envelope = try deserializeEnvelope(json, allocator);
     defer envelope.deinit(allocator);
 
-    // Version should default to 1 when not specified
     try std.testing.expect(envelope.version == 1);
 }
 
@@ -2530,8 +2432,6 @@ test "deserializeEnvelope with explicit version" {
 }
 
 test "deserializeEnvelope with stream_request frees all memory" {
-    // This test verifies that deinit properly frees all allocated memory
-    // when deserializing a stream_request (Issue #3)
     const allocator = std.testing.allocator;
 
     const json =
@@ -2575,20 +2475,15 @@ test "deserializeEnvelope with stream_request frees all memory" {
     var envelope = try deserializeEnvelope(json, allocator);
     defer envelope.deinit(allocator);
 
-    // Verify the envelope was parsed correctly
     try std.testing.expect(envelope.payload == .stream_request);
     try std.testing.expectEqualStrings("gpt-4o", envelope.payload.stream_request.model.id);
     try std.testing.expectEqualStrings("GPT-4o", envelope.payload.stream_request.model.name);
     try std.testing.expect(envelope.payload.stream_request.model.is_owned);
     try std.testing.expect(envelope.payload.stream_request.context.is_owned);
 
-    // deinit will be called by defer - if it doesn't free all memory,
-    // the test will fail with a memory leak error
 }
 
 test "deserializeEnvelope with complete_request frees all memory" {
-    // This test verifies that deinit properly frees all allocated memory
-    // when deserializing a complete_request (Issue #3)
     const allocator = std.testing.allocator;
 
     const json =
@@ -2617,18 +2512,14 @@ test "deserializeEnvelope with complete_request frees all memory" {
     var envelope = try deserializeEnvelope(json, allocator);
     defer envelope.deinit(allocator);
 
-    // Verify the envelope was parsed correctly
     try std.testing.expect(envelope.payload == .complete_request);
     try std.testing.expectEqualStrings("claude-3", envelope.payload.complete_request.model.id);
     try std.testing.expect(envelope.payload.complete_request.model.is_owned);
     try std.testing.expect(envelope.payload.complete_request.context.is_owned);
 
-    // deinit will be called by defer - if it doesn't free all memory,
-    // the test will fail with a memory leak error
 }
 
 test "deserializeEnvelope with complex context frees all memory" {
-    // Test with tool_result message to verify complete cleanup
     const allocator = std.testing.allocator;
 
     const json =
@@ -2674,11 +2565,9 @@ test "deserializeEnvelope with complex context frees all memory" {
     var envelope = try deserializeEnvelope(json, allocator);
     defer envelope.deinit(allocator);
 
-    // Verify parsing
     try std.testing.expect(envelope.payload == .stream_request);
     try std.testing.expect(envelope.payload.stream_request.context.messages.len == 2);
 
-    // deinit will be called by defer - verifies complete cleanup
 }
 
 test "serializeEnvelope with goodbye payload" {
@@ -2717,7 +2606,7 @@ test "serializeEnvelope with goodbye payload (no reason)" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.find(u8, json, "\"type\":\"goodbye\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"reason\"") == null); // reason should not be present
+    try std.testing.expect(std.mem.find(u8, json, "\"reason\"") == null);
 
     envelope.deinit(allocator);
 }
@@ -2746,7 +2635,6 @@ test "serializeEnvelope with sync_request payload" {
 test "serializeEnvelope with sync payload" {
     const allocator = std.testing.allocator;
 
-    // Create a partial with empty content (no strings to free)
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -3046,7 +2934,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_response" 
 
 test "deserializeEnvelope rejects models_request with oversized provider_id" {
     const allocator = std.testing.allocator;
-    const long_id = "a" ** 257; // 257 chars, exceeds MAX_IDENTIFIER_LENGTH (256)
+    const long_id = "a" ** 257;
 
     const json = std.fmt.allocPrint(allocator,
         \\{{
@@ -3117,7 +3005,7 @@ test "deserializeEnvelope accepts models_request with provider_id at exactly 256
 
 test "deserializeEnvelope rejects stream_request with oversized model id" {
     const allocator = std.testing.allocator;
-    const long_id = "a" ** 513; // exceeds MAX_MODEL_FIELD_LENGTH (512)
+    const long_id = "a" ** 513;
 
     const json = std.fmt.allocPrint(allocator,
         \\{{
@@ -3147,7 +3035,7 @@ test "deserializeEnvelope rejects stream_request with oversized model id" {
 
 test "deserializeEnvelope rejects stream_request with oversized provider" {
     const allocator = std.testing.allocator;
-    const long_provider = "p" ** 257; // exceeds MAX_IDENTIFIER_LENGTH (256)
+    const long_provider = "p" ** 257;
 
     const json = std.fmt.allocPrint(allocator,
         \\{{

@@ -1,7 +1,6 @@
 const std = @import("std");
 const oauth = @import("oauth/anthropic");
 
-// Global state for callbacks (needed for stdin reading)
 var gpa = std.heap.DebugAllocator(.{}){};
 var allocator: std.mem.Allocator = undefined;
 var input_buffer: [1024]u8 = undefined;
@@ -26,20 +25,16 @@ fn onPrompt(prompt: oauth.Prompt) []const u8 {
     stdout_file.writeAll(prompt.message) catch return "";
     stdout_file.writeAll(" ") catch return "";
 
-    // Read line from stdin using the Zig 0.16 file reader API.
     var reader = stdin_file.reader(&reader_buf);
     const line = reader.interface.takeDelimiter('\n') catch return "";
 
     if (line) |l| {
-        // Trim trailing whitespace
         const trimmed = std.mem.trim(u8, l, " \t\r\n");
 
-        // Return empty string directly if allowed and input is empty
         if (prompt.allow_empty and trimmed.len == 0) {
             return "";
         }
 
-        // Allocate and return a copy
         return allocator.dupe(u8, trimmed) catch return "";
     }
 
@@ -74,7 +69,6 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Free credentials on exit
     defer {
         allocator.free(credentials.refresh);
         allocator.free(credentials.access);
@@ -83,7 +77,6 @@ pub fn main() !void {
     try stdout_file.writeAll("\nLogin successful!\n\n");
     try stdout_file.writeAll("Credentials (JSON):\n");
 
-    // Output credentials as JSON
     try stdout_file.writeAll("{\n");
 
     try stdout_file.writeAll("  \"refresh\": \"");

@@ -10,7 +10,6 @@ const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
 
-/// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
     switch (msg) {
         .assistant => |a| {
@@ -21,7 +20,6 @@ fn shouldSkipAssistant(msg: ai_types.Message) bool {
     return false;
 }
 
-/// Collect all tool call IDs from assistant messages into a hash set
 fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.Message) !std.StringHashMap(void) {
     var tool_call_ids = std.StringHashMap(void).init(allocator);
     errdefer {
@@ -49,10 +47,7 @@ fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.M
     return tool_call_ids;
 }
 
-/// Check if a tool result is orphaned (no matching tool call)
-/// Only returns true if there ARE tool calls in the context but none match this result
 fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringHashMap(void)) bool {
-    // If there are no tool calls at all, don't filter - results might be from prior context
     if (tool_call_ids.count() == 0) {
         return false;
     }
@@ -67,7 +62,6 @@ fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringH
     return false;
 }
 
-/// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
     while (iter.next()) |key| {
@@ -102,7 +96,6 @@ fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const
     return out;
 }
 
-// Model detection helpers
 fn isGemini3ProModel(model_id: []const u8) bool {
     return std.mem.find(u8, model_id, "3-pro") != null;
 }
@@ -119,11 +112,9 @@ fn isGemini25FlashModel(model_id: []const u8) bool {
     return std.mem.find(u8, model_id, "2.5-flash") != null;
 }
 
-/// Check if a thought signature is valid base64
 fn isValidThoughtSignature(sig: ?[]const u8) bool {
     if (sig == null) return false;
     if (sig.?.len == 0) return false;
-    // Check it's valid base64 characters
     for (sig.?) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '/' and c != '=') {
             return false;
@@ -132,7 +123,6 @@ fn isValidThoughtSignature(sig: ?[]const u8) bool {
     return true;
 }
 
-/// Map ThinkingLevel to Google thinking level string (for Gemini 3)
 fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model) []const u8 {
     if (isGemini3ProModel(model.id)) {
         return switch (level) {
@@ -141,7 +131,6 @@ fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model)
             .medium, .high, .xhigh => "HIGH",
         };
     }
-    // Gemini 3 Flash supports MINIMAL, LOW, MEDIUM, HIGH
     return switch (level) {
         .off => "NONE",
         .minimal => "MINIMAL",
@@ -151,7 +140,6 @@ fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model)
     };
 }
 
-/// Get default thinking budget for Gemini 2.5 models
 fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets, model_id: []const u8) i32 {
     if (level == .off) return 0;
 
@@ -193,13 +181,11 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
-    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
-    // synthetic tool results for orphaned calls, aborted message filtering
     var transformed = try pre_transform.preTransform(allocator, context.messages, .{
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = 64, // Google max tool call ID length
+        .max_tool_id_len = 64,
         .insert_synthetic_results = true,
         .tools = context.tools,
     });
@@ -211,17 +197,14 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
 
-    // Collect tool call IDs for any remaining filtering
     var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
     try w.writeKey("contents");
     try w.beginArray();
     for (tx_context.messages) |m| {
-        // Skip aborted/error assistant messages
         if (shouldSkipAssistant(m)) continue;
 
-        // Skip orphaned tool results
         if (isOrphanedToolResult(m, &tool_call_ids)) continue;
 
         const role: []const u8 = switch (m) {
@@ -238,7 +221,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
             .user => |u| switch (u.content) {
                 .text => |t| {
                     try w.beginObject();
-                    // Sanitize text to remove unpaired surrogates
                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
                     defer {
                         if (sanitized.ptr != t.ptr) {
@@ -252,7 +234,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                     for (parts) |p| switch (p) {
                         .text => |t| {
                             try w.beginObject();
-                            // Sanitize text to remove unpaired surrogates
                             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                             defer {
                                 if (sanitized.ptr != t.text.ptr) {
@@ -279,7 +260,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         if (t.text.len > 0) {
                             try w.beginObject();
                             try w.writeStringField("text", t.text);
-                            // Preserve thoughtSignature on text parts for round-trip
                             if (t.text_signature) |sig| {
                                 if (sig.len > 0) {
                                     try w.writeStringField("thoughtSignature", sig);
@@ -293,7 +273,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                             try w.beginObject();
                             try w.writeStringField("text", t.thinking);
                             try w.writeBoolField("thought", true);
-                            // Preserve thoughtSignature for round-trip
                             if (t.thinking_signature) |sig| {
                                 if (sig.len > 0) {
                                     try w.writeStringField("thoughtSignature", sig);
@@ -310,7 +289,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         try w.writeKey("args");
                         try w.writeRawJson(tc.arguments_json);
                         try w.endObject();
-                        // Preserve thoughtSignature on tool calls for round-trip
                         if (tc.thought_signature) |sig| {
                             if (sig.len > 0) {
                                 try w.writeStringField("thoughtSignature", sig);
@@ -328,9 +306,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                 try w.writeStringField("name", tr.tool_name);
                 try w.writeKey("response");
                 try w.beginObject();
-                // Serialize content parts as the response.
-                // To avoid duplicate "result" fields, capture the last text part
-                // and write it once.
                 var last_text: ?[]const u8 = null;
                 for (tr.content) |c| switch (c) {
                     .text => |t| {
@@ -341,7 +316,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                 if (last_text) |text| {
                     try w.writeStringField("result", text);
                 }
-                // Include details_json if present
                 if (tr.getDetailsJson()) |dj| {
                     try w.writeKey("details");
                     try w.writeRawJson(dj);
@@ -379,7 +353,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     }
     try w.endObject();
 
-    // Add tools if present (Google uses functionDeclarations inside a tools array)
     if (context.tools) |tools| {
         if (tools.len > 0) {
             try w.writeKey("tools");
@@ -399,7 +372,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
             try w.endObject();
             try w.endArray();
 
-            // Add tool_config if tool_choice is specified
             if (options.tool_choice) |tc| {
                 try w.writeKey("tool_config");
                 try w.beginObject();
@@ -422,15 +394,12 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         }
     }
 
-    // Add thinkingConfig if thinking is enabled and model supports reasoning
     if (options.thinking_enabled and model.reasoning) {
         try w.writeKey("thinkingConfig");
         try w.beginObject();
         try w.writeBoolField("includeThoughts", true);
 
-        // Gemini 3 uses thinkingLevel, Gemini 2.5 uses thinkingBudget
         if (options.getThinkingEffort()) |effort| {
-            // Effort was provided directly (string like "LOW", "HIGH", etc.)
             try w.writeStringField("thinkingLevel", effort);
         } else if (options.thinking_budget_tokens) |budget| {
             try w.writeIntField("thinkingBudget", budget);
@@ -442,7 +411,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     return buf.toOwnedSlice(allocator);
 }
 
-/// Parsed part from a Google response
 const ParsedPart = union(enum) {
     text: struct {
         text: []const u8,
@@ -450,21 +418,19 @@ const ParsedPart = union(enum) {
         thought_signature: ?[]const u8,
     },
     tool_call: struct {
-        id: ?[]const u8, // May be null, will generate if so
+        id: ?[]const u8,
         name: []const u8,
-        args_json: []const u8, // JSON stringified args
-        thought_signature: ?[]const u8 = null, // For Gemini 3 thinking tool calls
+        args_json: []const u8,
+        thought_signature: ?[]const u8 = null,
     },
 };
 
-/// Parse result from a Google SSE event
 const GoogleParseResult = struct {
     parts: []const ParsedPart,
     usage: ai_types.Usage,
     finish_reason: ?[]const u8,
 };
 
-/// Stringify a std.json.Value to a buffer (helper for functionCall args)
 fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (value) {
         .null => try buf.appendSlice(allocator, "null"),
@@ -518,7 +484,6 @@ fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator:
     }
 }
 
-/// Parse a Google SSE event and extract parts with thinking info
 fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?GoogleParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
     defer parsed.deinit();
@@ -536,7 +501,6 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
         if (cands == .array and cands.array.items.len > 0) {
             const c = cands.array.items[0];
             if (c == .object) {
-                // Get finish reason
                 if (c.object.get("finishReason")) |fr| {
                     if (fr == .string) {
                         finish_reason = allocator.dupe(u8, fr.string) catch null;
@@ -549,10 +513,8 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                             if (parts == .array) {
                                 for (parts.array.items) |p| {
                                     if (p == .object) {
-                                        // Check for text part first
                                         if (p.object.get("text")) |t| {
                                             if (t == .string and t.string.len > 0) {
-                                                // Check if this is a thinking part
                                                 const is_thinking = blk: {
                                                     if (p.object.get("thought")) |thought| {
                                                         if (thought == .bool and thought.bool) break :blk true;
@@ -577,26 +539,22 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                 };
                                             }
                                         } else if (p.object.get("functionCall")) |fc| {
-                                            // Handle functionCall part
                                             if (fc == .object) {
                                                 const name = if (fc.object.get("name")) |n|
                                                     if (n == .string) n.string else ""
                                                 else
                                                     "";
 
-                                                // Get or generate ID (may be null)
                                                 const id = if (fc.object.get("id")) |i|
                                                     if (i == .string) allocator.dupe(u8, i.string) catch null else null
                                                 else
                                                     null;
 
-                                                // Get thought signature if present (for Gemini 3 thinking tool calls)
                                                 const sig = if (p.object.get("thoughtSignature")) |s| blk: {
                                                     if (s == .string) break :blk allocator.dupe(u8, s.string) catch null;
                                                     break :blk null;
                                                 } else null;
 
-                                                // Stringify args to JSON
                                                 const args_json = if (fc.object.get("args")) |args| blk: {
                                                     var buf = std.ArrayList(u8).empty;
                                                     stringifyJsonValue(args, &buf, allocator) catch break :blk "";
@@ -640,7 +598,6 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                 if (v == .integer) usage.output = @intCast(v.integer);
             }
             if (u.object.get("thoughtsTokenCount")) |v| {
-                // Include thinking tokens in output count
                 if (v == .integer) usage.output += @as(u64, @intCast(v.integer));
             }
             if (u.object.get("totalTokenCount")) |v| {
@@ -676,14 +633,12 @@ fn deinitGoogleParseResult(result: *const GoogleParseResult, allocator: std.mem.
     if (result.finish_reason) |fr| allocator.free(fr);
 }
 
-/// Current block type being streamed
 const CurrentBlock = enum {
     none,
     text,
     thinking,
 };
 
-/// Create a partial message for events (references model strings directly, no allocation)
 fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     return ai_types.AssistantMessage{
         .content = &.{},
@@ -696,7 +651,6 @@ fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     };
 }
 
-/// Map Google finish reason to StopReason
 fn mapFinishReason(reason: ?[]const u8) ai_types.StopReason {
     if (reason) |r| {
         if (std.mem.eql(u8, r, "STOP")) return .stop;
@@ -721,7 +675,6 @@ const ThreadCtx = struct {
     retry_config: ?ai_types.RetryConfig = null,
     ping_interval_ms: ?u64 = null,
 
-    /// Clean up all owned resources (model, context, api_key, body, base_url, self).
     fn deinit(self: *ThreadCtx) void {
         self.allocator.free(self.base_url);
         self.allocator.free(self.api_key);
@@ -735,7 +688,6 @@ const ThreadCtx = struct {
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
     const stream = ctx.stream;
     const model = ctx.model;
@@ -748,12 +700,10 @@ fn runThread(ctx: *ThreadCtx) void {
     const on_payload_ctx = ctx.on_payload_ctx;
     const retry_opts = ctx.retry_config;
 
-    // Invoke on_payload callback before sending
     if (on_payload_fn) |cb| {
         cb(on_payload_ctx, body);
     }
 
-    // Check cancellation before sending
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
@@ -786,7 +736,6 @@ fn runThread(ctx: *ThreadCtx) void {
         .{ .name = "x-goog-api-key", .value = api_key },
     };
 
-    // Retry configuration
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_opts) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
@@ -799,7 +748,6 @@ fn runThread(ctx: *ThreadCtx) void {
     defer if (req_initialized) req.deinit();
 
     while (true) {
-        // Check cancellation before each attempt
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -809,21 +757,18 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Deinit previous request if this is a retry
         if (req_initialized) {
             req.deinit();
             req_initialized = false;
         }
 
         req = client.openRequest(.POST, uri, .{ .extra_headers = &headers }) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -837,14 +782,12 @@ fn runThread(ctx: *ThreadCtx) void {
         req_initialized = true;
 
         compat.http.sendRequest(&req, body) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -857,14 +800,12 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         response = compat.http.receiveResponse(&req, &head_buf) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -877,28 +818,19 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         if (response.head.status == .ok) {
-            // Success - break out of retry loop
             break;
         }
 
-        // Check if status is retryable
         const status_code: u16 = @intFromEnum(response.head.status);
         const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
 
         if (should_retry) {
-            // Note: We skip reading the error body here because the response state machine
-            // may not be in a valid state for body reading (e.g., after a redirect or when
-            // the connection has been reset). The error body is only used for optional retry
-            // delay hints, so we rely on status code and Retry-After header instead.
             const error_text: []const u8 = &.{};
 
-            // Check if error body indicates a retryable error
             const is_retryable_error = retry_util.isRetryableError(error_text);
 
-            // Calculate delay - prefer server-provided delay
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header (only if headers contain valid \r\n separator)
             if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
@@ -913,21 +845,17 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             }
 
-            // Check body for retry delay
             if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
                 if (body_delay <= max_delay_ms) {
                     delay = body_delay;
                 }
             }
 
-            // If not a retryable error message, don't retry
             if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
                 break;
             }
 
-            // Wait before retry
             if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -938,11 +866,9 @@ fn runThread(ctx: *ThreadCtx) void {
             continue;
         }
 
-        // Non-retryable error or max retries reached
         break;
     }
 
-    // After retry loop, check final status
     if (response.head.status != .ok) {
         ctx.deinit();
         stream.markThreadDone();
@@ -957,7 +883,6 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = compat.http.responseReader(&response, &transfer_buf);
 
-    // Content block accumulators
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
     defer content_blocks.deinit(allocator);
     var current_text = std.ArrayList(u8).empty;
@@ -974,16 +899,13 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_block: CurrentBlock = .none;
     var tool_call_counter: usize = 0;
 
-    // Ping tracking
     var last_ping_time: i64 = 0;
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
-    // Emit start event
     const partial_start = createPartialMessage(model);
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
-        // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
@@ -992,7 +914,6 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -1022,17 +943,14 @@ fn runThread(ctx: *ThreadCtx) void {
             if (result) |*res| {
                 defer deinitGoogleParseResult(res, allocator);
 
-                // Update usage
                 if (res.usage.input > 0) usage.input = res.usage.input;
                 if (res.usage.output > 0) usage.output = res.usage.output;
                 if (res.usage.total_tokens > 0) usage.total_tokens = res.usage.total_tokens;
 
-                // Update finish reason if provided
                 if (res.finish_reason) |fr| {
                     stop_reason = mapFinishReason(fr);
                 }
 
-                // Process each part
                 for (res.parts) |part| {
                     switch (part) {
                         .text => |text_part| {
@@ -1041,12 +959,10 @@ fn runThread(ctx: *ThreadCtx) void {
                                 (is_thinking and current_block != .thinking) or
                                 (!is_thinking and current_block != .text);
 
-                            // Close current block if we need to switch
                             if (needs_new_block and current_block != .none) {
                                 const partial = createPartialMessage(model);
                                 switch (current_block) {
                                     .text => {
-                                        // Store completed text block
                                         const text_copy = allocator.dupe(u8, current_text.items) catch continue;
                                         const sig_copy = if (current_text_signature.items.len > 0)
                                             allocator.dupe(u8, current_text_signature.items) catch null
@@ -1065,7 +981,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                         current_text_signature.clearRetainingCapacity();
                                     },
                                     .thinking => {
-                                        // Store completed thinking block
                                         const thinking_copy = allocator.dupe(u8, current_thinking.items) catch continue;
                                         const sig_copy = if (current_thinking_signature.items.len > 0)
                                             allocator.dupe(u8, current_thinking_signature.items) catch null
@@ -1087,7 +1002,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 }
                             }
 
-                            // Start new block if needed
                             if (needs_new_block) {
                                 const content_idx = content_blocks.items.len;
                                 const partial = createPartialMessage(model);
@@ -1107,10 +1021,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 }
                             }
 
-                            // Append content and emit delta
-                            // Use slices from the ArrayList buffer directly (like Anthropic does).
-                            // The ArrayList is freed when the thread exits, and EventStream.deinit()
-                            // knows not to free delta slices.
                             const partial = createPartialMessage(model);
                             if (is_thinking) {
                                 const prev_len = current_thinking.items.len;
@@ -1118,7 +1028,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 if (text_part.thought_signature) |sig| {
                                     current_thinking_signature.appendSlice(allocator, sig) catch {};
                                 }
-                                // Use the newly appended portion for the delta
                                 const delta = current_thinking.items[prev_len..];
                                 stream.push(.{ .thinking_delta = .{
                                     .content_index = content_blocks.items.len,
@@ -1131,7 +1040,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 if (text_part.thought_signature) |sig| {
                                     current_text_signature.appendSlice(allocator, sig) catch {};
                                 }
-                                // Use the newly appended portion for the delta
                                 const delta = current_text.items[prev_len..];
                                 stream.push(.{ .text_delta = .{
                                     .content_index = content_blocks.items.len,
@@ -1141,7 +1049,6 @@ fn runThread(ctx: *ThreadCtx) void {
                             }
                         },
                         .tool_call => |tc| {
-                            // Close current text/thinking block if open
                             if (current_block != .none) {
                                 const partial = createPartialMessage(model);
                                 switch (current_block) {
@@ -1186,20 +1093,13 @@ fn runThread(ctx: *ThreadCtx) void {
                                 current_block = .none;
                             }
 
-                            // For Gemini 3 with thinking enabled, validate thought signature
-                            // If thinking is enabled for a Gemini 3 model and the tool call lacks
-                            // a valid thought signature, log a warning but still process the tool call.
-                            // The API may still accept it, but this could indicate an issue.
                             const is_gemini3 = isGemini3ProModel(model.id) or isGemini3FlashModel(model.id);
                             if (is_gemini3 and thinking_enabled) {
                                 if (!isValidThoughtSignature(tc.thought_signature)) {
-                                    // Unsigned tool call in thinking mode - still process it
-                                    // but this may indicate the thinking was truncated or missing
                                     std.log.debug("Gemini 3 tool call without valid thought signature: {s}", .{tc.name});
                                 }
                             }
 
-                            // Generate unique ID if not provided
                             const tool_id = if (tc.id) |id|
                                 allocator.dupe(u8, id) catch continue
                             else blk: {
@@ -1224,7 +1124,6 @@ fn runThread(ctx: *ThreadCtx) void {
 
                             const content_idx = content_blocks.items.len;
 
-                            // Emit toolcall_start
                             stream.push(.{ .toolcall_start = .{
                                 .content_index = content_idx,
                                 .id = tool_id,
@@ -1237,21 +1136,18 @@ fn runThread(ctx: *ThreadCtx) void {
                                 continue;
                             };
 
-                            // Emit toolcall_delta with args_json
                             stream.push(.{ .toolcall_delta = .{
                                 .content_index = content_idx,
                                 .delta = tool_args,
                                 .partial = createPartialMessage(model),
                             } }) catch {};
 
-                            // Build the ToolCall struct for storage and toolcall_end
                             const tool_call_struct = ai_types.ToolCall{
                                 .id = tool_id,
                                 .name = tool_name,
                                 .arguments_json = tool_args,
                             };
 
-                            // Store the tool call in content_blocks
                             content_blocks.append(allocator, .{ .tool_call = tool_call_struct }) catch {
                                 allocator.free(tool_id);
                                 allocator.free(tool_name);
@@ -1259,14 +1155,12 @@ fn runThread(ctx: *ThreadCtx) void {
                                 continue;
                             };
 
-                            // Dupe the tool_call for the event so it owns its own memory
                             const event_tc = ai_types.ToolCall{
                                 .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
                                 .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
                                 .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
                             };
 
-                            // Emit toolcall_end with the ToolCall struct
                             stream.push(.{ .toolcall_end = .{
                                 .content_index = content_idx,
                                 .tool_call = event_tc,
@@ -1279,7 +1173,6 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // Close final block if open
     if (current_block != .none) {
         switch (current_block) {
             .text => {
@@ -1323,7 +1216,6 @@ fn runThread(ctx: *ThreadCtx) void {
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
     usage.calculateCost(model.cost);
 
-    // If no content blocks were collected, add an empty text block
     if (content_blocks.items.len == 0) {
         content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
     }
@@ -1335,8 +1227,6 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    // Dupe metadata strings BEFORE composing `out` so a mid-dupe OOM can cascade-free
-    // both content_slice and any prior successful dupes without leaking.
     const api_dup = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
@@ -1370,14 +1260,9 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
-        .is_owned = true, // Strings were duped above
+        .is_owned = true,
     };
 
-    // Do NOT push a .done event here — the same AssistantMessage would be
-    // referenced by both the event and complete(), causing a double-free when
-    // the consumer deinits either one.
-
-    // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();
 
     stream.markThreadDone();
@@ -1389,9 +1274,6 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        // Read the vendor env key only for the canonical provider so a
-        // custom or routed base URL (MAKAI_BASE_URL) cannot receive a
-        // GOOGLE_API_KEY meant for Google's own endpoint.
         if (!std.mem.eql(u8, model.provider, "google")) return error.MissingApiKey;
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
@@ -1407,14 +1289,12 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
     };
     errdefer allocator.free(base_url);
 
-    // Clone model to own the memory (background thread outlives caller's memory)
     const owned_model = try ai_types.cloneModel(allocator, model);
     errdefer {
         var mut_m = owned_model;
         mut_m.deinit(allocator);
     }
 
-    // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = try ai_types.cloneContext(allocator, context);
     errdefer {
         var mut_ctx = owned_context;
@@ -1459,7 +1339,6 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
 pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
 
-    // Build thinking options based on reasoning level and model capabilities
     var thinking_enabled: bool = false;
     var thinking_budget_tokens: ?u32 = null;
     var thinking_effort: ?[]const u8 = null;
@@ -1469,10 +1348,8 @@ pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.C
             thinking_enabled = true;
 
             if (isGemini3ProModel(model.id) or isGemini3FlashModel(model.id)) {
-                // Gemini 3 uses thinkingLevel
                 thinking_effort = getGemini3ThinkingLevel(level, model);
             } else {
-                // Gemini 2.5 uses thinkingBudget
                 const budget = getGoogleBudget(level, o.thinking_budgets, model.id);
                 if (budget > 0) {
                     thinking_budget_tokens = @intCast(budget);
@@ -1569,7 +1446,7 @@ test "parseGoogleEventExtended - functionCall part" {
     try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.tool_call);
 
     const tc = result.parts[0].tool_call;
-    try std.testing.expect(tc.id == null); // No ID provided
+    try std.testing.expect(tc.id == null);
     try std.testing.expectEqualStrings("bash", tc.name);
     try std.testing.expectEqualStrings("{\"cmd\":\"ls -la\"}", tc.args_json);
 }
@@ -1613,15 +1490,12 @@ test "parseGoogleEventExtended - mixed parts" {
 
     try std.testing.expectEqual(@as(usize, 3), result.parts.len);
 
-    // First part is text
     try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.text);
     try std.testing.expectEqualStrings("Let me help you.", result.parts[0].text.text);
 
-    // Second part is tool_call
     try std.testing.expectEqual(std.meta.activeTag(result.parts[1]), ParsedPart.tool_call);
     try std.testing.expectEqualStrings("search", result.parts[1].tool_call.name);
 
-    // Third part is text
     try std.testing.expectEqual(std.meta.activeTag(result.parts[2]), ParsedPart.text);
     try std.testing.expectEqualStrings("Done.", result.parts[2].text.text);
 }
@@ -1647,13 +1521,11 @@ test "parseGoogleEventExtended - functionCall with empty args" {
 }
 
 test "isValidThoughtSignature - valid base64" {
-    // Valid base64 strings
     try std.testing.expect(isValidThoughtSignature("SGVsbG8gV29ybGQ="));
     try std.testing.expect(isValidThoughtSignature("YWJjMTIz"));
     try std.testing.expect(isValidThoughtSignature("AAA+BBB/CCC=="));
     try std.testing.expect(isValidThoughtSignature("validBase64String123"));
 
-    // Invalid cases
     try std.testing.expect(!isValidThoughtSignature(null));
     try std.testing.expect(!isValidThoughtSignature(""));
     try std.testing.expect(!isValidThoughtSignature("invalid!chars"));
@@ -1750,9 +1622,6 @@ test "streamSimpleGoogleGenerativeAI exits early when pre-cancelled" {
 
 test "streamGoogleGenerativeAI withholds vendor env key from non-google providers" {
     const allocator = std.testing.allocator;
-    // A custom/routed ref: the base URL is not Google's endpoint, so the
-    // GOOGLE_API_KEY env credential must not be consulted — an explicit key
-    // is required instead.
     const model = ai_types.Model{
         .id = "gemini-2.5-flash",
         .name = "Gemini 2.5 Flash",

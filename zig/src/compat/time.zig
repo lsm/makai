@@ -1,9 +1,5 @@
 const std = @import("std");
 
-/// Wall-clock milliseconds since the Unix epoch.
-///
-/// Uses `std.Io.Timestamp.now` through the Makai default context while keeping
-/// raw `std.Io` out of this public signature.
 fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
         std.testing.io
@@ -15,18 +11,10 @@ pub fn nowMillis() i64 {
     return std.Io.Timestamp.now(defaultIo(), .real).toMilliseconds();
 }
 
-/// Wall-clock seconds since the Unix epoch.
-///
-/// Uses `std.Io.Timestamp.now` through the Makai default context while
-/// preserving wall-clock semantics.
 pub fn nowSeconds() i64 {
     return std.Io.Timestamp.now(defaultIo(), .real).toSeconds();
 }
 
-/// Wall-clock nanoseconds since the Unix epoch.
-///
-/// Uses `std.Io.Timestamp.now` through the Makai default context and keeps this
-/// separate from monotonic-duration measurements.
 pub fn nowNanos() i64 {
     return @intCast(std.Io.Timestamp.now(defaultIo(), .real).toNanoseconds());
 }
@@ -34,11 +22,6 @@ pub fn nowNanos() i64 {
 var monotonic_origin: ?std.Io.Timestamp = null;
 var monotonic_mutex: std.Io.Mutex = .init;
 
-/// Monotonic nanoseconds suitable for durations and deadlines.
-///
-/// Uses the chosen default-context monotonic clock internally while keeping raw
-/// `std.Io` out of this API. Readings share a stable monotonic origin and can be
-/// subtracted for elapsed-duration math.
 pub fn monotonicNanos() !u64 {
     monotonic_mutex.lockUncancelable(defaultIo());
     defer monotonic_mutex.unlock(defaultIo());
@@ -51,25 +34,15 @@ pub fn monotonicNanos() !u64 {
     return @intCast(monotonic_origin.?.durationTo(now).nanoseconds);
 }
 
-/// Monotonic milliseconds suitable for TTL/idle age math.
-///
-/// Differences of these readings are immune to wall-clock adjustments (NTP
-/// steps, snapshot restores), unlike `nowMillis`. See `monotonicNanos` for
-/// the shared-origin guarantee.
 pub fn monotonicMillis() !i64 {
     return @intCast(try monotonicNanos() / std.time.ns_per_ms);
 }
 
-/// Sleep for a number of nanoseconds.
-///
-/// Routes through the Makai default I/O context timeout/sleep primitive while
-/// keeping this public helper stable.
 pub fn sleepNs(ns: u64) void {
     const capped_ns = @min(ns, @as(u64, std.math.maxInt(i64)));
     defaultIo().sleep(.fromNanoseconds(@intCast(capped_ns)), .boot) catch {};
 }
 
-/// Sleep for a number of milliseconds.
 pub fn sleepMs(ms: u64) void {
     sleepNs(std.math.mul(u64, ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
 }
@@ -113,10 +86,6 @@ test "compat sleep helpers bound short sleeps" {
     sleepNs(1 * std.time.ns_per_ms);
     const elapsed_ns = try monotonicNanos() - start_ns;
 
-    // Only assert the lower bound: `sleepNs` must wait at least the requested
-    // duration. Avoid an absolute upper bound here because scheduler pauses on
-    // loaded or virtualized CI runners can legitimately exceed any tight
-    // ceiling without indicating a defect in the wrapper.
     try std.testing.expect(elapsed_ns >= 1 * std.time.ns_per_ms);
 }
 

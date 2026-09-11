@@ -1,7 +1,3 @@
-//! Protocol Pump - Helper for protocol fullstack E2E tests
-//!
-//! This module provides the ProtocolPump helper that forwards events from
-//! provider streams to clients via the protocol layer in test environments.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -13,7 +9,6 @@ const ProtocolServer = protocol_server.ProtocolServer;
 const protocol_types = envelope.protocol_types;
 const PipeTransport = in_process.SerializedPipe;
 
-/// Protocol pump that forwards events from provider stream to client via protocol layer
 pub const ProtocolPump = struct {
     server: *ProtocolServer,
     pipe: *PipeTransport,
@@ -21,19 +16,14 @@ pub const ProtocolPump = struct {
 
     const Self = @This();
 
-    /// Forward events from all active streams to the client
-    /// Returns number of events forwarded
     pub fn pumpEvents(self: *Self) !usize {
         var events_forwarded: usize = 0;
 
-        // Get the server's active streams using the public iterator
         var iter = self.server.activeStreamIterator();
         while (iter.next()) |entry| {
             const active_stream = entry.stream;
             const stream_id = entry.stream_id;
 
-            // Poll ALL available events from the provider's event stream
-            // before checking if the stream is done
             while (active_stream.event_stream.poll()) |event| {
                 const seq = self.server.getNextSequence(stream_id);
                 const env = protocol_types.Envelope{
@@ -43,10 +33,7 @@ pub const ProtocolPump = struct {
                     .timestamp = compat.time.nowMillis(),
                     .payload = .{ .event = event },
                 };
-                // NOTE: Do NOT call env.deinit() - event payloads have borrowed strings
-                // from the provider's internal buffer that will be freed when the stream deinit
 
-                // Serialize and send to client
                 const json = try envelope.serializeEnvelope(env, self.allocator);
                 defer self.allocator.free(json);
 
@@ -57,9 +44,7 @@ pub const ProtocolPump = struct {
                 events_forwarded += 1;
             }
 
-            // Check if stream is done (only after polling all events)
             if (active_stream.event_stream.isDone()) {
-                // Send result or error to client
                 if (active_stream.event_stream.getResult()) |result| {
                     const seq = self.server.getNextSequence(stream_id);
                     const env = protocol_types.Envelope{
@@ -69,8 +54,6 @@ pub const ProtocolPump = struct {
                         .timestamp = compat.time.nowMillis(),
                         .payload = .{ .result = result },
                     };
-                    // NOTE: Do NOT call env.deinit() - result payloads have borrowed strings
-                    // from the provider's internal buffer that will be freed when the stream deinit
 
                     const json = try envelope.serializeEnvelope(env, self.allocator);
                     defer self.allocator.free(json);
@@ -79,7 +62,6 @@ pub const ProtocolPump = struct {
                     try sender.write(json);
                     try sender.flush();
                 } else if (active_stream.event_stream.getError()) |err_msg| {
-                    // Stream completed with error - send stream_error to client
                     const seq = self.server.getNextSequence(stream_id);
                     const err_copy = try self.allocator.dupe(u8, err_msg);
                     var env = protocol_types.Envelope{
@@ -100,7 +82,6 @@ pub const ProtocolPump = struct {
                     try sender.write(json);
                     try sender.flush();
 
-                    // Free the error envelope's allocated memory
                     env.deinit(self.allocator);
                 }
             }
@@ -109,7 +90,6 @@ pub const ProtocolPump = struct {
         return events_forwarded;
     }
 
-    /// Process any pending messages from client to server
     pub fn pumpClientMessages(self: *Self) !void {
         var receiver = self.pipe.serverReceiver();
         while (try receiver.readLine(self.allocator)) |line| {
@@ -118,7 +98,6 @@ pub const ProtocolPump = struct {
             var env = envelope.deserializeEnvelope(line, self.allocator) catch continue;
             defer env.deinit(self.allocator);
 
-            // Process through server
             if (try self.server.handleEnvelope(env)) |response| {
                 var mut_response = response;
                 defer mut_response.deinit(self.allocator);
@@ -134,7 +113,6 @@ pub const ProtocolPump = struct {
     }
 };
 
-/// Helper to get env var or return null
 pub fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return compat.getEnvVarOwned(allocator, name) catch null;
 }

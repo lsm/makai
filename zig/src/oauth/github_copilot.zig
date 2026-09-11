@@ -3,17 +3,14 @@ const compat = @import("compat");
 const http = compat.http;
 const oauth = @import("mod.zig");
 
-/// Decoded client ID for GitHub Copilot (Iv1.b507a08c87ecfe98)
 const CLIENT_ID = "Iv1.b507a08c87ecfe98";
 
-/// Headers required for GitHub Copilot API calls
 const COPILOT_HEADERS = [_]std.http.Header{
     .{ .name = "editor-version", .value = "Neovim/0.9.0" },
     .{ .name = "editor-plugin-version", .value = "copilot.vim/1.0.0" },
     .{ .name = "user-agent", .value = "GithubCopilot/1.0.0" },
 };
 
-/// Device flow information returned from startDeviceFlow
 pub const DeviceFlowInfo = struct {
     device_code: []const u8,
     user_code: []const u8,
@@ -28,11 +25,10 @@ pub const DeviceFlowInfo = struct {
     }
 };
 
-/// Copilot token response from exchangeForCopilotToken
 pub const CopilotToken = struct {
     token: []const u8,
     expires_at: i64,
-    base_url: ?[]const u8, // Extracted from token's proxy-ep field
+    base_url: ?[]const u8,
 
     pub fn deinit(self: *CopilotToken, allocator: std.mem.Allocator) void {
         allocator.free(self.token);
@@ -40,7 +36,6 @@ pub const CopilotToken = struct {
     }
 };
 
-/// Errors specific to GitHub Copilot OAuth
 pub const CopilotError = error{
     DeviceFlowFailed,
     AuthorizationPending,
@@ -53,15 +48,12 @@ pub const CopilotError = error{
     OutOfMemory,
 };
 
-/// GitHub Copilot OAuth implementation using Device Flow (RFC 8628)
 pub const GitHubCopilotOAuth = struct {
     allocator: std.mem.Allocator,
-    enterprise_domain: ?[]const u8, // null for github.com, or "github.example.com"
+    enterprise_domain: ?[]const u8,
 
     const Self = @This();
 
-    /// Initialize the OAuth provider
-    /// enterprise_domain should be null for github.com, or the hostname for GitHub Enterprise
     pub fn init(allocator: std.mem.Allocator, enterprise_domain: ?[]const u8) Self {
         return .{
             .allocator = allocator,
@@ -73,30 +65,25 @@ pub const GitHubCopilotOAuth = struct {
         if (self.enterprise_domain) |d| self.allocator.free(d);
     }
 
-    /// Get the domain to use for API calls
     fn getDomain(self: *const Self) []const u8 {
         return self.enterprise_domain orelse "github.com";
     }
 
-    /// Build URL for device code endpoint
     fn getDeviceCodeUrl(self: *const Self, buffer: []u8) ![]u8 {
         const domain = self.getDomain();
         return std.fmt.bufPrint(buffer, "https://{s}/login/device/code", .{domain});
     }
 
-    /// Build URL for access token endpoint
     fn getAccessTokenUrl(self: *const Self, buffer: []u8) ![]u8 {
         const domain = self.getDomain();
         return std.fmt.bufPrint(buffer, "https://{s}/login/oauth/access_token", .{domain});
     }
 
-    /// Build URL for Copilot token endpoint
     fn getCopilotTokenUrl(self: *const Self, buffer: []u8) ![]u8 {
         const domain = self.getDomain();
         return std.fmt.bufPrint(buffer, "https://api.{s}/copilot_internal/v2/token", .{domain});
     }
 
-    /// Start device flow - returns user_code and verification_uri
     pub fn startDeviceFlow(self: *Self) CopilotError!DeviceFlowInfo {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
@@ -105,7 +92,6 @@ pub const GitHubCopilotOAuth = struct {
         const url = try self.getDeviceCodeUrl(&url_buf);
         const uri = std.Uri.parse(url) catch return CopilotError.InvalidResponse;
 
-        // Build request body
         var body_buf: [256]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, "client_id={s}&scope=read:user", .{CLIENT_ID}) catch return CopilotError.OutOfMemory;
 
@@ -125,7 +111,6 @@ pub const GitHubCopilotOAuth = struct {
 
         if (response.head.status != .ok) return CopilotError.DeviceFlowFailed;
 
-        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
         const reader = http.responseReader(&response, &transfer_buf);
         const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
@@ -141,10 +126,9 @@ pub const GitHubCopilotOAuth = struct {
         if (parsed.value != .object) return CopilotError.InvalidResponse;
         const obj = parsed.value.object;
 
-        // Check for error
         if (obj.get("error")) |err_val| {
             if (err_val == .string) {
-                _ = err_val.string; // Could log error
+                _ = err_val.string;
             }
             return CopilotError.DeviceFlowFailed;
         }
@@ -171,8 +155,6 @@ pub const GitHubCopilotOAuth = struct {
         };
     }
 
-    /// Poll for access token after user enters code
-    /// Returns null if still pending, credentials if successful
     pub fn pollForAccessToken(self: *Self, device_code: []const u8) CopilotError!?oauth.OAuthCredentials {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
@@ -181,7 +163,6 @@ pub const GitHubCopilotOAuth = struct {
         const url = try self.getAccessTokenUrl(&url_buf);
         const uri = std.Uri.parse(url) catch return CopilotError.InvalidResponse;
 
-        // Build request body
         var body_buf: [512]u8 = undefined;
         const body = std.fmt.bufPrint(
             &body_buf,
@@ -205,7 +186,6 @@ pub const GitHubCopilotOAuth = struct {
 
         if (response.head.status != .ok) return CopilotError.HttpError;
 
-        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
         const reader = http.responseReader(&response, &transfer_buf);
         const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
@@ -221,7 +201,6 @@ pub const GitHubCopilotOAuth = struct {
         if (parsed.value != .object) return CopilotError.InvalidResponse;
         const obj = parsed.value.object;
 
-        // Check for error responses
         if (obj.get("error")) |err_val| {
             if (err_val == .string) {
                 const err_str = err_val.string;
@@ -241,15 +220,12 @@ pub const GitHubCopilotOAuth = struct {
             return CopilotError.DeviceFlowFailed;
         }
 
-        // Success - extract access token
         const access_token = obj.get("access_token") orelse return null;
         if (access_token != .string) return CopilotError.InvalidResponse;
 
         const token = self.allocator.dupe(u8, access_token.string) catch return CopilotError.OutOfMemory;
         errdefer self.allocator.free(token);
 
-        // The refresh token is the same as access token for GitHub OAuth
-        // It's used to get a Copilot token, not a traditional refresh
         const refresh_token = self.allocator.dupe(u8, access_token.string) catch {
             self.allocator.free(token);
             return CopilotError.OutOfMemory;
@@ -262,7 +238,6 @@ pub const GitHubCopilotOAuth = struct {
         };
     }
 
-    /// Exchange GitHub access token for Copilot API token
     pub fn exchangeForCopilotToken(self: *Self, access_token: []const u8) CopilotError!CopilotToken {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
@@ -271,7 +246,6 @@ pub const GitHubCopilotOAuth = struct {
         const url = try self.getCopilotTokenUrl(&url_buf);
         const uri = std.Uri.parse(url) catch return CopilotError.InvalidResponse;
 
-        // Build auth header
         var auth_buf: [512]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{access_token}) catch return CopilotError.OutOfMemory;
 
@@ -293,7 +267,6 @@ pub const GitHubCopilotOAuth = struct {
 
         if (response.head.status != .ok) return CopilotError.TokenExchangeFailed;
 
-        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
         const reader = http.responseReader(&response, &transfer_buf);
         const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
@@ -318,7 +291,6 @@ pub const GitHubCopilotOAuth = struct {
         const token = self.allocator.dupe(u8, token_val.string) catch return CopilotError.OutOfMemory;
         errdefer self.allocator.free(token);
 
-        // Extract base URL from token
         const base_url = extractBaseUrlFromToken(token_val.string);
         const base_url_duped = if (base_url) |url| self.allocator.dupe(u8, url) catch null else null;
 
@@ -329,22 +301,15 @@ pub const GitHubCopilotOAuth = struct {
         };
     }
 
-    /// Full login flow with polling
-    /// onAuth callback receives (verification_uri, user_code)
-    /// Returns OAuth credentials on success
     pub fn login(
         self: *Self,
         onAuth: *const fn (verification_uri: []const u8, user_code: []const u8) void,
     ) CopilotError!oauth.OAuthCredentials {
-        // Start device flow
         var device_info = try self.startDeviceFlow();
         defer device_info.deinit(self.allocator);
 
-        // Notify user
         onAuth(device_info.verification_uri, device_info.user_code);
 
-        // Poll for access token. These are wall-clock seconds because the OAuth
-        // device-code expiry is specified relative to the current Unix time.
         var interval_ms: u64 = @as(u64, device_info.interval) * 1000;
         const deadline = compat.time.nowSeconds() + device_info.expires_in;
 
@@ -370,10 +335,7 @@ pub const GitHubCopilotOAuth = struct {
         return CopilotError.ExpiredToken;
     }
 
-    /// Refresh expired credentials using the GitHub access token
-    /// This exchanges the GitHub token for a new Copilot token
     pub fn refreshToken(self: *Self, refresh_token: []const u8) CopilotError!oauth.OAuthCredentials {
-        // Exchange GitHub access token for new Copilot token
         const copilot_token = try self.exchangeForCopilotToken(refresh_token);
 
         return oauth.OAuthCredentials{
@@ -383,12 +345,10 @@ pub const GitHubCopilotOAuth = struct {
         };
     }
 
-    /// Enable a model for use (POST to /models/{id}/policy)
     pub fn enableModel(self: *Self, token: []const u8, model_id: []const u8) !bool {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        // Determine base URL
         const base_url = if (self.enterprise_domain) |domain|
             try std.fmt.allocPrint(self.allocator, "https://copilot-api.{s}", .{domain})
         else
@@ -426,8 +386,6 @@ pub const GitHubCopilotOAuth = struct {
 };
 
 fn accessTokenExpiresMillis(now_seconds: i64) i64 {
-    // Set expiry to 5 minutes before actual expiry (similar to TypeScript):
-    // 3600s lifetime - 300s refresh buffer = 55 minutes from now.
     return (now_seconds + 3600 - 300) * std.time.ms_per_s;
 }
 
@@ -435,43 +393,31 @@ fn copilotTokenRefreshExpiresMillis(expires_at_seconds: i64) i64 {
     return expires_at_seconds * std.time.ms_per_s - 5 * std.time.s_per_min * std.time.ms_per_s;
 }
 
-/// Extract base URL from Copilot token's proxy-ep field
-/// Token format: "tid=...;exp=...;proxy-ep=proxy.individual.githubcopilot.com;..."
-/// Returns URL like "https://api.individual.githubcopilot.com"
 pub fn extractBaseUrlFromToken(token: []const u8) ?[]const u8 {
-    // Find "proxy-ep=" in token
     const prefix = "proxy-ep=";
     const start_idx = std.mem.find(u8, token, prefix) orelse return null;
     const value_start = start_idx + prefix.len;
 
-    // Find end of value (next semicolon or end of string)
     const remaining = token[value_start..];
     const end_idx = std.mem.find(u8, remaining, ";") orelse remaining.len;
 
     const proxy_host = remaining[0..end_idx];
     if (proxy_host.len == 0) return null;
 
-    // Validate it starts with "proxy."
     if (!std.mem.startsWith(u8, proxy_host, "proxy.")) return null;
 
-    // Convert "proxy.xxx" to "api.xxx" by skipping the "proxy" prefix
-    const api_host = proxy_host["proxy".len..]; // ".individual.githubcopilot.com"
+    const api_host = proxy_host["proxy".len..];
 
-    // Return pointer into original token with "api" prefix conceptually
-    // Caller needs to build the full URL
     return api_host;
 }
 
-/// Build the full API URL from a token's proxy-ep or enterprise domain
 pub fn getCopilotBaseUrl(token: ?[]const u8, enterprise_domain: ?[]const u8, buffer: []u8) ?[]u8 {
-    // If we have a token, try to extract base URL from proxy-ep
     if (token) |t| {
         if (extractBaseUrlFromToken(t)) |api_host| {
             return std.fmt.bufPrint(buffer, "https://api{s}", .{api_host}) catch null;
         }
     }
 
-    // Fallback for enterprise or if token parsing fails
     if (enterprise_domain) |domain| {
         return std.fmt.bufPrint(buffer, "https://copilot-api.{s}", .{domain}) catch null;
     }
@@ -479,23 +425,18 @@ pub fn getCopilotBaseUrl(token: ?[]const u8, enterprise_domain: ?[]const u8, buf
     return std.fmt.bufPrint(buffer, "https://api.individual.githubcopilot.com", .{}) catch null;
 }
 
-/// Normalize a domain input (URL or hostname) to just the hostname
 pub fn normalizeDomain(input: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, input, " \t\n\r");
     if (trimmed.len == 0) return null;
 
-    // Check if it looks like a URL
     if (std.mem.find(u8, trimmed, "://")) |idx| {
-        // Skip the scheme
         const after_scheme = trimmed[idx + 3 ..];
-        // Find end of host (before first / or end)
         if (std.mem.find(u8, after_scheme, "/")) |slash_idx| {
             return after_scheme[0..slash_idx];
         }
         return after_scheme;
     }
 
-    // Assume it's already a hostname - find first /
     if (std.mem.find(u8, trimmed, "/")) |slash_idx| {
         return trimmed[0..slash_idx];
     }
@@ -503,7 +444,6 @@ pub fn normalizeDomain(input: []const u8) ?[]const u8 {
     return trimmed;
 }
 
-// Tests
 test "OAuth token expiry arithmetic preserves second-to-millisecond behavior" {
     const cases = [_]struct { now_seconds: i64, expected_expires_ms: i64 }{
         .{ .now_seconds = 0, .expected_expires_ms = 3_300_000 },

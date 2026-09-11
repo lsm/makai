@@ -1,11 +1,8 @@
-//! Mouse event handling for terminal applications.
-//! Supports standard terminal mouse protocols.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const keys = @import("keys.zig");
 
-/// Mouse button types
 pub const Button = enum {
     left,
     middle,
@@ -21,7 +18,6 @@ pub const Button = enum {
     none,
 };
 
-/// Mouse event types
 pub const EventType = enum {
     press,
     release,
@@ -29,7 +25,6 @@ pub const EventType = enum {
     move,
 };
 
-/// A mouse event
 pub const MouseEvent = struct {
     x: u16,
     y: u16,
@@ -54,19 +49,13 @@ pub const MouseEvent = struct {
     }
 };
 
-/// Mouse tracking modes
 pub const TrackingMode = enum {
-    /// No mouse tracking
     none,
-    /// Report button press events only
     normal,
-    /// Report button press and release events
     button,
-    /// Report all mouse events including motion
     all,
 };
 
-/// Generate ANSI sequence to enable mouse tracking
 pub fn enableSequence(mode: TrackingMode) []const u8 {
     return switch (mode) {
         .none => "",
@@ -76,7 +65,6 @@ pub fn enableSequence(mode: TrackingMode) []const u8 {
     };
 }
 
-/// Generate ANSI sequence to disable mouse tracking
 pub fn disableSequence(mode: TrackingMode) []const u8 {
     return switch (mode) {
         .none => "",
@@ -92,9 +80,7 @@ test "normal mouse tracking preserves terminal drag selection mode" {
     try std.testing.expect(std.mem.indexOf(u8, enableSequence(.normal), "?1003h") == null);
 }
 
-/// Parse SGR mouse event (\x1b[<...M or \x1b[<...m)
 pub fn parseSgr(data: []const u8) ?struct { event: MouseEvent, consumed: usize } {
-    // Format: \x1b[<Cb;Cx;CyM or \x1b[<Cb;Cx;Cym
     if (data.len < 6) return null;
     if (!std.mem.startsWith(u8, data, "\x1b[<")) return null;
 

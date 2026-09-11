@@ -1,9 +1,3 @@
-//! Distributed Fullstack E2E (mock-based)
-//!
-//! Verifies agent loop end-to-end behavior when:
-//!   - provider calls flow through provider protocol bridge
-//!   - tool calls execute through tool protocol runtime
-//! without requiring external provider credentials.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -302,9 +296,6 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
         .execute_tool_via_protocol_ctx = &local_tools,
         .max_iterations = 4,
         .transform_context_fn = filterContextForProtocol,
-        // M-006: provide an explicit api_key so the binary's credential
-        // resolver does not reject the upstream stream_request with
-        // `auth_required`. The mock provider does not validate the key.
         .api_key = "test-key",
     });
     defer {

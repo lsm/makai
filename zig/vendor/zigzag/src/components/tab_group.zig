@@ -1,6 +1,3 @@
-//! Tab group and multi-view routing component.
-//! Provides tab-strip rendering, key-driven navigation, and optional
-//! type-erased view routing for multi-screen applications.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -9,10 +6,8 @@ const measure = @import("../layout/measure.zig");
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 
-/// Maximum number of key bindings tracked per action.
 const max_binds = 8;
 
-/// A single key binding (key + optional modifiers).
 pub const KeyBind = struct {
     key: keys.Key,
     modifiers: keys.Modifiers = .{},
@@ -22,7 +17,6 @@ pub const KeyBind = struct {
     }
 };
 
-/// Default next-tab bindings: Right, Tab.
 pub const default_next_keys = [max_binds]?KeyBind{
     .{ .key = .right },
     .{ .key = .tab },
@@ -34,7 +28,6 @@ pub const default_next_keys = [max_binds]?KeyBind{
     null,
 };
 
-/// Default previous-tab bindings: Left, Shift+Tab.
 pub const default_prev_keys = [max_binds]?KeyBind{
     .{ .key = .left },
     .{ .key = .tab, .modifiers = .{ .shift = true } },
@@ -46,7 +39,6 @@ pub const default_prev_keys = [max_binds]?KeyBind{
     null,
 };
 
-/// Default "first tab" bindings: Home.
 pub const default_first_keys = [max_binds]?KeyBind{
     .{ .key = .home },
     null,
@@ -58,7 +50,6 @@ pub const default_first_keys = [max_binds]?KeyBind{
     null,
 };
 
-/// Default "last tab" bindings: End.
 pub const default_last_keys = [max_binds]?KeyBind{
     .{ .key = .end },
     null,
@@ -70,7 +61,6 @@ pub const default_last_keys = [max_binds]?KeyBind{
     null,
 };
 
-/// Default activation bindings (manual activation mode): Enter, Space.
 pub const default_activate_keys = [max_binds]?KeyBind{
     .{ .key = .enter },
     .{ .key = .space },
@@ -82,7 +72,6 @@ pub const default_activate_keys = [max_binds]?KeyBind{
     null,
 };
 
-/// Why active tab changed.
 pub const ChangeReason = enum {
     init,
     set_active,
@@ -104,14 +93,12 @@ pub const Change = struct {
     reason: ChangeReason,
 };
 
-/// Result of handling a key event.
 pub const KeyResult = struct {
     consumed: bool = false,
     change: ?Change = null,
     routed: bool = false,
 };
 
-/// Tab label rendering context.
 pub const LabelState = struct {
     index: usize,
     active: bool,
@@ -121,11 +108,8 @@ pub const LabelState = struct {
 };
 
 pub const OverflowMode = enum {
-    /// Render all tabs (no clipping).
     none,
-    /// Render all tabs then truncate final output.
     clip,
-    /// Keep active/focused tab visible and show scroll markers.
     scroll,
 };
 
@@ -134,7 +118,6 @@ pub const RouteRenderer = *const fn (ctx: *anyopaque, allocator: std.mem.Allocat
 pub const RouteKeyHandler = *const fn (ctx: *anyopaque, event: keys.KeyEvent) bool;
 pub const RouteHook = *const fn (ctx: *anyopaque) void;
 
-/// Optional route callbacks attached to a tab.
 pub const Route = struct {
     ctx: *anyopaque,
     render_fn: RouteRenderer,
@@ -154,7 +137,6 @@ pub const Tab = struct {
     user_data: ?*anyopaque = null,
 };
 
-/// Tab strip + multi-view routing container.
 pub const TabGroup = struct {
     allocator: std.mem.Allocator,
     tabs: std.array_list.Managed(Tab),
@@ -162,23 +144,19 @@ pub const TabGroup = struct {
     active_index: ?usize,
     focus_index: ?usize,
 
-    // Focus protocol compatibility
     focused: bool = true,
 
-    // Navigation behavior
     wrap: bool = true,
     activate_on_focus: bool = true,
     number_shortcuts: bool = true,
     focus_disabled_tabs: bool = false,
 
-    // Key maps
     next_keys: [max_binds]?KeyBind = default_next_keys,
     prev_keys: [max_binds]?KeyBind = default_prev_keys,
     first_keys: [max_binds]?KeyBind = default_first_keys,
     last_keys: [max_binds]?KeyBind = default_last_keys,
     activate_keys: [max_binds]?KeyBind = default_activate_keys,
 
-    // Rendering options
     bar_style: style_mod.Style,
     tab_style: style_mod.Style,
     active_tab_style: style_mod.Style,
@@ -630,7 +608,6 @@ pub const TabGroup = struct {
         return .{};
     }
 
-    /// Handle tab navigation keys; if not consumed, forward key to active route.
     pub fn handleKeyAndRoute(self: *Self, event: keys.KeyEvent) KeyResult {
         var res = self.handleKey(event);
         if (!res.consumed) {
@@ -640,7 +617,6 @@ pub const TabGroup = struct {
         return res;
     }
 
-    /// Route a key event to active tab route (if it has a key handler).
     pub fn routeKey(self: *Self, event: keys.KeyEvent) bool {
         const idx = self.active_index orelse return false;
         const route = self.tabs.items[idx].route orelse return false;
@@ -648,19 +624,16 @@ pub const TabGroup = struct {
         return key_fn(route.ctx, event);
     }
 
-    /// Render only the tab strip.
     pub fn view(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
         return self.renderStrip(allocator);
     }
 
-    /// Render only the active route content (if any).
     pub fn viewActiveContent(self: *const Self, allocator: std.mem.Allocator) !?[]const u8 {
         const idx = self.active_index orelse return null;
         const route = self.tabs.items[idx].route orelse return null;
         return try route.render_fn(route.ctx, allocator);
     }
 
-    /// Render `tabs + content`, with optional fallback content when route is missing.
     pub fn viewWithContent(self: *const Self, allocator: std.mem.Allocator, fallback_content: ?[]const u8) ![]const u8 {
         const tabs = try self.renderStrip(allocator);
         const content = (try self.viewActiveContent(allocator)) orelse fallback_content orelse "";
@@ -753,7 +726,6 @@ pub const TabGroup = struct {
 
         var truncated_single: ?[]const u8 = null;
 
-        // Degenerate case: marker + single tab still wider than max.
         const single_range_w = rangeWidthWithMarkers(pieces, sep, start, end, left_w, right_w, start > 0, end < pieces.len);
         if (single_range_w > max_w and end == start + 1) {
             const reserved = (if (start > 0) left_w else 0) + (if (end < pieces.len) right_w else 0);

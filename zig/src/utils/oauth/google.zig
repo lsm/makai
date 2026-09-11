@@ -31,22 +31,17 @@ pub const Prompt = struct {
     allow_empty: bool = false,
 };
 
-/// Google OAuth login for Gemini CLI (callback server + project discovery)
 pub fn loginGeminiCLI(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     return try login(callbacks, allocator, 8085, client_id_gemini);
 }
 
-/// Google OAuth login (shared for Gemini CLI and Vertex)
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator, port: u16, client_id: []const u8) !Credentials {
-    // 1. Start local callback server
     var server = try callback_server.CallbackServer.start(allocator, port);
     defer server.stop();
 
-    // 2. Generate PKCE
     const pkce = try pkce_mod.generate(allocator);
     defer pkce.deinit(allocator);
 
-    // 3. Build authorization URL
     const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}/auth/callback", .{port});
     defer allocator.free(redirect_uri);
 
@@ -58,34 +53,27 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator, port: u16, clie
 
     callbacks.onAuth(.{ .url = auth_url });
 
-    // 4. Wait for callback or manual input
     const code = if (callbacks.onManualCodeInput) |manual_fn| blk: {
-        // Try callback first with short timeout
-        const callback_result = try server.waitForCode(30_000); // 30s
+        const callback_result = try server.waitForCode(30_000);
         if (callback_result) |c| break :blk c;
 
-        // Fallback to manual input
         const manual_result = manual_fn();
         break :blk try parseCodeFromUrl(allocator, manual_result);
     } else blk: {
-        break :blk try server.waitForCode(300_000) orelse return error.NoCodeReceived; // 5min
+        break :blk try server.waitForCode(300_000) orelse return error.NoCodeReceived;
     };
     defer allocator.free(code);
 
-    // 5. Exchange code for tokens
     const token_response = try exchangeCode(code, pkce.verifier, redirect_uri, client_id, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
-    // 6. Discover/provision Cloud Code Assist project
     const project_id = try discoverProject(token_response.access_token, allocator);
     defer allocator.free(project_id);
 
-    // 7. Get user email
     const email = try getUserEmail(token_response.access_token, allocator);
     defer allocator.free(email);
 
-    // 8. Build provider data JSON
     const provider_data = try std.fmt.allocPrint(allocator,
         "{{\"projectId\":\"{s}\",\"email\":\"{s}\"}}",
         .{ project_id, email },
@@ -101,7 +89,6 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator, port: u16, clie
     };
 }
 
-/// Refresh Google OAuth token
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
     const body = try std.fmt.allocPrint(allocator,
         "grant_type=refresh_token&refresh_token={s}&client_id={s}",
@@ -123,12 +110,10 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     };
 }
 
-/// Get API key from credentials (access token IS the API key)
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
 }
 
-/// Parse code from URL
 fn parseCodeFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     if (std.mem.find(u8, url, "code=")) |idx| {
         const code_start = idx + 5;
@@ -144,7 +129,6 @@ const TokenResponse = struct {
     expires_in: i64,
 };
 
-/// Exchange authorization code for tokens
 fn exchangeCode(code: []const u8, verifier: []const u8, redirect_uri: []const u8, client_id: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     const body = try std.fmt.allocPrint(allocator,
         "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}",
@@ -155,7 +139,6 @@ fn exchangeCode(code: []const u8, verifier: []const u8, redirect_uri: []const u8
     return try exchangeTokens(body, allocator);
 }
 
-/// Exchange tokens with Google API (mock implementation for testing)
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     _ = body;
     return .{
@@ -165,17 +148,13 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     };
 }
 
-/// Discover or provision Google Cloud Code Assist project
 fn discoverProject(access_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     _ = access_token;
-    // Real implementation would make HTTP requests to Cloud Code Assist API
     return try allocator.dupe(u8, "mock_project_id");
 }
 
-/// Get user email from Google API
 fn getUserEmail(access_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     _ = access_token;
-    // Real implementation would make HTTP GET to userinfo API
     return try allocator.dupe(u8, "user@example.com");
 }
 

@@ -488,8 +488,6 @@ pub const AuthProtocolServer = struct {
 
     fn loginWorkerMain(server: *Self, flow: *FlowState) void {
         defer {
-            // INVARIANT: this defer must never lock server.mutex.
-            // cleanupCompletedFlowsLocked() joins worker threads while holding it.
             flow.mutex.lockUncancelable(defaultIo());
             flow.worker_done = true;
             flow.cond.broadcast(defaultIo());
@@ -863,8 +861,6 @@ const OAuthThreadContext = struct {
 };
 
 threadlocal var g_oauth_thread_context: ?*OAuthThreadContext = null;
-// OAuth callback signatures do not carry user context, so the auth runtime uses
-// a thread-local bridge while a flow is executing on that worker thread.
 
 fn anthropicOnAuth(info: anthropic_oauth.AuthInfo) void {
     const context = g_oauth_thread_context orelse return;

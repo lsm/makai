@@ -1,11 +1,8 @@
-//! Text measurement utilities for ANSI-aware width and height calculation.
-//! Properly handles ANSI escape sequences and Unicode characters.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const unicode = @import("../unicode.zig");
 
-/// Calculate the visible width of a string (excluding ANSI escape sequences)
 pub fn width(str: []const u8) usize {
     var w: usize = 0;
     var max_width: usize = 0;
@@ -27,13 +24,11 @@ pub fn width(str: []const u8) usize {
             if (c == '[') {
                 escape_bracket = true;
             } else if (escape_bracket) {
-                // CSI sequence ends with letter
                 if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
                     in_escape = false;
                     escape_bracket = false;
                 }
             } else if (c == ']') {
-                // OSC sequence - skip until BEL or ST
                 i += 1;
                 while (i < str.len and str[i] != 0x07) {
                     if (str[i] == 0x1b and i + 1 < str.len and str[i + 1] == '\\') {
@@ -44,7 +39,6 @@ pub fn width(str: []const u8) usize {
                 }
                 in_escape = false;
             } else {
-                // Single-character escape
                 in_escape = false;
             }
             i += 1;
@@ -60,13 +54,12 @@ pub fn width(str: []const u8) usize {
 
         if (c == '\r' or c == '\t') {
             if (c == '\t') {
-                w += 8 - (w % 8); // Tab stops every 8 characters
+                w += 8 - (w % 8);
             }
             i += 1;
             continue;
         }
 
-        // Handle UTF-8 characters
         const byte_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         if (i + byte_len <= str.len) {
             const codepoint = std.unicode.utf8Decode(str[i..][0..byte_len]) catch {
@@ -86,7 +79,6 @@ pub fn width(str: []const u8) usize {
     return @max(max_width, w);
 }
 
-/// Calculate the height of a string (number of lines)
 pub fn height(str: []const u8) usize {
     if (str.len == 0) return 0;
 
@@ -97,7 +89,6 @@ pub fn height(str: []const u8) usize {
     return h;
 }
 
-/// Calculate both width and height
 pub fn size(str: []const u8) struct { width: usize, height: usize } {
     return .{
         .width = width(str),
@@ -105,12 +96,10 @@ pub fn size(str: []const u8) struct { width: usize, height: usize } {
     };
 }
 
-/// Get the display width of a Unicode codepoint using full Unicode tables.
 pub fn charWidth(codepoint: u21) usize {
     return unicode.charWidth(codepoint);
 }
 
-/// Get the width of a specific line
 pub fn lineWidth(str: []const u8, line_num: usize) usize {
     var lines = std.mem.splitScalar(u8, str, '\n');
     var current: usize = 0;
@@ -125,7 +114,6 @@ pub fn lineWidth(str: []const u8, line_num: usize) usize {
     return 0;
 }
 
-/// Get the maximum line width
 pub fn maxLineWidth(str: []const u8) usize {
     var max_w: usize = 0;
     var lines = std.mem.splitScalar(u8, str, '\n');
@@ -137,7 +125,6 @@ pub fn maxLineWidth(str: []const u8) usize {
     return max_w;
 }
 
-/// Pad a string to a specific width
 pub fn padRight(allocator: std.mem.Allocator, str: []const u8, target_width: usize) ![]const u8 {
     const current_width = width(str);
     if (current_width >= target_width) return try allocator.dupe(u8, str);
@@ -152,7 +139,6 @@ pub fn padRight(allocator: std.mem.Allocator, str: []const u8, target_width: usi
     return result.toOwnedSlice();
 }
 
-/// Pad a string on the left to a specific width
 pub fn padLeft(allocator: std.mem.Allocator, str: []const u8, target_width: usize) ![]const u8 {
     const current_width = width(str);
     if (current_width >= target_width) return try allocator.dupe(u8, str);
@@ -167,7 +153,6 @@ pub fn padLeft(allocator: std.mem.Allocator, str: []const u8, target_width: usiz
     return result.toOwnedSlice();
 }
 
-/// Center a string within a specific width
 pub fn center(allocator: std.mem.Allocator, str: []const u8, target_width: usize) ![]const u8 {
     const current_width = width(str);
     if (current_width >= target_width) return try allocator.dupe(u8, str);
@@ -189,7 +174,6 @@ pub fn center(allocator: std.mem.Allocator, str: []const u8, target_width: usize
     return result.toOwnedSlice();
 }
 
-/// Truncate string to fit within max width, adding ellipsis if needed
 pub fn truncate(allocator: std.mem.Allocator, str: []const u8, max_width: usize) ![]const u8 {
     if (max_width == 0) return try allocator.dupe(u8, "");
     if (width(str) <= max_width) return try allocator.dupe(u8, str);
@@ -205,7 +189,7 @@ pub fn truncate(allocator: std.mem.Allocator, str: []const u8, max_width: usize)
     var i: usize = 0;
     var in_escape = false;
 
-    const target = max_width - 3; // Leave room for "..."
+    const target = max_width - 3;
 
     while (i < str.len and w < target) {
         const c = str[i];
@@ -214,7 +198,6 @@ pub fn truncate(allocator: std.mem.Allocator, str: []const u8, max_width: usize)
             in_escape = true;
             const start = i;
             i += 1;
-            // Copy escape sequence
             while (i < str.len) {
                 if (str[i] == '[') {
                     i += 1;
@@ -233,7 +216,6 @@ pub fn truncate(allocator: std.mem.Allocator, str: []const u8, max_width: usize)
             continue;
         }
 
-        // Regular character
         const byte_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         if (i + byte_len <= str.len) {
             const codepoint = std.unicode.utf8Decode(str[i..][0..byte_len]) catch {
@@ -243,7 +225,6 @@ pub fn truncate(allocator: std.mem.Allocator, str: []const u8, max_width: usize)
                 continue;
             };
             const cw = unicode.charWidth(codepoint);
-            // Wide char would exceed target — stop here
             if (w + cw > target) break;
             try result.appendSlice(str[i..][0..byte_len]);
             w += cw;

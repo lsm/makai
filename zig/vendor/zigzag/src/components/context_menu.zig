@@ -1,5 +1,3 @@
-//! Context menu component.
-//! Popup menu triggered by keyboard shortcut or mouse, positioned at a target location.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -13,20 +11,16 @@ pub fn ContextMenu(comptime Action: type) type {
     return struct {
         const max_items = 20;
 
-        // Items
         items: [max_items]?MenuItem,
         item_count: usize,
 
-        // State
         visible: bool,
         cursor: usize,
         selected_action: ?Action,
 
-        // Position
         x: usize,
         y: usize,
 
-        // Styling
         item_style: style_mod.Style,
         active_style: style_mod.Style,
         disabled_style: style_mod.Style,
@@ -96,7 +90,6 @@ pub fn ContextMenu(comptime Action: type) type {
             };
         }
 
-        /// Add an action item.
         pub fn addItem(self: *Self, label: []const u8, shortcut: []const u8, action: Action) void {
             if (self.item_count >= max_items) return;
             self.items[self.item_count] = .{ .action = .{
@@ -108,7 +101,6 @@ pub fn ContextMenu(comptime Action: type) type {
             self.item_count += 1;
         }
 
-        /// Add a disabled item.
         pub fn addDisabledItem(self: *Self, label: []const u8, action: Action) void {
             if (self.item_count >= max_items) return;
             self.items[self.item_count] = .{ .action = .{
@@ -120,14 +112,12 @@ pub fn ContextMenu(comptime Action: type) type {
             self.item_count += 1;
         }
 
-        /// Add a separator.
         pub fn addSeparator(self: *Self) void {
             if (self.item_count >= max_items) return;
             self.items[self.item_count] = .{ .separator = {} };
             self.item_count += 1;
         }
 
-        /// Show the menu at a position.
         pub fn show(self: *Self, pos_x: usize, pos_y: usize) void {
             self.visible = true;
             self.cursor = 0;
@@ -137,10 +127,9 @@ pub fn ContextMenu(comptime Action: type) type {
             self.skipToNextEnabled();
         }
 
-        /// Show clamped to terminal bounds.
         pub fn showClamped(self: *Self, pos_x: usize, pos_y: usize, term_width: usize, term_height: usize) void {
-            const menu_width = self.calcWidth() + 4; // borders + padding
-            const menu_height = self.item_count + 2; // borders
+            const menu_width = self.calcWidth() + 4;
+            const menu_height = self.item_count + 2;
 
             const clamped_x = if (pos_x + menu_width > term_width)
                 term_width -| menu_width
@@ -155,7 +144,6 @@ pub fn ContextMenu(comptime Action: type) type {
             self.show(clamped_x, clamped_y);
         }
 
-        /// Hide the menu.
         pub fn hide(self: *Self) void {
             self.visible = false;
         }
@@ -164,14 +152,12 @@ pub fn ContextMenu(comptime Action: type) type {
             return self.visible;
         }
 
-        /// Get and consume the selected action.
         pub fn getSelectedAction(self: *Self) ?Action {
             const act = self.selected_action;
             self.selected_action = null;
             return act;
         }
 
-        /// Handle key events. Returns true if consumed.
         pub fn handleKey(self: *Self, key: keys.KeyEvent) bool {
             if (!self.visible) return false;
 
@@ -285,7 +271,6 @@ pub fn ContextMenu(comptime Action: type) type {
             return max_label + max_shortcut + 4;
         }
 
-        /// Render the context menu.
         pub fn view(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
             if (!self.visible) return try allocator.dupe(u8, "");
 
@@ -294,13 +279,10 @@ pub fn ContextMenu(comptime Action: type) type {
 
             const inner_width = self.calcWidth();
 
-            // Indent to x position
-            // Top border
             try self.writeIndent(w, self.x);
             try self.writeBorder(w, allocator, inner_width, .top);
             try w.writeByte('\n');
 
-            // Items
             for (self.items[0..self.item_count], 0..) |maybe_item, i| {
                 const item = maybe_item orelse continue;
 
@@ -341,7 +323,6 @@ pub fn ContextMenu(comptime Action: type) type {
                 try w.writeByte('\n');
             }
 
-            // Bottom border
             try self.writeIndent(w, self.x);
             try self.writeBorder(w, allocator, inner_width, .bottom);
 

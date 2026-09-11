@@ -4,13 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { getNoopLogger, type MakaiLogger } from "./logger";
 
-/** Shared binary resolver options. */
 type BinaryResolverBaseOptions = {
   cacheDir?: string;
   logger?: MakaiLogger;
 };
 
-/** Resolve Makai from an explicit filesystem path. */
 type BinaryPathResolverOptions = BinaryResolverBaseOptions & {
   type?: "path";
   binaryPath: string;
@@ -18,7 +16,6 @@ type BinaryPathResolverOptions = BinaryResolverBaseOptions & {
   checksumSha256?: string;
 };
 
-/** Download Makai from a URL and verify it with a required SHA-256 checksum. */
 type BinaryUrlResolverOptions = BinaryResolverBaseOptions & {
   type?: "url";
   binaryPath?: undefined;
@@ -26,7 +23,6 @@ type BinaryUrlResolverOptions = BinaryResolverBaseOptions & {
   checksumSha256: string;
 };
 
-/** Resolve Makai automatically from local build outputs or the system PATH. */
 type BinaryAutoResolverOptions = BinaryResolverBaseOptions & {
   type?: "auto";
   binaryPath?: undefined;
@@ -34,12 +30,6 @@ type BinaryAutoResolverOptions = BinaryResolverBaseOptions & {
   checksumSha256?: string;
 };
 
-/**
- * Strategy options for locating the `makai` executable used by stdio clients.
- *
- * Use `binaryPath` for an existing local binary, `binaryUrl` plus
- * `checksumSha256` for a verified download, or omit both for automatic lookup.
- */
 export type BinaryResolverOptions =
   | BinaryPathResolverOptions
   | BinaryUrlResolverOptions
@@ -110,16 +100,6 @@ async function downloadToCache(url: string, targetPath: string, checksumSha256: 
   await fs.rename(tempPath, targetPath);
 }
 
-/**
- * Resolves the Makai executable path according to environment variables and options.
- *
- * Environment variables take precedence over options: `MAKAI_BINARY_PATH`,
- * `MAKAI_BINARY_URL`, and `MAKAI_BINARY_SHA256`.
- *
- * @param options Resolver strategy and cache directory options.
- * @returns Absolute path to a local binary, or `"makai"` to use PATH lookup.
- * @throws If an explicit binary is missing, download fails, or checksum verification fails.
- */
 export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): Promise<string> {
   const logger = options.logger ?? getNoopLogger();
 
@@ -170,7 +150,6 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
 
   const binaryName = binaryNameForPlatform();
 
-  // Check bundled platform-specific package first
   const platformKey = `${process.platform}-${process.arch}`;
   const bundledPackage = `@makai/cli-${platformKey}`;
   try {

@@ -12,13 +12,9 @@ fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
 }
 
 test "ollama e2e: basic text generation (new api)" {
-    // Ollama can run in two modes:
-    // 1. Cloud API (ollama.com) - requires OLLAMA_API_KEY
-    // 2. Local server (localhost:11434) - no auth required
     const api_key = getEnvOwned(testing.allocator, "OLLAMA_API_KEY");
     defer if (api_key) |k| testing.allocator.free(k);
 
-    // Skip if no API key and local server isn't running
     if (api_key == null) {
         var client = std.http.Client{ .allocator = testing.allocator, .io = std.testing.io };
         defer client.deinit();
@@ -52,7 +48,6 @@ test "ollama e2e: basic text generation (new api)" {
         }
     }
 
-    // Use gemma4:31b as default - a free model currently available on the Ollama cloud API
     const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "gemma4:31b");
     defer testing.allocator.free(model_id);
 
@@ -98,7 +93,6 @@ test "ollama e2e: basic text generation (new api)" {
         compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
-    // Allow detached provider thread to complete deferred cleanup
     compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {

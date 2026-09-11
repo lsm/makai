@@ -1,5 +1,3 @@
-//! Help component for displaying key bindings.
-//! Shows keyboard shortcuts and their descriptions.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -11,16 +9,13 @@ const join = @import("../layout/join.zig");
 pub const Help = struct {
     allocator: std.mem.Allocator,
 
-    // Bindings
     bindings: std.array_list.Managed(Binding),
 
-    // Appearance
     separator: []const u8,
     ellipsis: []const u8,
     max_width: ?u16,
     short_mode: bool,
 
-    // Styling
     key_style: style_mod.Style,
     desc_style: style_mod.Style,
     sep_style: style_mod.Style,
@@ -65,7 +60,6 @@ pub const Help = struct {
         self.bindings.deinit();
     }
 
-    /// Create a Help component from a KeyMap
     pub fn fromKeyMap(allocator: std.mem.Allocator, keymap: anytype) !Help {
         var help = Help.init(allocator);
         const bindings = try keymap.toHelpBindings(allocator);
@@ -73,7 +67,6 @@ pub const Help = struct {
         return help;
     }
 
-    /// Add a key binding
     pub fn addBinding(self: *Help, key: []const u8, description: []const u8) !void {
         try self.bindings.append(.{
             .key = key,
@@ -82,7 +75,6 @@ pub const Help = struct {
         });
     }
 
-    /// Add a key binding with short description
     pub fn addBindingShort(self: *Help, key: []const u8, description: []const u8, short_desc: []const u8) !void {
         try self.bindings.append(.{
             .key = key,
@@ -91,28 +83,23 @@ pub const Help = struct {
         });
     }
 
-    /// Set bindings from a list
     pub fn setBindings(self: *Help, bindings: []const Binding) !void {
         self.bindings.clearRetainingCapacity();
         try self.bindings.appendSlice(bindings);
     }
 
-    /// Clear all bindings
     pub fn clear(self: *Help) void {
         self.bindings.clearRetainingCapacity();
     }
 
-    /// Set max width (enables truncation)
     pub fn setMaxWidth(self: *Help, width: u16) void {
         self.max_width = width;
     }
 
-    /// Enable/disable short mode
     pub fn setShortMode(self: *Help, short: bool) void {
         self.short_mode = short;
     }
 
-    /// Render the help
     pub fn view(self: *const Help, allocator: std.mem.Allocator) ![]const u8 {
         if (self.bindings.items.len == 0) {
             return try allocator.dupe(u8, "");
@@ -124,7 +111,6 @@ pub const Help = struct {
         var total_width: usize = 0;
 
         for (self.bindings.items, 0..) |binding, i| {
-            // Calculate this binding's width
             const desc = if (self.short_mode and binding.short_desc != null)
                 binding.short_desc.?
             else
@@ -133,11 +119,9 @@ pub const Help = struct {
             const binding_text = try std.fmt.allocPrint(allocator, "{s} {s}", .{ binding.key, desc });
             const binding_width = measure.width(binding_text);
 
-            // Check if we need truncation
             if (self.max_width) |max_w| {
                 const sep_width = if (i > 0) measure.width(self.separator) else 0;
                 if (total_width + sep_width + binding_width > max_w) {
-                    // Add ellipsis and stop
                     if (i > 0) {
                         const sep_styled = try self.sep_style.render(allocator, self.separator);
                         try writer.writeAll(sep_styled);
@@ -147,18 +131,15 @@ pub const Help = struct {
                 }
             }
 
-            // Add separator
             if (i > 0) {
                 const sep_styled = try self.sep_style.render(allocator, self.separator);
                 try writer.writeAll(sep_styled);
                 total_width += measure.width(self.separator);
             }
 
-            // Add key
             const key_styled = try self.key_style.render(allocator, binding.key);
             try writer.writeAll(key_styled);
 
-            // Add description
             try writer.writeByte(' ');
             const desc_styled = try self.desc_style.render(allocator, desc);
             try writer.writeAll(desc_styled);
@@ -169,13 +150,11 @@ pub const Help = struct {
         return result.toOwnedSlice();
     }
 
-    /// Render as a vertical list
     pub fn viewVertical(self: *const Help, allocator: std.mem.Allocator) ![]const u8 {
         if (self.bindings.items.len == 0) {
             return try allocator.dupe(u8, "");
         }
 
-        // Find max key width
         var max_key_width: usize = 0;
         for (self.bindings.items) |binding| {
             max_key_width = @max(max_key_width, measure.width(binding.key));
@@ -187,7 +166,6 @@ pub const Help = struct {
         for (self.bindings.items, 0..) |binding, i| {
             if (i > 0) try writer.writeByte('\n');
 
-            // Key with padding
             const key_styled = try self.key_style.render(allocator, binding.key);
             try writer.writeAll(key_styled);
 
@@ -196,7 +174,6 @@ pub const Help = struct {
                 try writer.writeByte(' ');
             }
 
-            // Description
             const desc = if (self.short_mode and binding.short_desc != null)
                 binding.short_desc.?
             else
@@ -209,7 +186,6 @@ pub const Help = struct {
     }
 };
 
-/// Common key binding sets
 pub const CommonBindings = struct {
     pub const navigation = [_]Help.Binding{
         .{ .key = "↑/k", .description = "Move up", .short_desc = "up" },

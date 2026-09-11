@@ -1,13 +1,3 @@
-//! UI-level end-to-end tests for the Makai TUI.
-//!
-//! These drive the real `TuiModel` (init/update/view) the same way the zigzag
-//! runtime does: simulated keystrokes flow through `update`, and assertions run
-//! against the fully rendered frame produced by `view`. A `MockProvider` stands
-//! in for the network so turns, tool calls, and approvals are deterministic.
-//!
-//! The driver redirects `$HOME` to a throwaway temp directory so the session
-//! store never touches the developer's real `~/.makai`, keeping each test
-//! hermetic.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -34,8 +24,6 @@ const DriverOptions = struct {
     height: u16 = 30,
 };
 
-/// Drives a real `TuiModel` through simulated keystrokes and renders frames,
-/// mirroring how the zigzag `Program` runtime would.
 const Driver = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -57,9 +45,6 @@ const Driver = struct {
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
 
-        // Point the session store at the temp dir. The store joins HOME with
-        // ".makai/sessions" and creates it relative to the cwd, so a cwd-relative
-        // HOME keeps every file inside the temp tree the cleanup() removes.
         self.saved_home = compat.getEnvVarOwned(gpa, "HOME") catch null;
         const rel_home = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{self.tmp.sub_path[0..]});
         defer gpa.free(rel_home);
@@ -67,7 +52,6 @@ const Driver = struct {
         defer gpa.free(rel_home_z);
         _ = setenv("HOME", rel_home_z.ptr, 1);
 
-        // Frame allocator is the arena (reset each render); model state lives on gpa.
         self.ctx = zz.Context.init(self.arena.allocator(), gpa, std.testing.io, &self.env);
         self.ctx.width = view_opts.width;
         self.ctx.height = view_opts.height;
@@ -126,8 +110,6 @@ const Driver = struct {
         _ = self.model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &self.ctx);
     }
 
-    /// Render a frame. The returned slice is owned by the frame arena and stays
-    /// valid until the next `frame()` call or `deinit()`.
     fn frame(self: *Driver) []const u8 {
         _ = self.arena.reset(.retain_capacity);
         return self.model.view(&self.ctx);
@@ -137,7 +119,6 @@ const Driver = struct {
         return std.mem.indexOf(u8, self.frame(), needle) != null;
     }
 
-    /// Tick (draining async events) until `pred` holds or the budget runs out.
     fn pumpUntil(self: *Driver, pred: *const fn (*App) bool, max_iters: usize) !void {
         var i: usize = 0;
         while (i < max_iters) : (i += 1) {
@@ -148,8 +129,6 @@ const Driver = struct {
         return error.PumpTimeout;
     }
 
-    /// Tick until the rendered frame contains the expected output and the turn
-    /// is terminal. These are separate async events, so either may arrive first.
     fn pumpUntilTurnComplete(self: *Driver, needle: []const u8, max_iters: usize) !void {
         var i: usize = 0;
         while (i < max_iters) : (i += 1) {
@@ -277,11 +256,9 @@ test "e2e: tool approval prompt appears and approving runs the tool to completio
     d.typeText("please run the shell tool");
     d.pressEnter();
 
-    // The agent thread blocks awaiting approval; ticking surfaces the prompt.
     try d.pumpUntil(inApprovalMode, 2000);
     try std.testing.expect(d.frameContains("shell_command"));
 
-    // Approve: 'y' in approval mode resolves the waiter and the loop resumes.
     d.typeText("y");
     try d.pumpUntilTurnComplete(fixtures.final_text, 2000);
 
@@ -322,7 +299,6 @@ test "e2e: /model opens the picker and selecting switches the active model" {
     try std.testing.expect(d.frameContains("Select model"));
     try std.testing.expect(d.frameContains("second-model"));
 
-    // Highlight the second model and choose it.
     d.sendKey(.down);
     d.sendKey(.enter);
 
@@ -406,9 +382,6 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     try std.testing.expect(d.frameContains("Login provider"));
     try std.testing.expect(d.frameContains("anthropic"));
 
-    // Selecting a provider starts its OAuth worker and reports progress. The
-    // worker blocks awaiting a pasted code; cancelling (handled in deinit) makes
-    // the flow abort locally without any network exchange.
     d.sendKey(.enter);
     try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
     try std.testing.expect(d.frameContains("starting login for anthropic"));
@@ -445,13 +418,10 @@ test "e2e: /copy reports when there is a reply to copy" {
     }, .{});
     defer d.deinit();
 
-    // No assistant reply yet.
     d.typeText("/copy");
     d.pressEnter();
     try std.testing.expect(d.frameContains("nothing to copy yet"));
 
-    // With a reply present, /copy reports success (clipboard write is a no-op
-    // without a TTY, but the staging path runs).
     try d.app().state.appendTranscript(.assistant, "the answer is 42");
     d.typeText("/copy");
     d.pressEnter();
@@ -515,8 +485,6 @@ test "e2e: /export picker saves transcript to default file" {
     try std.Io.Dir.deleteFile(.cwd(), std.testing.io, path);
 }
 
-/// Returns the path from the most recent system transcript entry that reports a
-/// successful transcript export (e.g. "exported transcript to <path>").
 fn exportedTranscriptPath(app: *App) ?[]const u8 {
     const prefix = "exported transcript to ";
     var i = app.state.transcript.items.len;
@@ -573,7 +541,6 @@ test "e2e: /sessions opens the picker and resuming replays the saved transcript"
     }, .{});
     defer d.deinit();
 
-    // Seed one saved session into the (temp) store the driver's App reads from.
     {
         var store = try session_store.Store.initDefault(std.testing.allocator);
         defer store.deinit();
@@ -599,15 +566,13 @@ test "e2e: /sessions opens the picker and resuming replays the saved transcript"
         try store.save(meta, .{ .message_end = .{ .role = .assistant } });
     }
 
-    // /sessions reloads from the store and opens the picker.
     d.typeText("/sessions");
     d.pressEnter();
-    _ = d.frame(); // establishes last_view_height for picker sizing
+    _ = d.frame();
 
     try std.testing.expectEqual(tui_state.AppMode.session_picker, d.app().state.mode);
     try std.testing.expect(d.app().state.sessions.items.len >= 1);
 
-    // Resume the (only) selected session; its transcript should be replayed.
     d.sendKey(.enter);
 
     try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);

@@ -18,9 +18,6 @@ pub const Options = struct {
     empty_message: []const u8 = "  (nothing to select)",
 };
 
-/// Render a bordered single-column selection menu: a title, then one row per
-/// item with a ">" marker on the selected row. Shared by the /model and /login
-/// pickers, which differ only in title and item source.
 pub fn render(allocator: std.mem.Allocator, options: Options) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     const writer = &out.writer;

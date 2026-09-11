@@ -1,4 +1,3 @@
-//! Cartesian chart widget with axes, legend, and multiple datasets.
 
 const std = @import("std");
 const Writer = std.Io.Writer;

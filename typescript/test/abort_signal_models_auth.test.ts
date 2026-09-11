@@ -1,6 +1,3 @@
-/**
- * Tests for AbortSignal support in models and auth APIs.
- */
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -74,10 +71,6 @@ async function setupModelsHarness(): Promise<ModelsHarness> {
   };
 }
 
-// ---------------------------------------------------------------------------
-// models.list abort tests
-// ---------------------------------------------------------------------------
-
 test("models.list rejects immediately with AbortSignal.abort()", async () => {
   const harness = await setupModelsHarness();
   try {
@@ -106,7 +99,7 @@ test("models.list rejects when signal is aborted during response wait", async ()
       ...process.env,
       MAKAI_TEST_REQUEST_LOG: logPath,
       MAKAI_TEST_RESPONSE_PATH: responsePath,
-      MAKAI_TEST_RESPONSE_DELAY_MS: "5000", // Slow response so abort fires during wait
+      MAKAI_TEST_RESPONSE_DELAY_MS: "5000",
     },
     handshakeTimeoutMs: 5000,
   });
@@ -116,7 +109,6 @@ test("models.list rejects when signal is aborted during response wait", async ()
     const controller = new AbortController();
     const listPromise = api.list({ provider_id: "anthropic", signal: controller.signal });
 
-    // Abort after a short delay
     await new Promise((resolve) => setTimeout(resolve, 10));
     controller.abort();
 
@@ -158,10 +150,6 @@ test("models.list succeeds when signal is not aborted", async () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// auth.login abort tests
-// ---------------------------------------------------------------------------
-
 test("auth.login rejects immediately with AbortSignal.abort()", async () => {
   const fixture = path.join(sourceFixturesDir, "auth-protocol-login-success-server.js");
   const client = await createMakaiAuthClient({
@@ -198,10 +186,6 @@ test("auth.login succeeds when signal is not aborted", async () => {
     await client.close();
   }
 });
-
-// ---------------------------------------------------------------------------
-// createMakaiClient integration abort test
-// ---------------------------------------------------------------------------
 
 test("createMakaiClient provider.complete rejects with AbortSignal.abort()", async () => {
   const fixtureScript = path.join(sourceFixturesDir, "execution-server.js");

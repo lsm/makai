@@ -1,5 +1,3 @@
-//! Notification/Toast component for timed messages.
-//! Displays auto-dismissing messages with severity levels.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -25,7 +23,6 @@ pub const Notification = struct {
     messages: std.array_list.Managed(ToastMessage),
     max_visible: usize,
 
-    // Styling per level
     info_style: style_mod.Style,
     success_style: style_mod.Style,
     warning_style: style_mod.Style,
@@ -67,7 +64,6 @@ pub const Notification = struct {
         self.messages.deinit();
     }
 
-    /// Push a new notification
     pub fn push(self: *Notification, text: []const u8, level: Level, duration_ms: u64, current_ns: u64) !void {
         try self.messages.append(.{
             .text = text,
@@ -77,7 +73,6 @@ pub const Notification = struct {
         });
     }
 
-    /// Remove expired notifications
     pub fn update(self: *Notification, current_ns: u64) void {
         var i: usize = 0;
         while (i < self.messages.items.len) {
@@ -91,12 +86,10 @@ pub const Notification = struct {
         }
     }
 
-    /// Check if there are any active notifications
     pub fn hasMessages(self: *const Notification) bool {
         return self.messages.items.len > 0;
     }
 
-    /// Render notifications
     pub fn view(self: *const Notification, allocator: std.mem.Allocator) ![]const u8 {
         if (self.messages.items.len == 0) {
             return try allocator.dupe(u8, "");

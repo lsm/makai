@@ -1,4 +1,3 @@
-//! Process environment values captured at program startup.
 
 const std = @import("std");
 const builtin = @import("builtin");

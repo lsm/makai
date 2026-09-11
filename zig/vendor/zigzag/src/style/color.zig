@@ -1,23 +1,16 @@
-//! Color types for terminal styling.
-//! Supports ANSI 16, 256, and TrueColor (24-bit) colors.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const builtin = @import("builtin");
 const ansi = @import("../terminal/ansi.zig");
 
-/// Color representation supporting multiple color modes
 pub const Color = union(enum) {
-    /// No color (use terminal default)
     none,
 
-    /// Basic ANSI colors (0-15)
     ansi: AnsiColor,
 
-    /// 256-color palette (0-255)
     ansi256: u8,
 
-    /// True color (24-bit RGB)
     rgb: RGB,
 
     pub const RGB = struct {
@@ -26,7 +19,6 @@ pub const Color = union(enum) {
         b: u8,
     };
 
-    // Basic ANSI colors
     pub const black: Color = .{ .ansi = .black };
     pub const red: Color = .{ .ansi = .red };
     pub const green: Color = .{ .ansi = .green };
@@ -36,7 +28,6 @@ pub const Color = union(enum) {
     pub const cyan: Color = .{ .ansi = .cyan };
     pub const white: Color = .{ .ansi = .white };
 
-    // Bright ANSI colors
     pub const brightBlack: Color = .{ .ansi = .bright_black };
     pub const brightRed: Color = .{ .ansi = .bright_red };
     pub const brightGreen: Color = .{ .ansi = .bright_green };
@@ -46,12 +37,10 @@ pub const Color = union(enum) {
     pub const brightCyan: Color = .{ .ansi = .bright_cyan };
     pub const brightWhite: Color = .{ .ansi = .bright_white };
 
-    /// Create a color from RGB values
     pub fn fromRgb(r: u8, g: u8, b: u8) Color {
         return .{ .rgb = .{ .r = r, .g = g, .b = b } };
     }
 
-    /// Create a color from a hex string (e.g., "#FF5733" or "FF5733")
     pub fn hex(str: []const u8) Color {
         const s = if (str.len > 0 and str[0] == '#') str[1..] else str;
 
@@ -64,23 +53,19 @@ pub const Color = union(enum) {
         return .{ .rgb = .{ .r = r, .g = g, .b = b } };
     }
 
-    /// Create a color from the 256-color palette
     pub fn color256(n: u8) Color {
         return .{ .ansi256 = n };
     }
 
-    /// Create a grayscale color (0-23, where 0 is dark and 23 is light)
     pub fn gray(level: u8) Color {
         if (level > 23) return .{ .ansi256 = 255 };
         return .{ .ansi256 = 232 + level };
     }
 
-    /// Check if this is a "no color" value
     pub fn isNone(self: Color) bool {
         return self == .none;
     }
 
-    /// Convert to RGB (approximating ANSI colors)
     pub fn toRgb(self: Color) ?RGB {
         return switch (self) {
             .none => null,
@@ -90,7 +75,6 @@ pub const Color = union(enum) {
         };
     }
 
-    /// Write foreground color ANSI sequence
     pub fn writeFg(self: Color, writer: *Writer) !void {
         switch (self) {
             .none => {},
@@ -100,7 +84,6 @@ pub const Color = union(enum) {
         }
     }
 
-    /// Write background color ANSI sequence
     pub fn writeBg(self: Color, writer: *Writer) !void {
         switch (self) {
             .none => {},
@@ -110,7 +93,6 @@ pub const Color = union(enum) {
         }
     }
 
-    /// Calculate contrast ratio with another color
     pub fn contrastRatio(self: Color, other: Color) f32 {
         const rgb1 = self.toRgb() orelse return 1.0;
         const rgb2 = other.toRgb() orelse return 1.0;
@@ -136,7 +118,6 @@ pub const Color = union(enum) {
     }
 };
 
-/// Basic ANSI colors
 pub const AnsiColor = enum(u8) {
     black = 0,
     red = 1,
@@ -187,13 +168,10 @@ pub const AnsiColor = enum(u8) {
     }
 };
 
-/// Convert 256-color index to RGB
 fn ansi256ToRgb(n: u8) Color.RGB {
     if (n < 16) {
-        // Standard colors
         return @as(AnsiColor, @enumFromInt(n)).toRgb();
     } else if (n < 232) {
-        // 6x6x6 color cube
         const idx = n - 16;
         const r: u8 = @intCast((idx / 36) % 6);
         const g: u8 = @intCast((idx / 6) % 6);
@@ -204,19 +182,14 @@ fn ansi256ToRgb(n: u8) Color.RGB {
             .b = if (b == 0) 0 else b * 40 + 55,
         };
     } else {
-        // Grayscale
         const gray: u8 = (n - 232) * 10 + 8;
         return .{ .r = gray, .g = gray, .b = gray };
     }
 }
 
-/// Adaptive color that changes based on terminal capabilities
 pub const AdaptiveColor = struct {
-    /// Color for terminals with true color support
     true_color: Color,
-    /// Fallback for 256-color terminals
     color_256: Color,
-    /// Fallback for basic 16-color terminals
     ansi: Color,
 
     pub fn resolve(self: AdaptiveColor, supports_true_color: bool, supports_256: bool) Color {
@@ -226,13 +199,11 @@ pub const AdaptiveColor = struct {
     }
 };
 
-/// Complete color for foreground and background
 pub const CompleteColor = struct {
     fg: Color = .none,
     bg: Color = .none,
 };
 
-/// Complete adaptive color that changes based on terminal background
 pub const CompleteAdaptiveColor = struct {
     light: CompleteColor,
     dark: CompleteColor,
@@ -242,7 +213,6 @@ pub const CompleteAdaptiveColor = struct {
     }
 };
 
-/// Color profile representing terminal color capabilities
 pub const ColorProfile = enum {
     ascii,
     ansi,
@@ -255,10 +225,8 @@ pub const ColorProfile = enum {
         term: []const u8 = "",
     };
 
-    /// Detect terminal color profile from values captured at startup.
     pub fn detect(hints: DetectionHints) ColorProfile {
         if (comptime builtin.os.tag == .windows) {
-            // Windows Terminal supports true color VT sequences
             return .true_color;
         }
 
@@ -279,36 +247,30 @@ pub const ColorProfile = enum {
         return .ansi;
     }
 
-    /// Check if this profile supports true color
     pub fn supportsTrueColor(self: ColorProfile) bool {
         return self == .true_color;
     }
 
-    /// Check if this profile supports 256 colors
     pub fn supports256(self: ColorProfile) bool {
         return self == .true_color or self == .ansi256;
     }
 
-    /// Check if this profile supports any color
     pub fn supportsColor(self: ColorProfile) bool {
         return self != .ascii;
     }
 };
 
-/// Detect if terminal has a dark background from the COLORFGBG value captured at startup.
 pub fn hasDarkBackground(color_fg_bg: []const u8) bool {
     if (comptime builtin.os.tag == .windows) {
         return true;
     }
 
     if (color_fg_bg.len > 0) {
-        // Format: "foreground;background"
         if (std.mem.lastIndexOfScalar(u8, color_fg_bg, ';')) |idx| {
             const bg_str = color_fg_bg[idx + 1 ..];
             const bg_num = std.fmt.parseInt(u8, bg_str, 10) catch return true;
-            // Low numbers typically mean dark background
             return bg_num < 8;
         }
     }
-    return true; // Default to dark
+    return true;
 }

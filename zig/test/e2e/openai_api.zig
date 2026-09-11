@@ -23,7 +23,6 @@ fn waitResultOrFail(stream: *event_stream.AssistantMessageEventStream) !ai_types
         compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
-    // Small delay to allow detached provider thread to fully exit and free resources
     compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {

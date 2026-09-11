@@ -3,7 +3,6 @@ const provider_types = @import("protocol_types");
 const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Re-export Ulid from provider types for convenience
 pub const Ulid = provider_types.Ulid;
 pub const generateUlid = provider_types.generateUlid;
 pub const ulidToString = provider_types.ulidToString;
@@ -13,15 +12,10 @@ pub const generateSessionId = provider_types.generateSessionId;
 pub const sessionIdToString = provider_types.sessionIdToString;
 pub const parseSessionId = provider_types.parseSessionId;
 
-/// Re-export provider ack/nack/error-code envelope types so that the agent
-/// passthrough emits the same shape as the provider protocol.
 pub const Ack = provider_types.Ack;
 pub const Nack = provider_types.Nack;
 pub const ErrorCode = provider_types.ErrorCode;
 
-/// Re-export shared model catalog types — the agent passthrough must return
-/// the same typed shape as the provider protocol (no raw JSON blob passthrough).
-/// See `docs/v1-sdk-agent-provider-spec.md §6`.
 pub const ModelDescriptor = model_catalog_types.ModelDescriptor;
 pub const ModelCapability = model_catalog_types.ModelCapability;
 pub const ModelLifecycle = model_catalog_types.ModelLifecycle;
@@ -31,27 +25,8 @@ pub const AuthStatus = model_catalog_types.AuthStatus;
 pub const MetadataEntry = model_catalog_types.MetadataEntry;
 pub const ModelsResponse = model_catalog_types.ModelsResponse;
 
-/// Reuse provider's `ModelsRequest` shape verbatim so the agent passthrough is
-/// indistinguishable from the canonical provider protocol on the wire.
 pub const ModelsRequest = provider_types.ModelsRequest;
 
-// ============================================================================
-// Agent Protocol Types
-// ============================================================================
-//
-// These types define the wire protocol for distributed agent communication.
-// This protocol allows agents to run on separate processes/machines from
-// clients and providers.
-//
-// Architecture:
-//   Client <--protocol/agent--> Agent <--protocol/provider--> Provider
-//
-// The agent protocol enables:
-// - Remote agent execution
-// - Agent service scaling
-// - Tool execution distribution
-
-/// Error codes specific to agent protocol
 pub const AgentErrorCode = enum {
     invalid_request,
     agent_not_found,
@@ -62,21 +37,12 @@ pub const AgentErrorCode = enum {
     internal_error,
     agent_busy,
     session_expired,
-    /// No credentials available for the upstream provider; client must
-    /// authenticate. Mirrors `protocol/provider` `auth_required` so the
-    /// agent surface can propagate auth-required signals from the request
-    /// path. M-007 will add `auth_refresh_failed` and `auth_expired` as
-    /// refresh-on-expiry semantics land.
     auth_required,
 };
 
-/// Request to start an agent session
 pub const AgentStartRequest = struct {
-    /// Agent configuration (model, tools, etc.)
     config_json: []const u8,
-    /// Initial system prompt
     system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Session ID for resumption (null for new session)
     session_id: ?SessionId = null,
 
     pub fn getSystemPrompt(self: *const AgentStartRequest) ?[]const u8 {
@@ -85,13 +51,9 @@ pub const AgentStartRequest = struct {
     }
 };
 
-/// Request to send a message to an agent
 pub const AgentMessageRequest = struct {
-    /// Target agent session
     session_id: SessionId,
-    /// Message to send
     message_json: []const u8,
-    /// Options for this message
     options_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getOptionsJson(self: *const AgentMessageRequest) ?[]const u8 {
@@ -100,11 +62,8 @@ pub const AgentMessageRequest = struct {
     }
 };
 
-/// Request to stop an agent session
 pub const AgentStopRequest = struct {
-    /// Target agent session
     session_id: SessionId,
-    /// Reason for stopping
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getReason(self: *const AgentStopRequest) ?[]const u8 {
@@ -113,15 +72,10 @@ pub const AgentStopRequest = struct {
     }
 };
 
-/// Request to execute a tool (from agent to tool server)
 pub const ToolExecuteRequest = struct {
-    /// Tool call ID for correlation
     tool_call_id: []const u8,
-    /// Tool name
     tool_name: []const u8,
-    /// Arguments as JSON
     args_json: []const u8,
-    /// Partial result callback URL (for streaming tools)
     callback_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getCallbackUrl(self: *const ToolExecuteRequest) ?[]const u8 {
@@ -130,15 +84,10 @@ pub const ToolExecuteRequest = struct {
     }
 };
 
-/// Response from tool execution
 pub const ToolExecuteResponse = struct {
-    /// Tool call ID for correlation
     tool_call_id: []const u8,
-    /// Result content as JSON array of UserContentPart
     result_json: []const u8,
-    /// Whether execution failed
     is_error: bool = false,
-    /// Additional details JSON (optional)
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getDetailsJson(self: *const ToolExecuteResponse) ?[]const u8 {
@@ -147,9 +96,7 @@ pub const ToolExecuteResponse = struct {
     }
 };
 
-/// Request to list available tools
 pub const ToolListRequest = struct {
-    /// Filter by tool name prefix (optional)
     prefix: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getPrefix(self: *const ToolListRequest) ?[]const u8 {
@@ -158,19 +105,16 @@ pub const ToolListRequest = struct {
     }
 };
 
-/// Tool definition for listing
 pub const ToolDefinition = struct {
     name: []const u8,
     description: []const u8,
     parameters_schema_json: []const u8,
 };
 
-/// Response from tool list request
 pub const ToolListResponse = struct {
     tools: []const ToolDefinition,
 };
 
-/// Agent session status
 pub const AgentStatus = enum {
     starting,
     ready,
@@ -181,7 +125,6 @@ pub const AgentStatus = enum {
     @"error",
 };
 
-/// Agent session info
 pub const AgentSessionInfo = struct {
     session_id: SessionId,
     status: AgentStatus,
@@ -218,46 +161,33 @@ pub const Goodbye = struct {
     }
 };
 
-/// Agent protocol payload
 pub const Payload = union(enum) {
-    // Client -> Agent Server
     agent_start: AgentStartRequest,
     agent_message: AgentMessageRequest,
     agent_stop: AgentStopRequest,
     agent_status: struct { session_id: SessionId },
     tool_list: ToolListRequest,
-    /// Passthrough model discovery request — delegates to the provider protocol
-    /// and returns the same `ModelsResponse` shape. See spec §6.
     models_request: ModelsRequest,
 
-    // Agent Server -> Client
     agent_started: struct { session_id: SessionId },
-    agent_event: []const u8, // JSON-encoded AgentEvent
-    agent_result: []const u8, // JSON-encoded AgentLoopResult
+    agent_event: []const u8,
+    agent_result: []const u8,
     agent_stopped: AgentStopped,
     agent_error: struct { code: AgentErrorCode, message: []const u8 },
     session_info: AgentSessionInfo,
     tool_list_response: ToolListResponse,
-    /// Acknowledgment for two-step request/response flows (e.g. models_request).
     ack: Ack,
-    /// Negative acknowledgment used to surface typed protocol errors such as
-    /// `not_implemented` for capability probes.
     nack: Nack,
-    /// Passthrough models response — same typed shape as provider protocol.
     models_response: ModelsResponse,
 
-    // Agent -> Tool Server
     tool_execute: ToolExecuteRequest,
 
-    // Tool Server -> Agent
     tool_result: ToolExecuteResponse,
     tool_streaming: struct { tool_call_id: []const u8, partial_json: []const u8 },
 
-    // Keepalive (reused from provider protocol)
     ping: void,
     pong: struct { ping_id: OwnedSlice(u8) },
 
-    // Connection management
     goodbye: Goodbye,
 
     pub fn deinit(self: *Payload, allocator: std.mem.Allocator) void {
@@ -314,21 +244,13 @@ pub const Payload = union(enum) {
     }
 };
 
-/// Agent protocol envelope
 pub const Envelope = struct {
-    /// Protocol version
     version: u8 = 1,
-    /// Session identifier (stable for session lifecycle)
     session_id: SessionId,
-    /// Message ID (unique per message)
     message_id: Ulid,
-    /// Sequence number within session (starts at 1)
     sequence: u64,
-    /// For request/response correlation
     in_reply_to: ?Ulid = null,
-    /// Unix timestamp in milliseconds
     timestamp: i64,
-    /// The actual payload
     payload: Payload,
 
     pub fn deinit(self: *Envelope, allocator: std.mem.Allocator) void {
@@ -336,7 +258,6 @@ pub const Envelope = struct {
     }
 };
 
-// Tests
 test "AgentErrorCode enum values" {
     try std.testing.expectEqual(AgentErrorCode.invalid_request, .invalid_request);
     try std.testing.expectEqual(AgentErrorCode.agent_not_found, .agent_not_found);
@@ -359,7 +280,6 @@ test "Payload deinit for agent_start" {
     };
 
     payload.deinit(allocator);
-    // Should not leak
 }
 
 test "Payload deinit for models_request frees owned filters" {

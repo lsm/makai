@@ -2,25 +2,17 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 pub const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Partial state for a text content block
 pub const TextPartial = struct {
-    /// Length of accumulated text
     accumulated_len: usize = 0,
 };
 
-/// Partial state for a thinking content block
 pub const ThinkingPartial = struct {
-    /// Length of accumulated thinking
     accumulated_len: usize = 0,
 };
 
-/// Partial state for a tool call content block
 pub const ToolCallPartial = struct {
-    /// Tool call ID (from toolcall_start)
     id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Tool name (from toolcall_start)
     name: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    /// Length of accumulated JSON arguments
     json_len: usize = 0,
 
     pub fn getId(self: *const ToolCallPartial) ?[]const u8 {
@@ -39,12 +31,10 @@ pub const ToolCallPartial = struct {
     }
 };
 
-/// Partial state for a content block
 pub const ContentBlockPartial = union(enum) {
     text: TextPartial,
     thinking: ThinkingPartial,
     tool_call: ToolCallPartial,
-    /// Block exists but not actively tracked
     inactive: void,
 
     pub fn deinit(self: *ContentBlockPartial, allocator: std.mem.Allocator) void {
@@ -55,17 +45,13 @@ pub const ContentBlockPartial = union(enum) {
     }
 };
 
-/// Full partial state for a streaming message
 pub const MessagePartial = struct {
     allocator: std.mem.Allocator,
 
-    /// Block partials indexed by content_index
     blocks: std.AutoHashMap(usize, ContentBlockPartial),
 
-    /// Running usage totals
     usage: ai_types.Usage,
 
-    /// Metadata (constant during stream)
     model: []const u8 = "",
     api: []const u8 = "",
     provider: []const u8 = "",
@@ -87,14 +73,11 @@ pub const MessagePartial = struct {
         self.blocks.deinit();
     }
 
-    /// Get partial for a specific block
     pub fn getBlockPartial(self: *MessagePartial, content_index: usize) ?ContentBlockPartial {
         return self.blocks.get(content_index);
     }
 
-    /// Update partial for a specific block
     pub fn updateBlockPartial(self: *MessagePartial, content_index: usize, partial: ContentBlockPartial) !void {
-        // If there's an existing entry, deinit it first to free owned strings
         if (self.blocks.fetchRemove(content_index)) |old| {
             var old_partial = old.value;
             old_partial.deinit(self.allocator);
@@ -102,17 +85,12 @@ pub const MessagePartial = struct {
         try self.blocks.put(content_index, partial);
     }
 
-    /// Ensure a block exists (creates inactive if not)
     pub fn ensureBlock(self: *MessagePartial, content_index: usize) !void {
         if (!self.blocks.contains(content_index)) {
             try self.blocks.put(content_index, .{ .inactive = {} });
         }
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "MessagePartial init and deinit" {
     var partial = MessagePartial.init(std.testing.allocator);
@@ -136,7 +114,6 @@ test "ContentBlockPartial deinit frees owned strings" {
     };
 
     partial.deinit(std.testing.allocator);
-    // No leak - General Purpose Allocator will catch if we fail to free
 }
 
 test "getBlockPartial returns null for missing block" {
@@ -166,7 +143,6 @@ test "updateBlockPartial stores partial correctly" {
         try std.testing.expectEqual(@as(@TypeOf(b), .{ .thinking = .{ .accumulated_len = 50 } }), b);
     }
 
-    // Missing block should be null
     try std.testing.expect(partial.getBlockPartial(1) == null);
 }
 
@@ -174,10 +150,8 @@ test "ensureBlock creates inactive block if missing" {
     var partial = MessagePartial.init(std.testing.allocator);
     defer partial.deinit();
 
-    // Block doesn't exist initially
     try std.testing.expect(partial.getBlockPartial(0) == null);
 
-    // ensureBlock should create an inactive entry
     try partial.ensureBlock(0);
 
     const block = partial.getBlockPartial(0);
@@ -186,7 +160,6 @@ test "ensureBlock creates inactive block if missing" {
         try std.testing.expectEqual(@as(@TypeOf(b), .{ .inactive = {} }), b);
     }
 
-    // Calling ensureBlock again should not change an existing block
     try partial.updateBlockPartial(0, .{ .text = .{ .accumulated_len = 10 } });
     try partial.ensureBlock(0);
 
@@ -201,7 +174,6 @@ test "updateBlockPartial replaces and frees old partial" {
     var partial = MessagePartial.init(std.testing.allocator);
     defer partial.deinit();
 
-    // Insert a tool_call with allocated strings
     const id1 = try std.testing.allocator.dupe(u8, "tool-old");
     const name1 = try std.testing.allocator.dupe(u8, "old-tool");
 
@@ -213,7 +185,6 @@ test "updateBlockPartial replaces and frees old partial" {
         },
     });
 
-    // Replace with a new tool_call - old strings should be freed
     const id2 = try std.testing.allocator.dupe(u8, "tool-new");
     const name2 = try std.testing.allocator.dupe(u8, "new-tool");
 
@@ -238,7 +209,6 @@ test "MessagePartial usage tracking" {
     var partial = MessagePartial.init(std.testing.allocator);
     defer partial.deinit();
 
-    // Simulate usage updates
     partial.usage.input = 100;
     partial.usage.output = 50;
     partial.usage.cache_read = 20;

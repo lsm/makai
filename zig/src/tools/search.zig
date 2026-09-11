@@ -97,8 +97,6 @@ fn lessMatch(_: void, a: Match, b: Match) bool {
 }
 
 fn textLikeMatch(pattern: []const u8, text: []const u8) bool {
-    // Minimal text search surface for local TUI search bootstrap: literal substring,
-    // `.` wildcard, and `.*` gaps. Full indexing belongs later.
     var start: usize = 0;
     while (start <= text.len) : (start += 1) {
         if (matchFromIterative(pattern, text[start..])) return true;

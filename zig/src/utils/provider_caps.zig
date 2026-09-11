@@ -12,119 +12,92 @@ pub const ProviderType = enum {
 };
 
 pub const ProviderCapabilities = struct {
-    /// Supports streaming responses
     streaming: bool = true,
 
-    /// Supports extended thinking/reasoning
     extended_thinking: bool = false,
 
-    /// Supports prompt caching
     prompt_caching: bool = false,
 
-    /// Supports vision/image input
     vision: bool = false,
 
-    /// Supports function/tool calling
     function_calling: bool = true,
 
-    /// Requires Mistral-style tool IDs (9 alphanumeric)
     requires_mistral_tool_ids: bool = false,
 
-    /// Supports reasoning_effort parameter
     supports_reasoning_effort: bool = false,
 
-    /// Reasoning content field name (if different from provider default)
     reasoning_field: ?[]const u8 = null,
 
-    /// Provider type for compatibility
     provider_type: ProviderType = .unknown,
 
-    /// Whether this provider supports the "developer" role for system prompts (OpenAI o-series)
     supports_developer_role: bool = false,
 
-    /// Which field name to use for max tokens: "max_tokens" or "max_completion_tokens"
     max_tokens_field: []const u8 = "max_tokens",
 
-    /// Format for thinking/reasoning when serialized
     thinking_format: enum { openai, zai, qwen } = .openai,
 
-    /// Whether to convert thinking blocks to text for this provider
     requires_thinking_as_text: bool = false,
 
-    /// Whether to insert synthetic assistant after tool results
     requires_assistant_after_tool: bool = false,
 
-    /// Whether tool results require a name field
     requires_tool_result_name: bool = false,
 };
 
-/// Check if URL is GitHub Copilot
 pub fn isGitHubCopilot(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.githubcopilot.com") != null;
 }
 
-/// Check if URL is Mistral
 pub fn isMistral(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.mistral.ai") != null;
 }
 
-/// Check if URL is Groq
 pub fn isGroq(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.groq.com") != null;
 }
 
-/// Check if URL is Cerebras
 pub fn isCerebras(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.cerebras.ai") != null;
 }
 
-/// Check if URL is Z.ai
 pub fn isZai(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.zukijourney.com") != null or std.mem.find(u8, url, "zai") != null;
 }
 
-/// Check if URL is OpenRouter
 pub fn isOpenRouter(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "openrouter.ai") != null;
 }
 
-/// Check if URL is Chutes
 pub fn isChutes(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "chutes.ai") != null;
 }
 
-/// Check if URL is Qwen
 pub fn isQwen(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "dashscope") != null or std.mem.find(u8, url, "qwen") != null;
 }
 
-/// Check if URL is DeepSeek
 pub fn isDeepSeek(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.deepseek.com") != null;
 }
 
-/// Check if URL is OpenAI native
 pub fn isOpenAINative(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.openai.com") != null;
 }
 
-/// Check if URL is Anthropic
 pub fn isAnthropic(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.find(u8, url, "api.anthropic.com") != null;
 }
 
-/// Detect provider type from base URL
 pub fn detectProviderType(base_url: ?[]const u8) ProviderType {
     const url = base_url orelse return .unknown;
 
@@ -142,13 +115,11 @@ pub fn detectProviderType(base_url: ?[]const u8) ProviderType {
     if (std.mem.find(u8, url, ".openai.azure.com") != null or std.mem.find(u8, url, "cognitiveservices.azure.com") != null) return .azure;
     if (std.mem.find(u8, url, "localhost:11434") != null or std.mem.find(u8, url, "127.0.0.1:11434") != null or std.mem.find(u8, url, "ollama") != null) return .ollama;
 
-    // Default to OpenAI-compatible for unknown URLs
     if (url.len > 0) return .openai_compatible;
 
     return .unknown;
 }
 
-/// Detect capabilities from base URL
 pub fn detectCapabilities(base_url: ?[]const u8) ProviderCapabilities {
     const provider_type = detectProviderType(base_url);
 
@@ -231,7 +202,6 @@ pub fn detectCapabilities(base_url: ?[]const u8) ProviderCapabilities {
     };
 }
 
-// Tests
 test "isGitHubCopilot detection" {
     try std.testing.expect(isGitHubCopilot("https://api.githubcopilot.com/v1/chat"));
     try std.testing.expect(!isGitHubCopilot("https://api.openai.com/v1/chat"));

@@ -94,16 +94,12 @@ fn writeContext(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *co
     }
 }
 
-/// Dim vertical bar between segments — quieter and more structured than a
-/// bullet, so the colored values do the talking.
 fn writeSep(writer: *std.Io.Writer, allocator: std.mem.Allocator) !void {
     const sep = try tui_theme.dim().render(allocator, " " ++ tui_theme.glyph.sep ++ " ");
     defer allocator.free(sep);
     try writer.writeAll(sep);
 }
 
-/// Live activity indicator: an animated braille spinner + "streaming" while a
-/// turn is in flight, a quiet dot + "idle" otherwise.
 fn writeState(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
     if (state.status.streaming) {
         const value = try std.fmt.allocPrint(allocator, "{s} streaming", .{tui_theme.spinnerFrame(state.anim_tick)});
@@ -137,8 +133,6 @@ fn writeOwnedSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: 
     try writeSegment(writer, allocator, key, value);
 }
 
-/// Write a bare styled value with no `key:` prefix — used for segments that are
-/// self-evident from their content (model name, cost, activity state).
 fn writeValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, value: []const u8, value_style: zz.Style) !void {
     const styled_value = try value_style.render(allocator, value);
     defer allocator.free(styled_value);
@@ -187,8 +181,6 @@ test "status bar renders context gauge cost and permission" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "ctx") != null);
-    // `cost`/`model`/`state` keys were intentionally dropped; the bare cost
-    // value still renders (e.g. "$0.0300").
     try std.testing.expect(std.mem.indexOf(u8, text, "$") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);

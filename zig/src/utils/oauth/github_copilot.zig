@@ -3,15 +3,12 @@ const compat = @import("compat");
 const http = compat.http;
 const ai_types = @import("ai_types");
 
-// GitHub OAuth configuration
 pub const client_id = "Iv1.b507a08c87ecfe98";
 pub const device_code_url = "https://github.com/login/device/code";
 pub const token_url = "https://github.com/login/oauth/access_token";
 pub const copilot_token_url = "https://api.github.com/copilot_internal/v2/token";
 
-/// Known GitHub Copilot models (from pi-mono/models.dev)
 pub const KNOWN_COPILOT_MODELS = [_][]const u8{
-    // GPT models
     "gpt-4o",
     "gpt-4.1",
     "gpt-5",
@@ -22,22 +19,17 @@ pub const KNOWN_COPILOT_MODELS = [_][]const u8{
     "gpt-5.1-codex-mini",
     "gpt-5.2",
     "gpt-5.2-codex",
-    // Claude models
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
-    // Gemini models
     "gemini-2.5-pro",
     "gemini-3-flash-preview",
     "gemini-3-pro-preview",
-    // Grok models
     "grok-code-fast-1",
-    // Add more as needed
 };
 
-/// Copilot-specific headers required for API requests
 pub const COPILOT_HEADERS = struct {
     pub const user_agent = "GitHubCopilotChat/0.35.0";
     pub const editor_version = "vscode/1.107.0";
@@ -46,12 +38,12 @@ pub const COPILOT_HEADERS = struct {
 };
 
 pub const Credentials = struct {
-    refresh: []const u8, // GitHub access token (for refresh)
-    access: []const u8, // Copilot token
-    expires: i64, // Expiration timestamp (ms)
-    provider_data: ?[]const u8 = null, // JSON with enterpriseUrl if applicable
-    enabled_models: ?[][]const u8 = null, // Models successfully enabled
-    base_url: ?[]const u8 = null, // API base URL from token
+    refresh: []const u8,
+    access: []const u8,
+    expires: i64,
+    provider_data: ?[]const u8 = null,
+    enabled_models: ?[][]const u8 = null,
+    base_url: ?[]const u8 = null,
 };
 
 pub const Callbacks = struct {
@@ -69,37 +61,27 @@ pub const Prompt = struct {
     allow_empty: bool = false,
 };
 
-/// Parse proxy-ep from Copilot token and convert to API base URL
-/// Token format: tid=...;exp=...;proxy-ep=proxy.individual.githubcopilot.com;...
-/// Returns: https://api.individual.githubcopilot.com
 pub fn getBaseUrlFromToken(token: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
-    // Find "proxy-ep=" in token
     const prefix = "proxy-ep=";
     const start_idx = std.mem.find(u8, token, prefix) orelse return null;
     const value_start = start_idx + prefix.len;
 
-    // Find end of value (semicolon or end of string)
     const remaining = token[value_start..];
     const end_idx = std.mem.find(u8, remaining, ";") orelse remaining.len;
     const proxy_host = remaining[0..end_idx];
 
-    // Convert "proxy.xxx" to "api.xxx"
     if (std.mem.startsWith(u8, proxy_host, "proxy.")) {
-        const api_host = proxy_host[6..]; // Skip "proxy."
+        const api_host = proxy_host[6..];
         return std.fmt.allocPrint(allocator, "https://api.{s}", .{api_host}) catch null;
     }
 
-    // Fallback: just prepend https://
     return std.fmt.allocPrint(allocator, "https://{s}", .{proxy_host}) catch null;
 }
 
-/// Get default base URL for GitHub Copilot
 pub fn getDefaultBaseUrl(allocator: std.mem.Allocator) []const u8 {
     return std.fmt.allocPrint(allocator, "https://api.individual.githubcopilot.com", .{}) catch "https://api.individual.githubcopilot.com";
 }
 
-/// Enable a model via policy endpoint
-/// Returns true if successful, false otherwise
 pub fn enableModel(
     allocator: std.mem.Allocator,
     token: []const u8,
@@ -109,13 +91,11 @@ pub fn enableModel(
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Build URL
     const url = try std.fmt.allocPrint(allocator, "{s}/models/{s}/policy", .{ base_url, model_id });
     defer allocator.free(url);
 
     const uri = try std.Uri.parse(url);
 
-    // Build auth header
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth_header);
 
@@ -139,12 +119,9 @@ pub fn enableModel(
     var header_buffer: [4096]u8 = undefined;
     const response = try http.receiveResponse(&request, &header_buffer);
 
-    // Return true if status is 200, false otherwise
     return response.head.status == .ok;
 }
 
-/// Enable all models and return list of successfully enabled ones
-/// Models that fail enablement are excluded from the returned list
 pub fn enableAllModels(
     allocator: std.mem.Allocator,
     token: []const u8,
@@ -169,9 +146,7 @@ pub fn enableAllModels(
     return enabled.toOwnedSlice(allocator);
 }
 
-/// GitHub Copilot OAuth login (device code flow)
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
-    // 1. Prompt for enterprise domain (optional)
     const domain_input = callbacks.onPrompt(.{
         .message = "GitHub domain (press Enter for github.com):",
         .allow_empty = true,
@@ -179,13 +154,11 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     const github_domain = if (domain_input.len == 0) "github.com" else domain_input;
     defer if (domain_input.len > 0) allocator.free(domain_input);
 
-    // 2. Start device code flow
     const device_response = try startDeviceFlow(github_domain, allocator);
     defer allocator.free(device_response.device_code);
     defer allocator.free(device_response.user_code);
     defer allocator.free(device_response.verification_uri);
 
-    // 3. Show verification URI and user code
     const instructions = try std.fmt.allocPrint(allocator, "Enter code: {s}", .{device_response.user_code});
     defer allocator.free(instructions);
 
@@ -194,7 +167,6 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
         .instructions = instructions,
     });
 
-    // 4. Poll for token
     var interval_ms: u64 = device_response.interval * 1000;
     const deadline = compat.time.nowMillis() + (@as(i64, device_response.expires_in) * 1000);
 
@@ -204,13 +176,10 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
         defer if (poll_result.error_msg) |msg| allocator.free(msg);
 
         if (poll_result.access_token) |github_token| {
-            // 5. Exchange GitHub token for Copilot token
             const copilot_token = try getCopilotToken(github_domain, github_token, allocator);
 
-            // 6. Parse base URL from token
             const base_url = getBaseUrlFromToken(copilot_token, allocator);
 
-            // 7. Parse enterprise URL if needed
             const enterprise_url = if (!std.mem.eql(u8, github_domain, "github.com"))
                 try std.fmt.allocPrint(allocator, "https://{s}", .{github_domain})
             else
@@ -221,17 +190,15 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
                 break :blk try std.fmt.allocPrint(allocator, "{{\"enterpriseUrl\":\"{s}\"}}", .{url});
             } else null;
 
-            // 8. Enable all models
             const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
             const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
 
-            // Free base_url if we allocated it
             if (base_url) |bu| allocator.free(bu);
 
             return .{
                 .refresh = try allocator.dupe(u8, github_token),
                 .access = copilot_token,
-                .expires = compat.time.nowMillis() + (3600 * 1000), // 1 hour
+                .expires = compat.time.nowMillis() + (3600 * 1000),
                 .provider_data = provider_data,
                 .enabled_models = enabled_models,
                 .base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null,
@@ -255,9 +222,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     return error.OAuthTimeout;
 }
 
-/// Refresh GitHub Copilot token
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
-    // Parse enterprise URL from provider_data
     const github_domain = if (credentials.provider_data) |data| blk: {
         if (std.mem.find(u8, data, "enterpriseUrl")) |_| {
             if (std.mem.find(u8, data, "https://")) |idx| {
@@ -269,17 +234,13 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
         break :blk "github.com";
     } else "github.com";
 
-    // Use refresh token (GitHub token) to get new Copilot token
     const copilot_token = try getCopilotToken(github_domain, credentials.refresh, allocator);
 
-    // Parse base URL from new token
     const base_url = getBaseUrlFromToken(copilot_token, allocator);
 
-    // Re-enable models with new token
     const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
     const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
 
-    // Dupe base_url BEFORE freeing the original
     const result_base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null;
 
     if (base_url) |bu| allocator.free(bu);
@@ -294,14 +255,10 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     };
 }
 
-/// Get API key from credentials (access token IS the API key)
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
 }
 
-/// Infer the X-Initiator header value based on the last message role.
-/// Copilot expects "agent" when the last message is from the assistant (follow-up),
-/// and "user" otherwise.
 pub fn inferCopilotInitiator(messages: []const ai_types.Message) []const u8 {
     if (messages.len == 0) return "user";
     const last = messages[messages.len - 1];
@@ -311,7 +268,6 @@ pub fn inferCopilotInitiator(messages: []const ai_types.Message) []const u8 {
     };
 }
 
-/// Check if any message contains image content for Copilot-Vision-Request header.
 pub fn hasCopilotVisionInput(messages: []const ai_types.Message) bool {
     for (messages) |msg| {
         switch (msg) {
@@ -334,8 +290,6 @@ pub fn hasCopilotVisionInput(messages: []const ai_types.Message) bool {
     return false;
 }
 
-/// Build dynamic Copilot headers based on messages and image presence.
-/// Caller owns the returned slice and must free it with allocator.free().
 pub fn buildCopilotDynamicHeaders(
     messages: []const ai_types.Message,
     has_images: bool,
@@ -371,12 +325,10 @@ const DeviceCodeResponse = struct {
     interval: u64,
 };
 
-/// Start GitHub device code flow
 fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCodeResponse {
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Build URL (support enterprise domains)
     const url = if (std.mem.eql(u8, domain, "github.com"))
         device_code_url
     else
@@ -385,7 +337,6 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
 
     const uri = try std.Uri.parse(url);
 
-    // Build request body
     const body = try std.fmt.allocPrint(allocator, "client_id={s}&scope=user:email", .{client_id});
     defer allocator.free(body);
 
@@ -419,7 +370,6 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
-    // Parse JSON response
     const parsed = try std.json.parseFromSlice(
         struct {
             device_code: []const u8,
@@ -448,12 +398,10 @@ const PollResult = struct {
     error_msg: ?[]const u8 = null,
 };
 
-/// Poll for GitHub access token
 fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.Allocator) !PollResult {
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Build URL (support enterprise domains)
     const url = if (std.mem.eql(u8, domain, "github.com"))
         token_url
     else
@@ -462,7 +410,6 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
 
     const uri = try std.Uri.parse(url);
 
-    // Build request body
     const body = try std.fmt.allocPrint(
         allocator,
         "client_id={s}&device_code={s}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
@@ -496,7 +443,6 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
-    // Parse JSON response (can be success or error)
     const parsed = try std.json.parseFromSlice(
         struct {
             access_token: ?[]const u8 = null,
@@ -526,12 +472,10 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     }
 }
 
-/// Get Copilot token from GitHub token
 fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Build URL (support enterprise domains)
     const url = if (std.mem.eql(u8, domain, "github.com"))
         copilot_token_url
     else
@@ -540,7 +484,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
 
     const uri = try std.Uri.parse(url);
 
-    // Build auth header
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{github_token});
     defer allocator.free(auth_header);
 
@@ -548,7 +491,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "authorization", .value = auth_header });
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
-    // Copilot-specific headers required for token endpoint
     try headers.append(allocator, .{ .name = "editor-version", .value = COPILOT_HEADERS.editor_version });
     try headers.append(allocator, .{ .name = "editor-plugin-version", .value = COPILOT_HEADERS.editor_plugin_version });
     try headers.append(allocator, .{ .name = "user-agent", .value = COPILOT_HEADERS.user_agent });
@@ -559,7 +501,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     });
     defer request.deinit();
 
-    // Avoid compressed response bodies for simpler token JSON parsing
     request.headers.accept_encoding = .omit;
 
     try http.sendBodilessRequest(&request);
@@ -582,7 +523,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
-    // Parse JSON response (expected format: {"token": "..."})
     const parsed = std.json.parseFromSlice(
         struct {
             token: []const u8,
@@ -591,8 +531,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
         response_body,
         .{ .ignore_unknown_fields = true },
     ) catch {
-        // Some endpoints may return the raw token string directly instead of JSON.
-        // Accept token-like payloads as a fallback.
         const trimmed = std.mem.trim(u8, response_body, " \r\n\t\"");
         if (std.mem.find(u8, trimmed, "tid=") != null or
             std.mem.find(u8, trimmed, "proxy-ep=") != null)
@@ -606,7 +544,6 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     return try allocator.dupe(u8, parsed.value.token);
 }
 
-// Tests
 test "getBaseUrlFromToken - extracts and converts proxy-ep" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -643,7 +580,6 @@ test "getApiKey - returns access token" {
 test "KNOWN_COPILOT_MODELS - contains expected models" {
     const testing = std.testing;
 
-    // Check that key models are present
     var has_gpt4o = false;
     var has_claude = false;
     var has_gemini = false;
@@ -660,10 +596,7 @@ test "KNOWN_COPILOT_MODELS - contains expected models" {
 }
 
 test "startDeviceFlow - returns valid response (integration test, requires network)" {
-    // This test makes a real HTTP request to GitHub's device flow endpoint
-    // It may fail without network access or if GitHub's API is unavailable
     const response = startDeviceFlow("github.com", std.testing.allocator) catch |err| {
-        // If we get a network or parsing error, skip the test rather than fail
         if (err == error.ConnectionRefused or err == error.NetworkUnreachable or
             err == error.SyntaxError or err == error.UnexpectedToken)
         {

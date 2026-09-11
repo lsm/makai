@@ -329,8 +329,6 @@ test("client.auth.login per-call handlers override client-level defaults", async
       },
     });
     assert.deepEqual(result, { status: "success" });
-    // Per-call handlers entirely replace client-level defaults; the default
-    // onPrompt/onEvent must not have been invoked.
     assert.equal(calls.includes("client-default"), false);
     assert.equal(calls.includes("client-default-event"), false);
     assert.equal(calls.includes("per-call"), true);

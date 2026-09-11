@@ -3,27 +3,20 @@ const oauth = @import("mod.zig");
 const pkce = @import("pkce.zig");
 const compat = @import("compat");
 
-/// Client ID for Google Antigravity OAuth (internal Google service)
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojg4g403ep.apps.googleusercontent.com";
 
-/// Client secret for Google Antigravity OAuth
 const CLIENT_SECRET = "GOCSpx-K58FWR486LdLJ1mLB8sXC4z6qDAf";
 
-/// OAuth endpoints (same as Gemini CLI)
 const AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 
-/// Local callback server configuration - uses different port than Gemini CLI
 const REDIRECT_PORT: u16 = 51121;
 const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 
-/// OAuth scopes for Google Antigravity
 const SCOPES = "https://www.googleapis.com/auth/cloud-platform";
 
-/// Default GCP project for Antigravity service
 const DEFAULT_PROJECT_ID = "rising-fact-p41fc";
 
-/// Information returned from startAuth for the authorization flow
 pub const AuthInfo = struct {
     auth_url: []const u8,
     pkce_pair: pkce.PKCEPair,
@@ -34,7 +27,6 @@ pub const AuthInfo = struct {
     }
 };
 
-/// Errors specific to Google Antigravity OAuth
 pub const AntigravityError = error{
     NotImplemented,
     OutOfMemory,
@@ -46,18 +38,11 @@ pub const AntigravityError = error{
     CallbackServerFailed,
 };
 
-/// Google Antigravity OAuth implementation (internal Google service)
-/// Similar to Gemini CLI but uses different credentials and port
-/// - CLIENT_ID: 1071006060591-tmhssin2h21lcre235vtolojg4g403ep.apps.googleusercontent.com
-/// - CLIENT_SECRET: GOCSpx-K58FWR486LdLJ1mLB8sXC4z6qDAf
-/// - REDIRECT_URI: http://localhost:51121/oauth-callback
-/// - DEFAULT_PROJECT_ID: rising-fact-p41fc
 pub const GoogleAntigravityOAuth = struct {
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    /// Initialize the OAuth provider
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
@@ -68,11 +53,9 @@ pub const GoogleAntigravityOAuth = struct {
         _ = self;
     }
 
-    /// Generate a random state string for CSRF protection
     fn generateState() [32]u8 {
         var state: [32]u8 = undefined;
         compat.random.fillSecureBytes(&state);
-        // Encode as hex for URL safety
         var hex_state: [32]u8 = undefined;
         for (state[0..16], 0..) |byte, i| {
             const hi = byte >> 4;
@@ -83,13 +66,10 @@ pub const GoogleAntigravityOAuth = struct {
         return hex_state;
     }
 
-    /// Start authorization flow - returns URL and PKCE pair
-    /// Opens local callback server on port 51121
     pub fn startAuth(self: *Self) AntigravityError!AuthInfo {
         const pkce_pair = pkce.generatePKCE();
         const state = generateState();
 
-        // Build authorization URL
         var url_buf: [2048]u8 = undefined;
         const auth_url = std.fmt.bufPrint(
             &url_buf,
@@ -106,8 +86,6 @@ pub const GoogleAntigravityOAuth = struct {
         };
     }
 
-    /// Exchange authorization code for tokens
-    /// TODO: Implement full HTTP request to TOKEN_URL
     pub fn exchangeCode(self: *Self, code: []const u8, pkce_pair: pkce.PKCEPair) AntigravityError!oauth.OAuthCredentials {
         _ = self;
         _ = code;
@@ -115,28 +93,16 @@ pub const GoogleAntigravityOAuth = struct {
         return AntigravityError.NotImplemented;
     }
 
-    /// Discover or provision GCP project for the user
-    /// TODO: Implement project discovery via GCP API
     pub fn discoverProject(self: *Self, access_token: []const u8) AntigravityError![]const u8 {
         _ = access_token;
-        // For now, return the default project
         return self.allocator.dupe(u8, DEFAULT_PROJECT_ID) catch AntigravityError.OutOfMemory;
     }
 
-    /// Full login flow with local callback server
-    /// TODO: Implement complete flow:
-    /// 1. Start local HTTP server on port 51121
-    /// 2. Generate auth URL and open browser
-    /// 3. Wait for callback with auth code
-    /// 4. Exchange code for tokens
-    /// 5. Discover/provision GCP project
     pub fn login(self: *Self) AntigravityError!oauth.OAuthCredentials {
         _ = self;
         return AntigravityError.NotImplemented;
     }
 
-    /// Refresh expired tokens using refresh_token
-    /// TODO: Implement token refresh via TOKEN_URL
     pub fn refreshToken(self: *Self, refresh_token: []const u8) AntigravityError!oauth.OAuthCredentials {
         _ = self;
         _ = refresh_token;
@@ -144,7 +110,6 @@ pub const GoogleAntigravityOAuth = struct {
     }
 };
 
-// Tests
 test "GoogleAntigravityOAuth init and deinit" {
     const allocator = std.testing.allocator;
 
@@ -165,7 +130,6 @@ test "GoogleAntigravityOAuth startAuth returns valid AuthInfo with correct port"
 
     try std.testing.expect(auth_info.auth_url.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, auth_info.auth_url, "https://accounts.google.com"));
-    // Verify it uses port 51121
     try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "51121") != null);
     try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "code_challenge") != null);
 }

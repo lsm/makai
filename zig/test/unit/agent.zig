@@ -1,9 +1,3 @@
-//! Unit tests for the agent module
-//!
-//! Tests basic agent functionality:
-//! - Type definitions
-//! - Context operations
-//! - Agent loop behavior with a mock ProtocolClient implementation
 
 const std = @import("std");
 const compat = @import("compat");
@@ -14,15 +8,10 @@ const agent_loop = @import("agent_loop");
 
 const testing = std.testing;
 
-// Re-export types for convenience
 const AgentEvent = agent_types.AgentEvent;
 const AgentContext = agent_types.AgentContext;
 const AgentLoopConfig = agent_types.AgentLoopConfig;
 const ProtocolOptions = agent_types.ProtocolOptions;
-
-// =============================================================================
-// Context Tests
-// =============================================================================
 
 test "AgentContext: init and deinit" {
     var ctx = AgentContext.init(testing.allocator);
@@ -38,7 +27,6 @@ test "AgentContext: append and retrieve messages" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
-    // Use owned strings - don't free them ourselves, let AgentContext.deinit do it
     const text1 = try allocator.dupe(u8, "Hello");
     const text2 = try allocator.dupe(u8, "World");
 
@@ -64,24 +52,15 @@ test "AgentContext: with system prompt" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
-    // Don't free system_prompt ourselves - let AgentContext.deinit do it
     ctx.system_prompt = agent_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "You are a helpful assistant."));
 
     try testing.expectEqualStrings("You are a helpful assistant.", ctx.getSystemPrompt().?);
 }
 
-// =============================================================================
-// Event Type Tests
-// =============================================================================
-
 test "AgentEvent: tags are correct" {
     const event: AgentEvent = .agent_start;
     try testing.expect(std.meta.activeTag(event) == .agent_start);
 }
-
-// =============================================================================
-// Protocol Options Tests
-// =============================================================================
 
 test "ProtocolOptions: default values" {
     const opts = ProtocolOptions{};
@@ -91,10 +70,6 @@ test "ProtocolOptions: default values" {
     try testing.expect(opts.temperature == null);
     try testing.expect(opts.max_tokens == null);
 }
-
-// =============================================================================
-// Agent loop tests with mock ProtocolClient
-// =============================================================================
 
 const MockMode = enum { done, err };
 
@@ -202,8 +177,6 @@ fn mockProtocolStream(
         } });
     }
 
-    // Mark stream completed without attaching result ownership to avoid
-    // double-ownership in this test mock.
     stream.completeWithError("");
     stream.markThreadDone();
     return stream;
@@ -415,7 +388,6 @@ test "agentLoop: iteration cap reports max_turns on agent_end" {
     defer owned_result.deinit(allocator);
     stream.result = null;
 
-    // The final turn still ended wanting tools; the run ended on the cap.
     try testing.expect(result.final_message.stop_reason == .tool_use);
     try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), result.termination);
     try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), agent_end_termination);

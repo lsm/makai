@@ -1,5 +1,3 @@
-//! Confirmation dialog component.
-//! Simple yes/no prompt with keyboard navigation.
 
 const std = @import("std");
 const keys = @import("../input/keys.zig");
@@ -14,7 +12,6 @@ pub const Confirm = struct {
     active: bool,
     focused: bool,
 
-    // Styling
     prompt_style: style_mod.Style,
     active_style: style_mod.Style,
     inactive_style: style_mod.Style,
@@ -53,34 +50,28 @@ pub const Confirm = struct {
         };
     }
 
-    /// Show the confirmation dialog
     pub fn show(self: *Confirm) void {
         self.active = true;
         self.confirmed = null;
         self.selected = .yes;
     }
 
-    /// Hide the dialog
     pub fn hide(self: *Confirm) void {
         self.active = false;
     }
 
-    /// Check if confirmed (returns true for yes, false for no, null if not yet confirmed)
     pub fn result(self: *const Confirm) ?bool {
         return self.confirmed;
     }
 
-    /// Set focused state (for use with FocusGroup).
     pub fn focus(self: *Confirm) void {
         self.focused = true;
     }
 
-    /// Clear focused state (for use with FocusGroup).
     pub fn blur(self: *Confirm) void {
         self.focused = false;
     }
 
-    /// Handle a key event
     pub fn handleKey(self: *Confirm, key: keys.KeyEvent) void {
         if (!self.active or !self.focused) return;
 
@@ -113,7 +104,6 @@ pub const Confirm = struct {
         }
     }
 
-    /// Render the confirmation dialog
     pub fn view(self: *const Confirm, allocator: std.mem.Allocator) ![]const u8 {
         if (!self.active) {
             return try allocator.dupe(u8, "");
@@ -122,12 +112,10 @@ pub const Confirm = struct {
         var result_buf: Writer.Allocating = .init(allocator);
         const writer = &result_buf.writer;
 
-        // Prompt
         const styled_prompt = try self.prompt_style.render(allocator, self.prompt_text);
         try writer.writeAll(styled_prompt);
         try writer.writeAll(" ");
 
-        // Yes option
         const yes_style = if (self.selected == .yes) self.active_style else self.inactive_style;
         if (self.selected == .yes) {
             const styled = try yes_style.render(allocator, "[Yes]");
@@ -139,7 +127,6 @@ pub const Confirm = struct {
 
         try writer.writeAll(" ");
 
-        // No option
         const no_style = if (self.selected == .no) self.active_style else self.inactive_style;
         if (self.selected == .no) {
             const styled = try no_style.render(allocator, "[No]");

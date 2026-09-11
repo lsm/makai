@@ -323,7 +323,6 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
         }
         return;
     }
-    // OSC: ESC ] — followed by string until BEL or ST (ESC \)
     if (second == ']') {
         while (index.* < text.len) {
             const c = text[index.*];
@@ -336,12 +335,10 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
         }
         return;
     }
-    // SCS: ESC ( ) * + — followed by one more byte
     if (second >= '(' and second <= '+') {
         if (index.* < text.len) index.* += 1;
         return;
     }
-    // DCS: ESC P — followed by string until ST (ESC \) or BEL
     if (second == 'P') {
         while (index.* < text.len) {
             const c = text[index.*];

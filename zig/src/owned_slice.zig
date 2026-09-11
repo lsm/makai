@@ -1,11 +1,5 @@
 const std = @import("std");
 
-/// A slice that tracks ownership, replacing scattered legacy bool-guard ownership patterns.
-///
-/// When `is_owned` is true, `deinit()` frees the items (calling per-element `deinit` if available)
-/// and then frees the backing slice. When `is_owned` is false, `deinit()` is a no-op.
-///
-/// Inspired by Bun's ownership tracking patterns.
 pub fn OwnedSlice(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -13,41 +7,33 @@ pub fn OwnedSlice(comptime T: type) type {
         items: []const T,
         is_owned: bool,
 
-        /// Create a borrowed (non-owning) slice. `deinit()` will be a no-op.
         pub fn initBorrowed(items: []const T) Self {
             return .{ .items = items, .is_owned = false };
         }
 
-        /// Create an owned slice. `deinit()` will free items and the backing memory.
         pub fn initOwned(items: []const T) Self {
             return .{ .items = items, .is_owned = true };
         }
 
-        /// Access the underlying slice.
         pub fn slice(self: Self) []const T {
             return self.items;
         }
 
-        /// Ensure this slice is owned by duplicating if currently borrowed.
-        /// No-op if already owned.
         pub fn ensureOwned(self: *Self, allocator: std.mem.Allocator) !void {
             if (self.is_owned) return;
             self.items = try allocator.dupe(T, self.items);
             self.is_owned = true;
         }
 
-        /// Backward-compatible alias for ensureOwned().
         pub fn cloneIfBorrowed(self: *Self, allocator: std.mem.Allocator) !void {
             return self.ensureOwned(allocator);
         }
 
-        /// Free owned memory. No-op for borrowed slices.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (!self.is_owned) return;
 
             const mut_items: []T = @constCast(self.items);
 
-            // Call per-element deinit if T has one (taking allocator)
             const has_deinit = comptime blk: {
                 const info = @typeInfo(T);
                 switch (info) {
@@ -70,14 +56,9 @@ pub fn OwnedSlice(comptime T: type) type {
     };
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 test "OwnedSlice borrowed does not free" {
     const items = [_]u32{ 1, 2, 3 };
     var s = OwnedSlice(u32).initBorrowed(&items);
-    // deinit on borrowed is a no-op — no crash, no leak
     s.deinit(std.testing.allocator);
 }
 
@@ -94,7 +75,6 @@ test "OwnedSlice owned frees memory" {
     try std.testing.expectEqual(@as(u32, 20), s.slice()[1]);
 
     s.deinit(allocator);
-    // testing.allocator will detect leaks if deinit didn't free
 }
 
 test "OwnedSlice with struct that has deinit" {

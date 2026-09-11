@@ -1,4 +1,3 @@
-//! Scrollable content viewport component.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -11,25 +10,20 @@ const unicode = @import("../unicode.zig");
 pub const Viewport = struct {
     allocator: std.mem.Allocator,
 
-    // Content
     content: []const u8,
     owned_content: ?[]u8,
     lines: std.array_list.Managed([]const u8),
 
-    // Dimensions
     width: u16,
     height: u16,
 
-    // Scroll position (visual rows, display columns)
     y_offset: usize,
     x_offset: usize,
 
-    // Styling
     viewport_style: style.Style,
     scrollbar_track_style: style.Style,
     scrollbar_thumb_style: style.Style,
 
-    // Options
     wrap: bool,
     show_scrollbar: bool,
     empty_char: []const u8,

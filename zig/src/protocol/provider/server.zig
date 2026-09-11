@@ -17,22 +17,18 @@ const provider_base_url = @import("provider_base_url");
 
 pub const AuthStorage = oauth_storage.AuthStorage;
 
-/// Errors for sequence validation
 pub const SequenceError = error{
     InvalidSequence,
     DuplicateSequence,
     SequenceGap,
 };
 
-/// Validate incoming sequence number
 fn validateSequence(expected: u64, received: u64) SequenceError!void {
     if (received == 0) return error.InvalidSequence;
     if (received < expected) return error.DuplicateSequence;
     if (received > expected) return error.SequenceGap;
-    // received == expected is OK
 }
 
-/// Helper to create a NACK for sequence errors
 fn createSequenceNack(
     allocator: std.mem.Allocator,
     stream_id: protocol_types.Ulid,
@@ -91,7 +87,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "claude-sonnet-4-5",
         .display_name = "Claude Sonnet 4.5",
         .base_url = "https://api.anthropic.com",
-        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
+        .auth_status = .unknown,
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING_TOOLS_REASONING,
         .context_window = 200_000,
@@ -104,7 +100,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-4o",
         .display_name = "GPT-4o (Responses)",
         .base_url = "https://api.openai.com",
-        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
+        .auth_status = .unknown,
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING_REASONING,
         .context_window = 128_000,
@@ -117,7 +113,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-4o",
         .display_name = "GPT-4o (Completions)",
         .base_url = "https://api.openai.com",
-        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
+        .auth_status = .unknown,
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 128_000,
@@ -129,7 +125,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "qwen2.5:7b",
         .display_name = "Qwen2.5 7B",
         .base_url = "http://localhost:11434",
-        .auth_status = .unknown, // Local server, auth status unknown without runtime check
+        .auth_status = .unknown,
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 32_768,
@@ -141,7 +137,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-3.5-turbo",
         .display_name = "GPT-3.5 Turbo",
         .base_url = "https://api.openai.com",
-        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
+        .auth_status = .unknown,
         .lifecycle = .deprecated,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 16_384,
@@ -196,42 +192,23 @@ fn providerErrorMessage(err: anyerror) []const u8 {
     return "Failed to create stream";
 }
 
-/// Server-side protocol handler for the Makai Wire Protocol
-///
-/// Current Limitation (v1.0): The server creates streams and returns ACK but does
-/// not yet forward stream events as protocol envelopes. Event forwarding requires
-/// integration with the async runtime to poll provider streams and wrap events.
-/// This is planned for v2.0.
 pub const ProtocolServer = struct {
     allocator: std.mem.Allocator,
 
-    /// Active streams by stream_id
-    /// NOTE: While this map supports multiple streams, event forwarding is not
-    /// yet implemented. The server currently handles stream creation/abortion
-    /// but does not poll and forward events from provider streams.
     active_streams: std.AutoHashMap(protocol_types.Ulid, ActiveStream),
 
-    /// API registry for provider lookup
     registry: *api_registry.ApiRegistry,
 
-    /// Sequence counter per stream (outgoing)
     sequence_counters: std.AutoHashMap(protocol_types.Ulid, u64),
 
-    /// Expected next sequence number per stream (incoming)
     expected_sequences: std.AutoHashMap(protocol_types.Ulid, u64),
 
-    /// Queued outbound server envelopes that must be emitted after immediate ACK.
     outbox: std.ArrayList(protocol_types.Envelope),
 
-    /// Streams removed by abort but awaiting deferred cleanup (blocking deinit).
-    /// Not iterated by pumpProviderEvents, so no duplicate terminal forwarding.
     pending_cleanup: std.ArrayList(ActiveStream),
 
-    /// Options
     options: Options,
 
-    /// Per-provider refresh lock that prevents duplicate concurrent
-    /// refresh calls for the same provider scope.  See M-008.
     refresh_lock: refresh_lock_mod.RefreshLock,
 
     pub const ActiveStream = struct {
@@ -240,9 +217,6 @@ pub const ProtocolServer = struct {
         event_stream: *event_stream.AssistantMessageEventStream,
         partial_state: partial_serializer.PartialState,
         started_at: i64,
-        /// Atomic bool allocated on the heap. When the server receives an
-        /// abort_request for this stream it sets the flag so the in-flight
-        /// provider thread can notice and stop early (CancelToken path).
         cancelled: ?*std.atomic.Value(bool) = null,
     };
 
@@ -269,10 +243,6 @@ pub const ProtocolServer = struct {
         dynamic_catalog_ctx: ?*anyopaque = null,
         load_auth_storage_fn: LoadAuthStorageFn = defaultLoadAuthStorage,
         load_auth_storage_ctx: ?*anyopaque = null,
-        /// Auth storage used to resolve credentials when the request does not
-        /// supply an explicit `api_key`. When null, the refresh path loads
-        /// storage via `load_auth_storage_fn`; tests may inject an in-memory
-        /// storage instance here for M-006 credential resolution.
         auth_storage: ?*AuthStorage = null,
     };
 
@@ -291,16 +261,13 @@ pub const ProtocolServer = struct {
     }
 
     pub fn deinit(self: *ProtocolServer) void {
-        // Clean up all active streams
         self.refresh_lock.deinit();
         var iter = self.active_streams.iterator();
         while (iter.next()) |entry| {
             var active_stream = entry.value_ptr.*;
             active_stream.partial_state.deinit();
-            // Clean up the event stream
             active_stream.event_stream.deinit();
             self.allocator.destroy(active_stream.event_stream);
-            // Free the cancel flag if allocated
             if (active_stream.cancelled) |c| {
                 self.allocator.destroy(c);
             }
@@ -313,7 +280,6 @@ pub const ProtocolServer = struct {
         }
         self.outbox.deinit(self.allocator);
 
-        // Drain pending cleanup (aborted streams awaiting deferred deinit)
         for (self.pending_cleanup.items) |*stream| {
             stream.partial_state.deinit();
             stream.event_stream.deinit();
@@ -324,7 +290,6 @@ pub const ProtocolServer = struct {
         }
         self.pending_cleanup.deinit(self.allocator);
 
-        // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
     }
 
@@ -333,7 +298,6 @@ pub const ProtocolServer = struct {
         return self.outbox.orderedRemove(0);
     }
 
-    /// Handle incoming envelope, optionally return response envelope
     pub fn handleEnvelope(self: *ProtocolServer, env: protocol_types.Envelope) !?protocol_types.Envelope {
         if (env.version != protocol_types.PROTOCOL_VERSION) {
             return try envelope.createVersionMismatchNack(env, self.allocator);
@@ -341,7 +305,6 @@ pub const ProtocolServer = struct {
 
         switch (env.payload) {
             .stream_request => |req| {
-                // Validate sequence - client should start at 1 for new streams
                 if (env.sequence != 1) {
                     return try createSequenceNack(self.allocator, env.stream_id, env.message_id, error.InvalidSequence);
                 }
@@ -354,33 +317,26 @@ pub const ProtocolServer = struct {
                 return try handleAbortRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .complete_request => |req| {
-                // Validate sequence - client should start at 1 for complete requests
                 if (env.sequence != 1) {
                     return try createSequenceNack(self.allocator, env.stream_id, env.message_id, error.InvalidSequence);
                 }
                 return try handleCompleteRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .ack, .nack, .event, .result, .stream_error, .models_response => {
-                // Server receives these from clients - no response needed
                 return null;
             },
             .ping => {
-                // Respond with pong containing the ping's message_id as ping_id
                 const ping_id_str = try protocol_types.ulidToString(env.message_id, self.allocator);
                 const pong_payload: protocol_types.Payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id_str) } };
                 return envelope.createReply(env, pong_payload, self.allocator);
             },
             .pong => {
-                // No response to pong
                 return null;
             },
             .goodbye => {
-                // Handle graceful shutdown - no response needed
                 return null;
             },
             .sync_request => {
-                // Handle sync request - for now, return not implemented
-                // TODO: Implement full state sync
                 return try envelope.createNack(
                     env,
                     "Sync not yet implemented",
@@ -389,16 +345,12 @@ pub const ProtocolServer = struct {
                 );
             },
             .sync => {
-                // Handle sync response - for now, ignore
-                // TODO: Implement full state sync
                 return null;
             },
         }
     }
 
-    /// Clean up completed streams
     pub fn cleanupCompletedStreams(self: *ProtocolServer) void {
-        // Common path: avoid heap allocation by collecting IDs in a fixed pool.
         const CleanupNode = struct {
             stream_id: protocol_types.Ulid,
             next: ?*@This() = null,
@@ -406,7 +358,6 @@ pub const ProtocolServer = struct {
         var remove_pool = hive_array.HiveArray(CleanupNode, 128).init();
         var remove_head: ?*CleanupNode = null;
 
-        // Overflow path for unusually large batches in a single cleanup pass.
         var overflow = std.ArrayList(protocol_types.Ulid).initCapacity(self.allocator, 8) catch return;
         defer overflow.deinit(self.allocator);
 
@@ -425,7 +376,6 @@ pub const ProtocolServer = struct {
             }
         }
 
-        // Remove pooled IDs
         var current = remove_head;
         while (current) |node| {
             const stream_id = node.stream_id;
@@ -447,7 +397,6 @@ pub const ProtocolServer = struct {
             current = next;
         }
 
-        // Remove overflow IDs
         for (overflow.items) |stream_id| {
             if (self.active_streams.fetchRemove(stream_id)) |removed| {
                 var partial = removed.value.partial_state;
@@ -462,8 +411,6 @@ pub const ProtocolServer = struct {
             _ = self.expected_sequences.remove(stream_id);
         }
 
-        // Drain deferred abort cleanups (streams moved here by handleAbortRequest).
-        // These are not in active_streams so pumpProviderEvents never sees them.
         var cleanup_list = self.pending_cleanup;
         self.pending_cleanup = std.ArrayList(ActiveStream).empty;
         for (cleanup_list.items) |*stream| {
@@ -477,12 +424,10 @@ pub const ProtocolServer = struct {
         cleanup_list.deinit(self.allocator);
     }
 
-    /// Get active stream count
     pub fn activeStreamCount(self: *ProtocolServer) usize {
         return self.active_streams.count();
     }
 
-    /// Public access to active streams for event polling
     pub const ActiveStreamIterator = struct {
         iter: std.AutoHashMap(protocol_types.Ulid, ActiveStream).Iterator,
 
@@ -500,19 +445,16 @@ pub const ProtocolServer = struct {
         }
     };
 
-    /// Get iterator over active streams
     pub fn activeStreamIterator(self: *ProtocolServer) ActiveStreamIterator {
         return .{
             .iter = self.active_streams.iterator(),
         };
     }
 
-    /// Get next sequence number for a stream (public for event forwarding)
     pub fn getNextSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid) u64 {
         return self.nextSequence(stream_id);
     }
 
-    /// Get next sequence number for a stream
     fn nextSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid) u64 {
         const current = self.sequence_counters.get(stream_id) orelse 0;
         const next = current + 1;
@@ -520,17 +462,13 @@ pub const ProtocolServer = struct {
         return next;
     }
 
-    /// Validates and updates expected sequence for a stream/query scope.
-    /// Used by request payloads that accept per-stream incremental sequencing.
     fn validateAndUpdateSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid, received: u64) SequenceError!void {
         const expected = self.expected_sequences.get(stream_id) orelse 1;
         try validateSequence(expected, received);
-        // Update expected sequence for next message
         self.expected_sequences.put(stream_id, received + 1) catch {};
     }
 };
 
-/// Build a one-off envelope template suitable for `envelope.createNack`.
 fn nackTemplate(stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid) protocol_types.Envelope {
     return .{
         .stream_id = stream_id,
@@ -556,10 +494,6 @@ fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.Stream
     injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
 }
 
-/// Merge server-side options into the caller's StreamOptions.
-/// Preserves all existing fields; only sets cancel_token and marks the stream
-/// as requiring owned events so the producer thread can exit while the protocol
-/// runtime is still forwarding unconsumed events.
 fn injectServerOptions(
     options: ?ai_types.StreamOptions,
     cancel_token: ai_types.CancelToken,
@@ -579,9 +513,6 @@ fn authProvider(provider: api_registry.ApiProvider) ?oauth_storage.OAuthProvider
     };
 }
 
-/// Stream using standard key resolution (env-key / non-OAuth path).
-/// Called when no OAuth provider is registered or when stored OAuth credentials
-/// are unavailable, so that env-key workflows continue to work.
 fn streamWithResolvedKey(
     server: *ProtocolServer,
     provider: api_registry.ApiProvider,
@@ -614,11 +545,6 @@ fn streamWithResolvedKey(
     return provider.stream(model, context, resolved_options, server.allocator);
 }
 
-/// Acquire the refresh lock, perform a credential refresh if the caller
-/// wins the lock, and propagate the shared result to all waiters.
-///
-/// Returns success when the refresh completed (either by this caller or a
-/// concurrent one).  Returns an appropriate error on failure or timeout.
 fn refreshWithLock(
     server: *ProtocolServer,
     provider_id: []const u8,
@@ -632,7 +558,6 @@ fn refreshWithLock(
 
     switch (lock_result) {
         .acquired => |generation| {
-            // This thread owns the refresh.
             storage.refreshCredentials(provider_id, oauth_provider) catch |err| {
                 server.refresh_lock.complete(provider_id, null, generation, err);
                 return switch (err) {
@@ -643,9 +568,6 @@ fn refreshWithLock(
             server.refresh_lock.complete(provider_id, null, generation, null);
         },
         .completed_ok => {
-            // Another thread refreshed successfully — shared storage (if
-            // any) is already up to date.  If the storage is a locally
-            // loaded copy, the caller re-checks expiry after return.
         },
         .completed_err => |err| {
             return switch (err) {
@@ -668,10 +590,6 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
-    // API handlers may advertise a vendor credential source (for example,
-    // Anthropic Messages). Do not use that source for a differently named
-    // model provider: a global/custom endpoint must receive an explicit key
-    // instead of an ambient vendor credential.
     if (provider.auth_provider_id) |auth_provider_id| {
         const is_vendor_oauth = std.mem.eql(u8, auth_provider_id, "anthropic") or
             std.mem.eql(u8, auth_provider_id, "openai-codex");
@@ -694,9 +612,6 @@ fn streamWithRefresh(
             return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
-        // Non-OAuth entry or missing entry. If the loaded storage has an api_key,
-        // use it directly — streamWithResolvedKey cannot see the locally-loaded
-        // storage (it only consults server.options.auth_storage which may be null).
         const stored_key = storage.getApiKey(provider_id, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return err,
@@ -707,7 +622,6 @@ fn streamWithRefresh(
             defer deinitInjectedApiKey(server.allocator, &resolved_options);
             return provider.stream(model, context, resolved_options, server.allocator);
         }
-        // No key in loaded storage; fall back to env-key resolution.
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
     }
 
@@ -742,9 +656,6 @@ fn streamWithRefresh(
     stream.deinit();
     server.allocator.destroy(stream);
 
-    // Retry-path refresh: acquire a new lock entry. The pre-call lock
-    // above has already completed and been cleaned up, so this is a
-    // distinct lock scope.
     refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.AuthRefreshFailed,
@@ -760,8 +671,6 @@ fn streamWithRefresh(
         if (err == error.MissingApiKey) return error.AuthRequired;
         return err;
     };
-    // If the retry stream completed synchronously with another auth failure,
-    // map it to a terminal auth error so clients get the correct error code.
     if (retry_stream.isDone()) {
         if (retry_stream.getError()) |retry_err_msg| {
             const retry_auth_failure = if (provider.is_auth_failure) |detector| detector(retry_err_msg) else defaultAuthFailureDetector(retry_err_msg);
@@ -775,9 +684,6 @@ fn streamWithRefresh(
     return retry_stream;
 }
 
-/// An `ai_types.Model` paired with the optional base URL allocation the
-/// defaulting path produced. `deinit` frees only that allocation — every
-/// other field keeps the caller's original ownership.
 const EffectiveModel = struct {
     model: ai_types.Model,
     defaulted_base_url: ?[]const u8 = null,
@@ -788,18 +694,8 @@ const EffectiveModel = struct {
     }
 };
 
-/// Server-side model default for clients that send no token metadata. The
-/// TS SDK's model descriptors carry no max_tokens, and providers serialize
-/// a limit of 0 for such models (Anthropic requires max_tokens >= 1), so
-/// real-provider requests would still fail after the base URL fix. Matches
-/// the CLI's non-catalog default (tools/makai.zig modelFromCanonicalRef);
-/// catalog pairs with higher advertised limits override it.
 const DEFAULT_MODEL_MAX_TOKENS: u32 = 4_096;
 
-/// Output limit advertised for this exact model in the server's static
-/// catalog, null when the model is not a static entry. Used so a caller who
-/// selected a catalog-listed model without options.max_tokens gets the
-/// advertised limit rather than the generic fallback.
 fn staticCatalogMaxTokens(model: ai_types.Model) ?u32 {
     for (STATIC_MODEL_CATALOG) |entry| {
         if (!std.mem.eql(u8, entry.provider_id, model.provider)) continue;
@@ -810,27 +706,6 @@ fn staticCatalogMaxTokens(model: ai_types.Model) ?u32 {
     return null;
 }
 
-/// Resolve the model a provider sees, applying the server-side defaults the
-/// CLI print path already applies to non-catalog refs (#183):
-///
-/// - An empty `base_url` (the TS SDK sends "" in every model descriptor)
-///   resolves to the canonical vendor endpoint for known provider/API
-///   pairs — otherwise URL construction fails with e.g. "invalid anthropic
-///   URL". Env overrides (`MAKAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
-///   `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`) win over the canonical
-///   endpoints; catalog-issued pairs (openai-codex, kimi) resolve to the
-///   endpoints the production catalog itself serves, honoring the Kimi
-///   region stored on its OAuth credentials; explicit non-empty base URLs
-///   pass through unchanged; unknown providers keep the empty base URL so
-///   no endpoint is derived from the API type.
-/// - A zero `max_tokens` (client sent none) becomes a usable default.
-/// - When the effective base URL comes from the environment rather than the
-///   client and the client sent no compat options, transparent-proxy compat
-///   (`*_BASE_URL_IS_PROXY=true`) is applied so env-configured proxies shape
-///   requests exactly as they do on the CLI path.
-///
-/// The returned model is a shallow copy — providers clone what they need
-/// before `stream()` returns, so `deinit` only owns the defaulted base URL.
 fn modelWithProtocolDefaults(
     server: *ProtocolServer,
     model: ai_types.Model,
@@ -865,12 +740,6 @@ fn modelWithProtocolDefaults(
             provider_base_url.defaultMaxTokensForRef(model.provider, model.api);
     }
 
-    // Protocol clients send no capability metadata; a false reasoning flag
-    // is indistinguishable from an absent one on the wire, so rehydrate the
-    // CLI's inference — but only for minimal SDK-shaped descriptors (no
-    // base URL). A client that supplied an endpoint explicitly also had its
-    // reasoning flag serialized deliberately and is respected as-is; an
-    // explicit true always survives either way.
     if (!model.reasoning and !client_supplied_base and model.provider.len > 0 and model.id.len > 0) {
         effective.reasoning = provider_base_url.isReasoningModelRef(model.provider, model.id);
     }
@@ -882,23 +751,14 @@ fn modelWithProtocolDefaults(
     return .{ .model = effective, .defaulted_base_url = defaulted_base };
 }
 
-/// The catalog's Kimi pair: provider/api of the production Kimi entry.
 fn isKimiPair(provider_id: []const u8, api: []const u8) bool {
     return std.mem.eql(u8, provider_id, "kimi") and std.mem.eql(u8, api, "openai-completions");
 }
 
-/// Kimi region recorded on the provider's stored OAuth credentials
-/// (`provider_data: "region:<value>"`), normalized to its static region
-/// literal while the storage is still alive — the borrowed provider_data
-/// slice is securely freed by the storage deinit, so a raw slice must never
-/// escape this function. Null when no stored region is available.
 fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
 
-    // Same storage source streamWithRefresh authenticates against
-    // (configured instance or configured loader) so the region can never
-    // disagree with the credentials actually used for the request.
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
     else
@@ -917,9 +777,7 @@ fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     return provider_base_url.normalizeKimiRegion(provider_data["region:".len..]);
 }
 
-/// Handle stream_request - create stream, return ack with stream_id
 fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
-    // Reject duplicate stream_id
     if (server.active_streams.contains(stream_id)) {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -929,7 +787,6 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     }
 
-    // Check max streams limit
     if (server.active_streams.count() >= server.options.max_streams) {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -939,7 +796,6 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     }
 
-    // Look up provider in registry using model.api
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -949,21 +805,15 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
 
-    // Allocate a cancel flag so the server can signal the provider thread to stop
-    // on abort_request. Freed when the ActiveStream is cleaned up.
     const cancelled = oom.unreachableOnOom(server.allocator.create(std.atomic.Value(bool)));
     cancelled.* = std.atomic.Value(bool).init(false);
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
-    // Inject cancel token into options so the provider can observe it.
     const options_with_cancel = injectServerOptions(request.options, cancel_token);
 
-    // Default an empty client-supplied base URL to the canonical vendor
-    // endpoint so protocol clients don't need their own provider tables.
     var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
-    // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
     const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
         server.allocator.destroy(cancelled);
         return try envelope.createNack(
@@ -973,18 +823,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
             server.allocator,
         );
     };
-    // Provider streams are produced by background threads; wait for producer completion
-    // before deinit/destroy during abort and cleanup paths. Providers must honor
-    // `requires_owned_stream_events` in their stream init by setting owns_events and
-    // clone_event_fn before spawning the producer, so no post-creation mutation is
-    // needed here. Extension providers are validated at the protocol boundary so
-    // borrowed events cannot outlive producer-owned temporary buffers while the
-    // server forwards queued events.
     if (!stream.owns_events) {
-        // Extension providers must return owned events so the server can forward
-        // queued events after the producer thread exits. Cancel the in-flight
-        // producer and wait for it to finish before freeing the stream, otherwise
-        // a background thread could still be writing to the freed ring buffer.
         cancelled.store(true, .release);
         stream.wait_for_thread_on_deinit = true;
         stream.deinit();
@@ -999,7 +838,6 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     }
     stream.wait_for_thread_on_deinit = true;
 
-    // Create ActiveStream entry
     const active_stream = ProtocolServer.ActiveStream{
         .stream_id = stream_id,
         .model = request.model,
@@ -1009,17 +847,12 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .cancelled = cancelled,
     };
 
-    // Store in active_streams
     try server.active_streams.put(stream_id, active_stream);
 
-    // Initialize sequence counter to 1 since we're about to return sequence 1 in ACK
     try server.sequence_counters.put(stream_id, 1);
 
-    // Initialize expected sequence for incoming messages (starts at 1)
-    // The first message for a new stream should have sequence 1
     try server.expected_sequences.put(stream_id, received_seq + 1);
 
-    // Return ack with acknowledged_id
     return .{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -1032,40 +865,20 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     };
 }
 
-/// Handle abort_request - cancel stream, return ack.
-///
-/// On success the server:
-///   1. Signals the provider's CancelToken so the in-flight HTTP stream stops early.
-///   2. Marks the event stream complete with an error so consumers unblock.
-///   3. Queues a `stream_error` (code `stream_cancelled`) to the outbox so the
-///      runtime pump can forward it to the client before the stream disappears.
-///   4. Cleans up partial state and frees the cancel flag.
 fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
-    // Validate sequence for existing stream using validateAndUpdateSequence
     server.validateAndUpdateSequence(request.target_stream_id, received_seq) catch |err| {
         return try createSequenceNack(server.allocator, stream_id, in_reply_to, err);
     };
 
-    // Find stream by stream_id
     if (server.active_streams.fetchRemove(request.target_stream_id)) |removed| {
-        // 1. Signal cancellation so the provider thread stops streaming.
         if (removed.value.cancelled) |c| {
             c.store(true, .release);
         }
 
-        // 2. Complete the event stream so waiters unblock.
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // 3. Defer cleanup to pending_cleanup list (separate from active_streams).
-        //    This keeps the stream invisible to pumpProviderEvents so no duplicate
-        //    terminal frame is forwarded. cleanupCompletedStreams drains this list
-        //    and handles the blocking deinit there — after the ACK has been returned.
-        //    NOTE: Do NOT deinit partial_state here — it is a shallow copy, so
-        //    deinit would leave dangling pointers and cause a double-free when
-        //    cleanupCompletedStreams processes the deferred entry.
         server.pending_cleanup.append(server.allocator, removed.value) catch {
-            // If append fails (OOM), do full cleanup now as fallback.
             var partial = removed.value.partial_state;
             partial.deinit();
             removed.value.event_stream.deinit();
@@ -1075,23 +888,13 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             }
         };
 
-        // Get sequence for ACK first (sent immediately by runtime before outbox items).
         const seq = server.nextSequence(request.target_stream_id);
 
-        // Derive err_seq from seq to avoid a second nextSequence call, which
-        // could return the same value under OOM (put failure in nextSequence).
         const err_seq = seq + 1;
 
-        // Remove counters before returning.
         _ = server.sequence_counters.remove(request.target_stream_id);
         _ = server.expected_sequences.remove(request.target_stream_id);
 
-        // 5. Queue a stream_error envelope to the outbox so the runtime can
-        //    forward it to the client (informing them the stream was cancelled).
-        //    The outbox is drained after the immediate ACK response, so err_seq
-        //    must be higher than seq to preserve per-stream monotonic ordering.
-        //    Both the dupe and the append are best-effort: the ACK must always
-        //    be returned even under OOM conditions.
         const err_msg = server.allocator.dupe(u8, reason) catch null;
         if (err_msg) |msg| {
             server.outbox.append(server.allocator, .{
@@ -1105,12 +908,10 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
                     .message = protocol_types.OwnedSlice(u8).initOwned(msg),
                 } },
             }) catch {
-                // Outbox append is best-effort; don't fail the ACK on OOM.
                 server.allocator.free(msg);
             };
         }
 
-        // Return ack
         return .{
             .stream_id = request.target_stream_id,
             .message_id = protocol_types.generateUlid(),
@@ -1122,8 +923,6 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             } },
         };
     } else {
-        // Stream not found (already completed or never existed)
-        // Per spec, abort is idempotent - return ACK even if stream not found
         return .{
             .stream_id = request.target_stream_id,
             .message_id = protocol_types.generateUlid(),
@@ -1137,15 +936,9 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
     }
 }
 
-/// Handle complete_request - get final result
 fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
-    _ = received_seq; // Sequence validation is done in handleEnvelope
+    _ = received_seq;
 
-    // For complete_request, we use the stream_id from the envelope
-    // Since CompleteRequest doesn't have a target_stream_id, we need to find
-    // a stream for this model/context combination, or create one for non-streaming
-
-    // Look up provider
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -1155,12 +948,9 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         );
     };
 
-    // Default an empty client-supplied base URL to the canonical vendor
-    // endpoint so protocol clients don't need their own provider tables.
     var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
-    // Create a stream for non-streaming completion, resolving and refreshing stored auth when configured.
     const stream = streamWithRefresh(server, provider, effective_model.model, request.context, request.options) catch |err| {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -1169,32 +959,17 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             server.allocator,
         );
     };
-    // The stream is ephemeral to this request (never registered in
-    // active_streams), so free it once the response has been built. Deferred
-    // cleanup runs after the return expression, by which point the result has
-    // been deep-cloned and the error message copied out of stream storage.
     defer {
         stream.deinit();
         server.allocator.destroy(stream);
     }
 
-    // Wait for the producer to finish and publish its terminal state. Some
-    // providers mark their thread done immediately before the final
-    // complete()/completeWithError() call, while others complete first and
-    // mark done from a defer, so gate on both signals: once the thread is
-    // done AND the stream is completed, the producer no longer touches the
-    // stream, making the deferred cleanup below race-free (and its internal
-    // thread wait returns immediately). When the producer stalls past the
-    // configured timeout, skip the completion wait so the timeout NACK is
-    // not delayed by a second full timeout window.
     const timeout_ms = server.options.stream_timeout_ms;
     if (stream.waitForThread(timeout_ms)) {
         _ = stream.waitForCompletion(timeout_ms);
     }
 
-    // Get result
     if (stream.getResult()) |result| {
-        // Clone the result to return (the stream owns the original)
         var cloned_result = try ai_types.cloneAssistantMessage(server.allocator, result);
         cloned_result.is_owned = true;
 
@@ -1207,7 +982,6 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             .payload = .{ .result = cloned_result },
         };
     } else if (stream.getError()) |err_msg| {
-        // Return error as nack
         return try envelope.createNack(
             .{
                 .stream_id = stream_id,
@@ -1221,7 +995,6 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             server.allocator,
         );
     } else {
-        // Timeout or unknown error
         return try envelope.createNack(
             .{
                 .stream_id = stream_id,
@@ -1320,10 +1093,8 @@ fn resolveModelsRequest(
 ) anyerror!protocol_types.ModelsResponse {
     if (server.options.dynamic_catalog_fetcher) |fetcher| {
         const dynamic_response = fetcher(server.options.dynamic_catalog_ctx, server.allocator, request) catch |err| switch (err) {
-            // Only fall back to static catalog for capability-not-supported errors
             error.NotImplemented => null,
             error.OutOfMemory => return error.OutOfMemory,
-            // Propagate all other errors (provider error, rate limit, auth, etc.)
             else => return err,
         };
 
@@ -1526,8 +1297,6 @@ fn makeModelsNack(
     };
 }
 
-// Tests
-
 fn mockStream(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -1542,7 +1311,6 @@ fn mockStream(
     s.owns_events = true;
     s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
-    // Complete immediately for tests
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -2070,7 +1838,6 @@ test "stored api_key used when provider has OAuth hook but storage has non-OAuth
         std.testing.allocator.destroy(stream);
     }
 
-    // The stored api_key should have been used (not env key), stream should succeed
     try std.testing.expectEqual(@as(usize, 0), state.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), state.stream_calls);
     try std.testing.expectEqualStrings("stored-test-key", state.last_api_key[0..state.last_api_key_len]);
@@ -2091,7 +1858,6 @@ test "retry auth failure returns auth_required nack" {
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_required, response.payload.nack.error_code.?);
-    // Should have refreshed once and called stream twice
     try std.testing.expectEqual(@as(usize, 1), state.refresh_count);
     try std.testing.expectEqual(@as(usize, 2), state.stream_calls);
 }
@@ -2130,7 +1896,6 @@ test "handleEnvelope returns pong for ping" {
     try std.testing.expect(response != null);
     try std.testing.expect(response.?.payload == .pong);
 
-    // Clean up the response envelope
     if (response) |r| {
         var mutable_resp = r;
         mutable_resp.deinit(std.testing.allocator);
@@ -2174,7 +1939,6 @@ test "handleEnvelope returns nack for stream_request without provider" {
     try std.testing.expect(response != null);
     try std.testing.expect(response.?.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.provider_error, response.?.payload.nack.error_code.?);
-    // Verify NACK echoes client's stream_id
     try std.testing.expectEqualSlices(u8, &client_stream_id, &response.?.stream_id);
 
     stream_req_env.deinit(std.testing.allocator);
@@ -2254,16 +2018,13 @@ test "handleStreamRequest creates stream and returns ack" {
     try std.testing.expect(response.?.payload == .ack);
     try std.testing.expectEqualSlices(u8, &msg_id, &response.?.payload.ack.acknowledged_id);
 
-    // Server should echo client's stream_id, not generate a new one
     try std.testing.expectEqualSlices(u8, &client_stream_id, &response.?.stream_id);
 
-    // Verify stream was created
     try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
     const created = server.active_streams.get(client_stream_id).?;
     try std.testing.expect(created.event_stream.wait_for_thread_on_deinit);
 
     stream_req_env.deinit(std.testing.allocator);
-    // ack response doesn't allocate memory, so no need to deinit
 }
 
 test "handleStreamRequest rejects duplicate stream id" {
@@ -2358,7 +2119,6 @@ test "handleAbortRequest cancels stream" {
         .max_tokens = 4096,
     };
 
-    // First create a stream
     var stream_req_env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
@@ -2377,7 +2137,6 @@ test "handleAbortRequest cancels stream" {
 
     stream_req_env.deinit(std.testing.allocator);
 
-    // Now abort the stream
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -2392,17 +2151,11 @@ test "handleAbortRequest cancels stream" {
     const abort_response = try server.handleEnvelope(abort_env);
     try std.testing.expect(abort_response != null);
     try std.testing.expect(abort_response.?.payload == .ack);
-    // ACK is seq 2 because handleAbortRequest assigns the ACK sequence first
-    // (runtime sends immediate responses before outbox items), then the
-    // stream_cancelled outbox envelope gets seq 3.
     try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
 
-    // Stream removed from active_streams and moved to pending_cleanup for
-    // deferred blocking deinit (non-blocking ACK).
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
-    server.cleanupCompletedStreams(); // drains pending_cleanup
+    server.cleanupCompletedStreams();
 
-    // Verify a stream_cancelled error was queued to the outbox
     var outbox_env = server.popOutbound();
     try std.testing.expect(outbox_env != null);
     if (outbox_env) |*env| {
@@ -2434,7 +2187,6 @@ test "handleAbortRequest returns ack for unknown stream (idempotent)" {
 
     const response = try server.handleEnvelope(abort_env);
     try std.testing.expect(response != null);
-    // Per spec, abort is idempotent - returns ACK even if stream not found
     try std.testing.expect(response.?.payload == .ack);
 }
 
@@ -2465,7 +2217,6 @@ test "cleanupCompletedStreams removes done streams" {
         .max_tokens = 4096,
     };
 
-    // Create a stream
     var stream_req_env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
@@ -2481,7 +2232,6 @@ test "cleanupCompletedStreams removes done streams" {
     _ = try server.handleEnvelope(stream_req_env);
     try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
 
-    // Mock stream is already complete, so cleanup should remove it
     server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 
@@ -2517,7 +2267,6 @@ test "max streams limit enforced" {
         .max_tokens = 4096,
     };
 
-    // Create first stream - should succeed
     const client_stream_id_1 = protocol_types.generateUlid();
     var req1 = protocol_types.Envelope{
         .stream_id = client_stream_id_1,
@@ -2533,16 +2282,14 @@ test "max streams limit enforced" {
     const resp1 = try server.handleEnvelope(req1);
     try std.testing.expect(resp1 != null);
     try std.testing.expect(resp1.?.payload == .ack);
-    // Verify server echoes client's stream_id
     try std.testing.expectEqualSlices(u8, &client_stream_id_1, &resp1.?.stream_id);
     req1.deinit(std.testing.allocator);
 
-    // Create second stream - should succeed
     const client_stream_id_2 = protocol_types.generateUlid();
     var req2 = protocol_types.Envelope{
         .stream_id = client_stream_id_2,
         .message_id = protocol_types.generateUlid(),
-        .sequence = 1, // Each new stream starts at sequence 1
+        .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
@@ -2553,16 +2300,14 @@ test "max streams limit enforced" {
     const resp2 = try server.handleEnvelope(req2);
     try std.testing.expect(resp2 != null);
     try std.testing.expect(resp2.?.payload == .ack);
-    // Verify server echoes client's stream_id
     try std.testing.expectEqualSlices(u8, &client_stream_id_2, &resp2.?.stream_id);
     req2.deinit(std.testing.allocator);
 
-    // Create third stream - should fail with rate_limited
     const client_stream_id_3 = protocol_types.generateUlid();
     var req3 = protocol_types.Envelope{
         .stream_id = client_stream_id_3,
         .message_id = protocol_types.generateUlid(),
-        .sequence = 1, // Each new stream starts at sequence 1
+        .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
@@ -2574,7 +2319,6 @@ test "max streams limit enforced" {
     try std.testing.expect(resp3 != null);
     try std.testing.expect(resp3.?.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.rate_limited, resp3.?.payload.nack.error_code.?);
-    // Verify NACK also echoes client's stream_id
     try std.testing.expectEqualSlices(u8, &client_stream_id_3, &resp3.?.stream_id);
     req3.deinit(std.testing.allocator);
     if (resp3) |*r| r.deinit(std.testing.allocator);
@@ -2628,7 +2372,6 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
 
     const client_stream_id = protocol_types.generateUlid();
 
-    // Test with sequence = 0 (invalid)
     const req_seq0 = protocol_types.Envelope{
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -2650,7 +2393,6 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         mutable_resp.deinit(std.testing.allocator);
     }
 
-    // Test with sequence = 2 (should be 1 for new stream)
     const req_seq2 = protocol_types.Envelope{
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -2695,7 +2437,6 @@ test "handleEnvelope rejects complete_request with invalid sequence" {
 
     const client_stream_id = protocol_types.generateUlid();
 
-    // Test with sequence = 5 (should be 1 for complete_request)
     const req = protocol_types.Envelope{
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -2744,7 +2485,6 @@ test "handleAbortRequest rejects duplicate sequence" {
         .max_tokens = 4096,
     };
 
-    // First create a stream with sequence 1
     var stream_req_env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
@@ -2762,11 +2502,10 @@ test "handleAbortRequest rejects duplicate sequence" {
     const stream_id = create_response.?.stream_id;
     stream_req_env.deinit(std.testing.allocator);
 
-    // Now try to abort with duplicate sequence (should be 2, not 1)
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
-        .sequence = 1, // Duplicate - should be 2
+        .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
@@ -2811,7 +2550,6 @@ test "handleAbortRequest rejects sequence gap" {
         .max_tokens = 4096,
     };
 
-    // First create a stream with sequence 1
     var stream_req_env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
@@ -2829,11 +2567,10 @@ test "handleAbortRequest rejects sequence gap" {
     const stream_id = create_response.?.stream_id;
     stream_req_env.deinit(std.testing.allocator);
 
-    // Now try to abort with a sequence gap (should be 2, not 10)
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
-        .sequence = 10, // Gap - expected 2
+        .sequence = 10,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
@@ -2851,11 +2588,6 @@ test "handleAbortRequest rejects sequence gap" {
     }
 }
 
-// ===========================================================================
-// Abort / Cancel Integration Tests
-// ===========================================================================
-
-/// State shared between the cancel-aware mock stream and the test.
 const CancelMockState = struct {
     var received_cancel_token: ?ai_types.CancelToken = null;
 
@@ -2864,9 +2596,6 @@ const CancelMockState = struct {
     }
 };
 
-/// Mock stream that captures the cancel_token from StreamOptions so
-/// tests can verify it was injected by handleStreamRequest.
-/// Completes immediately with a result (no background thread).
 fn cancelCapturingStream(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -2876,7 +2605,6 @@ fn cancelCapturingStream(
     _ = model;
     _ = context;
 
-    // Capture the cancel token from options
     if (options) |opts| {
         CancelMockState.received_cancel_token = opts.cancel_token;
     }
@@ -2886,7 +2614,6 @@ fn cancelCapturingStream(
     s.owns_events = true;
     s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
-    // Complete immediately for tests
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -2950,14 +2677,11 @@ test "handleStreamRequest injects CancelToken into provider stream options" {
     try std.testing.expect(resp.?.payload == .ack);
     req.deinit(std.testing.allocator);
 
-    // Verify the cancel token was passed through to the provider
     try std.testing.expect(CancelMockState.received_cancel_token != null);
     if (CancelMockState.received_cancel_token) |ct| {
-        // Should not be cancelled initially
         try std.testing.expect(!ct.isCancelled());
     }
 
-    // Verify the cancelled flag is stored in the active stream
     const active = server.active_streams.get(stream_id);
     try std.testing.expect(active != null);
     if (active) |a| {
@@ -2968,14 +2692,6 @@ test "handleStreamRequest injects CancelToken into provider stream options" {
     }
 }
 
-// ===========================================================================
-// Default Base URL Tests (#183)
-// ===========================================================================
-
-/// Model fields the last mock provider stream received. The capture happens
-/// synchronously inside handleStreamRequest/handleCompleteRequest, before
-/// the test inspects it. The static buffer outlives the request (wire base
-/// URLs are capped at MAX_MODEL_FIELD_LENGTH = 512 bytes).
 const BaseUrlMockState = struct {
     var buffer: [512]u8 = undefined;
     var received_base_url: ?[]const u8 = null;
@@ -3000,9 +2716,6 @@ const BaseUrlMockState = struct {
     }
 };
 
-/// Mock stream that captures the model's base URL so tests can verify the
-/// server defaulted empty client-supplied base URLs before provider dispatch.
-/// Completes immediately with a result (no background thread).
 fn baseUrlCapturingStream(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -3059,9 +2772,6 @@ fn baseUrlCapturingStreamSimple(
     return s;
 }
 
-/// Registry with the capturing mock registered under the real API names, so
-/// models routed like production traffic (e.g. provider "anthropic", api
-/// "anthropic-messages") reach it.
 fn baseUrlCaptureRegistry(allocator: std.mem.Allocator) !api_registry.ApiRegistry {
     var registry = api_registry.ApiRegistry.init(allocator);
     errdefer registry.deinit();
@@ -3074,9 +2784,6 @@ fn baseUrlCaptureRegistry(allocator: std.mem.Allocator) !api_registry.ApiRegistr
     return registry;
 }
 
-/// Model shaped like the TS SDK's descriptors: known provider/API routing
-/// but an empty base URL and no token metadata (deserializeModel defaults
-/// max_tokens to 0 when the client omits it).
 fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8, model_id: []const u8) ai_types.Model {
     return .{
         .id = model_id,
@@ -3123,9 +2830,6 @@ test "handleStreamRequest defaults empty base URL for known provider" {
         mutable_resp.deinit(std.testing.allocator);
     }
 
-    // The provider must have seen the canonical endpoint (or the env
-    // override when one is set), never the empty client value, plus a
-    // usable token limit (the SDK descriptors carry none).
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     const expected = try provider_base_url.defaultBaseUrlForRef(std.testing.allocator, "anthropic", "anthropic-messages");
     defer std.testing.allocator.free(expected);
@@ -3167,7 +2871,6 @@ test "handleStreamRequest preserves explicit base URL" {
 
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://explicit.example.com", captured);
-    // Client-supplied limits are never overridden.
     try std.testing.expectEqual(@as(u32, 1234), BaseUrlMockState.received_max_tokens);
 }
 
@@ -3199,9 +2902,6 @@ test "handleStreamRequest keeps unknown provider base URL empty" {
         mutable_resp.deinit(std.testing.allocator);
     }
 
-    // No endpoint may be derived from the API type for an unknown provider.
-    // A configured global override (MAKAI_BASE_URL) still applies by design,
-    // so compare against the resolver instead of a bare empty string.
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "mystery-vendor", "anthropic-messages", null);
     defer std.testing.allocator.free(expected);
@@ -3209,8 +2909,6 @@ test "handleStreamRequest keeps unknown provider base URL empty" {
 }
 
 test "handleStreamRequest defaults catalog-issued codex and kimi base URLs" {
-    // openai-codex models always use the ChatGPT backend regardless of the
-    // host environment (no override form), so a literal assertion is safe.
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3247,19 +2945,12 @@ test "handleStreamRequest defaults catalog-issued codex and kimi base URLs" {
 
         const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
         try std.testing.expect(captured.len > 0);
-        // Exact endpoint literals are pinned by the provider_base_url unit
-        // tests; here a global host override (MAKAI_BASE_URL) legitimately
-        // changes the answer, so compare against the resolver.
         const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "openai-codex", "openai-codex-responses", null);
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(expected, captured);
-        // gpt-5-codex is a reasoning family; the SDK sends no capability
-        // metadata, so the server must rehydrate the flag before dispatch.
         try std.testing.expect(BaseUrlMockState.received_reasoning);
     }
 
-    // Kimi resolves through the region-aware path (env / stored region /
-    // china default), so compare against the same resolver the server uses.
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3315,10 +3006,6 @@ test "handleStreamRequest honors kimi region stored on OAuth credentials" {
     };
     try registry.registerApiProvider(provider, null);
 
-    // Stored Kimi credentials carrying a global region. The region slice is
-    // securely freed with the storage, so reading it must normalize while
-    // the storage is alive (a dangling read previously resolved global
-    // accounts to the china endpoint).
     var storage = AuthStorage{
         .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
         .allocator = std.testing.allocator,
@@ -3356,19 +3043,12 @@ test "handleStreamRequest honors kimi region stored on OAuth credentials" {
         mutable_resp.deinit(std.testing.allocator);
     }
 
-    // The stored region flows through resolution (KIMI_REGION env, when set
-    // on the host, legitimately wins — comparing against the same resolver
-    // covers both cases).
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "kimi", "openai-completions", "global");
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, captured);
 }
 
-/// Loader matching ProtocolServer.Options.load_auth_storage_fn, serving an
-/// in-memory storage with a global-region Kimi credential: proves the
-/// region read goes through the configured loader (the same source
-/// streamWithRefresh authenticates against), not the host default file.
 fn kimiRegionTestLoader(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
     _ = ctx;
     var storage = oauth_storage.AuthStorage{
@@ -3430,8 +3110,6 @@ test "handleStreamRequest reads kimi region via configured auth loader" {
 }
 
 test "handleStreamRequest infers reasoning capability and preserves explicit flags" {
-    // Client-sent true survives; absent/false capabilities are rehydrated
-    // from the CLI's model-family inference.
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3463,7 +3141,6 @@ test "handleStreamRequest infers reasoning capability and preserves explicit fla
             mutable_resp.deinit(std.testing.allocator);
         }
 
-        // claude-1-0 infers false, but the client said true explicitly.
         try std.testing.expect(BaseUrlMockState.received_reasoning);
     }
     {
@@ -3494,11 +3171,8 @@ test "handleStreamRequest infers reasoning capability and preserves explicit fla
             mutable_resp.deinit(std.testing.allocator);
         }
 
-        // A non-reasoning family stays false — inference is not blanket-on.
         try std.testing.expect(!BaseUrlMockState.received_reasoning);
     }
-    // An explicit endpoint means the descriptor was built by a client that
-    // also serialized its reasoning flag deliberately — never overridden.
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3536,8 +3210,6 @@ test "handleStreamRequest infers reasoning capability and preserves explicit fla
 }
 
 test "handleStreamRequest applies advertised catalog token limits" {
-    // A static-catalog model selected via models.list() but sent without
-    // options.max_tokens gets its advertised limit, not the generic 4096.
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3568,7 +3240,6 @@ test "handleStreamRequest applies advertised catalog token limits" {
 
         try std.testing.expectEqual(@as(u32, 8_192), BaseUrlMockState.received_max_tokens);
     }
-    // The Kimi pair uses its production-catalog limit (16_384).
     {
         BaseUrlMockState.reset();
         defer BaseUrlMockState.reset();
@@ -3722,13 +3393,11 @@ test "handleAbortRequest signals CancelToken so provider stops early" {
     try std.testing.expect(resp.?.payload == .ack);
     req.deinit(std.testing.allocator);
 
-    // Verify cancel token was passed to the provider and is not cancelled yet
     try std.testing.expect(CancelMockState.received_cancel_token != null);
     if (CancelMockState.received_cancel_token) |ct| {
         try std.testing.expect(!ct.isCancelled());
     }
 
-    // Now send abort
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -3744,11 +3413,9 @@ test "handleAbortRequest signals CancelToken so provider stops early" {
     try std.testing.expect(abort_resp != null);
     try std.testing.expect(abort_resp.?.payload == .ack);
 
-    // Stream moved to pending_cleanup (not active_streams) for deferred deinit.
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
-    server.cleanupCompletedStreams(); // drains pending_cleanup
+    server.cleanupCompletedStreams();
 
-    // Verify outbox has a stream_cancelled error
     var outbox_env = server.popOutbound();
     try std.testing.expect(outbox_env != null);
     if (outbox_env) |*env| {
@@ -3786,7 +3453,6 @@ test "handleAbortRequest with custom reason propagates to outbox stream_error" {
         .max_tokens = 4096,
     };
 
-    // Create stream
     const stream_id = protocol_types.generateUlid();
     var stream_req = protocol_types.Envelope{
         .stream_id = stream_id,
@@ -3804,7 +3470,6 @@ test "handleAbortRequest with custom reason propagates to outbox stream_error" {
     try std.testing.expect(create_resp != null);
     stream_req.deinit(std.testing.allocator);
 
-    // Abort with a custom reason
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
@@ -3820,7 +3485,6 @@ test "handleAbortRequest with custom reason propagates to outbox stream_error" {
     try std.testing.expect(abort_resp != null);
     try std.testing.expect(abort_resp.?.payload == .ack);
 
-    // Verify outbox has the custom reason
     var outbox_env = server.popOutbound();
     try std.testing.expect(outbox_env != null);
     if (outbox_env) |*env| {
@@ -3830,7 +3494,6 @@ test "handleAbortRequest with custom reason propagates to outbox stream_error" {
         env.deinit(std.testing.allocator);
     }
 
-    // Verify no more outbox messages
     try std.testing.expect(server.popOutbound() == null);
 }
 
@@ -3861,7 +3524,6 @@ test "cleanupCompletedStreams frees cancel flag for completed streams" {
         .max_tokens = 4096,
     };
 
-    // Create a stream
     const stream_id = protocol_types.generateUlid();
     var stream_req = protocol_types.Envelope{
         .stream_id = stream_id,
@@ -3879,10 +3541,8 @@ test "cleanupCompletedStreams frees cancel flag for completed streams" {
     try std.testing.expect(resp != null);
     stream_req.deinit(std.testing.allocator);
 
-    // Stream is already complete (mockStream completes immediately)
     try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
 
-    // Cleanup should free the cancel flag without leaks
     server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 }
@@ -3908,7 +3568,6 @@ test "ErrorCode.stream_cancelled serializes and deserializes in stream_error" {
     try std.testing.expect(std.mem.find(u8, json, "\"code\":\"stream_cancelled\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"message\":\"Client aborted\"") != null);
 
-    // Roundtrip
     var parsed = try envelope.deserializeEnvelope(json, allocator);
     defer parsed.deinit(allocator);
 
@@ -3919,25 +3578,6 @@ test "ErrorCode.stream_cancelled serializes and deserializes in stream_error" {
     env.deinit(allocator);
 }
 
-// ===========================================================================
-// M-006: Credential resolution tests
-// ===========================================================================
-//
-// These tests cover the binary's request-path auth resolution:
-//   1. Explicit API key on the request bypasses storage entirely.
-//   2. Missing API key triggers a storage lookup by `model.provider` and uses
-//      the stored credential (api_key or oauth access token).
-//   3. With neither an explicit key nor a stored credential, the server
-//      returns a `nack` carrying `auth_required` so the TS SDK can drive its
-//      auth retry policy.
-
-/// Stream provider that captures the api_key seen in StreamOptions so tests
-/// can assert that the binary forwarded the resolved credential to the
-/// upstream call. The captured slice is duplicated using the provided
-/// allocator and must be freed by the test.
-// SERIAL-ONLY: these fields are mutable globals. Tests that write CapturedCreds
-// must run serially (the default for `zig test` / `zig build test`). Do not add
-// concurrent tests against this struct without per-test synchronisation.
 const CapturedCreds = struct {
     var captured_key: ?[]u8 = null;
     var captured_allocator: ?std.mem.Allocator = null;
@@ -3998,8 +3638,6 @@ test "credential resolution: explicit api_key bypasses storage lookup" {
         .stream_simple = mockStreamSimple,
     }, null);
 
-    // Storage HAS a different key for this provider — the explicit key on
-    // the request must win, and the stored key must NOT be observed.
     var storage = AuthStorage{
         .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
         .allocator = std.testing.allocator,
@@ -4088,7 +3726,6 @@ test "credential resolution: missing api_key loads credentials from storage by p
         .max_tokens = 4096,
     };
 
-    // No options → no explicit api_key; resolver must hit storage.
     var stream_req_env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
@@ -4119,7 +3756,6 @@ test "credential resolution: missing api_key and missing storage entry falls bac
         .stream_simple = mockStreamSimple,
     }, null);
 
-    // Empty auth storage — no credentials for this provider.
     var storage = AuthStorage{
         .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
         .allocator = std.testing.allocator,
@@ -4209,10 +3845,6 @@ test "credential resolution: complete_request without credentials falls back to 
     try std.testing.expect(response.?.payload == .result);
 }
 
-// ===========================================================================
-// M-008: Refresh lock integration tests
-// ===========================================================================
-
 fn expectRefreshLockAcquired(result: refresh_lock_mod.RefreshLock.AcquireResult) !u64 {
     return switch (result) {
         .acquired => |generation| generation,
@@ -4221,18 +3853,13 @@ fn expectRefreshLockAcquired(result: refresh_lock_mod.RefreshLock.AcquireResult)
 }
 
 test "refresh lock prevents duplicate concurrent refresh calls" {
-    // Verify that the per-server refresh lock deduplicates refresh attempts.
     var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
     defer lock.deinit();
 
-    // First acquire wins
     const gen1 = try expectRefreshLockAcquired(try lock.acquire("test-auth", null));
 
-    // Complete the first refresh
     lock.complete("test-auth", null, gen1, null);
 
-    // Completed entries with no waiters are removed, so a later acquire
-    // starts a fresh refresh.
     const gen2 = try expectRefreshLockAcquired(try lock.acquire("test-auth", null));
     lock.complete("test-auth", null, gen2, null);
 }
@@ -4274,12 +3901,9 @@ test "refreshWithLock wraps refreshCredentials under the lock" {
     });
     defer server.deinit();
 
-    // Call refreshWithLock — should acquire, refresh, and complete.
     try refreshWithLock(&server, "test-auth", &storage, oauth_provider);
     try std.testing.expectEqual(@as(usize, 1), state.refresh_count);
 
-    // Calling again should get completed_ok (lock still has result cached briefly)
-    // but since the entry is cleaned up after the first call, it will acquire again.
     try refreshWithLock(&server, "test-auth", &storage, oauth_provider);
     try std.testing.expectEqual(@as(usize, 2), state.refresh_count);
 }
@@ -4288,33 +3912,25 @@ test "refresh lock propagates refresh failure to waiters" {
     var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
     defer lock.deinit();
 
-    // Simulate a failed refresh
     const gen1 = try expectRefreshLockAcquired(try lock.acquire("failing-provider", null));
 
-    // Complete with failure
     lock.complete("failing-provider", null, gen1, error.AuthRefreshFailed);
 
-    // Completed entries with no waiters are removed, so a later acquire
-    // starts a fresh refresh.
     const gen2 = try expectRefreshLockAcquired(try lock.acquire("failing-provider", null));
     lock.complete("failing-provider", null, gen2, error.AuthRefreshFailed);
 }
 
 test "refresh lock timeout returns timed_out for stale locks" {
-    // 1 ms timeout for fast test
     var lock = refresh_lock_mod.RefreshLock.initWithTimeout(std.testing.allocator, 1);
     defer lock.deinit();
 
     const gen1 = try expectRefreshLockAcquired(try lock.acquire("slow-provider", null));
 
-    // Wait for timeout
     compat.time.sleepNs(5 * std.time.ns_per_ms);
 
-    // Second caller should get timed_out
     const r2 = try lock.acquire("slow-provider", null);
     try std.testing.expect(r2 == .timed_out);
 
-    // Clean up
     lock.complete("slow-provider", null, gen1, null);
 }
 
@@ -4322,13 +3938,10 @@ test "refresh lock independent providers do not block each other" {
     var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
     defer lock.deinit();
 
-    // Acquire lock for provider A
     const gen1 = try expectRefreshLockAcquired(try lock.acquire("provider-a", null));
 
-    // Provider B should acquire without waiting
     const gen2 = try expectRefreshLockAcquired(try lock.acquire("provider-b", null));
 
-    // Clean up
     lock.complete("provider-a", null, gen1, null);
     lock.complete("provider-b", null, gen2, null);
 }

@@ -1,12 +1,3 @@
-//! Worker-thread driver for interactive `/login` OAuth flows.
-//!
-//! The OAuth `login()` functions are blocking and use context-free function
-//! pointer callbacks, which are incompatible with the zigzag event loop. This
-//! module runs a provider's `login()` on a worker thread and bridges its
-//! callbacks through a module-level global (only one login may run at a time).
-//! The main thread drives the UI by calling `poll()` each tick: it surfaces the
-//! authorization URL, switches to an input prompt when the worker blocks on
-//! `onPrompt`, and collects the result when the flow completes.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -22,8 +13,6 @@ pub const Provider = enum {
     kimi,
 };
 
-/// Storage key under which credentials are persisted in `~/.makai/auth.json`.
-/// Must match the provider IDs consumers expect (see protocol/auth/server.zig).
 pub fn providerStorageKey(provider: Provider) []const u8 {
     return switch (provider) {
         .anthropic => "anthropic",
@@ -37,19 +26,12 @@ const Phase = enum { running, done, failed };
 
 pub const PollResult = union(enum) {
     none,
-    /// The flow produced an authorization URL the user must open. Borrowed,
-    /// valid until the next `poll()`/`deinit()`.
     show_auth: struct { url: []const u8, instructions: ?[]const u8 },
-    /// The worker is blocked waiting for pasted input. Borrowed message.
     request_input: struct { message: []const u8 },
-    /// Login finished; ownership of the credentials transfers to the caller.
     done: storage.Credentials,
-    /// Login failed; borrowed error name, valid until `deinit()`.
     failed: []const u8,
 };
 
-/// Only one login may be active at a time. The OAuth callbacks take no context
-/// pointer, so they reach the active session through this global.
 var g_active: ?*LoginSession = null;
 
 pub const LoginSession = struct {
@@ -74,8 +56,6 @@ pub const LoginSession = struct {
     result: ?storage.Credentials = null,
     error_name: []u8 = &.{},
 
-    /// Spawn the worker thread for `provider`. Caller owns the returned pointer
-    /// and must call `deinit()`.
     pub fn start(allocator: std.mem.Allocator, provider: Provider) !*LoginSession {
         if (g_active != null) return error.LoginInProgress;
 
@@ -99,12 +79,10 @@ pub const LoginSession = struct {
         return self;
     }
 
-    /// Spin until the mutex is acquired (std.atomic.Mutex has no blocking lock).
     fn lock(self: *LoginSession) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    /// Signal the worker to stop, join it, and free everything.
     pub fn deinit(self: *LoginSession) void {
         {
             self.lock();
@@ -123,7 +101,6 @@ pub const LoginSession = struct {
         allocator.destroy(self);
     }
 
-    /// Main-thread step. Performs at most one transition per call.
     pub fn poll(self: *LoginSession) PollResult {
         self.lock();
         defer self.mutex.unlock();
@@ -152,8 +129,6 @@ pub const LoginSession = struct {
         return .none;
     }
 
-    /// Provide the input the worker is blocked on. Empty text is allowed for
-    /// optional prompts (e.g. the GitHub enterprise domain).
     pub fn provideInput(self: *LoginSession, text: []const u8) !void {
         const dup = try self.allocator.dupe(u8, text);
         self.lock();
@@ -162,8 +137,6 @@ pub const LoginSession = struct {
         self.input_value = dup;
         self.input_ready = true;
     }
-
-    // --- worker-side helpers (run on the worker thread) ---
 
     fn recordAuth(self: *LoginSession, url: []const u8, instructions: ?[]const u8) void {
         self.lock();
@@ -175,10 +148,6 @@ pub const LoginSession = struct {
         self.auth_pending = true;
     }
 
-    /// Block until the main thread supplies input, then hand ownership of the
-    /// allocated slice to the caller when non-empty input is required. Optional
-    /// prompts keep empty input as a non-owned literal so provider flows that
-    /// interpret empty as "use default" do not try to free it.
     fn waitForInput(self: *LoginSession, message: []const u8, allow_empty: bool) []const u8 {
         self.lock();
         if (self.prompt_message.len > 0) self.allocator.free(self.prompt_message);
@@ -249,8 +218,6 @@ pub const LoginSession = struct {
     }
 };
 
-// --- callback bridges (one shim per provider; all funnel into the active session) ---
-
 fn anthropicOnAuth(info: anthropic.AuthInfo) void {
     if (g_active) |s| s.recordAuth(info.url, info.instructions);
 }
@@ -274,8 +241,6 @@ fn codexOnPrompt(prompt: codex.Prompt) []const u8 {
     const s = g_active orelse return "";
     return s.waitForInput(prompt.message, prompt.allow_empty);
 }
-
-// --- worker entry points ---
 
 fn runAnthropic(self: *LoginSession) void {
     const creds = anthropic.login(.{ .onAuth = anthropicOnAuth, .onPrompt = anthropicOnPrompt }, self.allocator) catch |err| {
@@ -312,7 +277,6 @@ fn runCodex(self: *LoginSession) void {
 }
 
 fn runKimi(self: *LoginSession) void {
-    // First, ask for region selection
     const region_prompt = "Select your region:\n  1. China (api.kimi.com)\n  2. Global (api.moonshot.ai)\nEnter choice (1 or 2):";
     const region_choice = self.waitForInput(region_prompt, false);
     defer self.allocator.free(region_choice);
@@ -320,7 +284,7 @@ fn runKimi(self: *LoginSession) void {
     const region = if (std.mem.eql(u8, std.mem.trim(u8, region_choice, " \t\r\n"), "2"))
         "global"
     else
-        "china"; // Default to China
+        "china";
 
     const api_key = self.waitForInput("Enter Kimi API key:", false);
     defer self.allocator.free(api_key);
@@ -330,7 +294,6 @@ fn runKimi(self: *LoginSession) void {
         return;
     }
 
-    // Store region in provider_data as "region:china" or "region:global"
     const provider_data = std.fmt.allocPrint(self.allocator, "region:{s}", .{region}) catch {
         self.finishError("OutOfMemory");
         return;
@@ -359,7 +322,6 @@ test "providerStorageKey maps to expected ids" {
 }
 
 test "LoginSession start rejects a second concurrent login" {
-    // Manually occupy the global without spawning a worker.
     var placeholder: LoginSession = .{
         .allocator = std.testing.allocator,
         .provider = .anthropic,
@@ -390,7 +352,6 @@ test "LoginSession bridges prompt input through the worker" {
     session.thread = try std.Thread.spawn(.{}, Helper.worker, .{session});
     defer session.deinit();
 
-    // Wait for the worker to request input.
     var requested = false;
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {

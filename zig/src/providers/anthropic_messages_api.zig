@@ -47,8 +47,6 @@ fn anthropicIsAuthFailure(err_msg: []const u8) bool {
 }
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
-    // Check ANTHROPIC_AUTH_TOKEN first (OAuth), then ANTHROPIC_API_KEY
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
     return null;
@@ -94,19 +92,15 @@ fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     return out;
 }
 
-/// Result of cache control resolution
 const CacheControlResult = struct {
     retention: ai_types.CacheRetention,
-    /// If non-null, contains the cache_control object to add
     has_ttl: bool,
 };
 
-/// Resolve cache retention and determine cache_control settings
 fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention, supports_long_ttl: bool) ?CacheControlResult {
     const retention = cache_retention orelse .short;
     if (retention == .none) return null;
 
-    // Only add ttl for "long" retention on api.anthropic.com
     const has_ttl = retention == .long and (isAnthropicHost(base_url) or supports_long_ttl);
 
     return .{
@@ -122,16 +116,14 @@ fn isAnthropicHost(base_url: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value, "api.anthropic.com");
 }
 
-/// Check if a model supports adaptive thinking (Opus 4.6+)
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
     return std.mem.find(u8, model_id, "opus-4-6") != null or
         std.mem.find(u8, model_id, "opus-4.6") != null;
 }
 
-/// Map ThinkingLevel to Anthropic effort levels for adaptive thinking
 fn mapThinkingLevelToEffort(level: ai_types.ThinkingLevel) []const u8 {
     return switch (level) {
-        .off => "low", // off maps to lowest effort
+        .off => "low",
         .minimal => "low",
         .low => "low",
         .medium => "medium",
@@ -140,11 +132,10 @@ fn mapThinkingLevelToEffort(level: ai_types.ThinkingLevel) []const u8 {
     };
 }
 
-/// Get default thinking budget tokens for a thinking level (older models)
 fn getDefaultThinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets) u32 {
     if (budgets) |b| {
         return switch (level) {
-            .off => 0, // off means no thinking budget
+            .off => 0,
             .minimal => b.minimal orelse 256,
             .low => b.low orelse 512,
             .medium => b.medium orelse 1024,
@@ -195,7 +186,6 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
     }
 }
 
-/// Check if an assistant message contains tool_use blocks
 fn hasToolUse(msg: ai_types.Message) bool {
     switch (msg) {
         .assistant => |a| {
@@ -208,7 +198,6 @@ fn hasToolUse(msg: ai_types.Message) bool {
     return false;
 }
 
-/// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
     switch (msg) {
         .assistant => |a| {
@@ -219,7 +208,6 @@ fn shouldSkipAssistant(msg: ai_types.Message) bool {
     return false;
 }
 
-/// Collect all tool call IDs from assistant messages into a hash set
 fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.Message) !std.StringHashMap(void) {
     var tool_call_ids = std.StringHashMap(void).init(allocator);
     errdefer {
@@ -247,10 +235,7 @@ fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.M
     return tool_call_ids;
 }
 
-/// Check if a tool result is orphaned (no matching tool call)
-/// Only returns true if there ARE tool calls in the context but none match this result
 fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringHashMap(void)) bool {
-    // If there are no tool calls at all, don't filter - results might be from prior context
     if (tool_call_ids.count() == 0) {
         return false;
     }
@@ -265,7 +250,6 @@ fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringH
     return false;
 }
 
-/// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
     while (iter.next()) |key| {
@@ -278,24 +262,20 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
-    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
-    // synthetic tool results for orphaned calls, aborted message filtering
     var transformed = try pre_transform.preTransform(allocator, context.messages, .{
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = 64, // Anthropic max tool ID length
+        .max_tool_id_len = 64,
         .insert_synthetic_results = true,
         .tools = context.tools,
         .is_oauth = is_oauth,
     });
     defer transformed.deinit();
 
-    // Use transformed messages
     var tx_context = context;
     tx_context.messages = transformed.messages;
 
-    // Resolve cache control settings
     const supports_long_cache_ttl = if (model.compat) |compat_options|
         compat_options.supports_anthropic_cache_ttl == true
     else
@@ -314,15 +294,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         (supportsAdaptiveThinking(model.id) or requested_max > 1024);
     if (options.temperature) |t| {
         if (emits_thinking and t != 1) {
-            // Anthropic extended thinking requires the default temperature.
         } else {
         try w.writeKey("temperature");
         try w.writeFloat(t);
         }
     }
 
-    // System prompt as array of content blocks with cache_control
-    // For OAuth, prepend Claude Code identity to system prompt
     if (context.getSystemPrompt()) |sp| {
         try w.writeKey("system");
         try w.beginArray();
@@ -330,10 +307,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.beginObject();
         try w.writeStringField("type", "text");
         if (is_oauth) {
-            // Prepend Claude Code identity for OAuth
             const full_prompt = try std.fmt.allocPrint(allocator, "You are Claude Code, Anthropic's official CLI for Claude.\n\n{s}", .{sp});
             defer allocator.free(full_prompt);
-            // Sanitize system prompt
             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, full_prompt);
             defer {
                 if (sanitized.ptr != full_prompt.ptr) {
@@ -342,7 +317,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             }
             try w.writeStringField("text", sanitized);
         } else {
-            // Sanitize system prompt
             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
             defer {
                 if (sanitized.ptr != sp.ptr) {
@@ -364,7 +338,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
         try w.endArray();
     } else if (is_oauth) {
-        // OAuth requires at least the identity even without custom system prompt
         try w.writeKey("system");
         try w.beginArray();
         try w.beginObject();
@@ -383,11 +356,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.endArray();
     }
 
-    // Collect tool call IDs from transformed messages for any remaining filtering
     var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    // Find the last user message index for cache_control placement
     var last_user_idx: ?usize = null;
     for (tx_context.messages, 0..) |m, i| {
         switch (m) {
@@ -402,13 +373,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     while (msg_idx < tx_context.messages.len) {
         const m = tx_context.messages[msg_idx];
 
-        // Skip aborted/error assistant messages
         if (shouldSkipAssistant(m)) {
             msg_idx += 1;
             continue;
         }
 
-        // Skip orphaned tool results (no matching tool call)
         if (isOrphanedToolResult(m, &tool_call_ids)) {
             msg_idx += 1;
             continue;
@@ -416,14 +385,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
         const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
 
-        // Group consecutive tool_result messages into a single user message
         if (m == .tool_result) {
             try w.beginObject();
             try w.writeStringField("role", "user");
             try w.writeKey("content");
             try w.beginArray();
 
-            // Collect ALL consecutive tool_results
             while (msg_idx < tx_context.messages.len and tx_context.messages[msg_idx] == .tool_result) {
                 const tr = tx_context.messages[msg_idx].tool_result;
 
@@ -431,20 +398,15 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "tool_result");
                 try w.writeStringField("tool_use_id", tr.tool_call_id);
 
-                // Serialize content - can be text, images, or array of content blocks
                 if (tr.content.len == 1 and tr.content[0] == .text) {
-                    // Single text: serialize as string for simplicity
-                    // Sanitize text to remove unpaired surrogates
                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, tr.content[0].text.text);
                     defer {
-                        // Only free if a new allocation was made
                         if (sanitized.ptr != tr.content[0].text.text.ptr) {
                             allocator.free(@constCast(sanitized));
                         }
                     }
                     try w.writeStringField("content", sanitized);
                 } else if (tr.content.len > 1 or (tr.content.len > 0 and tr.content[0] == .image)) {
-                    // Multiple parts or image: serialize as array
                     try w.writeKey("content");
                     try w.beginArray();
                     for (tr.content) |c| {
@@ -452,7 +414,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                // Sanitize text to remove unpaired surrogates
                                 const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                                 defer {
                                     if (sanitized.ptr != t.text.ptr) {
@@ -477,7 +438,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     }
                     try w.endArray();
                 } else {
-                    // Empty content
                     try w.writeStringField("content", "");
                 }
 
@@ -489,7 +449,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
             try w.endArray();
             try w.endObject();
-            continue; // Already incremented msg_idx
+            continue;
         }
 
         const role: []const u8 = switch (m) {
@@ -497,20 +457,17 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             else => "user",
         };
 
-        // Handle assistant messages with tool_use blocks specially
         if (m == .assistant and hasToolUse(m)) {
             try w.beginObject();
             try w.writeStringField("role", role);
             try w.writeKey("content");
             try w.beginArray();
 
-            // Serialize each content block
             for (m.assistant.content) |c| {
                 switch (c) {
                     .text => |t| {
                         try w.beginObject();
                         try w.writeStringField("type", "text");
-                        // Sanitize text to remove unpaired surrogates
                         const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                         defer {
                             if (sanitized.ptr != t.text.ptr) {
@@ -521,11 +478,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         try w.endObject();
                     },
                     .thinking => |t| {
-                        // If signature is missing (aborted stream), convert to text
                         if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
                             try w.beginObject();
                             try w.writeStringField("type", "text");
-                            // Sanitize thinking text
                             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
                             defer {
                                 if (sanitized.ptr != t.thinking.ptr) {
@@ -537,7 +492,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         } else {
                             try w.beginObject();
                             try w.writeStringField("type", "thinking");
-                            // Sanitize thinking text
                             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
                             defer {
                                 if (sanitized.ptr != t.thinking.ptr) {
@@ -575,19 +529,15 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.endArray();
             try w.endObject();
         } else if (is_last_user and cache_control != null) {
-            // For the last user message with cache_control, use content array format
             try w.beginObject();
             try w.writeStringField("role", role);
             try w.writeKey("content");
             try w.beginArray();
 
-            // Serialize user message content (text and images)
             switch (m.user.content) {
                 .text => |t| {
-                    // Text block with cache_control
                     try w.beginObject();
                     try w.writeStringField("type", "text");
-                    // Sanitize text to remove unpaired surrogates
                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
                     defer {
                         if (sanitized.ptr != t.ptr) {
@@ -610,7 +560,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                // Sanitize text to remove unpaired surrogates
                                 const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                                 defer {
                                     if (sanitized.ptr != t.text.ptr) {
@@ -618,7 +567,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                     }
                                 }
                                 try w.writeStringField("text", sanitized);
-                                // Add cache_control only to the last block
                                 if (i == parts.len - 1) {
                                     try w.writeKey("cache_control");
                                     try w.beginObject();
@@ -649,7 +597,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.endArray();
             try w.endObject();
         } else {
-            // Standard message serialization with image support
             switch (m) {
                 .user => |u| {
                     try w.beginObject();
@@ -657,7 +604,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
                     switch (u.content) {
                         .text => |t| {
-                            // Sanitize text to remove unpaired surrogates
                             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
                             defer {
                                 if (sanitized.ptr != t.ptr) {
@@ -674,7 +620,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                     .text => |t| {
                                         try w.beginObject();
                                         try w.writeStringField("type", "text");
-                                        // Sanitize text to remove unpaired surrogates
                                         const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                                         defer {
                                             if (sanitized.ptr != t.text.ptr) {
@@ -706,7 +651,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     try w.beginObject();
                     try w.writeStringField("role", role);
 
-                    // Serialize assistant content blocks
                     try w.writeKey("content");
                     try w.beginArray();
                     for (a.content) |c| {
@@ -714,7 +658,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                // Sanitize text to remove unpaired surrogates
                                 const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                                 defer {
                                     if (sanitized.ptr != t.text.ptr) {
@@ -725,11 +668,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 try w.endObject();
                             },
                             .thinking => |t| {
-                                // If signature is missing (aborted stream), convert to text
                                 if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
                                     try w.beginObject();
                                     try w.writeStringField("type", "text");
-                                    // Sanitize thinking text
                                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
                                     defer {
                                         if (sanitized.ptr != t.thinking.ptr) {
@@ -741,7 +682,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 } else {
                                     try w.beginObject();
                                     try w.writeStringField("type", "thinking");
-                                    // Sanitize thinking text
                                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
                                     defer {
                                         if (sanitized.ptr != t.thinking.ptr) {
@@ -761,7 +701,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
                     try w.endObject();
                 },
-                .tool_result => unreachable, // Handled above
+                .tool_result => unreachable,
             }
         }
 
@@ -769,7 +709,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
     try w.endArray();
 
-    // Serialize tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
             try w.writeKey("tools");
@@ -786,7 +725,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         }
     }
 
-    // Serialize tool_choice if present
     if (options.tool_choice) |tc| {
         try w.writeKey("tool_choice");
         switch (tc) {
@@ -815,7 +753,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         }
     }
 
-    // Serialize metadata.user_id if present
     if (options.metadata) |meta| {
         if (meta.getUserId()) |user_id| {
             try w.writeKey("metadata");
@@ -825,10 +762,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         }
     }
 
-    // Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
     if (options.thinking_enabled and model.reasoning) {
         if (supportsAdaptiveThinking(model.id)) {
-            // Adaptive thinking: Claude decides when and how much to think
             try w.writeKey("thinking");
             try w.beginObject();
             try w.writeStringField("type", "adaptive");
@@ -841,7 +776,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.endObject();
             }
         } else if (requested_max > 1024) {
-            // Budget-based thinking for older models
             try w.writeKey("thinking");
             try w.beginObject();
             try w.writeStringField("type", "enabled");
@@ -855,15 +789,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     return buf.toOwnedSlice(allocator);
 }
 
-/// Result type for parsing an Anthropic SSE event
 const ParseResult = union(enum) {
     none: void,
     message_start: struct { input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64 },
     content_block_start: struct {
         index: usize,
         block_type: ContentType,
-        tool_id: []const u8 = "", // Only for tool_use
-        tool_name: []const u8 = "", // Only for tool_use
+        tool_id: []const u8 = "",
+        tool_name: []const u8 = "",
     },
     content_block_delta: struct { index: usize, delta: ContentDelta },
     content_block_stop: struct { index: usize },
@@ -941,7 +874,6 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
         else
             return .{ .none = {} };
 
-        // For tool_use, extract id and name
         if (block_type == .tool_use) {
             var tool_id: []const u8 = "";
             var tool_name: []const u8 = "";
@@ -951,7 +883,6 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
             if (content_block.object.get("name")) |name_val| {
                 if (name_val == .string) tool_name = name_val.string;
             }
-            // Dupe the strings since they come from temporary JSON parse buffer
             const duped_id = try allocator.dupe(u8, tool_id);
             errdefer allocator.free(duped_id);
             const duped_name = try allocator.dupe(u8, tool_name);
@@ -1069,7 +1000,6 @@ const ThreadCtx = struct {
     retry: ?ai_types.RetryConfig = null,
     ping_interval_ms: ?u64 = null,
 
-    /// Clean up all owned resources (model, context, api_key, request_body, self).
     fn deinit(self: *ThreadCtx) void {
         self.allocator.free(self.api_key);
         self.allocator.free(self.request_body);
@@ -1115,18 +1045,15 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !Ant
 
     const is_oauth = isOAuthToken(api_key);
 
-    // OAuth tokens use Authorization: Bearer, API keys use x-api-key
     if (is_oauth) {
         out.auth_header = try buildBearerAuthValue(allocator, api_key);
         try out.headers.append(allocator, .{ .name = "authorization", .value = out.auth_header.? });
-        // OAuth-specific headers (mimic Claude Code)
         try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
         try out.headers.append(allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" });
         try out.headers.append(allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" });
         try out.headers.append(allocator, .{ .name = "x-app", .value = "cli" });
     } else {
         try out.headers.append(allocator, .{ .name = "x-api-key", .value = api_key });
-        // Add beta headers for fine-grained tool streaming and interleaved thinking
         try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
     }
 
@@ -1137,7 +1064,6 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !Ant
 }
 
 fn runThread(ctx: *ThreadCtx) void {
-    // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
     const stream = ctx.stream;
     const model = ctx.model;
@@ -1148,12 +1074,10 @@ fn runThread(ctx: *ThreadCtx) void {
     const on_payload_ctx = ctx.on_payload_ctx;
     const retry_options = ctx.retry;
 
-    // Invoke on_payload callback before sending
     if (on_payload_fn) |cb| {
         cb(on_payload_ctx, request_body);
     }
 
-    // Check cancellation before sending
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
@@ -1190,7 +1114,6 @@ fn runThread(ctx: *ThreadCtx) void {
     defer header_set.deinit(allocator);
     const headers = header_set.headers.items;
 
-    // Retry configuration
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_options) |ro| ro.max_retry_delay_ms orelse 60000 else 60000;
@@ -1205,7 +1128,6 @@ fn runThread(ctx: *ThreadCtx) void {
     defer if (req_initialized) req.deinit();
 
     while (true) {
-        // Check cancellation before each attempt
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -1215,7 +1137,6 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Deinit previous request if this is a retry
         if (req_initialized) {
             req.deinit();
             req_initialized = false;
@@ -1228,23 +1149,16 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         }
 
-        // SSE streams must not be gzip-compressed — gzip buffers the entire
-        // stream before delivery, breaking real-time event delivery.
-        // Use .headers.accept_encoding = .{ .override = "identity" } to
-        // replace the Zig HTTP client's built-in "accept-encoding: gzip, deflate"
-        // with "accept-encoding: identity" (no compression).
         req = http_client.openRequest(.POST, uri, .{
             .extra_headers = headers,
             .accept_encoding = "identity",
         }) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -1258,14 +1172,12 @@ fn runThread(ctx: *ThreadCtx) void {
         req_initialized = true;
 
         compat.http.sendRequest(&req, request_body) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -1285,14 +1197,12 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         response = compat.http.receiveResponse(&req, &head_buf) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -1305,28 +1215,19 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         if (response.head.status == .ok) {
-            // Success - break out of retry loop
             break;
         }
 
-        // Check if status is retryable
         const status_code: u16 = @intFromEnum(response.head.status);
         const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
 
         if (should_retry) {
-            // Note: We skip reading the error body here because the response state machine
-            // may not be in a valid state for body reading (e.g., after a redirect or when
-            // the connection has been reset). The error body is only used for optional retry
-            // delay hints, so we rely on status code and Retry-After header instead.
             const error_text: []const u8 = &.{};
 
-            // Check if error body indicates a retryable error
             const is_retryable_error = retry_util.isRetryableError(error_text);
 
-            // Calculate delay - prefer server-provided delay
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header (only if headers contain valid \r\n separator)
             if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
@@ -1341,21 +1242,17 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             }
 
-            // Check body for retry delay
             if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
                 if (body_delay <= max_delay_ms) {
                     delay = body_delay;
                 }
             }
 
-            // If not a retryable error message, don't retry
             if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
                 break;
             }
 
-            // Wait before retry
             if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
@@ -1366,11 +1263,9 @@ fn runThread(ctx: *ThreadCtx) void {
             continue;
         }
 
-        // Non-retryable error or max retries reached
         break;
     }
 
-    // After retry loop, check final status
     if (response.head.status != .ok) {
         const status_code = @intFromEnum(response.head.status);
         if (last_error) |e| allocator.free(e);
@@ -1392,19 +1287,16 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = compat.http.responseReader(&response, &transfer_buf);
 
-    // Track content blocks by API index
     const BlockInfo = struct {
         content_type: ParseResult.ContentType,
-        content_index: usize, // index in our content array
+        content_index: usize,
     };
     var block_map = std.AutoHashMap(usize, BlockInfo).init(allocator);
     defer block_map.deinit();
 
-    // Track tool calls during streaming
     var tc_tracker = tool_call_tracker.ToolCallTracker.init(allocator);
     defer tc_tracker.deinit();
 
-    // Accumulate content for final message
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
     defer content_blocks.deinit(allocator);
     var current_text = std.ArrayList(u8).empty;
@@ -1414,38 +1306,25 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_thinking_signature = std.ArrayList(u8).empty;
     defer current_thinking_signature.deinit(allocator);
 
-    // Deferred frees for delta strings pushed to the stream.
-    // stream.push() stores borrowed references (owns_events=false); we must not free
-    // a delta string until AFTER the SSE loop exits to avoid a GPA timing issue where
-    // an in-flight free interleaves with subsequent GPA allocations in the same thread
-    // (content_blocks.append / block_map.put), which can silently fail under load.
-    // By collecting delta pointers here and freeing them all at thread exit we:
-    //   a) eliminate the leak the GPA would otherwise report, and
-    //   b) guarantee the frees only happen after all SSE processing is complete.
     var pending_delta_frees = std.ArrayList([]const u8).empty;
     defer {
         for (pending_delta_frees.items) |s| allocator.free(s);
         pending_delta_frees.deinit(allocator);
     }
 
-    // Accumulate raw response bytes for error diagnosis (up to 8 KB).
-    // Used to detect non-SSE JSON error bodies returned with HTTP 200.
     var raw_body = std.ArrayList(u8).empty;
     defer raw_body.deinit(allocator);
 
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
-    // Ping tracking
     var last_ping_time: i64 = 0;
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
-    // Emit start event with partial message
     const partial_start = createPartialMessage(model);
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
-        // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
@@ -1454,7 +1333,6 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -1486,7 +1364,6 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         }
 
-        // Accumulate raw bytes for error diagnosis (capped at 8 KB)
         if (raw_body.items.len < 8192) {
             const cap = 8192 - raw_body.items.len;
             raw_body.appendSlice(allocator, read_buf[0..@min(n, cap)]) catch {};
@@ -1519,18 +1396,15 @@ fn runThread(ctx: *ThreadCtx) void {
                 .content_block_start => |cbs| {
                     const content_idx = content_blocks.items.len;
 
-                    // Initialize accumulators based on block type
                     switch (cbs.block_type) {
                         .text => {
                             current_text.clearRetainingCapacity();
-                            // Emit text_start event
                             const partial = createPartialMessage(model);
                             stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .thinking => {
                             current_thinking.clearRetainingCapacity();
                             current_thinking_signature.clearRetainingCapacity();
-                            // Emit thinking_start event
                             const partial = createPartialMessage(model);
                             stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
@@ -1556,10 +1430,6 @@ fn runThread(ctx: *ThreadCtx) void {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
                                 stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
-                                // Defer the free: freeing a duped delta while the SSE loop is still
-                                // running can interfere with subsequent GPA allocations (block_map.put,
-                                // content_blocks.append) causing them to silently fail. Track the pointer
-                                // and free the batch at thread exit via pending_delta_frees.
                                 pending_delta_frees.append(allocator, txt) catch allocator.free(txt);
                             },
                             .thinking => |thk| {
@@ -1569,11 +1439,9 @@ fn runThread(ctx: *ThreadCtx) void {
                             },
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
-                                // sig is not stored in the stream, so it is safe to free immediately.
                                 allocator.free(sig);
                             },
                             .input_json => |json_delta| {
-                                // appendDelta copies json_delta into its accumulator.
                                 tc_tracker.appendDelta(cbd.index, json_delta) catch {};
 
                                 if (tc_tracker.getContentIndex(cbd.index)) |content_idx| {
@@ -1598,7 +1466,6 @@ fn runThread(ctx: *ThreadCtx) void {
 
                         switch (block_info.content_type) {
                             .text => {
-                                // Store the completed text block
                                 const text_copy = allocator.dupe(u8, current_text.items) catch {
                                     ctx.deinit();
                                     stream.markThreadDone();
@@ -1610,7 +1477,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 stream.push(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } }) catch {};
                             },
                             .thinking => {
-                                // Store the completed thinking block
                                 const thinking_copy = allocator.dupe(u8, current_thinking.items) catch {
                                     ctx.deinit();
                                     stream.markThreadDone();
@@ -1633,7 +1499,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 if (tc_tracker.completeCall(cbs.index, allocator)) |tool_call| {
                                     content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {};
 
-                                    // Dupe the tool_call for the event so it owns its own memory
                                     const event_tc = ai_types.ToolCall{
                                         .id = allocator.dupe(u8, tool_call.id) catch tool_call.id,
                                         .name = allocator.dupe(u8, tool_call.name) catch tool_call.name,
@@ -1668,10 +1533,6 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // Flush SSE parser: finalizes any partial event that was missing its trailing \n\n.
-    // This handles truncated SSE responses where the API closes the connection before
-    // sending the final blank line.  Only api_error is actionable here; other events
-    // from a genuinely truncated stream are incomplete and best ignored.
     {
         const tail = parser.feed("\n\n") catch |err| {
             ctx.deinit();
@@ -1697,7 +1558,6 @@ fn runThread(ctx: *ThreadCtx) void {
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
     usage.calculateCost(model.cost);
 
-    // If no content blocks were collected but we have text, create a text block
     if (content_blocks.items.len == 0 and current_text.items.len > 0) {
         const text_copy = allocator.dupe(u8, current_text.items) catch {
             ctx.deinit();
@@ -1708,15 +1568,12 @@ fn runThread(ctx: *ThreadCtx) void {
         content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
     }
 
-    // If still no content, try to detect a plain JSON error body (no SSE framing)
-    // that Anthropic sometimes returns with HTTP 200 under load.
     if (content_blocks.items.len == 0) {
         var err_text: []const u8 = "anthropic returned empty response with no content blocks";
         var err_owned: ?[]u8 = null;
         defer if (err_owned) |e| allocator.free(e);
 
         if (raw_body.items.len > 0) {
-            // Attempt to parse the entire raw body as a JSON error object
             if (std.json.parseFromSlice(std.json.Value, allocator, raw_body.items, .{})) |body_json| {
                 defer body_json.deinit();
                 if (body_json.value == .object) {
@@ -1737,7 +1594,6 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             } else |_| {}
 
-            // If not a JSON error body, include the byte count for self-diagnosing failures
             if (err_owned == null) {
                 err_owned = std.fmt.allocPrint(allocator, "anthropic: empty response ({d} raw bytes, no SSE events)", .{raw_body.items.len}) catch null;
                 if (err_owned) |e| err_text = e;
@@ -1747,7 +1603,7 @@ fn runThread(ctx: *ThreadCtx) void {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError(err_text);
-        return; // defer fires, freeing err_owned after completeWithError has duped err_text
+        return;
     }
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
@@ -1780,15 +1636,9 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
-        .is_owned = true, // Strings were duped above
+        .is_owned = true,
     };
 
-    // Do NOT push a .done event here — the same AssistantMessage would be
-    // referenced by both the event and complete(), causing a double-free when
-    // the consumer deinits either one. OpenAI Completions uses the same
-    // pattern (complete() only, no preceding .done event).
-
-    // Free ctx allocations before completing
     ctx.deinit();
 
     stream.markThreadDone();
@@ -1823,14 +1673,12 @@ pub fn streamAnthropicMessages(
     };
     errdefer allocator.free(api_key);
 
-    // Clone model to own the memory (background thread outlives caller's memory)
     const owned_model = try ai_types.cloneModel(allocator, model);
     errdefer {
         var mut_m = owned_model;
         mut_m.deinit(allocator);
     }
 
-    // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = try ai_types.cloneContext(allocator, context);
     errdefer {
         var mut_ctx = owned_context;
@@ -1879,7 +1727,6 @@ pub fn streamSimpleAnthropicMessages(
 ) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
 
-    // Build thinking options based on reasoning level and model capabilities
     var thinking_enabled: bool = false;
     var thinking_budget_tokens: ?u32 = null;
     var thinking_effort: ?[]const u8 = null;
@@ -1888,10 +1735,8 @@ pub fn streamSimpleAnthropicMessages(
         if (o.reasoning) |level| {
             thinking_enabled = true;
             if (supportsAdaptiveThinking(model.id)) {
-                // Adaptive thinking: use effort level
                 thinking_effort = mapThinkingLevelToEffort(level);
             } else {
-                // Budget-based thinking for older models
                 const max_tokens = o.max_tokens orelse model.max_tokens;
                 if (level != .off and max_tokens > 1024) {
                     thinking_budget_tokens = @max(1024, @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1));
@@ -1990,10 +1835,9 @@ test "buildRequestBody includes cache_control in system prompt" {
     const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
-    // Verify system prompt is an array with cache_control
     try std.testing.expect(std.mem.find(u8, body, "\"system\":[") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"ttl\"") == null); // short retention, no ttl
+    try std.testing.expect(std.mem.find(u8, body, "\"ttl\"") == null);
 }
 
 test "buildRequestBody includes ttl for long retention on anthropic url" {
@@ -2029,7 +1873,6 @@ test "buildRequestBody includes ttl for long retention on anthropic url" {
     const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
-    // Verify ttl is included for long retention
     try std.testing.expect(std.mem.find(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
 }
 
@@ -2073,23 +1916,19 @@ test "buildRequestBody serializes tool_result as tool_result content block" {
     const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
-    // Parse to verify structure
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
     const msg_array = parsed.value.object.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 3), msg_array.items.len);
 
-    // Tool result message should have role "user"
     const tool_result_msg = msg_array.items[2];
     try std.testing.expectEqualStrings("user", tool_result_msg.object.get("role").?.string);
 
-    // Content should be an array
     const content = tool_result_msg.object.get("content").?;
     try std.testing.expect(content == .array);
     try std.testing.expectEqual(@as(usize, 1), content.array.items.len);
 
-    // Verify tool_result content block structure
     const tool_result_block = content.array.items[0];
     try std.testing.expectEqualStrings("tool_result", tool_result_block.object.get("type").?.string);
     try std.testing.expectEqualStrings("toolu_123", tool_result_block.object.get("tool_use_id").?.string);
@@ -2132,7 +1971,6 @@ test "buildRequestBody serializes tool_result with is_error=true" {
     const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
-    // Verify is_error is true
     try std.testing.expect(std.mem.find(u8, body, "\"is_error\":true") != null);
 }
 
@@ -2171,17 +2009,14 @@ test "buildRequestBody adds cache_control to last user message" {
     const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
-    // Parse to verify structure
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
     const msg_array = parsed.value.object.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 3), msg_array.items.len);
 
-    // First user message should be string content
     try std.testing.expect(msg_array.items[0].object.get("content").? == .string);
 
-    // Last user message should be array content with cache_control
     const last_content = msg_array.items[2].object.get("content").?;
     try std.testing.expect(last_content == .array);
     const last_block = last_content.array.items[0];
@@ -2201,7 +2036,6 @@ test "parseAnthropicEventType extracts tool_use id and name" {
     try std.testing.expectEqualStrings("toolu_01A", result.content_block_start.tool_id);
     try std.testing.expectEqualStrings("bash", result.content_block_start.tool_name);
 
-    // Free the duped strings
     allocator.free(result.content_block_start.tool_id);
     allocator.free(result.content_block_start.tool_name);
 }

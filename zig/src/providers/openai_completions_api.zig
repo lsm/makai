@@ -13,7 +13,6 @@ const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
 const compat_mod = @import("compat");
 
-/// Merged compatibility options from model-level config and detected capabilities
 const MergedCompat = struct {
     supports_store: bool,
     supports_developer_role: bool,
@@ -28,17 +27,10 @@ const MergedCompat = struct {
     supports_strict_mode: bool,
 };
 
-/// Merge model-level compat options with detected provider capabilities
-/// Model-level options take precedence over detected capabilities
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
     const is_openai_native = isOpenAIHost(model.base_url);
-    // detectCapabilities matches api.openai.com anywhere in the URL, so a
-    // generic gateway whose path merely contains that host would inherit
-    // OpenAI-native roles, reasoning effort and token fields. Honor those
-    // only on the parsed OpenAI host or an explicitly declared transparent
-    // proxy; every other endpoint keeps the compatible-endpoint defaults.
     const honors_native_caps = is_openai_native or isTransparentOpenAIProxy(model);
     const detected_developer_role = if (honors_native_caps) caps.supports_developer_role else false;
     const detected_reasoning_effort = if (honors_native_caps) caps.supports_reasoning_effort else false;
@@ -141,7 +133,6 @@ fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
     }
 }
 
-/// Check if we're using OpenRouter with an Anthropic model
 fn isOpenRouterAnthropic(model: ai_types.Model) bool {
     if (model.base_url.len == 0) return false;
     if (std.mem.find(u8, model.base_url, "openrouter") == null) return false;
@@ -149,7 +140,6 @@ fn isOpenRouterAnthropic(model: ai_types.Model) bool {
     return true;
 }
 
-/// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
     switch (msg) {
         .assistant => |a| {
@@ -160,7 +150,6 @@ fn shouldSkipAssistant(msg: ai_types.Message) bool {
     return false;
 }
 
-/// Collect all tool call IDs from assistant messages into a hash set
 fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.Message) !std.StringHashMap(void) {
     var tool_call_ids = std.StringHashMap(void).init(allocator);
     errdefer {
@@ -188,10 +177,7 @@ fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.M
     return tool_call_ids;
 }
 
-/// Check if a tool result is orphaned (no matching tool call)
-/// Only returns true if there ARE tool calls in the context but none match this result
 fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringHashMap(void)) bool {
-    // If there are no tool calls at all, don't filter - results might be from prior context
     if (tool_call_ids.count() == 0) {
         return false;
     }
@@ -206,7 +192,6 @@ fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringH
     return false;
 }
 
-/// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
     while (iter.next()) |key| {
@@ -224,7 +209,6 @@ fn writeMessagesArray(
     const merged = mergeCompat(model);
     const is_github_copilot = std.mem.eql(u8, model.provider, "github-copilot");
 
-    // Find the last user message index for cache_control (OpenRouter + Anthropic)
     const should_add_cache_control = isOpenRouterAnthropic(model);
     var last_user_msg_idx: ?usize = null;
     if (should_add_cache_control) {
@@ -240,17 +224,14 @@ fn writeMessagesArray(
     try writer.writeKey("messages");
     try writer.beginArray();
 
-    // Collect tool call IDs for orphaned tool result filtering
     var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
     if (context.getSystemPrompt()) |sp| {
         try writer.beginObject();
-        // Use developer role for reasoning models on providers that support it
         const use_developer = model.reasoning and merged.supports_developer_role;
         const system_role: []const u8 = if (use_developer) "developer" else "system";
         try writer.writeStringField("role", system_role);
-        // Sanitize system prompt to remove unpaired surrogates
         const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
         defer {
             if (sanitized.ptr != sp.ptr) {
@@ -266,13 +247,10 @@ fn writeMessagesArray(
     while (msg_idx < context.messages.len) : (msg_idx += 1) {
         const msg = context.messages[msg_idx];
 
-        // Skip aborted/error assistant messages
         if (shouldSkipAssistant(msg)) continue;
 
-        // Skip orphaned tool results
         if (isOrphanedToolResult(msg, &tool_call_ids)) continue;
 
-        // Handle user messages
         if (msg == .user) {
             const u = msg.user;
             const is_last_user_msg = should_add_cache_control and last_user_msg_idx != null and msg_idx == last_user_msg_idx.?;
@@ -282,7 +260,6 @@ fn writeMessagesArray(
 
             switch (u.content) {
                 .text => |t| {
-                    // Sanitize text to remove unpaired surrogates
                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
                     defer {
                         if (sanitized.ptr != t.ptr) {
@@ -320,7 +297,6 @@ fn writeMessagesArray(
                             const is_last_part = part_idx == parts.len - 1;
                             switch (p) {
                                 .text => |t| {
-                                    // Sanitize text to remove unpaired surrogates
                                     const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
                                     defer {
                                         if (sanitized.ptr != t.text.ptr) {
@@ -365,11 +341,9 @@ fn writeMessagesArray(
             continue;
         }
 
-        // Handle assistant messages - proper structured serialization
         if (msg == .assistant) {
             const a = msg.assistant;
 
-            // Collect text, thinking, and tool_call blocks
             var has_text = false;
             var has_thinking = false;
             var has_tool_calls = false;
@@ -386,17 +360,13 @@ fn writeMessagesArray(
                 .image => {},
             };
 
-            // Skip empty assistant messages (no content and no tool_calls)
-            // Mistral explicitly requires "either content or tool_calls, but not none"
             if (!has_text and !has_thinking and !has_tool_calls) continue;
 
             try writer.beginObject();
             try writer.writeStringField("role", "assistant");
 
-            // Serialize content - text blocks as array of {type: "text", text: ...}
             if (has_text) {
                 if (is_github_copilot) {
-                    // GitHub Copilot requires content as a flat string
                     var text_buf = std.ArrayList(u8).empty;
                     defer text_buf.deinit(allocator);
                     for (a.content) |c| switch (c) {
@@ -412,7 +382,6 @@ fn writeMessagesArray(
                 } else {
                     try writer.writeKey("content");
                     try writer.beginArray();
-                    // If thinking needs to be prepended as text (for DeepSeek etc.)
                     if (has_thinking and merged.requires_thinking_as_text) {
                         for (a.content) |c| switch (c) {
                             .thinking => |t| {
@@ -440,7 +409,6 @@ fn writeMessagesArray(
                     try writer.endArray();
                 }
             } else if (merged.requires_thinking_as_text and has_thinking) {
-                // Only thinking content, converted to text
                 try writer.writeKey("content");
                 try writer.beginArray();
                 for (a.content) |c| switch (c) {
@@ -456,7 +424,6 @@ fn writeMessagesArray(
                 };
                 try writer.endArray();
             } else {
-                // No text content - null or empty based on compat
                 if (merged.requires_thinking_as_text) {
                     try writer.writeStringField("content", "");
                 } else {
@@ -465,10 +432,7 @@ fn writeMessagesArray(
                 }
             }
 
-            // Serialize thinking as reasoning_content field (separate from content)
-            // Only if not already converted to text above
             if (has_thinking and !merged.requires_thinking_as_text) {
-                // Use the signature from the first thinking block for round-trip
                 var reasoning_field: []const u8 = "reasoning_content";
                 for (a.content) |c| switch (c) {
                     .thinking => |t| {
@@ -480,7 +444,6 @@ fn writeMessagesArray(
                     else => {},
                 };
 
-                // Collect all thinking text
                 var thinking_buf = std.ArrayList(u8).empty;
                 defer thinking_buf.deinit(allocator);
                 for (a.content) |c| switch (c) {
@@ -497,7 +460,6 @@ fn writeMessagesArray(
                 }
             }
 
-            // Serialize tool_calls
             if (has_tool_calls) {
                 try writer.writeKey("tool_calls");
                 try writer.beginArray();
@@ -517,8 +479,6 @@ fn writeMessagesArray(
                 };
                 try writer.endArray();
 
-                // Serialize reasoning_details for tool calls with thought_signature
-                // This is for OpenAI encrypted reasoning round-trip
                 var has_reasoning_details = false;
                 for (a.content) |c| {
                     if (c == .tool_call and c.tool_call.thought_signature != null) {
@@ -532,8 +492,6 @@ fn writeMessagesArray(
                     for (a.content) |c| {
                         if (c == .tool_call) {
                             if (c.tool_call.thought_signature) |sig| {
-                                // The thought_signature is already a JSON-serialized reasoning_detail object
-                                // Just write it directly as raw JSON
                                 try writer.writeRawJson(sig);
                             }
                         }
@@ -547,17 +505,13 @@ fn writeMessagesArray(
             continue;
         }
 
-        // Handle tool_result messages - group consecutive ones, extract images
         if (msg == .tool_result) {
-            // Collect image blocks from all consecutive tool results
             var image_blocks = std.ArrayList(ai_types.UserContentPart).empty;
             defer image_blocks.deinit(allocator);
 
-            // Process consecutive tool_result messages
             while (msg_idx < context.messages.len and context.messages[msg_idx] == .tool_result) {
                 const tr = context.messages[msg_idx].tool_result;
 
-                // Insert synthetic assistant message if required (Mistral compat)
                 if (merged.requires_assistant_after_tool_result and std.mem.eql(u8, prev_role, "tool")) {
                     try writer.beginObject();
                     try writer.writeStringField("role", "assistant");
@@ -565,7 +519,6 @@ fn writeMessagesArray(
                     try writer.endObject();
                 }
 
-                // Extract text content
                 var text_buf = std.ArrayList(u8).empty;
                 defer text_buf.deinit(allocator);
                 var has_images = false;
@@ -579,7 +532,6 @@ fn writeMessagesArray(
                     },
                 };
 
-                // Write tool result message
                 try writer.beginObject();
                 try writer.writeStringField("role", "tool");
                 try writer.writeStringField("tool_call_id", tr.tool_call_id);
@@ -591,7 +543,6 @@ fn writeMessagesArray(
                 try writer.endObject();
                 prev_role = "tool";
 
-                // Collect images for separate user message
                 if (has_images) {
                     for (tr.content) |c| switch (c) {
                         .image => |img| {
@@ -603,12 +554,9 @@ fn writeMessagesArray(
 
                 msg_idx += 1;
             }
-            // Back up one since the outer while will increment
             msg_idx -= 1;
 
-            // If we collected images, send them as a separate user message
             if (image_blocks.items.len > 0) {
-                // May need synthetic assistant before user message
                 if (merged.requires_assistant_after_tool_result) {
                     try writer.beginObject();
                     try writer.writeStringField("role", "assistant");
@@ -638,7 +586,6 @@ fn writeMessagesArray(
     try writer.endArray();
 }
 
-/// Write an image_url content part
 fn writeImageUrlPart(writer: *json_writer.JsonWriter, img: ai_types.ImageContent, allocator: std.mem.Allocator) !void {
     try writer.beginObject();
     try writer.writeStringField("type", "image_url");
@@ -665,8 +612,6 @@ fn buildRequestBody(
 
     const merged = mergeCompat(model);
 
-    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
-    // synthetic tool results for orphaned calls, aborted message filtering
     var transformed = try pre_transform.preTransform(allocator, context.messages, .{
         .target_api = model.api,
         .target_provider = model.provider,
@@ -678,7 +623,6 @@ fn buildRequestBody(
     });
     defer transformed.deinit();
 
-    // Build context with transformed messages
     var tx_context = context;
     tx_context.messages = transformed.messages;
 
@@ -687,30 +631,24 @@ fn buildRequestBody(
     try w.writeStringField("model", model.id);
     try writeMessagesArray(&w, tx_context, model, allocator);
     try w.writeBoolField("stream", true);
-    // Only include stream_options if provider supports usage in streaming
     if (merged.supports_usage_in_streaming) {
         try w.writeKey("stream_options");
         try w.beginObject();
         try w.writeBoolField("include_usage", true);
         try w.endObject();
     }
-    // Use appropriate max tokens field based on provider
     try w.writeIntField(merged.max_tokens_field, options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
-        // Kimi Coding only accepts temperature=1. Omit incompatible inherited
-        // TUI defaults instead of turning a valid request into HTTP 400.
         if (!isKimiModel(model) or t == 1.0) {
             try w.writeKey("temperature");
             try w.writeFloat(t);
         }
     }
-    // Add reasoning_effort for providers that support it
     if (options.getReasoningEffort()) |effort| {
         if (model.reasoning and merged.supports_reasoning_effort) {
             try w.writeStringField("reasoning_effort", effort);
         }
     }
-    // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
             try w.writeKey("tools");
@@ -724,7 +662,6 @@ fn buildRequestBody(
                 try w.writeStringField("description", tool.description);
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
-                // Add strict mode if supported
                 if (merged.supports_strict_mode) {
                     try w.writeBoolField("strict", true);
                 }
@@ -733,7 +670,6 @@ fn buildRequestBody(
             }
             try w.endArray();
 
-            // Add tool_choice if specified
             if (options.tool_choice) |tc| {
                 try w.writeKey("tool_choice");
                 switch (tc) {
@@ -752,8 +688,6 @@ fn buildRequestBody(
             }
         }
     }
-    // Privacy: don't store requests for OpenAI training
-    // Only add for providers that support the store field
     if (merged.supports_store) {
         try w.writeBoolField("store", false);
     }
@@ -775,7 +709,6 @@ const ThreadCtx = struct {
     retry_config: ?ai_types.RetryConfig = null,
     ping_interval_ms: ?u64 = null,
 
-    /// Clean up all owned resources
     fn deinit(self: *ThreadCtx) void {
         self.allocator.free(self.api_key);
         self.allocator.free(self.request_body);
@@ -787,7 +720,6 @@ const ThreadCtx = struct {
     }
 };
 
-/// Current block type being parsed
 const BlockType = enum {
     none,
     text,
@@ -795,11 +727,9 @@ const BlockType = enum {
     tool_call,
 };
 
-/// Tool call event parsed from delta, to be processed after parseChunk returns
-/// All strings are owned and must be freed with deinit.
 const ToolCallEvent = struct {
     api_index: usize,
-    is_start: bool, // true if this is a start event (has id)
+    is_start: bool,
     id: ?[]const u8,
     name: ?[]const u8,
     arguments_delta: ?[]const u8,
@@ -811,12 +741,8 @@ const ToolCallEvent = struct {
     }
 };
 
-/// Reasoning detail event parsed from delta.reasoning_details
-/// Used for OpenAI encrypted reasoning round-trip.
-/// All strings are owned and must be freed with deinit.
 const ReasoningDetailEvent = struct {
     tool_call_id: []const u8,
-    /// JSON-serialized reasoning_detail object
     detail_json: []const u8,
 
     fn deinit(self: *ReasoningDetailEvent, allocator: std.mem.Allocator) void {
@@ -825,10 +751,8 @@ const ReasoningDetailEvent = struct {
     }
 };
 
-/// Reasoning field names to check (in priority order)
 const reasoning_fields: []const []const u8 = &.{ "reasoning_content", "reasoning", "reasoning_text" };
 
-/// Find the first non-empty reasoning field in a delta object
 fn findReasoningField(delta: std.json.ObjectMap) ?struct { field: []const u8, value: []const u8 } {
     for (reasoning_fields) |field| {
         if (delta.get(field)) |val| {
@@ -864,20 +788,17 @@ fn parseChunk(
     const root = parsed.value;
     if (root != .object) return;
 
-    // Parse usage including reasoning tokens
     if (root.object.get("usage")) |u| {
         if (u == .object) {
             if (u.object.get("prompt_tokens")) |v| {
                 if (v == .integer) usage.input = @intCast(v.integer);
             }
-            // Check for cached tokens in prompt_tokens_details
             if (u.object.get("prompt_tokens_details")) |details| {
                 if (details == .object) {
                     if (details.object.get("cached_tokens")) |cached| {
                         if (cached == .integer) {
                             const cached_tokens: u64 = @intCast(cached.integer);
                             usage.cache_read = cached_tokens;
-                            // Subtract cached from input since OpenAI includes them in prompt_tokens
                             if (usage.input > cached_tokens) {
                                 usage.input -= cached_tokens;
                             }
@@ -885,12 +806,10 @@ fn parseChunk(
                     }
                 }
             }
-            // Get base completion tokens
             var completion_tokens: u64 = 0;
             if (u.object.get("completion_tokens")) |v| {
                 if (v == .integer) completion_tokens = @intCast(v.integer);
             }
-            // Check for reasoning tokens in completion_tokens_details
             var reasoning_tokens: u64 = 0;
             if (u.object.get("completion_tokens_details")) |details| {
                 if (details == .object) {
@@ -899,7 +818,6 @@ fn parseChunk(
                     }
                 }
             }
-            // Output includes both regular completion and reasoning tokens
             usage.output = completion_tokens + reasoning_tokens;
             if (u.object.get("total_tokens")) |v| {
                 if (v == .integer) usage.total_tokens = @intCast(v.integer);
@@ -920,7 +838,6 @@ fn parseChunk(
 
         if (ch.object.get("delta")) |d| {
             if (d == .object) {
-                // Check for tool_calls first (priority over reasoning and text)
                 if (d.object.get("tool_calls")) |tool_calls| {
                     if (tool_calls == .array) {
                         for (tool_calls.array.items) |tc| {
@@ -933,11 +850,9 @@ fn parseChunk(
                                 const tc_id = tc.object.get("id");
                                 const tc_func = tc.object.get("function");
 
-                                // If has id, it's a new tool call start
                                 if (tc_id) |id| {
                                     if (id == .string and id.string.len > 0) {
                                         current_block.* = .tool_call;
-                                        // Get name from function object
                                         var name_str: []const u8 = "";
                                         if (tc_func) |f| {
                                             if (f == .object) {
@@ -949,11 +864,9 @@ fn parseChunk(
                                             }
                                         }
 
-                                        // Dupe the strings since parsed JSON will be freed
                                         const duped_id = try allocator.dupe(u8, id.string);
                                         const duped_name = try allocator.dupe(u8, name_str);
 
-                                        // Add start event
                                         try tool_call_events.append(allocator, .{
                                             .api_index = tc_index,
                                             .is_start = true,
@@ -964,15 +877,12 @@ fn parseChunk(
                                     }
                                 }
 
-                                // Append arguments delta (can come with or without id)
                                 if (tc_func) |f| {
                                     if (f == .object) {
                                         if (f.object.get("arguments")) |args| {
                                             if (args == .string and args.string.len > 0) {
                                                 current_block.* = .tool_call;
-                                                // Dupe the string since parsed JSON will be freed
                                                 const duped_args = try allocator.dupe(u8, args.string);
-                                                // Add delta event
                                                 try tool_call_events.append(allocator, .{
                                                     .api_index = tc_index,
                                                     .is_start = false,
@@ -988,24 +898,18 @@ fn parseChunk(
                         }
                     }
                 } else if (findReasoningField(d.object)) |reasoning| {
-                    // Check for reasoning content (priority over text)
-                    // Track which field reasoning came from (for round-trip)
                     if (reasoning_signature.* == null) {
                         reasoning_signature.* = try allocator.dupe(u8, reasoning.field);
                     }
                     current_block.* = .thinking;
                     try thinking.appendSlice(allocator, reasoning.value);
                 } else if (d.object.get("content")) |c| {
-                    // Regular text content
                     if (c == .string and c.string.len > 0) {
                         current_block.* = .text;
                         try text.appendSlice(allocator, c.string);
                     }
                 }
 
-                // Parse reasoning_details for encrypted reasoning round-trip (OpenAI)
-                // Each detail with type="reasoning.encrypted" and matching tool_call id
-                // stores the serialized JSON as thought_signature on the tool call
                 if (d.object.get("reasoning_details")) |rd| {
                     if (rd == .array) {
                         for (rd.array.items) |detail| {
@@ -1020,7 +924,6 @@ fn parseChunk(
                                             if (id == .string and id.string.len > 0) {
                                                 if (detail_data) |dat| {
                                                     if (dat == .string and dat.string.len > 0) {
-                                                        // Serialize the detail object back to JSON
                                                         var detail_buf = std.ArrayList(u8).empty;
                                                         defer detail_buf.deinit(allocator);
                                                         detail_buf.print(allocator, "{{\"type\":\"reasoning.encrypted\",\"id\":\"{s}\",\"data\":\"{s}\"}}", .{ id.string, dat.string }) catch return;
@@ -1082,13 +985,6 @@ fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     return out;
 }
 
-/// Clone an event (deep-copy all string/content fields into stable heap
-/// allocations) before pushing it onto the stream. Required because this
-/// provider accumulates text/thinking into growing ArrayLists whose backing
-/// buffers move on reallocation; delta events that borrow a slice
-/// (`buf.items[prev..]`) would dangle after the next append. Cloning makes
-/// every pushed event self-owned so it survives buffer growth. The stream is
-/// configured with `owns_events = true` so consumers free the clones.
 fn pushOwnedEvent(
     allocator: std.mem.Allocator,
     stream: *event_stream.AssistantMessageEventStream,
@@ -1113,7 +1009,6 @@ fn maybeDumpProviderPayload(allocator: std.mem.Allocator, request_body: []const 
 }
 
 fn runThread(ctx: *ThreadCtx) void {
-    // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
     const stream = ctx.stream;
     const model = ctx.model;
@@ -1125,13 +1020,11 @@ fn runThread(ctx: *ThreadCtx) void {
     const on_payload_ctx = ctx.on_payload_ctx;
     const retry_config = ctx.retry_config;
 
-    // Invoke on_payload callback before sending
     if (on_payload_fn) |cb| {
         cb(on_payload_ctx, request_body);
     }
     maybeDumpProviderPayload(allocator, request_body);
 
-    // Check cancellation before sending
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
@@ -1144,7 +1037,6 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = compat_mod.http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // GitHub Copilot uses /chat/completions, others use /v1/chat/completions
     const url = if (std.mem.eql(u8, model.provider, "github-copilot"))
         buildUrlWithSuffix(allocator, model.base_url, "/chat/completions") catch {
             ctx.deinit();
@@ -1197,9 +1089,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    // Add GitHub Copilot headers if provider is github-copilot
     if (std.mem.eql(u8, model.provider, "github-copilot")) {
-        // Static Copilot headers (required for all requests)
         headers.append(allocator, .{ .name = "user-agent", .value = github_copilot.COPILOT_HEADERS.user_agent }) catch {
             ctx.deinit();
             stream.completeWithError("oom copilot headers");
@@ -1225,7 +1115,6 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
-        // Dynamic Copilot headers (based on request content)
         const has_images = github_copilot.hasCopilotVisionInput(context.messages);
         const copilot_headers = github_copilot.buildCopilotDynamicHeaders(
             context.messages,
@@ -1249,17 +1138,11 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // Kimi requires a specific User-Agent header for authentication; without it
-    // the WAF returns 403 ("only available for Coding Agents"). We must OVERRIDE
-    // the client's default user-agent (which would otherwise be `zig/...` and
-    // collide with any value added via extra_headers, producing a duplicate
-    // header). The override is applied in openRequest below.
     const user_agent_override: ?[]const u8 = if (isKimiModel(model))
         "claude-code/0.1.0"
     else
         null;
 
-    // Retry configuration
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_config) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
@@ -1272,7 +1155,6 @@ fn runThread(ctx: *ThreadCtx) void {
     defer if (req_initialized) req.deinit();
 
     while (true) {
-        // Check cancellation before each attempt
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -1282,21 +1164,18 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Deinit previous request if this is a retry
         if (req_initialized) {
             req.deinit();
             req_initialized = false;
         }
 
         req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items, .user_agent = user_agent_override }) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
                 stream.markThreadDone();
@@ -1310,14 +1189,12 @@ fn runThread(ctx: *ThreadCtx) void {
         req_initialized = true;
 
         compat_mod.http.sendRequest(&req, request_body) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
                 stream.markThreadDone();
@@ -1330,14 +1207,12 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         response = compat_mod.http.receiveResponse(&req, &head_buf) catch {
-            // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
                     continue;
                 }
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
                 stream.markThreadDone();
@@ -1350,28 +1225,19 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         if (response.head.status == .ok) {
-            // Success - break out of retry loop
             break;
         }
 
-        // Check if status is retryable
         const status_code: u16 = @intFromEnum(response.head.status);
         const should_retry = retry.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
 
         if (should_retry) {
-            // Note: We skip reading the error body here because the response state machine
-            // may not be in a valid state for body reading (e.g., after a redirect or when
-            // the connection has been reset). The error body is only used for optional retry
-            // delay hints, so we rely on status code and Retry-After header instead.
             const error_text: []const u8 = &.{};
 
-            // Check if error body indicates a retryable error
             const is_retryable_error = retry.isRetryableError(error_text);
 
-            // Calculate delay - prefer server-provided delay
             var delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header (only if headers contain valid \r\n separator)
             if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
@@ -1386,21 +1252,17 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             }
 
-            // Check body for retry delay
             if (retry.extractRetryDelayFromBody(error_text)) |body_delay| {
                 if (body_delay <= max_delay_ms) {
                     delay = body_delay;
                 }
             }
 
-            // If not a retryable error message, don't retry
             if (!is_retryable_error and !retry.isRetryable(status_code)) {
                 break;
             }
 
-            // Wait before retry
             if (!retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
-                // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
                 stream.markThreadDone();
@@ -1411,13 +1273,10 @@ fn runThread(ctx: *ThreadCtx) void {
             continue;
         }
 
-        // Non-retryable error or max retries reached
         break;
     }
 
-    // After retry loop, check final status
     if (response.head.status != .ok) {
-        // Read error body for debugging
         var error_buf: [4096]u8 = undefined;
         const error_reader = compat_mod.http.responseReader(&response, &error_buf);
         const error_body = compat_mod.http.allocRemainingResponse(allocator, error_reader, 8192) catch null;
@@ -1451,7 +1310,6 @@ fn runThread(ctx: *ThreadCtx) void {
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
 
-    // Tool call tracking
     var tool_call_tracker_instance = tool_call_tracker.ToolCallTracker.init(allocator);
     defer tool_call_tracker_instance.deinit();
     var tool_call_events = std.ArrayList(ToolCallEvent).empty;
@@ -1475,11 +1333,9 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = compat_mod.http.responseReader(&response, &transfer_buf);
 
-    // Ping tracking
     var last_ping_time: i64 = 0;
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
-    // Emit start event
     pushOwnedEvent(allocator, stream, .{
         .start = .{
             .partial = .{
@@ -1495,7 +1351,6 @@ fn runThread(ctx: *ThreadCtx) void {
     });
 
     read_loop: while (true) {
-        // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat_mod.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
@@ -1504,7 +1359,6 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
@@ -1530,18 +1384,15 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            // Free any previous tool call events
             for (tool_call_events.items) |*tce| {
                 @constCast(tce).deinit(allocator);
             }
             tool_call_events.clearRetainingCapacity();
-            // Free any previous reasoning detail events
             for (reasoning_detail_events.items) |*rde| {
                 @constCast(rde).deinit(allocator);
             }
             reasoning_detail_events.clearRetainingCapacity();
 
-            // Track previous lengths for delta emission
             const prev_text_len = text.items.len;
             const prev_thinking_len = thinking.items.len;
 
@@ -1556,12 +1407,11 @@ fn runThread(ctx: *ThreadCtx) void {
                 return;
             };
 
-            // Emit text_delta event if text was appended
             if (text.items.len > prev_text_len) {
                 const delta = text.items[prev_text_len..];
                 pushOwnedEvent(allocator, stream, .{
                     .text_delta = .{
-                        .content_index = 0, // Text is always first content block
+                        .content_index = 0,
                         .delta = delta,
                         .partial = .{
                             .content = &.{},
@@ -1576,12 +1426,11 @@ fn runThread(ctx: *ThreadCtx) void {
                 });
             }
 
-            // Emit thinking_delta event if thinking was appended
             if (thinking.items.len > prev_thinking_len and !isKimiModel(model)) {
                 const delta = thinking.items[prev_thinking_len..];
                 pushOwnedEvent(allocator, stream, .{
                     .thinking_delta = .{
-                        .content_index = 0, // Thinking is always first if present
+                        .content_index = 0,
                         .delta = delta,
                         .partial = .{
                             .content = &.{},
@@ -1596,15 +1445,12 @@ fn runThread(ctx: *ThreadCtx) void {
                 });
             }
 
-            // Process reasoning detail events - set thought_signature on matching tool calls
             for (reasoning_detail_events.items) |rde| {
                 tool_call_tracker_instance.setThoughtSignatureById(rde.tool_call_id, rde.detail_json) catch {};
             }
 
-            // Process tool call events
             for (tool_call_events.items) |tce| {
                 if (tce.is_start) {
-                    // Start a new tool call
                     const content_index = next_content_index;
                     const id = tce.id orelse "";
                     const name = tce.name orelse "";
@@ -1617,7 +1463,6 @@ fn runThread(ctx: *ThreadCtx) void {
                     next_content_index += 1;
                     tool_call_count += 1;
 
-                    // Emit toolcall_start event
                     pushOwnedEvent(allocator, stream, .{
                         .toolcall_start = .{
                             .content_index = content_index,
@@ -1635,7 +1480,6 @@ fn runThread(ctx: *ThreadCtx) void {
                         },
                     });
                 } else if (tce.arguments_delta) |delta| {
-                    // Append arguments delta
                     tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
                         ctx.deinit();
                         stream.completeWithError("oom tool call delta");
@@ -1643,7 +1487,6 @@ fn runThread(ctx: *ThreadCtx) void {
                         return;
                     };
 
-                    // Emit toolcall_delta event
                     if (tool_call_tracker_instance.getContentIndex(tce.api_index)) |content_index| {
                         pushOwnedEvent(allocator, stream, .{
                             .toolcall_delta = .{
@@ -1669,19 +1512,15 @@ fn runThread(ctx: *ThreadCtx) void {
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     usage.calculateCost(model.cost);
 
-    // Complete all tool calls and emit toolcall_end events
-    // We need to complete tool calls in content_index order
     var api_indices = std.ArrayList(usize).empty;
     defer api_indices.deinit(allocator);
     api_indices.ensureTotalCapacity(allocator, tool_call_tracker_instance.count()) catch {};
 
-    // Collect all api indices
     var tc_iter = tool_call_tracker_instance.calls.iterator();
     while (tc_iter.next()) |entry| {
         api_indices.append(allocator, entry.key_ptr.*) catch {};
     }
 
-    // Sort by content_index for consistent ordering
     std.mem.sort(usize, api_indices.items, tool_call_tracker_instance, struct {
         fn lessThan(tracker: tool_call_tracker.ToolCallTracker, a: usize, b: usize) bool {
             const a_idx = tracker.getContentIndex(a) orelse 0;
@@ -1690,15 +1529,12 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }.lessThan);
 
-    // Build content blocks - thinking first if present, then text, then tool calls
     const has_thinking = thinking.items.len > 0;
     const has_text = text.items.len > 0;
     const content_count: usize = if (has_thinking) 1 else 0;
     const content_count_final = content_count + (if (has_text) @as(usize, 1) else @as(usize, 0)) + tool_call_count;
 
     if (content_count_final == 0) {
-        // No content - create empty text block with borrowed empty string reference
-        // Using a static empty string avoids an unnecessary allocation for the empty case
         var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
             ctx.deinit();
             stream.completeWithError("oom building result");
@@ -1706,9 +1542,6 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         content[0] = .{ .text = .{ .text = "" } };
-        // The result outlives the producer thread, so it must own its metadata
-        // strings: ctx.deinit() below frees the thread-owned model before
-        // complete() publishes the result to the consumer.
         const api = allocator.dupe(u8, model.api) catch {
             ai_types.deinitAssistantContent(allocator, content);
             ctx.deinit();
@@ -1741,7 +1574,7 @@ fn runThread(ctx: *ThreadCtx) void {
             .usage = usage,
             .stop_reason = stop_reason,
             .timestamp = compat_mod.time.nowMillis(),
-            .is_owned = true, // Strings were duped above
+            .is_owned = true,
         };
         ctx.deinit();
         stream.complete(out);
@@ -1768,7 +1601,6 @@ fn runThread(ctx: *ThreadCtx) void {
                     return;
                 },
                 .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
-                    // Free previously allocated content
                     for (content[0..idx]) |*block| {
                         switch (block.*) {
                             .thinking => |t| allocator.free(t.thinking),
@@ -1790,7 +1622,6 @@ fn runThread(ctx: *ThreadCtx) void {
         content[idx] = .{
             .text = .{
                 .text = allocator.dupe(u8, text.items) catch {
-                    // Free previously allocated content
                     for (content[0..idx]) |*block| {
                         switch (block.*) {
                             .thinking => |t| {
@@ -1811,12 +1642,10 @@ fn runThread(ctx: *ThreadCtx) void {
         idx += 1;
     }
 
-    // Complete tool calls and add to content, emit toolcall_end events
     for (api_indices.items) |api_idx| {
         if (tool_call_tracker_instance.completeCall(api_idx, allocator)) |tc| {
             content[idx] = .{ .tool_call = tc };
 
-            // Emit toolcall_end event
             pushOwnedEvent(allocator, stream, .{
                 .toolcall_end = .{
                     .content_index = idx,
@@ -1837,9 +1666,6 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // The result outlives the producer thread, so it must own its metadata
-    // strings: ctx.deinit() below frees the thread-owned model before
-    // complete() publishes the result to the consumer.
     const api = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content);
         ctx.deinit();
@@ -1873,7 +1699,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat_mod.time.nowMillis(),
-        .is_owned = true, // Strings were duped above
+        .is_owned = true,
     };
 
     ctx.deinit();
@@ -1898,14 +1724,12 @@ pub fn streamOpenAICompletions(
     };
     errdefer allocator.free(api_key);
 
-    // Clone model to own the memory (background thread outlives caller's memory)
     const owned_model = try ai_types.cloneModel(allocator, model);
     errdefer {
         var mut_m = owned_model;
         mut_m.deinit(allocator);
     }
 
-    // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = try ai_types.cloneContext(allocator, context);
     errdefer {
         var mut_ctx = owned_context;
@@ -1919,8 +1743,6 @@ pub fn streamOpenAICompletions(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
-    // Events are deep-cloned in pushOwnedEvent, so the stream owns them and
-    // consumers must free each polled event via deinitAssistantMessageEvent.
     s.owns_events = true;
 
     const ctx = try allocator.create(ThreadCtx);
@@ -1953,7 +1775,6 @@ pub fn streamOpenAICompletions(
     return s;
 }
 
-/// Convert ThinkingLevel enum to reasoning_effort string
 fn thinkingLevelToString(level: ai_types.ThinkingLevel) []const u8 {
     return switch (level) {
         .off => "off",
@@ -2043,7 +1864,6 @@ test "buildRequestBody includes stream_options and tools without memory leak" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Verify the body contains expected fields
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(std.mem.find(u8, body, "stream_options") != null);
@@ -2127,7 +1947,6 @@ test "buildRequestBody with assistant message containing tool_calls" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Verify the body contains tool_calls
     try std.testing.expect(std.mem.find(u8, body, "tool_calls") != null);
     try std.testing.expect(std.mem.find(u8, body, "call_456") != null);
     try std.testing.expect(std.mem.find(u8, body, "bash") != null);
@@ -2163,7 +1982,6 @@ test "parseChunk does not leak memory with reasoning content" {
         reasoning_detail_events.deinit(allocator);
     }
 
-    // Simulate a chunk with reasoning_content (like DeepSeek responses)
     const chunk_data =
         \\{"choices":[{"delta":{"reasoning_content":"Let me think about this..."}}]}
     ;
@@ -2264,7 +2082,6 @@ test "parseChunk handles tool_calls without leaking" {
         reasoning_detail_events.deinit(allocator);
     }
 
-    // Simulate tool call start chunk
     const chunk1 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"bash","arguments":""}}]}}]}
     ;
@@ -2288,13 +2105,11 @@ test "parseChunk handles tool_calls without leaking" {
     try std.testing.expectEqualStrings("call_abc123", tool_call_events.items[0].id.?);
     try std.testing.expectEqualStrings("bash", tool_call_events.items[0].name.?);
 
-    // Free events before clearing
     for (tool_call_events.items) |*tce| {
         @constCast(tce).deinit(allocator);
     }
     tool_call_events.clearRetainingCapacity();
 
-    // Simulate tool call arguments delta chunk
     const chunk2 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\": \"ls\""}}]}}]}
     ;
@@ -2317,13 +2132,11 @@ test "parseChunk handles tool_calls without leaking" {
     try std.testing.expectEqual(@as(usize, 0), tool_call_events.items[0].api_index);
     try std.testing.expectEqualStrings("{\"cmd\": \"ls\"", tool_call_events.items[0].arguments_delta.?);
 
-    // Free events before clearing
     for (tool_call_events.items) |*tce| {
         @constCast(tce).deinit(allocator);
     }
     tool_call_events.clearRetainingCapacity();
 
-    // Simulate finish_reason for tool_calls
     const chunk3 =
         \\{"choices":[{"finish_reason":"tool_calls"}]}
     ;
@@ -2371,7 +2184,6 @@ test "parseChunk handles multiple tool_calls" {
         reasoning_detail_events.deinit(allocator);
     }
 
-    // Start first tool call
     const chunk1 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"read","arguments":""}}]}}]}
     ;
@@ -2393,13 +2205,11 @@ test "parseChunk handles multiple tool_calls" {
     try std.testing.expect(tool_call_events.items[0].is_start);
     try std.testing.expectEqualStrings("call_001", tool_call_events.items[0].id.?);
 
-    // Free events before clearing
     for (tool_call_events.items) |*tce| {
         @constCast(tce).deinit(allocator);
     }
     tool_call_events.clearRetainingCapacity();
 
-    // Start second tool call
     const chunk2 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_002","type":"function","function":{"name":"write","arguments":""}}]}}]}
     ;
@@ -2422,13 +2232,11 @@ test "parseChunk handles multiple tool_calls" {
     try std.testing.expectEqualStrings("call_002", tool_call_events.items[0].id.?);
     try std.testing.expectEqualStrings("write", tool_call_events.items[0].name.?);
 
-    // Free events before clearing
     for (tool_call_events.items) |*tce| {
         @constCast(tce).deinit(allocator);
     }
     tool_call_events.clearRetainingCapacity();
 
-    // Delta for first tool call
     const chunk3 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}
     ;
@@ -2452,7 +2260,6 @@ test "parseChunk handles multiple tool_calls" {
 }
 
 test "isOpenRouterAnthropic detection" {
-    // OpenRouter with Anthropic model
     const model1 = ai_types.Model{
         .id = "anthropic/claude-3-opus",
         .name = "Claude 3 Opus",
@@ -2467,7 +2274,6 @@ test "isOpenRouterAnthropic detection" {
     };
     try std.testing.expect(isOpenRouterAnthropic(model1));
 
-    // OpenRouter with non-Anthropic model
     const model2 = ai_types.Model{
         .id = "openai/gpt-4o",
         .name = "GPT-4o",
@@ -2482,7 +2288,6 @@ test "isOpenRouterAnthropic detection" {
     };
     try std.testing.expect(!isOpenRouterAnthropic(model2));
 
-    // OpenAI native (not OpenRouter)
     const model3 = ai_types.Model{
         .id = "gpt-4o-mini",
         .name = "GPT-4o Mini",
@@ -2524,12 +2329,9 @@ test "buildRequestBody adds cache_control for OpenRouter Anthropic models" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Verify cache_control is added to the last user message
     try std.testing.expect(std.mem.find(u8, body, "cache_control") != null);
     try std.testing.expect(std.mem.find(u8, body, "ephemeral") != null);
 
-    // The body should contain array content format for the last user message
-    // Verify structure contains the expected format
     try std.testing.expect(std.mem.find(u8, body, "\"content\":[") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"text\"") != null);
 }
@@ -2559,34 +2361,31 @@ test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" 
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Verify cache_control is NOT added for non-OpenRouter
     try std.testing.expect(std.mem.find(u8, body, "cache_control") == null);
 }
 
 test "mergeCompat uses model-level compat options over detected capabilities" {
-    // Model with explicit compat options that override detected capabilities
     const model = ai_types.Model{
         .id = "custom-model",
         .name = "Custom Model",
         .api = "openai-completions",
         .provider = "custom",
-        .base_url = "https://api.openai.com", // Would normally detect supports_store=true
+        .base_url = "https://api.openai.com",
         .reasoning = true,
         .input = &[_][]const u8{"text"},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 128_000,
         .max_tokens = 100,
         .compat = .{
-            .supports_store = false, // Override detected capability
+            .supports_store = false,
             .supports_reasoning_effort = false,
-            .max_tokens_field = .max_tokens, // Override default
+            .max_tokens_field = .max_tokens,
             .supports_strict_mode = false,
         },
     };
 
     const merged = mergeCompat(model);
 
-    // Model-level compat should take precedence
     try std.testing.expect(!merged.supports_store);
     try std.testing.expect(!merged.supports_reasoning_effort);
     try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
@@ -2605,12 +2404,10 @@ test "mergeCompat falls back to detected capabilities when model compat is null"
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 128_000,
         .max_tokens = 100,
-        // No compat field - should use detected capabilities
     };
 
     const merged = mergeCompat(model);
 
-    // Should use detected capabilities for OpenAI native
     try std.testing.expect(merged.supports_store);
     try std.testing.expect(merged.supports_developer_role);
     try std.testing.expect(merged.supports_reasoning_effort);
@@ -2639,9 +2436,6 @@ test "mergeCompat keeps custom OpenAI endpoints generic" {
 }
 
 test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
-    // detectCapabilities substring-matches api.openai.com anywhere in the
-    // URL; a gateway whose path merely contains the host must not inherit
-    // OpenAI-native capabilities.
     const model: ai_types.Model = .{
         .id = "custom-model",
         .name = "Custom Model",
@@ -2677,7 +2471,7 @@ test "buildRequestBody uses max_tokens field from compat options" {
         .context_window = 128_000,
         .max_tokens = 100,
         .compat = .{
-            .max_tokens_field = .max_tokens, // Mistral uses max_tokens
+            .max_tokens_field = .max_tokens,
             .supports_store = false,
         },
     };
@@ -2689,10 +2483,8 @@ test "buildRequestBody uses max_tokens field from compat options" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 50 }, allocator);
     defer allocator.free(body);
 
-    // Should use max_tokens, not max_completion_tokens
     try std.testing.expect(std.mem.find(u8, body, "\"max_tokens\":50") != null);
     try std.testing.expect(std.mem.find(u8, body, "max_completion_tokens") == null);
-    // Should not include store field
     try std.testing.expect(std.mem.find(u8, body, "\"store\"") == null);
 }
 
@@ -2729,7 +2521,6 @@ test "buildRequestBody adds strict mode when supported" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Should include strict: true in tool definition
     try std.testing.expect(std.mem.find(u8, body, "\"strict\":true") != null);
 }
 
@@ -2766,7 +2557,6 @@ test "buildRequestBody omits strict mode when not supported" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Should NOT include strict field
     try std.testing.expect(std.mem.find(u8, body, "\"strict\"") == null);
 }
 
@@ -2793,7 +2583,6 @@ test "buildRequestBody adds store: false for OpenAI native" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Should include store: false
     try std.testing.expect(std.mem.find(u8, body, "\"store\":false") != null);
 }
 
@@ -2820,7 +2609,6 @@ test "buildRequestBody omits store field for non-OpenAI providers" {
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Should NOT include store field for Mistral
     try std.testing.expect(std.mem.find(u8, body, "\"store\"") == null);
 }
 
@@ -2851,7 +2639,6 @@ test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" 
         reasoning_detail_events.deinit(allocator);
     }
 
-    // First, start a tool call
     const chunk1 =
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"bash","arguments":""}}]}}]}
     ;
@@ -2875,7 +2662,6 @@ test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" 
     }
     tool_call_events.clearRetainingCapacity();
 
-    // Now send reasoning_details with encrypted reasoning
     const chunk2 =
         \\{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_abc123","data":"encrypted_data_here"}]}}]}
     ;
@@ -2893,7 +2679,6 @@ test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" 
         allocator,
     );
 
-    // Should have extracted the reasoning_detail event
     try std.testing.expectEqual(@as(usize, 1), reasoning_detail_events.items.len);
     try std.testing.expectEqualStrings("call_abc123", reasoning_detail_events.items[0].tool_call_id);
     try std.testing.expect(std.mem.find(u8, reasoning_detail_events.items[0].detail_json, "reasoning.encrypted") != null);
@@ -2917,7 +2702,6 @@ test "buildRequestBody includes reasoning_details for tool calls with thought_si
         .max_tokens = 100,
     };
 
-    // Assistant message with tool call that has thought_signature
     const tool_call_id = try allocator.dupe(u8, "call_abc123");
     defer allocator.free(tool_call_id);
     const tool_call_name = try allocator.dupe(u8, "bash");
@@ -2957,7 +2741,6 @@ test "buildRequestBody includes reasoning_details for tool calls with thought_si
     const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
     defer allocator.free(body);
 
-    // Should include reasoning_details array
     try std.testing.expect(std.mem.find(u8, body, "reasoning_details") != null);
     try std.testing.expect(std.mem.find(u8, body, "reasoning.encrypted") != null);
     try std.testing.expect(std.mem.find(u8, body, "call_abc123") != null);

@@ -189,20 +189,17 @@ pub const Goodbye = struct {
 };
 
 pub const Payload = union(enum) {
-    // Client -> server
     auth_providers_request: struct {},
     auth_login_start: AuthLoginStartRequest,
     auth_prompt_response: AuthPromptResponse,
     auth_cancel: AuthCancelRequest,
 
-    // Server -> client
     ack: Ack,
     nack: Nack,
     auth_providers_response: AuthProvidersResponse,
     auth_event: AuthEvent,
     auth_login_result: AuthLoginResult,
 
-    // Keepalive / connection
     ping: void,
     pong: Pong,
     goodbye: Goodbye,

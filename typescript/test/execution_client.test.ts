@@ -62,12 +62,6 @@ function readLoggedRequests(logPath: string): Array<Record<string, unknown>> {
   return fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 }
 
-/**
- * Waits until the fixture's request log satisfies `predicate`. Error-path
- * teardown sends agent_stop asynchronously (no awaited drain, so the error is
- * not delayed past caller abort/retry windows), so the log assertion must
- * tolerate the fixture processing the stop a beat after the rejection.
- */
 async function waitForLoggedRequests(
   logPath: string,
   predicate: (entries: Array<Record<string, unknown>>) => boolean,
@@ -600,8 +594,6 @@ test("client.agent.stream yields turn_end detail then throws retryable auth erro
         err.provider_id === "anthropic" &&
         err.message === "auth_required",
     );
-    // The failing turn's detail is still surfaced on the yielded turn_end
-    // event before the typed auth error terminates the stream.
     assert.deepEqual(events.map((event) => event.type), ["agent_start", "turn_start", "turn_end"]);
     const turnEnd = events.at(-1);
     assert.equal(turnEnd?.type, "turn_end");
@@ -655,8 +647,6 @@ test("client.agent.stream auto_once retries after yielded auth lifecycle events"
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-retry-stream-test-"));
   const logPath = path.join(tmpDir, "request.log");
   const eventsPath = path.join(tmpDir, "events.json");
-  // Mirrors a real run: prompt echo message frames arrive before the failing
-  // provider turn, so the retry gate must classify them as replayable.
   fs.writeFileSync(eventsPath, JSON.stringify([
     { type: "agent_start", session_id: "testNanoIdSess1234567" },
     { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
@@ -681,8 +671,6 @@ test("client.agent.stream auto_once retries after yielded auth lifecycle events"
       },
       (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "anthropic",
     );
-    // Both attempts yielded only replayable markers: the prompt echo frames,
-    // the failed attempt's turn_end detail, then the retried attempt's replay.
     assert.deepEqual(events.map((event) => event.type), [
       "agent_start", "message_start", "message_end", "turn_start", "turn_end",
       "agent_start", "message_start", "message_end", "turn_start", "turn_end",
@@ -736,9 +724,6 @@ test("client.agent.run does not auth-retry after tools have executed", async () 
     },
   };
   const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
-  // The run already executed a tool; a retry would replay its side effects, so
-  // the auth-shaped terminal failure surfaces as the typed terminal auth error
-  // (never re-entering auto_once) rather than a retryable error.
   await assert.rejects(
     () => agent.run({
       ...request(),
@@ -751,7 +736,6 @@ test("client.agent.run does not auth-retry after tools have executed", async () 
     }),
     (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "fixture-provider",
   );
-  // Only one agent run was started: no retry attempt.
   assert.equal(transport.sent.filter((frame) => frame.type === "agent_start").length, 1);
 });
 
@@ -788,21 +772,16 @@ test("client.agent.run scopes provider-specific auth patterns to the matching pr
     },
   });
 
-  // Non-Anthropic provider: permission_error is not an auth failure per the
-  // server's default detector, so the run resolves with the error completion.
   const generic = createMakaiAgentApi(transportFor("fixture-error-api", "fixture-provider") as unknown as MakaiStdioClient);
   const completion = await generic.run(request());
   assert.equal(completion.stop_reason, "error");
   assert.equal(completion.error_message, "permission_error: scope denied");
 
-  // Remapped model: provider_id "anthropic" on a non-Anthropic API must not
-  // borrow the anthropic-messages detector patterns.
   const remapped = createMakaiAgentApi(transportFor("openai-completions", "anthropic") as unknown as MakaiStdioClient);
   const remappedCompletion = await remapped.run(request());
   assert.equal(remappedCompletion.stop_reason, "error");
   assert.equal(remappedCompletion.error_message, "permission_error: scope denied");
 
-  // Anthropic API: the registered detector treats permission_error as auth.
   const anthropic = createMakaiAgentApi(transportFor("anthropic-messages", "anthropic") as unknown as MakaiStdioClient);
   await assert.rejects(
     () => anthropic.run(request()),
@@ -887,8 +866,6 @@ test("client.agent.stream resolves auth retry provider from the streamed agent_e
 test("client.agent.run event fallback applies API-scoped auth via terminal agent_end api", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-fallback-api-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
-  // No assistant message_start (failed before provider output); the terminal
-  // agent_end carries the resolved identity including api.
   fs.writeFileSync(eventsPath, JSON.stringify([
     { type: "agent_start", session_id: "testNanoIdSess1234567" },
     { type: "turn_start" },
@@ -1373,7 +1350,6 @@ test("manual policy backfills provider_id on auth_required stream nack missing p
     await assert.rejects(
       async () => {
         for await (const _event of handle.provider.stream(request())) {
-          // no-op
         }
       },
       (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
@@ -1427,7 +1403,6 @@ test("manual policy backfills provider_id on agent stream auth_required nack mis
     await assert.rejects(
       async () => {
         for await (const _event of handle.agent.stream(request())) {
-          // no-op
         }
       },
       (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
@@ -1832,9 +1807,6 @@ test("agent_start payload includes session_id (#198)", async () => {
     assert.ok(start);
     const payload = start?.payload as Record<string, unknown>;
     assert.equal(payload.session_id, "testNanoIdSess1234567");
-    // The legacy `resume_session_id` alias rides along with the SAME value so
-    // pre-rename servers keep binding the caller's id; dual-key servers
-    // prefer the canonical key (#198).
     assert.equal(payload.resume_session_id, "testNanoIdSess1234567");
   } finally {
     await harness.cleanup();
@@ -1965,8 +1937,6 @@ test("acceptance: provider and agent execution accept the same model_ref", async
   }
 });
 
-// --- model_ref input validation tests ---
-
 test("provider.complete rejects model_ref exceeding 4096 characters before transport I/O", async () => {
   const harness = await setupHarness();
   try {
@@ -2039,8 +2009,6 @@ test("agent.stream rejects model_ref exceeding 4096 characters before transport 
   }
 });
 
-// --- model_ref segment-level validation tests ---
-
 test("provider.complete rejects canonical model_ref with provider segment exceeding 256 characters", async () => {
   const harness = await setupHarness();
   try {
@@ -2103,7 +2071,6 @@ test("provider.complete rejects fallback model_ref with provider segment exceedi
   try {
     const provider = createMakaiProviderApi(harness.client);
     const longProvider = "a".repeat(257);
-    // Use colon in model_id to force parseModelRef failure, triggering fallback path
     const modelRef = `${longProvider}/anthropic-messages@model:id`;
     await assert.rejects(
       () => provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
@@ -2123,7 +2090,6 @@ test("provider.complete rejects fallback model_ref with api segment exceeding 25
   try {
     const provider = createMakaiProviderApi(harness.client);
     const longApi = "a".repeat(257);
-    // Use colon in model_id to force parseModelRef failure, triggering fallback path
     const modelRef = `anthropic/${longApi}@model:id`;
     await assert.rejects(
       () => provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
@@ -2138,13 +2104,10 @@ test("provider.complete rejects fallback model_ref with api segment exceeding 25
   }
 });
 
-// --- opaque model_ref validation tests ---
-
 test("provider.complete rejects opaque model_ref exceeding 512 characters before transport I/O", async () => {
   const harness = await setupHarness();
   try {
     const provider = createMakaiProviderApi(harness.client);
-    // No / or @ separators — fully opaque ref that becomes model.id/model.name
     const longModelRef = "x".repeat(513);
     await assert.rejects(
       () => provider.complete({ model_ref: longModelRef, messages: [{ role: "user", content: "hi" }] }),
@@ -2177,10 +2140,8 @@ test("provider.complete accepts canonical model_ref with max valid segment sizes
   const harness = await setupHarness();
   try {
     const provider = createMakaiProviderApi(harness.client);
-    // Max valid canonical ref: 256-char provider, 256-char api, 512-char model_id = 1026 total
     const modelRef = `${"p".repeat(256)}/${"a".repeat(256)}@${"m".repeat(512)}`;
     assert.equal(modelRef.length, 256 + 1 + 256 + 1 + 512);
-    // Passes both total cap (4096) and all segment caps
     await provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] });
     const logged = readLoggedRequests(harness.logPath);
     assert.equal(logged.length, 1);
@@ -2242,9 +2203,6 @@ test("client.agent.run surfaces error_message from error agent results", async (
 });
 
 test("client.agent.run tears down the session so the same session_id can be reused", async () => {
-  // Tracking fixture mirrors the real server: agent_start on a live session
-  // id fails with agent_busy until a sequence-valid agent_stop removes it.
-  // Without teardown, the second run below rejects (issue #199).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client);
@@ -2258,8 +2216,6 @@ test("client.agent.run tears down the session so the same session_id can be reus
     assert.equal(stops.length, 2);
     for (const stop of stops) {
       assert.equal(stop.session_id, "testNanoIdSess1234567");
-      // start=1, message=2, so the server expects the stop at sequence 3 —
-      // a default-sequence stop would be rejected and the session would leak.
       assert.equal(stop.sequence, 3);
       assert.equal((stop.payload as Record<string, unknown>).reason, "completed");
     }
@@ -2282,21 +2238,11 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
 
     const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2);
     const stops = logged.filter((entry) => entry.type === "agent_stop");
-    // The settlement agent_error is UNCORRELATED, so it cannot confirm the
-    // message's admission (it is wire-identical to an admission failure's
-    // unscoped runtime error, §13.4.1): the teardown probes both counter
-    // states — stop@2 rejected correlated invalid_request (the message WAS
-    // admitted, counter at 3), stop@3 accepted.
     assert.equal(stops.length, 2);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
     assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
     assert.equal((stops.at(-1)?.payload as Record<string, unknown>).reason, "completed");
 
-    // The probe's second stop took effect server-side: an immediate retry
-    // with the same id starts a fresh session (the fixture's agent_error
-    // replays for it — it is NOT rejected with agent_busy, and the stale
-    // stop-reply frames are skipped rather than consumed as the retry's own
-    // frames).
     await assert.rejects(
       () => agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
@@ -2312,13 +2258,6 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
 });
 
 test("client.agent.run probes both counter states when an uncorrelated runtime error may be an admission failure (#210 gap 7)", async () => {
-  // §13.4.1: an allocation failure in the server's message-acceptance path
-  // surfaces as an UNCORRELATED runtime agent_error with the counter rolled
-  // back and nothing admitted — wire-identical to §13.4.2's settlement of an
-  // admitted run. Consuming the frame must not confirm the advanced counter:
-  // the teardown probes, and the PRE-send stop succeeds immediately because
-  // the counter never advanced (a plain stop at 3 would be rejected and the
-  // owned session would leak).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_ADMISSION_RUNTIME_ERROR: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client);
@@ -2330,7 +2269,7 @@ test("client.agent.run probes both counter states when an uncorrelated runtime e
     const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
-    assert.equal(stops[0]?.sequence, 2); // pre-send — accepted, the counter never advanced
+    assert.equal(stops[0]?.sequence, 2);
     assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
   } finally {
     await harness.cleanup();
@@ -2338,9 +2277,6 @@ test("client.agent.run probes both counter states when an uncorrelated runtime e
 });
 
 test("client.agent.stream tears down the session when the consumer closes the iterator early", async () => {
-  // Breaking out of the for-await at the terminal event closes the generator
-  // while suspended at its yield — loop-exit code never runs, so teardown
-  // must live in the generator's finally (issue #199, review finding).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client);
@@ -2368,28 +2304,16 @@ test("client.agent.stream tears down the session when the consumer closes the it
 });
 
 test("client.agent.run does not stop a session owned by another run after agent_busy", async () => {
-  // A second run on an id owned by a live first run is rejected with
-  // agent_busy; that rejection must NOT send an agent_stop — the tracked
-  // sequence would validate against the other run's session and tear it down
-  // (review finding on #199).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 500 });
     const first = agent.run(request());
-    // Give the first run's start/message a beat to register the session.
     await new Promise((resolve) => setTimeout(resolve, 25));
     await assert.rejects(
       () => agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.code === "agent_busy" && err.message === "session already exists",
     );
 
-    // The live session survives the busy attempt untouched; it is stopped
-    // only by its own run's timeout teardown — a two-state probe (#210 gap
-    // 7): the first run's message was accepted (the fixture advanced the
-    // counter) but its output was suppressed, so the outcome is unknown and
-    // the teardown tries the pre-send sequence first (rejected
-    // invalid_request), then the post-send sequence, which removes the
-    // session. The busy attempt contributed no stop of its own.
     await assert.rejects(
       () => first,
       (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
@@ -2405,12 +2329,6 @@ test("client.agent.run does not stop a session owned by another run after agent_
 });
 
 test("concurrent client.agent.run on one session id: duplicate is rejected promptly, established run completes", async () => {
-  // §13.3.1 (#201): two overlapping runs on the same consumer-supplied
-  // session id share one session route. With in_reply_to-aware waiter
-  // routing each run receives its own start reply — the duplicate learns of
-  // its agent_busy rejection immediately instead of surfacing the response
-  // timeout after the established run finishes, and the established run is
-  // unaffected (neither consuming the rejection nor losing its own reply).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
@@ -2429,9 +2347,6 @@ test("concurrent client.agent.run on one session id: duplicate is rejected promp
     const reason = (duplicate as PromiseRejectedResult).reason;
     assert.ok(reason instanceof MakaiStreamError && reason.code === "agent_busy" && reason.message === "session already exists", `unexpected duplicate rejection: ${String(reason)}`);
 
-    // Exactly one teardown stop — the established run's. The duplicate owns
-    // nothing on the session and must not stop it (its tracked sequence
-    // would validate and tear the established run's session down).
     const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
@@ -2442,9 +2357,6 @@ test("concurrent client.agent.run on one session id: duplicate is rejected promp
 });
 
 test("concurrent client.agent.run duplicate receives the agent_error-shaped agent_busy rejection", async () => {
-  // Same scenario with the real agent server's rejection flavor: the
-  // duplicate start is refused with an agent_error frame (not a nack); the
-  // correlated delivery must route it to the duplicate regardless of frame
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_BUSY_AS_ERROR: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
@@ -2536,11 +2448,9 @@ test("client.agent.run auth retry stops the abandoned session", async () => {
 
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 2);
-    // The abandoned attempt stopped at the sequence it reached (start only).
     assert.equal(stops[0]?.session_id, firstSessionId);
     assert.equal(stops[0]?.sequence, 2);
     assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
-    // The retried attempt runs its full lifecycle and stops at sequence 3.
     assert.equal(stops[1]?.session_id, secondSessionId);
     assert.equal(stops[1]?.sequence, 3);
     assert.equal((stops[1]?.payload as Record<string, unknown>).reason, "completed");
@@ -2551,11 +2461,6 @@ test("client.agent.run auth retry stops the abandoned session", async () => {
 });
 
 test("client.agent.stream tears down the session and drains the trailing terminal frame", async () => {
-  // In agent_result mode the tracking fixture mirrors the real server's
-  // double publish: agent_result first, then a trailing terminal agent_end.
-  // The stream terminates on the agent_result-derived event, so the teardown
-  // drain must consume the trailing frame or a follow-up run reusing the
-  // session id would consume it as its first frame (issue #199).
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-stream-"));
   const resultPath = path.join(tmpDir, "agent-result.json");
   fs.writeFileSync(resultPath, JSON.stringify({
@@ -2594,12 +2499,6 @@ test("client.agent.stream tears down the session and drains the trailing termina
 });
 
 test("client.agent.run does not stop a caller-supplied session when the start outcome is unknown (§6.1, #205)", async () => {
-  // Timeout on a caller-supplied id with no reply to our own agent_start
-  // observed: the id may have been registered by another caller whose start
-  // won the race while our agent_busy reply was lost, and that owner's fresh
-  // pre-message session also expects inbound sequence 2 — a sequence-2 stop
-  // would be ACCEPTED and destroy it. The teardown must settle without
-  // sending (spec §6.1: the leaked-if-ours session is strictly preferable).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
@@ -2608,18 +2507,12 @@ test("client.agent.run does not stop a caller-supplied session when the start ou
       (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
     );
 
-    // The stop decision is made synchronously in the error path, so by the
-    // time the run rejects the log already reflects whatever was sent.
     const logged = readLoggedRequests(harness.logPath);
     const starts = logged.filter((entry) => entry.type === "agent_start");
     assert.equal(starts.length, 1);
     assert.equal(starts[0]?.session_id, "testNanoIdSess1234567");
     assert.equal(logged.filter((entry) => entry.type === "agent_stop").length, 0);
 
-    // A same-id follow-up attempt is refused with a correlated agent_busy —
-    // the un-stopped session stayed registered (the §6.1 leak, bounded only
-    // by server eviction) — and the refusal must still not stop it: the
-    // guard is per attempt, and the busy path settles without a send too.
     await assert.rejects(
       () => agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.code === "agent_busy" && err.message === "session already exists",
@@ -2633,10 +2526,6 @@ test("client.agent.run does not stop a caller-supplied session when the start ou
 });
 
 test("client.agent.run still stops a client-generated session when the start outcome is unknown (#205)", async () => {
-  // An exclusive client-generated id is the one sufficient ownership evidence
-  // for stopping on an unknown start outcome (§6.1, until #204's generation
-  // tokens): no other caller could hold the id, so the timeout teardown keeps
-  // the always-stop behavior.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
@@ -2650,8 +2539,6 @@ test("client.agent.run still stops a client-generated session when the start out
     assert.equal(starts.length, 1);
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
-    // Start sent (sequence 1), message never sent — the session expects the
-    // stop at sequence 2.
     assert.equal(stops[0]?.session_id, starts[0]?.session_id);
     assert.equal(stops[0]?.sequence, 2);
     assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
@@ -2678,12 +2565,6 @@ test("client.agent.stream does not stop a caller-supplied session when the start
 });
 
 test("client.agent.run auth-retry attempt with a lost start reply still stops its SDK-generated session (#205)", async () => {
-  // Codex review on PR #208: auto_once retries store their SDK-generated id
-  // in options.session_id, so deriving the id's origin from the option's
-  // presence misclassifies the retry's id as caller-supplied — a retry whose
-  // start reply is lost (suppressed here) would then skip its teardown stop
-  // and leak the admitted session. The origin must be tracked when the retry
-  // request is constructed, not inferred from the request shape.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-retry-lost-"));
   const logPath = path.join(tmpDir, "request.log");
   const handle = await createMakaiClient({
@@ -2695,11 +2576,6 @@ test("client.agent.run auth-retry attempt with a lost start reply still stops it
     auth: { auth_retry_policy: "auto_once" },
   });
   try {
-    // Attempt 1 is auth-rejected (correlated nack — a resolved outcome, so
-    // its abandoned session is stopped); the auto_once retry gets a fresh
-    // SDK-generated id whose start reply is suppressed, so it times out with
-    // an unknown outcome — and must STILL stop, because no other caller
-    // could hold a client-generated id.
     await assert.rejects(
       () => handle.agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
@@ -2713,10 +2589,8 @@ test("client.agent.run auth-retry attempt with a lost start reply still stops it
     assert.match(retryId, /^[0-9A-Za-z]{21}$/);
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 2);
-    // Attempt 1's abandon stop (its correlated rejection resolved the start).
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
     assert.equal(stops[0]?.sequence, 2);
-    // Attempt 2's unknown-outcome teardown: SDK-generated id keeps the stop.
     assert.equal(stops[1]?.session_id, retryId);
     assert.equal(stops[1]?.sequence, 2);
   } finally {
@@ -2726,20 +2600,10 @@ test("client.agent.run auth-retry attempt with a lost start reply still stops it
 });
 
 test("session teardown drain consumes terminal-shaped frames before the current stop's reply (#205)", async () => {
-  // Codex P1 on PR #208: the quiescent drain exited on ANY agent_error /
-  // agent_stopped, so the failure pair's uncorrelated settlement ended the
-  // drain before the CURRENT stop's agent_stopped reply was consumed. That
-  // stale reply could then terminate a later same-id run's drain early,
-  // leaving its trailing agent_end for a subsequent run to claim as its own
-  // completion. The early exit must key on the reply's in_reply_to naming
-  // the current stop only.
   const sessionId = "testNanoIdSess1234567";
   const frames: StdioFrame[] = [
-    // The failure pair's settlement: terminal-shaped, but NOT a reply to the stop.
     { type: "agent_error", session_id: sessionId, message_id: "m-settlement", sequence: 4, timestamp: 1, version: 1, payload: { code: "internal_error", message: "fixture loop failure" } },
-    // A stale agent_stopped replying to an EARLIER stop on the same id.
     { type: "agent_stopped", session_id: sessionId, message_id: "m-stale", sequence: 9, timestamp: 1, version: 1, in_reply_to: "earlier-stop-message-id", payload: {} },
-    // The current stop's reply — the only frame that may end the drain early.
     { type: "agent_stopped", session_id: sessionId, message_id: "m-current", sequence: 9, timestamp: 1, version: 1, in_reply_to: "current-stop-message-id", payload: {} },
   ];
   const consumed: string[] = [];
@@ -2751,25 +2615,12 @@ test("session teardown drain consumes terminal-shaped frames before the current 
       return frame;
     },
   };
-  // Positional timeouts in their original (pre-#205) slots with `opts`
-  // appended — the exported signature stays source-compatible with callers
-  // written against `(transport, sessionId, idleMs, maxMs)`.
   await drainSessionFramesUntilQuiescent(transport as never, sessionId, 20, 500, { stopReplyTo: "current-stop-message-id" });
-  // All three frames were consumed: the settlement and the stale reply did
-  // not end the drain (pre-fix it stopped at the settlement, leaving the
-  // stale and current stop replies queued for later runs to trip over).
   assert.deepEqual(consumed, ["agent_error", "agent_stopped", "agent_stopped"]);
   assert.equal(frames.length, 0);
 });
 
 test("client.agent.run drains the failure pair's settlement before the error surfaces, so an immediate same-id run is not poisoned (#205)", async () => {
-  // §13.4.2: a loop-internal failure settles via the pair agent_event(error)
-  // + settlement agent_error — ONE settlement. The fixture emits BOTH frames
-  // uncorrelated (faithful to the real server's async output), so a consumer
-  // terminating on the first frame must drain the second before the id is
-  // reused: the queued settlement agent_error would otherwise be claimed by
-  // the follow-up run's first post-acceptance wait, treated as its own
-  // rejection, and stop the newly registered session.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-failure-pair-"));
   const pairPath = path.join(tmpDir, "failure-pair.json");
   fs.writeFileSync(pairPath, JSON.stringify({ code: "internal_error", message: "fixture loop failure" }));
@@ -2781,16 +2632,10 @@ test("client.agent.run drains the failure pair's settlement before the error sur
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture loop failure" && err.code === "internal_error",
     );
 
-    // The failing run tore its session down at the throw site: the stop is
-    // sent and the quiescent drain has consumed the settlement agent_error.
-    // (The fixture logs the stop a beat after the rejection, so wait for it.)
     const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     assert.equal(logged.filter((entry) => entry.type === "agent_stop").length, 1);
     assert.equal((logged.find((entry) => entry.type === "agent_stop")?.payload as Record<string, unknown>).reason, "completed");
 
-    // The immediate same-id follow-up must NOT consume the stale settlement
-    // (it runs the fixture's normal event flow — the pair fires once) and
-    // must NOT send a session-destroying stop of its own before completing.
     const second = await agent.run(request());
     assert.equal(second.stop_reason, "end_turn");
 
@@ -2809,12 +2654,6 @@ test("client.agent.run drains the failure pair's settlement before the error sur
 });
 
 test("client.agent.run rolls the sequence tracker back on a correlated agent_message rejection and retries with the right sequence (#210 gap 7)", async () => {
-  // §13.1/#210 gap 7: a rejected agent_message never advances the server's
-  // expected counter. The first message on the session is rejected with a
-  // request-correlated invalid_request, so the teardown stop MUST carry the
-  // pre-send sequence (2) — the eager post-send value (3) would be rejected
-  // invalid_request and leak the owned session — and the corrected retry on
-  // the same id must succeed.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_REJECT_FIRST_AGENT_MESSAGE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client);
@@ -2823,17 +2662,12 @@ test("client.agent.run rolls the sequence tracker back on a correlated agent_mes
       (err: unknown) => err instanceof MakaiStreamError && err.code === "invalid_request" && err.message === "invalid sequence",
     );
 
-    // The teardown stop used the rolled-back pre-send sequence and removed
-    // the session, so the id is immediately reusable.
     const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
     assert.equal(stops[0]?.sequence, 2);
 
-    // Corrected retry: the fixture's one-shot rejection already fired, so the
-    // new run's message carries sequence 2 against the fresh registration
-    // (no duplicate-sequence error) and completes normally.
     const second = await agent.run(request());
     assert.equal(second.stop_reason, "end_turn");
     const loggedAfter = await waitForLoggedRequests(
@@ -2849,15 +2683,6 @@ test("client.agent.run rolls the sequence tracker back on a correlated agent_mes
 });
 
 test("client.agent.run probes both counter states after an unknown message outcome, so timeout-then-retry on a caller-supplied id works (#210 gap 7)", async () => {
-  // §13.4.1/#210 gap 7: acceptance has no positive receipt. The fixture
-  // ACCEPTS the message (counter advances 2→3) but suppresses all run
-  // output, so the run times out with the send's outcome unknown. The §6.1
-  // ownership guard passes (this attempt observed its own agent_started), so
-  // the teardown MUST probe: a stop at the pre-send sequence first — rejected
-  // correlated invalid_request because the counter advanced — then one retry
-  // at the post-send value, which removes the session. The probe consumed the
-  // rejection, so an immediate same-id retry starts fresh (no agent_busy, no
-  // duplicate-sequence error) and completes.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
@@ -2875,9 +2700,6 @@ test("client.agent.run probes both counter states after an unknown message outco
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
     assert.deepEqual(stops.map((entry) => entry.sequence), [2, 3]);
 
-    // The probe's second stop removed the session: the immediate same-id
-    // retry is not refused agent_busy and the suppressed-message knob fired
-    // once, so its message is accepted at sequence 2 and the run completes.
     const second = await agent.run(request());
     assert.equal(second.stop_reason, "end_turn");
   } finally {
@@ -2886,9 +2708,6 @@ test("client.agent.run probes both counter states after an unknown message outco
 });
 
 test("client.agent.stream probes both counter states after an unknown message outcome (#210 gap 7)", async () => {
-  // Stream-mode parity with the run() probe test: the same tracker feeds both
-  // consumption modes, so an unresolved message outcome in stream() must
-  // produce the same two-state teardown.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
@@ -2910,10 +2729,6 @@ test("client.agent.stream probes both counter states after an unknown message ou
 });
 
 test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlated invalid_request and settles at the accepted value (#210 gap 7)", async () => {
-  // Unit coverage for the probe helper itself (mock transport, mirroring the
-  // drain helper's test): the first stop (pre-send 2) is rejected with a
-  // correlated agent_error — the real server's validation shape — so the
-  // probe retries once at the post-send value and reports where it settled.
   const sessionId = "testNanoIdSess1234567";
   const sentStops: Array<{ sequence: number; messageId: string }> = [];
   const replies: StdioFrame[] = [];
@@ -2930,9 +2745,6 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
       }
     },
     nextFrameForSession: async (sid: string, timeoutMs?: number, wait?: { correlate?: string }) => {
-      // Each probe read MUST be correlated to the outstanding stop (§13.3.1
-      // / #210 gap 7): replies reach the probe promptly even while it is
-      // queued behind a transport read lock an abandoned read still holds.
       waitCorrelates.push(wait?.correlate);
       const frame = replies.shift();
       if (!frame) throw new Error(`timed out waiting for frame for session ${sid} after ${timeoutMs ?? 1000}ms`);
@@ -2943,8 +2755,6 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
   const acceptedAt = await stopAgentWithSequenceProbe(transport as never, sessionId, { preSend: 2, postSend: 3 }, "timeout", 20, 500);
   assert.equal(acceptedAt, 3);
   assert.deepEqual(sentStops.map((stop) => stop.sequence), [2, 3]);
-  // The first read is correlated to the first stop; after the retry, the
-  // next read is correlated to the SECOND stop's message id.
   assert.equal(waitCorrelates[0], sentStops[0]?.messageId);
   assert.ok(waitCorrelates.slice(1).includes(sentStops[1]?.messageId));
 });
@@ -2952,7 +2762,6 @@ test("stopAgentWithSequenceProbe retries at the post-send sequence on a correlat
 test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and recognizes the nack rejection shape (#210 gap 7)", async () => {
   const sessionId = "testNanoIdSess1234567";
 
-  // Acceptance at the pre-send value: one stop, no retry.
   {
     const replies: StdioFrame[] = [];
     const sentStops: number[] = [];
@@ -2973,8 +2782,6 @@ test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and 
     assert.deepEqual(sentStops, [2]);
   }
 
-  // The nack rejection shape (peers/fixtures) also triggers the one retry —
-  // including the shared protocol's invalid_sequence spelling.
   {
     const replies: StdioFrame[] = [];
     const sentStops: number[] = [];
@@ -3003,7 +2810,6 @@ test("stopAgentWithSequenceProbe accepts the pre-send state without a retry and 
 test("stopAgentWithSequenceProbe is bounded: no reply and a non-invalid_request rejection both end the probe without a retry (#210 gap 7)", async () => {
   const sessionId = "testNanoIdSess1234567";
 
-  // No reply at all: the bounded wait expires unresolved (undefined).
   {
     const sentStops: number[] = [];
     const transport = {
@@ -3019,7 +2825,6 @@ test("stopAgentWithSequenceProbe is bounded: no reply and a non-invalid_request 
     assert.deepEqual(sentStops, [2]);
   }
 
-  // agent_not_found: the session is already gone — no retry.
   {
     const replies: StdioFrame[] = [];
     const sentStops: number[] = [];
@@ -3042,17 +2847,8 @@ test("stopAgentWithSequenceProbe is bounded: no reply and a non-invalid_request 
 });
 
 test("stopAgentSession drains queued session output after a successful sequence probe (#210 gap 7)", async () => {
-  // The probe's reads are correlated to its stop, and the transport serves a
-  // correlated wait from its reply queue AHEAD of the session queue: the
-  // `agent_stopped` that resolves the probe can be delivered while the
-  // timed-out attempt's late run output is still parked on the session
-  // route. A successful probe must therefore still drain before the id is
-  // reusable — otherwise an immediate same-id follow-up claims the previous
-  // run's output as its own result after its start is accepted.
   const sessionId = "testNanoIdSess1234567";
   const queue: StdioFrame[] = [];
-  // Late output from the timed-out run, parked BEFORE the stop's reply —
-  // exactly the ordering a concurrent read-lock holder produces.
   queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-stale-output", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
   const sentStops: number[] = [];
   const waitCorrelates: Array<string | undefined> = [];
@@ -3064,9 +2860,6 @@ test("stopAgentSession drains queued session output after a successful sequence 
       queue.push({ type: "agent_stopped", session_id: sessionId, message_id: "m-stopped", sequence: 9, timestamp: 1, version: 1, in_reply_to: frame.message_id, payload: {} });
     },
     nextFrameForSession: async (_sid: string, _timeoutMs?: number, wait?: { correlate?: string }) => {
-      // Mirrors the real transport's dequeueOwnFrame priority: a correlated
-      // wait claims its reply regardless of queue position, while an
-      // uncorrelated wait (the drain) takes parked output in order.
       const correlate = wait?.correlate;
       waitCorrelates.push(correlate);
       const frame = correlate !== undefined
@@ -3090,27 +2883,14 @@ test("stopAgentSession drains queued session output after a successful sequence 
     { drain: "quiescent" },
   );
 
-  // The probe settled at the pre-send value (one stop, no retry) — its own
-  // reads correlated to the stop, the drain's reads uncorrelated ...
   assert.deepEqual(sentStops, [2]);
   assert.ok(waitCorrelates[0] !== undefined);
   assert.ok(waitCorrelates.includes(undefined));
-  // ... and the post-probe drain consumed the parked late output, leaving
-  // the route empty for an immediate same-id follow-up.
   assert.deepEqual(drainedFrameIds, ["m-stale-output"]);
   assert.equal(queue.length, 0);
 });
 
 test("the post-probe drain consumes only already-queued output, not a re-registered session's frames (#210 gap 7)", async () => {
-  // The probe's accepted stop removed the old registration, so a concurrent
-  // caller may already be re-registering the id; its uncorrelated run output
-  // routes by session id (immune to correlation) and must not be eaten by a
-  // drain that LINGERS. idleMs 0 makes the drain backlog-only: every
-  // uncorrelated read is an IMMEDIATE dequeue attempt (timeout 0) and the
-  // first empty one ends the drain. The contract is asserted on the
-  // requested timeouts — deterministic, no wall-clock race: a waiting read
-  // (the old 50ms idle window) is exactly what could consume a
-  // re-registered run's frames.
   const sessionId = "testNanoIdSess1234567";
   const queue: StdioFrame[] = [];
   const sentStops: number[] = [];
@@ -3132,7 +2912,6 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
       throw new Error("timed out");
     },
   };
-  // Parked late output from the unresolved run, ahead of the stop's reply.
   queue.push({ type: "agent_result", session_id: sessionId, message_id: "m-parked", sequence: 9, timestamp: 1, version: 1, payload: { result_json: "{\"stale\":true}" } });
 
   const api = createMakaiAgentApi(transport as never, {}) as unknown as {
@@ -3146,9 +2925,6 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
     { drain: "quiescent" },
   );
 
-  // The probe settled at the pre-send value, the parked frame drained, and
-  // every uncorrelated drain read was an immediate dequeue — no idle window
-  // in which a re-registered caller's frames could be consumed.
   assert.deepEqual(sentStops, [2]);
   assert.equal(queue.length, 0);
   assert.ok(uncorrelatedTimeouts.length >= 1);
@@ -3156,11 +2932,6 @@ test("the post-probe drain consumes only already-queued output, not a re-registe
 });
 
 test("the abort-path background drain is backlog-only, not a lingering route reader (#210 gap 7)", async () => {
-  // The abort teardowns await the probe but leave the drain running in the
-  // background: a deadline-based drain keeps polling the uncorrelated
-  // session route for its full window even when empty and can consume a
-  // re-registered session's output. The background drain must request only
-  // immediate (0ms) dequeues, like the quiescent one.
   const sessionId = "testNanoIdSess1234567";
   const queue: StdioFrame[] = [];
   const sentStops: number[] = [];
@@ -3194,8 +2965,6 @@ test("the abort-path background drain is backlog-only, not a lingering route rea
     "client aborted",
     { drain: "background" },
   );
-  // The fire-and-forget drain starts within the call's microtasks; give it a
-  // tick to issue its reads, then verify they were all immediate dequeues.
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(sentStops, [2]);
   assert.equal(queue.length, 0);
@@ -3204,11 +2973,6 @@ test("the abort-path background drain is backlog-only, not a lingering route rea
 });
 
 test("stopAgentWithSequenceProbe waits through idle windows for a delayed rejection before retrying (#210 gap 7)", async () => {
-  // The pre-send stop's correlated rejection lands AFTER one idle window
-  // (a briefly loaded child process or host event loop): the probe must keep
-  // waiting within its budget and still issue the post-send retry — treating
-  // the first silent window as settled would leave an accepted message's
-  // session registered and same-id starts agent_busy.
   const sessionId = "testNanoIdSess1234567";
   const sentStops: number[] = [];
   const replies: StdioFrame[] = [];
@@ -3242,11 +3006,6 @@ test("stopAgentWithSequenceProbe waits through idle windows for a delayed reject
 });
 
 test("stopAgentWithSequenceProbe treats the retry's own rejection as terminal (#210 gap 7)", async () => {
-  // Both candidate states rejected — the session was removed or
-  // re-registered between the two stops, so neither value can stop it. The
-  // probe must END there: its correlated reads also accept uncorrelated
-  // frames, so continuing for the remaining budget could dequeue the NEW
-  // registration's events or result and time that run out.
   const sessionId = "testNanoIdSess1234567";
   const sentStops: number[] = [];
   const replies: StdioFrame[] = [];

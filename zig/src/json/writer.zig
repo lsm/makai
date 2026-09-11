@@ -15,7 +15,6 @@ pub const JsonWriter = struct {
         };
     }
 
-    // Object methods
     pub fn beginObject(self: *JsonWriter) !void {
         try self.writeCommaIfNeeded();
         try self.buffer.append(self.allocator, '{');
@@ -29,7 +28,6 @@ pub const JsonWriter = struct {
         self.needs_comma = true;
     }
 
-    // Array methods
     pub fn beginArray(self: *JsonWriter) !void {
         try self.writeCommaIfNeeded();
         try self.buffer.append(self.allocator, '[');
@@ -43,7 +41,6 @@ pub const JsonWriter = struct {
         self.needs_comma = true;
     }
 
-    // Key-value writing (for objects)
     pub fn writeKey(self: *JsonWriter, key: []const u8) !void {
         try self.writeCommaIfNeeded();
         try self.writeEscapedString(key);
@@ -51,7 +48,6 @@ pub const JsonWriter = struct {
         self.needs_comma = false;
     }
 
-    // Value writing
     pub fn writeString(self: *JsonWriter, value: []const u8) !void {
         try self.writeCommaIfNeeded();
         try self.writeEscapedString(value);
@@ -82,15 +78,12 @@ pub const JsonWriter = struct {
         self.needs_comma = true;
     }
 
-    /// Write pre-serialized JSON directly without escaping.
-    /// Useful for embedding already-serialized JSON strings (e.g., schema definitions).
     pub fn writeRawJson(self: *JsonWriter, json_string: []const u8) !void {
         try self.writeCommaIfNeeded();
         try self.buffer.appendSlice(self.allocator, json_string);
         self.needs_comma = true;
     }
 
-    // Combined key:value for convenience
     pub fn writeStringField(self: *JsonWriter, key: []const u8, value: []const u8) !void {
         try self.writeKey(key);
         try self.writeString(value);
@@ -106,7 +99,6 @@ pub const JsonWriter = struct {
         try self.writeBool(value);
     }
 
-    // Helper for string escaping
     fn writeEscapedString(self: *JsonWriter, s: []const u8) !void {
         try self.buffer.append(self.allocator, '"');
         var i: usize = 0;
@@ -119,7 +111,6 @@ pub const JsonWriter = struct {
                 '\r' => try self.buffer.appendSlice(self.allocator, "\\r"),
                 '\t' => try self.buffer.appendSlice(self.allocator, "\\t"),
                 0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                    // Other control characters
                     try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
                 },
                 0x80...0xFF => {
@@ -149,7 +140,6 @@ pub const JsonWriter = struct {
     }
 };
 
-// Get the result as a slice
 pub fn getResult(writer: *JsonWriter) []const u8 {
     return writer.buffer.items;
 }
@@ -161,7 +151,6 @@ test "build anthropic request" {
 
     var writer = JsonWriter.init(&buffer, allocator);
 
-    // Build: {"model":"claude-3","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}
     try writer.beginObject();
     try writer.writeStringField("model", "claude-3");
     try writer.writeIntField("max_tokens", 1024);
@@ -304,7 +293,6 @@ test "float values" {
 
     const result = getResult(&writer);
 
-    // Float formatting may vary slightly, so just check structure
     try std.testing.expect(std.mem.startsWith(u8, result, "{\"temperature\":0.7"));
     try std.testing.expect(std.mem.endsWith(u8, result, "}"));
 }
@@ -316,7 +304,6 @@ test "writeRawJson embeds pre-serialized JSON" {
 
     var writer = JsonWriter.init(&buffer, allocator);
 
-    // Simulate embedding a pre-serialized schema
     const schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}";
 
     try writer.beginObject();

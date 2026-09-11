@@ -1,28 +1,3 @@
-//! Screen stack / router.
-//!
-//! Manages a stack of independent screens (each with its own state, key
-//! handler, and view), letting an app push/pop modal or full-screen layers
-//! the way a browser navigates pages. Distinct from `SubProgram` which is a
-//! static-typed wrapper for one child model: a `ScreenStack` holds a runtime
-//! stack of heterogeneous screens via a small vtable interface.
-//!
-//! Usage outline:
-//!
-//!     var stack = zz.ScreenStack.init(allocator);
-//!     defer stack.deinit();
-//!     try stack.push(login_screen);
-//!     // In your top-level update:
-//!     switch (try stack.handleKey(key, ctx)) {
-//!         .none => {},
-//!         .quit => return .quit,
-//!         .pushed, .popped, .replaced => {},
-//!     }
-//!     // In your top-level view:
-//!     return try stack.view(ctx, allocator);
-//!
-//! Screens marked `modal = true` render layered on top of the screen below,
-//! so the previous screen stays visible behind a centered overlay (commonly
-//! used for confirm dialogs or command palettes).
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -31,47 +6,28 @@ const keys = @import("../input/keys.zig");
 const measure = @import("../layout/measure.zig");
 const join = @import("../layout/join.zig");
 
-/// Result of a key handler. Tells the stack how to mutate itself.
 pub const Action = union(enum) {
-    /// Do nothing.
     none,
-    /// Pop this screen off the top.
     pop,
-    /// Pop this screen and push another.
     replace: Screen,
-    /// Push a new screen on top of this one.
     push: Screen,
-    /// Quit the whole program.
     quit,
 };
 
-/// Outcome of a `handleKey` call to the stack — useful when the parent wants
-/// to react to navigation.
 pub const HandleResult = enum { none, pushed, popped, replaced, quit };
 
-/// A single screen owned by the stack. Implemented via a tiny vtable so the
-/// stack can hold heterogeneous screen types.
 pub const Screen = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
-    /// Title shown in breadcrumbs/diagnostics. Optional.
     title: []const u8 = "",
-    /// If true, the screen behind this one is rendered first and this view
-    /// is overlaid (centered horizontally + vertically).
     modal: bool = false,
 
     pub const VTable = struct {
         update: *const fn (ctx: *anyopaque, msg_ctx: *Context, key: keys.KeyEvent) Action,
         view: *const fn (ctx: *anyopaque, msg_ctx: *const Context, allocator: std.mem.Allocator) anyerror![]const u8,
-        /// Called by the stack when the screen is removed (pop or replace).
-        /// Use this to free per-screen resources. May be null.
         deinit: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void = null,
-        /// Called when the screen is pushed onto the stack. May be null.
         on_enter: ?*const fn (ctx: *anyopaque, msg_ctx: *Context) void = null,
-        /// Called when another screen is pushed on top, so this one is
-        /// covered. May be null.
         on_suspend: ?*const fn (ctx: *anyopaque, msg_ctx: *Context) void = null,
-        /// Called when this screen becomes the top again after a pop.
         on_resume: ?*const fn (ctx: *anyopaque, msg_ctx: *Context) void = null,
     };
 };
@@ -88,7 +44,6 @@ pub const ScreenStack = struct {
     }
 
     pub fn deinit(self: *ScreenStack) void {
-        // Tear down in reverse order so on_suspend semantics make sense.
         while (self.stack.pop()) |s| {
             if (s.vtable.deinit) |fn_ptr| fn_ptr(s.ptr, self.allocator);
         }
@@ -103,7 +58,6 @@ pub const ScreenStack = struct {
         return self.stack.items.len == 0;
     }
 
-    /// The currently-active (top-of-stack) screen, or null.
     pub fn top(self: *const ScreenStack) ?Screen {
         if (self.stack.items.len == 0) return null;
         return self.stack.items[self.stack.items.len - 1];
@@ -151,7 +105,6 @@ pub const ScreenStack = struct {
         if (screen.vtable.on_enter) |fn_ptr| fn_ptr(screen.ptr, undefined);
     }
 
-    /// Forward a key event to the top screen and apply the returned action.
     pub fn handleKey(self: *ScreenStack, ctx: *Context, key: keys.KeyEvent) !HandleResult {
         const current = self.top() orelse return .none;
         const action = current.vtable.update(current.ptr, ctx, key);
@@ -181,13 +134,9 @@ pub const ScreenStack = struct {
         }
     }
 
-    /// Render the visible screens. Walks down from the top to find the
-    /// nearest non-modal "background" screen, then layers each modal on top.
     pub fn view(self: *const ScreenStack, ctx: *const Context, allocator: std.mem.Allocator) ![]const u8 {
         if (self.stack.items.len == 0) return try allocator.dupe(u8, "");
 
-        // Find the deepest screen we need to render: walk back until we hit
-        // a non-modal screen, that's our background.
         var background_idx: usize = self.stack.items.len - 1;
         while (background_idx > 0 and self.stack.items[background_idx].modal) {
             background_idx -= 1;
@@ -216,10 +165,6 @@ pub const ScreenStack = struct {
     }
 };
 
-/// Place `overlay` centered on top of `background`. The overlay's lines
-/// replace the corresponding lines in the background; lines that don't
-/// extend through the overlay region are kept as-is. The result has the
-/// dimensions of the larger of the two.
 fn compose(allocator: std.mem.Allocator, background: []const u8, overlay: []const u8) ![]const u8 {
     const bg_w = measure.maxLineWidth(background);
     const bg_h = measure.height(background);
@@ -229,7 +174,6 @@ fn compose(allocator: std.mem.Allocator, background: []const u8, overlay: []cons
     if (ov_w == 0 or ov_h == 0) return allocator.dupe(u8, background);
     if (bg_w == 0 or bg_h == 0) return allocator.dupe(u8, overlay);
 
-    // Vertical centering: place overlay starting at row (bg_h - ov_h) / 2.
     const top: usize = if (bg_h > ov_h) (bg_h - ov_h) / 2 else 0;
     const left: usize = if (bg_w > ov_w) (bg_w - ov_w) / 2 else 0;
 
@@ -256,7 +200,6 @@ fn compose(allocator: std.mem.Allocator, background: []const u8, overlay: []cons
         const ov_row_idx = if (row >= top) row - top else null;
         if (ov_row_idx) |oidx| {
             if (oidx < ov_lines.items.len) {
-                // Background prefix + overlay + background suffix.
                 const bg_line = bg_lines.items[row];
                 const padded = try padOrTrim(allocator, bg_line, left);
                 defer allocator.free(padded);
@@ -281,12 +224,9 @@ fn padOrTrim(allocator: std.mem.Allocator, line: []const u8, target: usize) ![]u
         @memset(out[line.len..], ' ');
         return out;
     }
-    // w > target: truncate visible width while preserving escapes. Best-effort.
     const trimmed = try measure.truncate(allocator, line, target);
     return @constCast(trimmed);
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -387,7 +327,6 @@ test "modal screen overlays previous screen" {
     const out = try stack.view(&ctx, testing.allocator);
     defer testing.allocator.free(out);
 
-    // Both background and modal should appear in output.
     try testing.expect(std.mem.indexOf(u8, out, "background") != null);
     try testing.expect(std.mem.indexOf(u8, out, "MODAL") != null);
 }

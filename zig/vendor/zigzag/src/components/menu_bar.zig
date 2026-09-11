@@ -1,5 +1,3 @@
-//! Menu bar component.
-//! Horizontal menu bar with dropdown menus and keyboard navigation.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -14,19 +12,15 @@ pub fn MenuBar(comptime Action: type) type {
         const max_menus = 10;
         const max_items = 20;
 
-        // Menus
         menus: [max_menus]?Menu,
         menu_count: usize,
 
-        // State
         state: State,
         active_menu: usize,
         active_item: usize,
 
-        // Result
         selected_action: ?Action,
 
-        // Styling
         bar_style: style_mod.Style,
         bar_item_style: style_mod.Style,
         bar_active_style: style_mod.Style,
@@ -38,7 +32,6 @@ pub fn MenuBar(comptime Action: type) type {
         border_chars: border_mod.BorderChars,
         border_fg: Color,
 
-        // Layout
         gap: usize,
 
         const Self = @This();
@@ -136,7 +129,6 @@ pub fn MenuBar(comptime Action: type) type {
             };
         }
 
-        /// Add a menu to the bar.
         pub fn addMenu(self: *Self, label: []const u8, accelerator: ?u8, items: []const MenuItem) void {
             if (self.menu_count >= max_menus) return;
 
@@ -157,7 +149,6 @@ pub fn MenuBar(comptime Action: type) type {
             self.menu_count += 1;
         }
 
-        /// Create an action menu item.
         pub fn action(label: []const u8, shortcut: []const u8, act: Action) MenuItem {
             return .{ .action = .{
                 .label = label,
@@ -168,7 +159,6 @@ pub fn MenuBar(comptime Action: type) type {
             } };
         }
 
-        /// Create a disabled action menu item.
         pub fn disabledAction(label: []const u8, shortcut: []const u8, act: Action) MenuItem {
             return .{ .action = .{
                 .label = label,
@@ -179,7 +169,6 @@ pub fn MenuBar(comptime Action: type) type {
             } };
         }
 
-        /// Create a checked action menu item.
         pub fn checkedAction(label: []const u8, act: Action, is_checked: bool) MenuItem {
             return .{ .action = .{
                 .label = label,
@@ -190,12 +179,9 @@ pub fn MenuBar(comptime Action: type) type {
             } };
         }
 
-        /// Create a separator.
         pub fn separator() MenuItem {
             return .{ .separator = {} };
         }
-
-        // ── State management ─────────────────────────
 
         pub fn isOpen(self: *const Self) bool {
             return self.state != .closed;
@@ -216,10 +202,7 @@ pub fn MenuBar(comptime Action: type) type {
             return act;
         }
 
-        // ── Input handling ───────────────────────────
-
         pub fn handleKey(self: *Self, key: keys.KeyEvent) bool {
-            // Check for Alt+letter accelerators
             if (key.modifiers.alt and key.key == .char) {
                 const c = key.key.char;
                 for (self.menus[0..self.menu_count], 0..) |maybe_menu, i| {
@@ -388,13 +371,10 @@ pub fn MenuBar(comptime Action: type) type {
             return if (c >= 'A' and c <= 'Z') c + 32 else c;
         }
 
-        // ── Rendering ───────────────────────────────
-
         pub fn view(self: *const Self, allocator: std.mem.Allocator, term_width: usize) ![]const u8 {
             var result: Writer.Allocating = .init(allocator);
             const writer = &result.writer;
 
-            // Render menu bar
             var bar_content: Writer.Allocating = .init(allocator);
             const bar_writer = &bar_content.writer;
 
@@ -414,7 +394,6 @@ pub fn MenuBar(comptime Action: type) type {
                 try bar_writer.writeAll(styled);
             }
 
-            // Pad bar to terminal width
             const bar_text = try bar_content.toOwnedSlice();
             const bar_width = measure.width(bar_text);
             try writer.writeAll(bar_text);
@@ -425,7 +404,6 @@ pub fn MenuBar(comptime Action: type) type {
                 try writer.writeAll(styled_pad);
             }
 
-            // Render dropdown if open
             if (self.state == .dropdown_open) {
                 if (self.menus[self.active_menu]) |menu| {
                     const dropdown = try self.renderDropdown(allocator, menu);
@@ -441,7 +419,6 @@ pub fn MenuBar(comptime Action: type) type {
             var result: Writer.Allocating = .init(allocator);
             const w = &result.writer;
 
-            // Calculate width
             var max_label_width: usize = 0;
             var max_shortcut_width: usize = 0;
             for (menu.items[0..menu.item_count]) |maybe_item| {
@@ -457,23 +434,19 @@ pub fn MenuBar(comptime Action: type) type {
                 }
             }
 
-            const inner_width = max_label_width + max_shortcut_width + 4; // padding + gap
+            const inner_width = max_label_width + max_shortcut_width + 4;
 
-            // Calculate x offset for dropdown
             var x_offset: usize = 1;
             for (self.menus[0..self.active_menu]) |maybe_menu| {
                 if (maybe_menu) |m| {
                     x_offset += measure.width(m.label) + 2 + self.gap;
                 }
             }
-            // Indent dropdown to align with menu item
             for (0..x_offset) |_| try w.writeByte(' ');
 
-            // Top border
             try self.writeBorder(w, allocator, inner_width, .top);
             try w.writeByte('\n');
 
-            // Items
             for (menu.items[0..menu.item_count], 0..) |maybe_item, i| {
                 const item = maybe_item orelse continue;
 
@@ -489,13 +462,11 @@ pub fn MenuBar(comptime Action: type) type {
                         const is_active = (i == self.active_item);
                         const s = if (!a.enabled) self.item_disabled_style else if (is_active) self.item_active_style else self.item_style;
 
-                        // Build line content
                         var line: Writer.Allocating = .init(allocator);
                         const lw = &line.writer;
 
                         try lw.writeByte(' ');
 
-                        // Check mark
                         if (a.checked) |checked| {
                             if (checked) {
                                 try lw.writeAll("\u{2713} ");
@@ -506,7 +477,6 @@ pub fn MenuBar(comptime Action: type) type {
 
                         try lw.writeAll(a.label);
 
-                        // Pad between label and shortcut
                         const label_width = measure.width(a.label) + if (a.checked != null) @as(usize, 2) else @as(usize, 0);
                         const gap_needed = inner_width -| label_width -| measure.width(a.shortcut_display) -| 2;
                         for (0..gap_needed) |_| try lw.writeByte(' ');
@@ -528,7 +498,6 @@ pub fn MenuBar(comptime Action: type) type {
                 try w.writeByte('\n');
             }
 
-            // Bottom border
             for (0..x_offset) |_| try w.writeByte(' ');
             try self.writeBorder(w, allocator, inner_width, .bottom);
 

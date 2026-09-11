@@ -12,51 +12,26 @@ fn defaultIo() std.Io {
         std.Io.Threaded.global_single_threaded.io();
 }
 
-/// Return the process current working directory handle.
-///
-/// Zig 0.16 mapping: this remains the stable wrapper for cwd access. Internal
-/// implementation may borrow the Makai default I/O context, but public callers
-/// should not receive or pass raw `std.Io` handles.
 pub fn getCwd() Dir {
     return Dir.cwd();
 }
 
-/// Open a file relative to `dir`.
-///
-/// Parameter order follows the migration convention: I/O handle (`dir`) first
-/// for handle-scoped operations, then operation-specific parameters.
 pub fn openFile(dir: Dir, path: []const u8, flags: OpenFlags) !File {
     return dir.openFile(defaultIo(), path, flags);
 }
 
-/// Read a file relative to `dir` into an allocated buffer.
-///
-/// Zig 0.16 mapping: preserve allocation ownership and error behavior while
-/// routing file reads through the Makai filesystem wrapper internals.
 pub fn readFileAlloc(allocator: std.mem.Allocator, dir: Dir, path: []const u8, max_bytes: usize) ![]u8 {
     return dir.readFileAlloc(defaultIo(), path, allocator, .limited(max_bytes));
 }
 
 pub const default_file_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 
-/// Write a file relative to `dir`, replacing existing contents.
-///
-/// Files are created with restrictive permissions by default because later OAuth
-/// storage migration work may use this wrapper for credential material. Existing
-/// files keep their current mode when opened with truncation on POSIX systems.
 pub fn writeFile(dir: Dir, path: []const u8, data: []const u8) !void {
     var file = try dir.createFile(defaultIo(), path, .{ .truncate = true, .permissions = default_file_mode });
     defer file.close(defaultIo());
     try file.writeStreamingAll(defaultIo(), data);
 }
 
-/// Atomically replace `target_path` by writing `data` to `tmp_path` in `dir` and
-/// renaming it over the target.
-///
-/// Zig 0.16 mapping: keep the same-directory temporary-file boundary so later
-/// OAuth storage work can preserve same-filesystem rename guarantees and file
-/// mode expectations. This skeleton is intentionally thin; crash-safety policy
-/// hardening belongs to the dedicated filesystem wrapper PR.
 pub fn atomicReplace(dir: Dir, target_path: []const u8, tmp_path: []const u8, data: []const u8) !void {
     if (std.mem.eql(u8, target_path, tmp_path)) return error.InvalidAtomicReplacePaths;
 
@@ -79,7 +54,6 @@ pub fn atomicReplace(dir: Dir, target_path: []const u8, tmp_path: []const u8, da
     cleanup_tmp = false;
 }
 
-/// Create a directory and any missing parents relative to `dir`.
 pub fn createDir(dir: Dir, path: []const u8) !void {
     try dir.createDirPath(defaultIo(), path);
 }

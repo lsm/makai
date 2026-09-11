@@ -16,12 +16,8 @@ pub const MetadataEntry = model_catalog_types.MetadataEntry;
 pub const ModelDescriptor = model_catalog_types.ModelDescriptor;
 pub const ModelsResponse = model_catalog_types.ModelsResponse;
 
-/// ULID type for stream/message identification.
-/// Internally this is the canonical 128-bit ULID payload: 48-bit
-/// millisecond timestamp followed by 80 bits of randomness.
 pub const Ulid = [16]u8;
 
-/// NanoID-compatible session identifier for agent sessions.
 pub const SESSION_ID_LENGTH: usize = 21;
 pub const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 pub const SessionId = [SESSION_ID_LENGTH]u8;
@@ -35,19 +31,14 @@ fn generateSessionIdWithRandomInt(random_int_range_less_than: fn (comptime type,
     return session_id;
 }
 
-/// Generate a random NanoID-style session ID with an alphanumeric alphabet.
-/// Session IDs are protocol correlation values, so use secure entropy to make
-/// accidental or malicious guessing impractical across distributed runtimes.
 pub fn generateSessionId() SessionId {
     return generateSessionIdWithRandomInt(compat.random.secureIntRangeLessThan);
 }
 
-/// Convert session ID to string representation (21 alphanumeric chars).
 pub fn sessionIdToString(session_id: SessionId, allocator: std.mem.Allocator) ![]const u8 {
     return allocator.dupe(u8, session_id[0..]);
 }
 
-/// Parse session ID from string.
 pub fn parseSessionId(str: []const u8) ?SessionId {
     if (str.len != SESSION_ID_LENGTH) return null;
     var session_id: SessionId = undefined;
@@ -108,20 +99,15 @@ fn generateUlidWithRandom(fill_random: fn ([]u8) void) Ulid {
     return ulid;
 }
 
-/// Generate a ULID with the current millisecond timestamp and 80 random bits.
-/// Protocol stream/message IDs use secure entropy because they are externally
-/// visible correlation identifiers in distributed transports.
 pub fn generateUlid() Ulid {
     return generateUlidWithRandom(compat.random.fillSecureBytes);
 }
 
-/// Convert ULID to Crockford Base32 string representation (26 chars).
 pub fn ulidToString(ulid: Ulid, allocator: std.mem.Allocator) ![]const u8 {
     const result = try allocator.alloc(u8, 26);
     return ulidToBuffer(ulid, @ptrCast(result.ptr));
 }
 
-/// Convert ULID to Crockford Base32 in caller-provided storage.
 pub fn ulidToBuffer(ulid: Ulid, result: *[26]u8) []const u8 {
     for (result, 0..) |*out, i| {
         var value: u5 = 0;
@@ -140,13 +126,11 @@ pub fn ulidToBuffer(ulid: Ulid, result: *[26]u8) []const u8 {
     return result;
 }
 
-/// Parse ULID from a 26-character Crockford Base32 string.
 pub fn parseUlid(str: []const u8) ?Ulid {
     if (str.len != 26) return null;
 
     var values: [26]u5 = undefined;
     for (str, 0..) |c, i| values[i] = ulidDecode(c) orelse return null;
-    // 26 Base32 digits encode 130 bits; the top two overflow bits must be zero.
     if (values[0] > 7) return null;
 
     var ulid: Ulid = [_]u8{0} ** 16;
@@ -165,21 +149,13 @@ pub fn parseUlid(str: []const u8) ?Ulid {
     return ulid;
 }
 
-/// Protocol envelope wrapping all messages
 pub const Envelope = struct {
-    /// Protocol version
     version: u8 = 1,
-    /// Unique stream identifier (stable for stream lifecycle)
     stream_id: Ulid,
-    /// Message ID (unique per message)
     message_id: Ulid,
-    /// Sequence number within stream (starts at 1)
     sequence: u64,
-    /// For request/response correlation
     in_reply_to: ?Ulid = null,
-    /// Unix timestamp in milliseconds
     timestamp: i64,
-    /// The actual payload
     payload: Payload,
 
     pub fn deinit(self: *Envelope, allocator: std.mem.Allocator) void {
@@ -187,15 +163,12 @@ pub const Envelope = struct {
     }
 };
 
-/// Discriminated payload union
 pub const Payload = union(enum) {
-    // Client -> Server
     stream_request: StreamRequest,
     complete_request: CompleteRequest,
     abort_request: AbortRequest,
     models_request: ModelsRequest,
 
-    // Server -> Client
     ack: Ack,
     nack: Nack,
     event: ai_types.AssistantMessageEvent,
@@ -203,11 +176,9 @@ pub const Payload = union(enum) {
     stream_error: StreamError,
     models_response: ModelsResponse,
 
-    // Keepalive
     ping: void,
     pong: Pong,
 
-    // Connection management
     goodbye: Goodbye,
     sync_request: SyncRequest,
     sync: Sync,
@@ -231,22 +202,17 @@ pub const Payload = union(enum) {
     }
 };
 
-/// Helper to deinit AssistantMessageEvent variants that own memory
-/// This is a convenience wrapper around ai_types.deinitAssistantMessageEvent
 pub fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEvent) void {
     ai_types.deinitAssistantMessageEvent(allocator, event);
 }
 
-/// Request to start a streaming completion
 pub const StreamRequest = struct {
     model: ai_types.Model,
     context: ai_types.Context,
     options: ?ai_types.StreamOptions = null,
-    /// If true, include lightweight partials in events
     include_partial: bool = false,
 
     pub fn deinit(self: *StreamRequest, allocator: std.mem.Allocator) void {
-        // Model fields are owned when deserialized
         self.model.deinit(allocator);
         self.context.deinit(allocator);
         if (self.options) |*opts| {
@@ -255,14 +221,12 @@ pub const StreamRequest = struct {
     }
 };
 
-/// Request for non-streaming completion
 pub const CompleteRequest = struct {
     model: ai_types.Model,
     context: ai_types.Context,
     options: ?ai_types.StreamOptions = null,
 
     pub fn deinit(self: *CompleteRequest, allocator: std.mem.Allocator) void {
-        // Model fields are owned when deserialized
         self.model.deinit(allocator);
         self.context.deinit(allocator);
         if (self.options) |*opts| {
@@ -271,7 +235,6 @@ pub const CompleteRequest = struct {
     }
 };
 
-/// Request to abort a stream
 pub const AbortRequest = struct {
     target_stream_id: Ulid,
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -287,21 +250,14 @@ pub const AbortRequest = struct {
     }
 };
 
-/// Acknowledgment response
 pub const Ack = struct {
-    /// The message_id being acknowledged
     acknowledged_id: Ulid,
 };
 
-/// Negative acknowledgment response
 pub const Nack = struct {
-    /// The message_id that was rejected
     rejected_id: Ulid,
-    /// Human-readable reason for rejection
     reason: OwnedSlice(u8),
-    /// Optional error code
     error_code: ?ErrorCode = null,
-    /// Optional list of supported protocol versions (for VERSION_MISMATCH)
     supported_versions: OwnedSlice(OwnedSlice(u8)) = OwnedSlice(OwnedSlice(u8)).initBorrowed(&.{}),
 
     pub fn deinit(self: *Nack, allocator: std.mem.Allocator) void {
@@ -311,7 +267,6 @@ pub const Nack = struct {
     }
 };
 
-/// Error codes for protocol errors
 pub const ErrorCode = enum {
     invalid_request,
     model_not_found,
@@ -325,18 +280,12 @@ pub const ErrorCode = enum {
     duplicate_sequence,
     sequence_gap,
     not_implemented,
-    /// Missing or invalid authentication credentials. The TS SDK uses this code
-    /// to drive the auth-required retry policy (manual login or auto_once).
     auth_required,
-    /// OAuth refresh attempt failed (e.g., refresh token rejected by IdP).
     auth_refresh_failed,
-    /// Stored credentials are expired and cannot be refreshed (no refresh token).
     auth_expired,
-    /// Stream was cancelled by the client via abort_request.
     stream_cancelled,
 };
 
-/// Stream error payload
 pub const StreamError = struct {
     code: ErrorCode,
     message: OwnedSlice(u8),
@@ -347,7 +296,6 @@ pub const StreamError = struct {
     }
 };
 
-/// Pong response - echoes ping_id from the corresponding ping
 pub const Pong = struct {
     ping_id: OwnedSlice(u8),
 
@@ -357,7 +305,6 @@ pub const Pong = struct {
     }
 };
 
-/// Graceful connection close message
 pub const Goodbye = struct {
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
@@ -372,15 +319,13 @@ pub const Goodbye = struct {
     }
 };
 
-/// Request full state resync
 pub const SyncRequest = struct {
     target_stream_id: Ulid,
 };
 
-/// Full partial state resync response
 pub const Sync = struct {
-    target_stream_id: Ulid, // renamed from stream_id per spec
-    partial: ?ai_types.AssistantMessage = null, // AssistantMessage object, not string
+    target_stream_id: Ulid,
+    partial: ?ai_types.AssistantMessage = null,
 
     pub fn deinit(self: *Sync, allocator: std.mem.Allocator) void {
         if (self.partial) |*p| {
@@ -417,8 +362,6 @@ pub const ModelsRequest = struct {
         self.model_id.deinit(allocator);
     }
 };
-
-// Tests
 
 test "ModelsRequest getters return null for empty borrowed filters" {
     const req = ModelsRequest{};
@@ -495,7 +438,6 @@ test "generateUlid produces valid ULID" {
     try std.testing.expect(ulid_ms <= now_ms);
     try std.testing.expect(now_ms - ulid_ms < 1_000);
 
-    // Generate multiple ULIDs and ensure they're different
     const ulid2 = generateUlid();
     try std.testing.expect(!std.mem.eql(u8, &ulid, &ulid2));
 }
@@ -511,18 +453,15 @@ test "ulidToString and parseUlid roundtrip" {
     const str = try ulidToString(ulid, std.testing.allocator);
     defer std.testing.allocator.free(str);
 
-    // Check format: 26 Crockford Base32 characters.
     try std.testing.expectEqual(@as(usize, 26), str.len);
     for (str) |c| {
         try std.testing.expect(ulidDecode(c) != null);
     }
 
-    // Roundtrip
     const parsed = parseUlid(str);
     try std.testing.expect(parsed != null);
     try std.testing.expectEqualSlices(u8, &ulid, &parsed.?);
 
-    // Test with known ULID
     const known_ulid: Ulid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
     const known_str = try ulidToString(known_ulid, std.testing.allocator);
     defer std.testing.allocator.free(known_str);
@@ -537,26 +476,20 @@ test "ulidToString and parseUlid roundtrip" {
 }
 
 test "parseUlid returns null for invalid strings" {
-    // Wrong length
-    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG") == null); // 25 chars
-    try std.testing.expect(parseUlid("014D2PF2DBSQQZXQ5TK1V58CGG0") == null); // 27 chars
+    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG") == null);
+    try std.testing.expect(parseUlid("014D2PF2DBSQQZXQ5TK1V58CGG0") == null);
 
-    // Invalid Crockford Base32 characters
     try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CGU") == null);
     try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG-") == null);
 
-    // Overflow in the 130-bit representation
     try std.testing.expect(parseUlid("8ZZZZZZZZZZZZZZZZZZZZZZZZZ") == null);
 
-    // Ambiguous Crockford aliases are accepted
     try std.testing.expect(parseUlid("0I8D2PF2DBSQQZWQ5TK1V58CGG") != null);
 
-    // Empty string
     try std.testing.expect(parseUlid("") == null);
 }
 
 test "ErrorCode enum values match protocol spec" {
-    // Verify all expected error codes exist
     const codes = [_]ErrorCode{
         .invalid_request,
         .model_not_found,
@@ -576,10 +509,8 @@ test "ErrorCode enum values match protocol spec" {
         .stream_cancelled,
     };
 
-    // Verify enum has exactly 16 values
     try std.testing.expectEqual(@as(usize, 16), codes.len);
 
-    // Verify each can be instantiated
     inline for (codes) |code| {
         _ = code;
     }
@@ -595,7 +526,6 @@ test "Envelope with ping payload" {
         .payload = .ping,
     };
 
-    // No memory to free for ping
     envelope.deinit(std.testing.allocator);
 }
 
@@ -608,7 +538,6 @@ test "Nack deinit frees reason and supported_versions" {
     };
 
     nack.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "StreamError deinit frees message" {
@@ -619,7 +548,6 @@ test "StreamError deinit frees message" {
     };
 
     stream_err.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "AbortRequest deinit frees reason" {
@@ -630,7 +558,6 @@ test "AbortRequest deinit frees reason" {
     };
 
     abort.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "AbortRequest deinit handles empty reason" {
@@ -639,20 +566,16 @@ test "AbortRequest deinit handles empty reason" {
     };
 
     abort.deinit(std.testing.allocator);
-    // Should not crash
 }
 
 test "Payload deinit handles all variants" {
-    // Test ping
     var ping_payload: Payload = .ping;
     ping_payload.deinit(std.testing.allocator);
 
-    // Test pong with ping_id
     const ping_id = try std.testing.allocator.dupe(u8, "test-ping-123");
     var pong_payload: Payload = .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(ping_id) } };
     pong_payload.deinit(std.testing.allocator);
 
-    // Test ack
     var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUlid() } };
     ack_payload.deinit(std.testing.allocator);
 }
@@ -661,24 +584,20 @@ test "Pong deinit frees ping_id" {
     const ping_id = try std.testing.allocator.dupe(u8, "test-ping-id");
     var pong = Pong{ .ping_id = OwnedSlice(u8).initOwned(ping_id) };
     pong.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "Goodbye deinit frees reason" {
     const reason = try std.testing.allocator.dupe(u8, "Server shutting down");
     var goodbye = Goodbye{ .reason = OwnedSlice(u8).initOwned(reason) };
     goodbye.deinit(std.testing.allocator);
-    // Should not leak
 }
 
 test "Goodbye deinit handles empty reason" {
     var goodbye = Goodbye{};
     goodbye.deinit(std.testing.allocator);
-    // Should not crash
 }
 
 test "Sync deinit handles partial" {
-    // Create a partial with empty content (no strings to free)
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -694,7 +613,6 @@ test "Sync deinit handles partial" {
         .partial = partial,
     };
     sync.deinit(std.testing.allocator);
-    // Should not leak or crash
 }
 
 test "Sync deinit handles null partial" {
@@ -703,7 +621,6 @@ test "Sync deinit handles null partial" {
         .partial = null,
     };
     sync.deinit(std.testing.allocator);
-    // Should not crash
 }
 
 test "SyncRequest has target_stream_id" {
@@ -713,7 +630,6 @@ test "SyncRequest has target_stream_id" {
 }
 
 test "StreamRequest deinit with owned strings frees memory" {
-    // Create a StreamRequest with owned strings (simulating deserialized data)
     const model = ai_types.Model{
         .id = try std.testing.allocator.dupe(u8, "gpt-4"),
         .name = try std.testing.allocator.dupe(u8, "GPT-4"),
@@ -746,11 +662,9 @@ test "StreamRequest deinit with owned strings frees memory" {
     };
 
     req.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "CompleteRequest deinit with owned strings frees memory" {
-    // Create a CompleteRequest with owned strings (simulating deserialized data)
     const model = ai_types.Model{
         .id = try std.testing.allocator.dupe(u8, "claude-3"),
         .name = try std.testing.allocator.dupe(u8, "Claude 3"),
@@ -780,11 +694,9 @@ test "CompleteRequest deinit with owned strings frees memory" {
     };
 
     req.deinit(std.testing.allocator);
-    // Should not leak - test passes if no memory leak detected
 }
 
 test "StreamRequest deinit with borrowed strings does not free" {
-    // Create a StreamRequest with borrowed string literals (is_owned = false)
     const model = ai_types.Model{
         .id = "gpt-4",
         .name = "GPT-4",
@@ -796,14 +708,14 @@ test "StreamRequest deinit with borrowed strings does not free" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .is_owned = false, // Borrowed, not owned
+        .is_owned = false,
     };
 
     const context = ai_types.Context{
         .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("Be helpful"),
         .messages = &.{},
         .tools = null,
-        .is_owned = false, // Borrowed, not owned
+        .is_owned = false,
     };
 
     var req = StreamRequest{
@@ -814,5 +726,4 @@ test "StreamRequest deinit with borrowed strings does not free" {
     };
 
     req.deinit(std.testing.allocator);
-    // Should not crash - borrowed strings are not freed
 }

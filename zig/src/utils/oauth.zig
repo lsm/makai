@@ -7,12 +7,11 @@ pub const pkce = @import("oauth/pkce");
 pub const callback_server = @import("oauth/callback_server");
 pub const storage = @import("oauth/storage");
 
-/// OAuth credentials with refresh token, access token, and expiry
 pub const Credentials = struct {
     refresh: []const u8,
     access: []const u8,
-    expires: i64, // Unix timestamp (ms)
-    provider_data: ?[]const u8 = null, // JSON blob for provider-specific fields
+    expires: i64,
+    provider_data: ?[]const u8 = null,
 
     pub fn deinit(self: *const Credentials, allocator: std.mem.Allocator) void {
         allocator.free(self.refresh);
@@ -23,7 +22,6 @@ pub const Credentials = struct {
     }
 };
 
-/// OAuth callback functions for user interaction
 pub const Callbacks = struct {
     onAuth: *const fn (info: AuthInfo) void,
     onPrompt: *const fn (prompt: Prompt) []const u8,
@@ -31,20 +29,17 @@ pub const Callbacks = struct {
     onManualCodeInput: ?*const fn () []const u8 = null,
 };
 
-/// Authentication info shown to user
 pub const AuthInfo = struct {
     url: []const u8,
     instructions: ?[]const u8 = null,
 };
 
-/// User prompt configuration
 pub const Prompt = struct {
     message: []const u8,
     placeholder: ?[]const u8 = null,
     allow_empty: bool = false,
 };
 
-/// OAuth provider interface
 pub const OAuthProvider = struct {
     id: []const u8,
     name: []const u8,
@@ -53,7 +48,6 @@ pub const OAuthProvider = struct {
     get_api_key_fn: *const fn (credentials: Credentials, allocator: std.mem.Allocator) anyerror![]const u8,
 };
 
-// Adapter functions for Anthropic
 fn anthropicLogin(callbacks: Callbacks, allocator: std.mem.Allocator) anyerror!Credentials {
     const anthro_callbacks = anthropic_mod.Callbacks{
         .onAuth = @ptrCast(callbacks.onAuth),
@@ -90,7 +84,6 @@ fn anthropicGetApiKey(credentials: Credentials, allocator: std.mem.Allocator) an
     return try anthropic_mod.getApiKey(anthro_creds, allocator);
 }
 
-// Adapter functions for GitHub Copilot
 fn githubCopilotLogin(callbacks: Callbacks, allocator: std.mem.Allocator) anyerror!Credentials {
     const gh_callbacks = github_copilot_mod.Callbacks{
         .onAuth = @ptrCast(callbacks.onAuth),
@@ -131,7 +124,6 @@ fn githubCopilotGetApiKey(credentials: Credentials, allocator: std.mem.Allocator
     return try github_copilot_mod.getApiKey(gh_creds, allocator);
 }
 
-// Adapter functions for Google
 fn googleLogin(callbacks: Callbacks, allocator: std.mem.Allocator) anyerror!Credentials {
     const g_callbacks = google_mod.Callbacks{
         .onAuth = @ptrCast(callbacks.onAuth),
@@ -197,14 +189,12 @@ const google_gemini_provider = OAuthProvider{
     .get_api_key_fn = googleGetApiKey,
 };
 
-/// Registry of OAuth providers
 pub const registry = std.StaticStringMap(OAuthProvider).initComptime(.{
     .{ "anthropic", anthropic_provider },
     .{ "github-copilot", github_copilot_provider },
     .{ "google-gemini-cli", google_gemini_provider },
 });
 
-/// Get OAuth provider by ID
 pub fn getProvider(id: []const u8) ?OAuthProvider {
     return registry.get(id);
 }

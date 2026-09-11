@@ -1,5 +1,3 @@
-//! Diff viewer component.
-//! Displays unified or side-by-side text diffs with syntax coloring.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -14,18 +12,12 @@ pub const DiffView = struct {
     mode: Mode = .unified,
     show_line_numbers: bool = true,
     context_lines: usize = 3,
-    /// Width of each side in side-by-side mode.
     side_width: usize = 38,
-    /// Separator character for side-by-side mode.
     separator: []const u8 = "\xe2\x94\x82",
-    /// Add prefix symbol.
     add_prefix: []const u8 = "+",
-    /// Remove prefix symbol.
     remove_prefix: []const u8 = "-",
-    /// Context prefix symbol.
     context_prefix: []const u8 = " ",
 
-    // Styles
     add_style: style_mod.Style = blk: {
         var s = style_mod.Style{};
         s = s.fg(.green);
@@ -80,12 +72,10 @@ pub const DiffView = struct {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
 
-        // Header
         const hdr = std.fmt.allocPrint(allocator, "--- {s}\n+++ {s}", .{ self.old_label, self.new_label }) catch "";
         writer.writeAll(self.header_style.render(allocator, hdr) catch hdr) catch {};
         writer.writeByte('\n') catch {};
 
-        // Compute diff using LCS-based approach
         const old_lines = splitLines(allocator, self.old_text);
         const new_lines = splitLines(allocator, self.new_text);
         const ops = computeDiff(allocator, old_lines, new_lines);
@@ -129,7 +119,6 @@ pub const DiffView = struct {
             }
         }
 
-        // Trim trailing newline
         var array = result.toArrayList();
         if (array.items.len > 0 and array.items[array.items.len - 1] == '\n') {
             _ = array.pop();
@@ -148,7 +137,6 @@ pub const DiffView = struct {
 
         const half_width: usize = self.side_width;
 
-        // Header
         const old_hdr = padRight(allocator, self.old_label, half_width);
         const new_hdr = self.new_label;
         writer.writeAll(self.header_style.render(allocator, old_hdr) catch old_hdr) catch {};
@@ -156,7 +144,6 @@ pub const DiffView = struct {
         writer.writeAll(self.header_style.render(allocator, new_hdr) catch new_hdr) catch {};
         writer.writeByte('\n') catch {};
 
-        // Separator line
         for (0..half_width) |_| writer.writeAll("\xe2\x94\x80") catch {};
         writer.writeAll("\xe2\x94\xbc") catch {};
         for (0..half_width + 2) |_| writer.writeAll("\xe2\x94\x80") catch {};
@@ -213,18 +200,15 @@ pub const DiffView = struct {
     }
 };
 
-/// Diff operation.
 const DiffOp = union(enum) {
     equal: []const u8,
     delete: []const u8,
     insert: []const u8,
 };
 
-/// Simple Myers-like diff: compute edit operations between old and new line arrays.
 fn computeDiff(allocator: std.mem.Allocator, old: []const []const u8, new: []const []const u8) []const DiffOp {
     var ops = std.array_list.Managed(DiffOp).init(allocator);
 
-    // Simple O(n*m) LCS-based diff
     const m = old.len;
     const n = new.len;
 
@@ -237,9 +221,7 @@ fn computeDiff(allocator: std.mem.Allocator, old: []const []const u8, new: []con
         return ops.items;
     }
 
-    // Build LCS table
     const table = allocator.alloc(usize, (m + 1) * (n + 1)) catch {
-        // Fallback: show all as delete + insert
         for (old) |line| ops.append(.{ .delete = line }) catch {};
         for (new) |line| ops.append(.{ .insert = line }) catch {};
         return ops.items;
@@ -256,7 +238,6 @@ fn computeDiff(allocator: std.mem.Allocator, old: []const []const u8, new: []con
         }
     }
 
-    // Backtrack to produce ops
     var rev_ops = std.array_list.Managed(DiffOp).init(allocator);
     var i: usize = m;
     var j: usize = n;
@@ -274,7 +255,6 @@ fn computeDiff(allocator: std.mem.Allocator, old: []const []const u8, new: []con
         }
     }
 
-    // Reverse
     var idx: usize = rev_ops.items.len;
     while (idx > 0) {
         idx -= 1;

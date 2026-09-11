@@ -39,16 +39,6 @@ pub const AgentProtocolRuntime = struct {
 
     pub fn pumpServerOutbox(self: *Self) !usize {
         var count: usize = 0;
-        // Transactional delivery (#210 gap 5): peek, serialize, and write a
-        // frame BEFORE removing it from the outbox — popping first (the old
-        // order) destroyed the already-built envelope on any serialization
-        // or write failure, so an `agent_result` lost this way left its
-        // completed run settled-nowhere with nothing to retry. Now the
-        // failure propagates (surfacing as the host's typed runtime error
-        // frame) and the envelope stays queued for the next pump. The
-        // pipe's write is all-or-nothing (`SerializedPipe.appendFramed`
-        // reserves data + newline before appending), so a retried frame can
-        // never land on a partial line.
         while (self.server.peekOutbound()) |env| {
             const json = try agent_envelope.serializeEnvelope(env.*, self.allocator);
             defer self.allocator.free(json);
@@ -169,10 +159,6 @@ test "AgentProtocolRuntime pumps full request/response and outbox" {
     try std.testing.expectEqualStrings("{\"messages\":[]}", client.getLastResultJson().?);
 }
 
-// #210 gap 5: an outbox envelope must never be destroyed by its own
-// delivery failure — the frame stays queued (peek-before-pop), the failure
-// propagates, and the next pump delivers it exactly once. Sweeping
-// fail_index covers every allocation of the serialize path.
 test "AgentProtocolRuntime outbox delivery is transactional under allocation failure" {
     const allocator = std.testing.allocator;
 
@@ -193,9 +179,6 @@ test "AgentProtocolRuntime outbox delivery is transactional under allocation fai
     };
     _ = try client.sendAgentStart("{}", null);
     try setup_runtime.pumpClientMessages();
-    // Deliver the synchronous agent_started reply into the client (this is
-    // what adopts the session id) and consume it, so only the queued
-    // agent_result is read at the end of this test.
     try setup_runtime.pumpServerMessagesIntoClient(&client);
     const sid = client.session_id.?;
 
@@ -213,14 +196,10 @@ test "AgentProtocolRuntime outbox delivery is transactional under allocation fai
             try std.testing.expect(server.peekOutbound() == null);
         } else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
-            // The frame survived its own failed delivery.
             try std.testing.expect(server.peekOutbound() != null);
         }
     }
 
-    // Whatever the sweep did, the frame was delivered AT MOST once and
-    // never lost: after a final recovery pump exactly one agent_result line
-    // is readable.
     _ = try setup_runtime.pumpServerOutbox();
     try std.testing.expect(server.peekOutbound() == null);
 

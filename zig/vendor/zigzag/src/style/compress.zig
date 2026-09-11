@@ -1,11 +1,8 @@
-//! ANSI output compression utilities.
-//! Reduces ANSI escape sequence overhead by tracking terminal state and emitting only diffs.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const ansi = @import("../terminal/ansi.zig");
 
-/// Tracks the current terminal style state for efficient transitions
 pub const StyleState = struct {
     bold: bool = false,
     dim: bool = false,
@@ -25,14 +22,11 @@ pub const StyleState = struct {
     fg_ansi: ?u8 = null,
     bg_ansi: ?u8 = null,
 
-    /// Reset to default state
     pub fn reset(self: *StyleState) void {
         self.* = .{};
     }
 
-    /// Emit only the ANSI escape sequences needed to transition to the target state
     pub fn transitionTo(self: *StyleState, writer: *Writer, target: StyleState) !void {
-        // If target is fully default, just emit reset
         if (!target.bold and !target.dim and !target.italic and !target.underline and
             !target.blink and !target.reverse and !target.strikethrough and
             !target.fg_set and !target.bg_set)
@@ -47,7 +41,6 @@ pub const StyleState = struct {
             return;
         }
 
-        // Check if we need a full reset first (any attribute going from on to off)
         const needs_reset = (self.bold and !target.bold) or
             (self.dim and !target.dim) or
             (self.italic and !target.italic) or
@@ -61,7 +54,6 @@ pub const StyleState = struct {
             self.reset();
         }
 
-        // Now emit only the attributes that need to be turned on
         if (target.bold and !self.bold) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.bold});
         if (target.dim and !self.dim) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.dim});
         if (target.italic and !self.italic) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.italic});
@@ -70,7 +62,6 @@ pub const StyleState = struct {
         if (target.reverse and !self.reverse) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.reverse});
         if (target.strikethrough and !self.strikethrough) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.strikethrough});
 
-        // Foreground color
         if (target.fg_set) {
             const fg_changed = !self.fg_set or
                 self.fg_r != target.fg_r or self.fg_g != target.fg_g or self.fg_b != target.fg_b or
@@ -86,7 +77,6 @@ pub const StyleState = struct {
             try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.fg_default});
         }
 
-        // Background color
         if (target.bg_set) {
             const bg_changed = !self.bg_set or
                 self.bg_r != target.bg_r or self.bg_g != target.bg_g or self.bg_b != target.bg_b or
@@ -102,13 +92,10 @@ pub const StyleState = struct {
             try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.bg_default});
         }
 
-        // Update state
         self.* = target;
     }
 };
 
-/// Post-process an ANSI string to remove redundant escape sequences.
-/// Strips consecutive resets and duplicate attribute settings.
 pub fn compressAnsi(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result: Writer.Allocating = .init(allocator);
     const writer = &result.writer;
@@ -117,9 +104,7 @@ pub fn compressAnsi(allocator: std.mem.Allocator, input: []const u8) ![]const u8
     var last_was_reset = false;
 
     while (i < input.len) {
-        // Check for ESC[
         if (i + 1 < input.len and input[i] == 0x1b and input[i + 1] == '[') {
-            // Find the end of the CSI sequence
             var seq_end = i + 2;
             while (seq_end < input.len) {
                 const c = input[seq_end];
@@ -132,13 +117,11 @@ pub fn compressAnsi(allocator: std.mem.Allocator, input: []const u8) ![]const u8
 
             const seq = input[i..seq_end];
 
-            // Check for reset sequence
             if (std.mem.eql(u8, seq, ansi.reset)) {
                 if (!last_was_reset) {
                     try writer.writeAll(seq);
                     last_was_reset = true;
                 }
-                // Skip duplicate resets
             } else {
                 try writer.writeAll(seq);
                 last_was_reset = false;

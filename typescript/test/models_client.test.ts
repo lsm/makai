@@ -79,9 +79,6 @@ async function setupHarness(opts: {
     command: process.execPath,
     args: [fixtureScript],
     env,
-    // Bump from default to absorb subprocess-spawn jitter under parallel
-    // test-file execution (multiple node:test workers can spawn dozens of
-    // node fixture children at once on first cold start).
     handshakeTimeoutMs: 5000,
   });
   await client.connect();
@@ -155,7 +152,6 @@ test("models.list parses and returns full ListModelsResponse shape", async () =>
 });
 
 test("models.list defaults missing cache_max_age_ms to 5 minutes", async () => {
-  // Spec §2.3: clients should default to 300_000 when server omits it.
   const responseWithoutCache = {
     models: [makeDescriptor()],
     fetched_at_ms: 1_760_000_000_500,
@@ -218,7 +214,6 @@ test("models.list passes filter fields through on the wire", async () => {
     assert.equal(payload.api, "anthropic-messages");
     assert.equal(payload.include_deprecated, true);
     assert.equal(payload.include_login_required, false);
-    // Resolve-only fields must not leak into a regular list.
     assert.equal(payload.model_id, undefined);
   } finally {
     await harness.cleanup();
@@ -480,8 +475,6 @@ test("models.resolve rejects locally when provider_id or model_id is missing", a
   }
 });
 
-// --- provider_id / model_id input length validation tests ---
-
 test("models.resolve rejects provider_id exceeding 256 characters before transport I/O", async () => {
   const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
   try {
@@ -528,7 +521,6 @@ test("models.resolve accepts provider_id at exactly 256 characters", async () =>
     const api = createMakaiModelsApi(harness.client);
     await api.resolve({ provider_id: "a".repeat(256), model_id: "claude-sonnet-4-5" });
   } catch (err) {
-    // Expected: may fail at model mismatch check, but NOT at length validation
     assert.ok(err instanceof MakaiProtocolError && err.code === "invalid_request");
     assert.ok(
       !err.message.includes("exceeds maximum length"),

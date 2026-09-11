@@ -1,5 +1,3 @@
-//! Dropdown/Select component.
-//! Collapsible list for selecting one or more options.
 
 const std = @import("std");
 const keys = @import("../input/keys.zig");
@@ -14,37 +12,29 @@ pub fn Dropdown(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
 
-        // Items
         items: std.array_list.Managed(Item),
         filtered_indices: std.array_list.Managed(usize),
 
-        // State
         expanded: bool,
         cursor: usize,
         selected_index: ?usize,
         selected_indices: std.AutoHashMap(usize, void),
 
-        // Filtering
         filter_text: std.array_list.Managed(u8),
         filter_active: bool,
 
-        // Scrolling
         y_offset: usize,
         max_visible: u16,
 
-        // Focus
         focused: bool,
 
-        // Behavior
         multi_select: bool,
         close_on_select: bool,
         wrap_around: bool,
 
-        // Labels
         label: []const u8,
         placeholder: []const u8,
 
-        // Symbols
         expand_symbol: []const u8,
         cursor_symbol: []const u8,
         checked_symbol: []const u8,
@@ -52,7 +42,6 @@ pub fn Dropdown(comptime T: type) type {
         scroll_up_symbol: []const u8,
         scroll_down_symbol: []const u8,
 
-        // Styling
         label_style: style_mod.Style,
         trigger_style: style_mod.Style,
         trigger_focused_style: style_mod.Style,
@@ -178,8 +167,6 @@ pub fn Dropdown(comptime T: type) type {
             self.filter_text.deinit();
         }
 
-        // ── Item management ─────────────────────────────
-
         pub fn addItem(self: *Self, item: Item) !void {
             try self.items.append(item);
             try self.rebuildFilter();
@@ -200,14 +187,11 @@ pub fn Dropdown(comptime T: type) type {
             try self.rebuildFilter();
         }
 
-        // ── State ───────────────────────────────────────
-
         pub fn open(self: *Self) void {
             self.expanded = true;
             self.filter_active = false;
             self.filter_text.clearRetainingCapacity();
             self.rebuildFilter() catch {};
-            // Position cursor at selected item if any
             if (self.selected_index) |sel| {
                 for (self.filtered_indices.items, 0..) |idx, i| {
                     if (idx == sel) {
@@ -232,8 +216,6 @@ pub fn Dropdown(comptime T: type) type {
         pub fn isExpanded(self: *const Self) bool {
             return self.expanded;
         }
-
-        // ── Selection ───────────────────────────────────
 
         pub fn selectedItem(self: *const Self) ?*const Item {
             if (self.selected_index) |idx| {
@@ -282,8 +264,6 @@ pub fn Dropdown(comptime T: type) type {
             }
         }
 
-        // ── Focus protocol ──────────────────────────────
-
         pub fn focus(self: *Self) void {
             self.focused = true;
         }
@@ -292,12 +272,9 @@ pub fn Dropdown(comptime T: type) type {
             self.focused = false;
         }
 
-        // ── Input handling ──────────────────────────────
-
         pub fn handleKey(self: *Self, key: keys.KeyEvent) void {
             if (!self.focused) return;
 
-            // When filter is active, capture typed characters
             if (self.expanded and self.filter_active and key.key == .char and !key.modifiers.ctrl) {
                 const c = key.key.char;
                 var buf: [4]u8 = undefined;
@@ -316,7 +293,6 @@ pub fn Dropdown(comptime T: type) type {
             }
 
             if (!self.expanded) {
-                // Collapsed state
                 switch (key.key) {
                     .enter, .space => self.open(),
                     .down => self.open(),
@@ -325,7 +301,6 @@ pub fn Dropdown(comptime T: type) type {
                 return;
             }
 
-            // Expanded state
             switch (key.key) {
                 .up => self.cursorUp(),
                 .down => self.cursorDown(),
@@ -359,8 +334,6 @@ pub fn Dropdown(comptime T: type) type {
                 else => {},
             }
         }
-
-        // ── Navigation ──────────────────────────────────
 
         fn cursorUp(self: *Self) void {
             const visible = self.filtered_indices.items;
@@ -425,7 +398,7 @@ pub fn Dropdown(comptime T: type) type {
                 if (self.items.items[visible[self.cursor]].enabled) return;
                 self.cursor += 1;
             }
-            self.cursor = start; // no enabled item found, revert
+            self.cursor = start;
         }
 
         fn skipDisabledUp(self: *Self) void {
@@ -437,7 +410,7 @@ pub fn Dropdown(comptime T: type) type {
                 if (self.cursor == 0) break;
                 self.cursor -= 1;
             }
-            self.cursor = start; // revert
+            self.cursor = start;
         }
 
         fn ensureVisible(self: *Self) void {
@@ -447,8 +420,6 @@ pub fn Dropdown(comptime T: type) type {
                 self.y_offset = self.cursor - self.max_visible + 1;
             }
         }
-
-        // ── Filtering ──────────────────────────────────
 
         fn rebuildFilter(self: *Self) !void {
             self.filtered_indices.clearRetainingCapacity();
@@ -483,20 +454,16 @@ pub fn Dropdown(comptime T: type) type {
             self.ensureVisible();
         }
 
-        // ── Rendering ───────────────────────────────────
-
         pub fn view(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
             var result: Writer.Allocating = .init(allocator);
             const writer = &result.writer;
 
-            // Label
             if (self.label.len > 0) {
                 const styled_label = try self.label_style.render(allocator, self.label);
                 try writer.writeAll(styled_label);
                 try writer.writeAll(" ");
             }
 
-            // Trigger line
             const display_text = if (self.selectedItem()) |item|
                 item.label
             else if (self.multi_select and self.selectedCount() > 0)
@@ -516,10 +483,8 @@ pub fn Dropdown(comptime T: type) type {
                 return result.toOwnedSlice();
             }
 
-            // Expanded dropdown
             try writer.writeByte('\n');
 
-            // Compute dropdown width
             var max_item_width: usize = 0;
             for (self.items.items) |item| {
                 const w = measure.width(item.label) + self.cursor_symbol.len;
@@ -527,13 +492,11 @@ pub fn Dropdown(comptime T: type) type {
                 if (w + extra > max_item_width) max_item_width = w + extra;
             }
             max_item_width = @max(max_item_width, 10);
-            const inner_width = max_item_width + 2; // padding
+            const inner_width = max_item_width + 2;
 
-            // Top border
             try self.writeBorderLine(writer, allocator, inner_width, .top);
             try writer.writeByte('\n');
 
-            // Filter line
             if (self.filter_active) {
                 try self.writeBorderSide(writer, allocator, .left);
                 const filter_line = try std.fmt.allocPrint(allocator, " / {s}_", .{self.filter_text.items});
@@ -546,12 +509,10 @@ pub fn Dropdown(comptime T: type) type {
                 try self.writeBorderSide(writer, allocator, .right);
                 try writer.writeByte('\n');
 
-                // Separator
                 try self.writeBorderLine(writer, allocator, inner_width, .middle);
                 try writer.writeByte('\n');
             }
 
-            // Scroll indicator (top)
             const visible = self.filtered_indices.items;
             const has_above = self.y_offset > 0;
             const end_idx = @min(self.y_offset + self.max_visible, visible.len);
@@ -569,14 +530,12 @@ pub fn Dropdown(comptime T: type) type {
                 try writer.writeByte('\n');
             }
 
-            // Items
             var rendered: usize = 0;
             while (rendered < self.max_visible) : (rendered += 1) {
                 const idx = self.y_offset + rendered;
                 if (idx >= visible.len) break;
 
                 if (rendered > 0 or has_above) {
-                    // already have newline from previous
                 }
 
                 try self.writeBorderSide(writer, allocator, .left);
@@ -588,7 +547,6 @@ pub fn Dropdown(comptime T: type) type {
 
                 try line_writer.writeByte(' ');
 
-                // Cursor symbol
                 if (idx == self.cursor) {
                     try line_writer.writeAll(self.cursor_symbol);
                 } else {
@@ -597,7 +555,6 @@ pub fn Dropdown(comptime T: type) type {
                     }
                 }
 
-                // Multi-select check
                 if (self.multi_select) {
                     if (self.selected_indices.contains(item_idx)) {
                         try line_writer.writeAll(self.checked_symbol);
@@ -606,7 +563,6 @@ pub fn Dropdown(comptime T: type) type {
                     }
                 }
 
-                // Label
                 try line_writer.writeAll(item.label);
 
                 const line_text = try line.toOwnedSlice();
@@ -622,7 +578,6 @@ pub fn Dropdown(comptime T: type) type {
                 const styled_line = try item_s.render(allocator, line_text);
                 try writer.writeAll(styled_line);
 
-                // Pad to width
                 const used = measure.width(line_text);
                 if (used < inner_width) {
                     try self.writePadding(writer, inner_width - used);
@@ -634,7 +589,6 @@ pub fn Dropdown(comptime T: type) type {
                 }
             }
 
-            // Scroll indicator (bottom)
             if (has_below) {
                 try writer.writeByte('\n');
                 try self.writeBorderSide(writer, allocator, .left);
@@ -647,7 +601,6 @@ pub fn Dropdown(comptime T: type) type {
                 try self.writeBorderSide(writer, allocator, .right);
             }
 
-            // Bottom border
             try writer.writeByte('\n');
             try self.writeBorderLine(writer, allocator, inner_width, .bottom);
 

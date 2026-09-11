@@ -45,10 +45,6 @@ pub fn complete(
         allocator.destroy(s);
     }
 
-    // Zig 0.16 exposes futex waits through the active I/O context. The stream
-    // completion path increments this word before waking waiters, so using the
-    // currently observed value preserves the prior `std.Thread.Futex.wait`
-    // behavior while avoiding missed completion notifications.
     while (!s.isDone()) {
         defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
     }
@@ -70,10 +66,6 @@ pub fn completeSimple(
         allocator.destroy(s);
     }
 
-    // Zig 0.16 exposes futex waits through the active I/O context. The stream
-    // completion path increments this word before waking waiters, so using the
-    // currently observed value preserves the prior `std.Thread.Futex.wait`
-    // behavior while avoiding missed completion notifications.
     while (!s.isDone()) {
         defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
     }
@@ -100,9 +92,9 @@ fn mockStream(
 
     const result = ai_types.AssistantMessage{
         .content = result_content,
-        .api = "openai-completions", // Borrowed reference
-        .provider = "openai", // Borrowed reference
-        .model = "gpt-4o", // Borrowed reference
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o",
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = 1,

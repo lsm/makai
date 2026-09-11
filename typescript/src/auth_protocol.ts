@@ -16,14 +16,8 @@ import {
   type TimeoutDiagnostics,
 } from "./timeout_diagnostics";
 
-// ---------------------------------------------------------------------------
-// Spec-aligned types (docs/v1-sdk-agent-provider-spec.md §3, §3.6, §4).
-// ---------------------------------------------------------------------------
-
-/** Stable identifier for an auth-capable provider configured in Makai. */
 export type ProviderId = string;
 
-/** All authentication statuses the TypeScript SDK recognizes on the wire. */
 export const AUTH_STATUSES = [
   "authenticated",
   "login_required",
@@ -34,12 +28,10 @@ export const AUTH_STATUSES = [
   "unknown",
 ] as const;
 
-/** Authentication status reported by {@link MakaiAuthApi.listProviders}. */
 export type AuthStatus = (typeof AUTH_STATUSES)[number];
 
 const VALID_AUTH_STATUSES = new Set<string>(AUTH_STATUSES);
 
-/** Authentication metadata for a provider returned by {@link MakaiAuthApi.listProviders}. */
 export interface ProviderAuthInfo {
   id: ProviderId;
   name: string;
@@ -47,7 +39,6 @@ export interface ProviderAuthInfo {
   last_error?: string;
 }
 
-/** Event emitted during an interactive {@link MakaiAuthApi.login} flow. */
 export type MakaiAuthEvent =
   | {
       type: "auth_url";
@@ -83,7 +74,6 @@ export type MakaiAuthEvent =
       message: string;
     };
 
-/** Callback hooks used to observe and respond to interactive auth flows. */
 export interface AuthFlowHandlers {
   onEvent?: (event: MakaiAuthEvent) => void;
   onPrompt?: (
@@ -91,23 +81,17 @@ export interface AuthFlowHandlers {
   ) => Promise<string> | string;
 }
 
-/** Categorizes failures raised by the Makai auth API. */
 export type MakaiAuthErrorKind =
   | "provider_error"
   | "cancelled"
   | "transport_error"
   | "unknown";
 
-/** Error thrown for auth protocol, provider, cancellation, and transport failures. */
 export class MakaiAuthError extends Error {
   public readonly kind: MakaiAuthErrorKind;
   public readonly code?: string;
   public readonly diagnostics?: TimeoutDiagnostics;
 
-  /**
-   * @param message Human-readable auth failure.
-   * @param options Optional structured error metadata.
-   */
   constructor(
     message: string,
     options: { kind?: MakaiAuthErrorKind; code?: string; diagnostics?: TimeoutDiagnostics } = {},
@@ -120,34 +104,14 @@ export class MakaiAuthError extends Error {
   }
 }
 
-/** Provider authentication API exposed as `client.auth`. */
 export interface MakaiAuthApi {
-  /**
-   * Lists auth-capable providers and current auth state.
-   *
-   * @returns Provider authentication metadata.
-   * @throws {@link MakaiAuthError} on transport or protocol failures.
-   */
   listProviders(): Promise<ProviderAuthInfo[]>;
-  /**
-   * Starts a login flow for a provider. Handler precedence is per-call handlers,
-   * then client-level defaults, then none.
-   *
-   * @param providerId Provider to authenticate.
-   * @param handlers Optional handlers for this login call.
-   * @returns Success status when authentication completes.
-   * @throws {@link MakaiAuthError} if authentication fails or is cancelled.
-   */
   login(
     providerId: ProviderId,
     handlers?: AuthFlowHandlers,
     options?: { signal?: AbortSignal },
   ): Promise<{ status: "success" }>;
 }
-
-// ---------------------------------------------------------------------------
-// Wire helpers.
-// ---------------------------------------------------------------------------
 
 const AUTH_EVENT_VARIANTS = [
   "auth_url",
@@ -158,17 +122,6 @@ const AUTH_EVENT_VARIANTS = [
 ] as const;
 type AuthEventVariant = (typeof AUTH_EVENT_VARIANTS)[number];
 
-/**
- * Auth events on the wire are Zig union objects (e.g. `{ "prompt": { ... } }`).
- * Flatten to the SDK's `MakaiAuthEvent` shape (`{ type: "prompt", ... }`).
- */
-/**
- * Converts a wire-format auth event union into the SDK's discriminated union.
- *
- * @param payload Raw auth event payload from the stdio protocol.
- * @returns A normalized {@link MakaiAuthEvent}.
- * @throws {@link MakaiAuthError} if the payload is malformed or unknown.
- */
 export function flattenAuthEvent(payload: Record<string, unknown>): MakaiAuthEvent {
   for (const variant of AUTH_EVENT_VARIANTS) {
     const value = payload[variant];
@@ -257,10 +210,6 @@ function optionalStringField(
   return value.length > 0 ? value : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Auth client implementation over a stdio transport.
-// ---------------------------------------------------------------------------
-
 const PROTOCOL_VERSION = 1;
 
 type RawEnvelope = StdioFrame & {
@@ -269,40 +218,18 @@ type RawEnvelope = StdioFrame & {
   payload?: unknown;
 };
 
-/** Options for constructing a {@link MakaiAuthClient}. */
 export interface MakaiAuthClientOptions {
-  /**
-   * Default handlers used when `login()` is invoked without per-call handlers.
-   * Per-call handlers take precedence.
-   */
   handlers?: AuthFlowHandlers;
-  /**
-   * Maximum time to wait for individual response frames (ms). Defaults to 30s.
-   * This bounds prompt-handler-free flows; interactive flows depend on the
-   * caller's onPrompt to drive progress.
-   */
   frameTimeoutMs?: number;
-  /** Optional structured logger for auth protocol diagnostics. */
   logger?: MakaiLogger;
 }
 
-/**
- * High-level auth API implemented on top of an auth-capable stdio transport.
- *
- * Per docs/v1-sdk-agent-provider-spec.md §3.6, all calls map to auth protocol
- * envelopes; CLI-subprocess wiring is prohibited in V1.
- */
-/** Auth protocol client backed by an already-connected Makai stdio transport. */
 export class MakaiAuthClient implements MakaiAuthApi {
   private readonly transport: MakaiStdioClient;
   private readonly defaultHandlers?: AuthFlowHandlers;
   private readonly frameTimeoutMs: number;
   private readonly logger: MakaiLogger;
 
-  /**
-   * @param transport Connected stdio transport used for auth envelopes.
-   * @param options Client-level handler and timeout options.
-   */
   constructor(transport: MakaiStdioClient, options: MakaiAuthClientOptions = {}) {
     this.transport = transport;
     this.defaultHandlers = options.handlers;
@@ -310,12 +237,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
     this.logger = options.logger ?? getNoopLogger();
   }
 
-  /**
-   * Lists auth-capable providers and their current authentication status.
-   *
-   * @returns Provider authentication metadata.
-   * @throws {@link MakaiAuthError} on transport or protocol failures.
-   */
   async listProviders(): Promise<ProviderAuthInfo[]> {
     const streamId = ulid();
     const messageId = ulid();
@@ -353,15 +274,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
     }
   }
 
-  /**
-   * Starts an interactive login flow for a provider.
-   *
-   * @param providerId Provider to authenticate.
-   * @param handlers Optional per-call handlers; these replace client defaults.
-   * @param options Optional AbortSignal to cancel the login flow.
-   * @returns Success status when login completes.
-   * @throws {@link MakaiAuthError} if login fails, is cancelled, or the protocol errors.
-   */
   async login(
     providerId: ProviderId,
     handlers?: AuthFlowHandlers,
@@ -371,10 +283,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
     if (signal?.aborted) {
       throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
     }
-    // Spec §3.6: per-call handlers > client-level defaults > none.
-    // Whole-object replacement: per-call handlers entirely replace defaults
-    // (not per-property merge), so `{ onPrompt }` intentionally drops a
-    // client-level `onEvent`.
     const effective = handlers ?? this.defaultHandlers;
     const flowId = ulid();
     let outboundSequence = 1;
@@ -424,7 +332,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
         try {
           effective?.onEvent?.(event);
         } catch (err) {
-          // onEvent should not throw; propagate as transport_error if it does.
           throw new MakaiAuthError(
             err instanceof Error ? err.message : String(err),
             { kind: "unknown" },
@@ -438,10 +345,8 @@ export class MakaiAuthClient implements MakaiAuthApi {
 
         if (event.type === "prompt") {
           if (!effective?.onPrompt) {
-            // No prompt handler: cancel the flow so the server can clean up.
             cancelled = true;
             this.bestEffortCancel(flowId, outboundSequence++);
-            // Continue draining until terminal `auth_login_result`.
             continue;
           }
           let answer: string;
@@ -475,7 +380,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
           continue;
         }
 
-        // auth_url, progress, success — already published via onEvent.
         continue;
       }
 
@@ -570,8 +474,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
         payload: { flow_id: flowId },
       });
     } catch {
-      // Best-effort cancellation; ignore transport errors here so we keep
-      // surfacing the original failure to the caller.
     }
   }
 }
@@ -641,45 +543,18 @@ function nackToAuthError(frame: RawEnvelope): MakaiAuthError {
   return new MakaiAuthError(reason, { kind: "transport_error", code });
 }
 
-// ---------------------------------------------------------------------------
-// Factory.
-// ---------------------------------------------------------------------------
-
-/** Options for {@link createMakaiAuthClient}. */
 export type CreateMakaiAuthClientOptions = CreateMakaiStdioClientOptions & {
-  /** Default handlers reused by `login(...)` when no per-call handlers are provided. */
   handlers?: AuthFlowHandlers;
-  /** See `MakaiAuthClientOptions.frameTimeoutMs`. */
   frameTimeoutMs?: number;
-  /** Resolver options for locating the makai binary. */
   resolver?: BinaryResolverOptions;
-  /** Optional structured logger for diagnostics. */
   logger?: MakaiLogger;
 };
 
-/** Handle returned by {@link createMakaiAuthClient}. */
 export interface MakaiAuthClientHandle {
   auth: MakaiAuthApi;
   close(): Promise<void>;
 }
 
-/**
- * Creates an auth-capable client backed by `makai --stdio`. Connects the
- * underlying transport (handshake) before returning.
- *
- * @param options Transport, resolver, handler, and timeout options.
- * @returns A connected auth client handle.
- * @throws If the binary cannot be resolved, the stdio process fails, or handshake fails.
- *
- * @example
- * ```ts
- * const client = await createMakaiAuthClient({
- *   handlers: { onEvent: console.log },
- * });
- * await client.auth.login("anthropic");
- * await client.close();
- * ```
- */
 export async function createMakaiAuthClient(
   options: CreateMakaiAuthClientOptions = {},
 ): Promise<MakaiAuthClientHandle> {

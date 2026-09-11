@@ -51,7 +51,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     try w.beginObject();
     try w.writeStringField("model", model.id);
 
-    // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
             try w.writeKey("tools");
@@ -89,7 +88,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                 try w.writeStringField("type", "message");
                 try w.writeStringField("role", "user");
 
-                // Handle content
                 switch (u.content) {
                     .text => |t| {
                         try w.writeStringField("content", t);
@@ -119,7 +117,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                 try w.endObject();
             },
             .assistant => |a| {
-                // Output each content item as appropriate type
                 for (a.content) |c| {
                     switch (c) {
                         .text => |t| {
@@ -130,11 +127,9 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                             try w.endObject();
                         },
                         .thinking => |t| {
-                            // Thinking content - skip or handle as needed
                             _ = t;
                         },
                         .tool_call => |tc| {
-                            // Output as function_call item
                             try w.beginObject();
                             try w.writeStringField("type", "function_call");
                             try w.writeStringField("call_id", tc.id);
@@ -147,7 +142,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                 }
             },
             .tool_result => |tr| {
-                // Output as function_call_output
                 var result_text = std.ArrayList(u8).empty;
                 defer result_text.deinit(allocator);
                 for (tr.content) |c| {
@@ -227,7 +221,6 @@ const ThreadCtx = struct {
     cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
 
-    /// Clean up all owned resources (model, context, api_key, base_url, body, self).
     fn deinit(self: *ThreadCtx) void {
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
@@ -299,7 +292,6 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     if (response.head.status != .ok) {
-        // Read error body for debugging
         var error_buf: [4096]u8 = undefined;
         const error_reader = compat.http.responseReader(&response, &error_buf);
         const error_body = compat.http.allocRemainingResponse(ctx.allocator, error_reader, 8192) catch null;
@@ -327,12 +319,10 @@ fn runThread(ctx: *ThreadCtx) void {
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
-    // Ping tracking
     var last_ping_time: i64 = 0;
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     while (true) {
-        // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
@@ -394,7 +384,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
-        .is_owned = true, // Strings were duped above
+        .is_owned = true,
     };
 
     ctx.stream.markThreadDone();
@@ -406,9 +396,6 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        // Read the vendor env key only for the canonical provider so a
-        // custom or routed base URL (MAKAI_BASE_URL) cannot receive an
-        // AZURE_OPENAI_API_KEY meant for Azure's own endpoint.
         if (!std.mem.eql(u8, model.provider, "azure")) return error.MissingApiKey;
         const e = env(allocator, "AZURE_OPENAI_API_KEY");
         if (e) |k| break :blk @constCast(k);
@@ -426,14 +413,12 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     };
     errdefer allocator.free(base_url);
 
-    // Clone model to own the memory (background thread outlives caller's memory)
     const owned_model = try ai_types.cloneModel(allocator, model);
     errdefer {
         var mut_m = owned_model;
         mut_m.deinit(allocator);
     }
 
-    // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = try ai_types.cloneContext(allocator, context);
     errdefer {
         var mut_ctx = owned_context;
@@ -533,7 +518,6 @@ test "parseEvent ignores done sentinel" {
     try std.testing.expectEqual(ai_types.StopReason.stop, stop_reason);
 }
 
-
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
     return .{
         .id = "regression-model",
@@ -572,7 +556,6 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
-
 
 test "provider_cancellation_azure_cancel_before_request" {
     var cancelled = std.atomic.Value(bool).init(true);

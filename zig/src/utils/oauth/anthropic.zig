@@ -37,39 +37,30 @@ fn buildAuthUrl(allocator: std.mem.Allocator, challenge: []const u8, state: []co
     );
 }
 
-/// Anthropic OAuth login (manual code flow with PKCE)
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
-    // 1. Generate PKCE
     const pkce = try pkce_mod.generate(allocator);
     defer pkce.deinit(allocator);
 
-    // 2. Build authorization URL
     const auth_url = try buildAuthUrl(allocator, pkce.challenge, pkce.verifier);
     defer allocator.free(auth_url);
 
-    // 3. Show URL to user
     callbacks.onAuth(.{
         .url = auth_url,
         .instructions = "Paste the code from the URL after '#code=' below:",
     });
 
-    // 4. Get manual code input
     const manual_input = callbacks.onPrompt(.{ .message = "Enter code:" });
     defer allocator.free(manual_input);
 
-    // Parse "code#state" format
     const parsed_auth = try parseAuthFromManualInput(allocator, manual_input);
     defer allocator.free(parsed_auth.code);
     defer allocator.free(parsed_auth.state);
 
-    // 5. Exchange code for tokens.
-    // Some UX paths provide only the code, so fall back to our original state value.
     const state_for_exchange = if (parsed_auth.state.len > 0) parsed_auth.state else pkce.verifier;
     const token_response = try exchangeCode(parsed_auth.code, state_for_exchange, pkce.verifier, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
-    // 6. Return credentials with 5-minute buffer
     const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
@@ -79,9 +70,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     };
 }
 
-/// Refresh Anthropic OAuth token
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
-    // Build JSON request body
     const body = try std.json.Stringify.valueAlloc(allocator, .{
         .grant_type = "refresh_token",
         .client_id = client_id,
@@ -89,7 +78,6 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     }, .{});
     defer allocator.free(body);
 
-    // Make HTTP request (simplified - real implementation would use http.zig)
     const token_response = try exchangeTokens(body, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
@@ -103,37 +91,29 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     };
 }
 
-/// Get API key from credentials (access token IS the API key)
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
 }
 
-/// Parsed code and state from manual input
 const ParsedAuth = struct {
     code: []const u8,
     state: []const u8,
 };
 
-/// Parse code and state from manual input (format: "code#state" or just "code")
 fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
-    // An empty paste means the user dismissed the prompt: treat it as a
-    // cancellation rather than attempting a doomed exchange with a blank code.
     if (std.mem.trim(u8, input, " \t\r\n").len == 0) return error.OAuthCancelled;
 
-    // Try to find #code= in URL
     if (std.mem.find(u8, input, "#code=")) |idx| {
         const code_start = idx + 6;
         var code_end = input.len;
         var state: []const u8 = "";
 
-        // Look for & or # after code
         if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
             code_end = code_start + end;
         }
 
         const code = try allocator.dupe(u8, input[code_start..code_end]);
 
-        // Look for state parameter
         if (std.mem.find(u8, input, "&state=")) |state_idx| {
             const state_start = state_idx + 7;
             var state_end = input.len;
@@ -153,20 +133,17 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
         return .{ .code = code, .state = state };
     }
 
-    // Try to find ?code= in URL
     if (std.mem.find(u8, input, "?code=")) |idx| {
         const code_start = idx + 6;
         var code_end = input.len;
         var state: []const u8 = "";
 
-        // Look for & or # after code
         if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
             code_end = code_start + end;
         }
 
         const code = try allocator.dupe(u8, input[code_start..code_end]);
 
-        // Look for state parameter
         if (std.mem.find(u8, input, "&state=")) |state_idx| {
             const state_start = state_idx + 7;
             var state_end = input.len;
@@ -179,14 +156,12 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
         return .{ .code = code, .state = state };
     }
 
-    // Assume raw "code#state" format
     if (std.mem.find(u8, input, "#")) |hash_idx| {
         const code = try allocator.dupe(u8, input[0..hash_idx]);
         const state = try allocator.dupe(u8, input[hash_idx + 1 ..]);
         return .{ .code = code, .state = state };
     }
 
-    // Just code, no state
     return .{
         .code = try allocator.dupe(u8, input),
         .state = try allocator.dupe(u8, ""),
@@ -265,9 +240,7 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
     };
 }
 
-/// Exchange authorization code for tokens
 fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    // Build JSON body
     const body = try std.json.Stringify.valueAlloc(allocator, .{
         .grant_type = "authorization_code",
         .client_id = client_id,
@@ -281,12 +254,10 @@ fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, alloc
     return try exchangeTokens(body, allocator);
 }
 
-/// Exchange tokens with Anthropic API
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
     var environ_map = compat.createEnvMap(allocator) catch null;
     defer if (environ_map) |*map| map.deinit();
     if (environ_map) |*map| {
@@ -309,7 +280,6 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     });
     defer request.deinit();
 
-    // Avoid compressed response bodies for stable token JSON parsing.
     request.headers.accept_encoding = .omit;
 
     try http.sendRequest(&request, body);

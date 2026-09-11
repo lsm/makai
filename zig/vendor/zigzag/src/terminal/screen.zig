@@ -1,12 +1,9 @@
-//! Screen buffer management for efficient terminal rendering.
-//! Provides double-buffering to minimize flickering and optimize updates.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const ansi = @import("ansi.zig");
 const unicode = @import("../unicode.zig");
 
-/// A cell in the screen buffer
 pub const Cell = struct {
     char: u21 = ' ',
     fg: ?Color = null,
@@ -18,7 +15,6 @@ pub const Cell = struct {
     blink: bool = false,
     reverse: bool = false,
     strikethrough: bool = false,
-    /// True if this cell is the continuation (right half) of a wide character.
     wide: bool = false,
 
     pub fn eql(self: Cell, other: Cell) bool {
@@ -42,7 +38,6 @@ pub const Cell = struct {
     }
 };
 
-/// Color representation
 pub const Color = struct {
     r: u8,
     g: u8,
@@ -53,7 +48,6 @@ pub const Color = struct {
     }
 };
 
-/// Screen buffer for rendering
 pub const Screen = struct {
     allocator: std.mem.Allocator,
     cells: []Cell,
@@ -82,7 +76,6 @@ pub const Screen = struct {
         const new_cells = try self.allocator.alloc(Cell, new_size);
         @memset(new_cells, Cell{});
 
-        // Copy existing content
         const copy_height = @min(self.height, new_height);
         const copy_width = @min(self.width, new_width);
 
@@ -114,18 +107,15 @@ pub const Screen = struct {
         if (x >= self.width or y >= self.height) return;
         const idx = @as(usize, y) * self.width + x;
 
-        // If we're overwriting a wide-char continuation cell, clear the left half
         if (self.cells[idx].wide and x > 0) {
             self.cells[idx - 1] = Cell{};
         }
-        // If we're overwriting the left half of a wide char, clear the continuation
         if (!self.cells[idx].wide and x + 1 < self.width and self.cells[idx + 1].wide) {
             self.cells[idx + 1] = Cell{};
         }
 
         self.cells[idx] = cell;
 
-        // If this is a wide character, set the continuation cell
         const cw = unicode.charWidth(cell.char);
         if (cw == 2 and x + 1 < self.width) {
             var cont = Cell{};
@@ -144,7 +134,6 @@ pub const Screen = struct {
         self.setCell(x, y, cell);
     }
 
-    /// Write a string to the screen at the given position
     pub fn writeString(self: *Screen, x: u16, y: u16, str: []const u8) u16 {
         var col = x;
         var utf8 = std.unicode.Utf8View.init(str) catch return 0;
@@ -152,8 +141,8 @@ pub const Screen = struct {
 
         while (iter.nextCodepoint()) |cp| {
             const cw = unicode.charWidth(cp);
-            if (cw == 0) continue; // Skip zero-width characters
-            if (col + cw > self.width) break; // Wide char won't fit
+            if (cw == 0) continue;
+            if (col + cw > self.width) break;
             self.setChar(col, y, cp);
             col += @intCast(cw);
         }
@@ -161,7 +150,6 @@ pub const Screen = struct {
         return col - x;
     }
 
-    /// Render screen differences to the writer
     pub fn renderDiff(self: *const Screen, prev: *const Screen, writer: *Writer) !void {
         var last_x: u16 = 0;
         var last_y: u16 = 0;
@@ -176,7 +164,6 @@ pub const Screen = struct {
                 const idx = y_usize * self.width + x_usize;
                 const cell = self.cells[idx];
 
-                // Skip wide continuation cells
                 if (cell.wide) {
                     x_usize += 1;
                     need_move = true;
@@ -186,17 +173,14 @@ pub const Screen = struct {
                 const prev_cell = if (idx < prev.cells.len) prev.cells[idx] else Cell{};
 
                 if (!cell.eql(prev_cell)) {
-                    // Need to update this cell
                     if (need_move or x != last_x + 1 or y != last_y) {
                         try ansi.cursorTo0(writer, y, x);
                         need_move = false;
                     }
 
-                    // Apply style changes
                     try applyStyle(writer, &current_cell, cell);
                     current_cell = cell;
 
-                    // Write character
                     var buf: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(cell.char, &buf) catch 1;
                     try writer.writeAll(buf[0..len]);
@@ -211,11 +195,9 @@ pub const Screen = struct {
             }
         }
 
-        // Reset styles at the end
         try writer.writeAll(ansi.reset);
     }
 
-    /// Render entire screen to writer
     pub fn render(self: *const Screen, writer: *Writer) !void {
         try writer.writeAll(ansi.cursor_home);
         try writer.writeAll(ansi.reset);
@@ -232,7 +214,6 @@ pub const Screen = struct {
                 const idx = y_usize * self.width + x_usize;
                 const cell = self.cells[idx];
 
-                // Skip wide continuation cells
                 if (cell.wide) {
                     x_usize += 1;
                     continue;
@@ -256,7 +237,6 @@ pub const Screen = struct {
     fn applyStyle(writer: *Writer, current: *Cell, new: Cell) !void {
         var needs_reset = false;
 
-        // Check if we need to reset (turning off attributes)
         if ((current.bold and !new.bold) or
             (current.dim and !new.dim) or
             (current.italic and !new.italic) or
@@ -270,7 +250,6 @@ pub const Screen = struct {
             current.* = Cell{};
         }
 
-        // Apply foreground color
         if (!eqlOptColor(current.fg, new.fg)) {
             if (new.fg) |fg| {
                 try ansi.fgRgb(writer, fg.r, fg.g, fg.b);
@@ -279,7 +258,6 @@ pub const Screen = struct {
             }
         }
 
-        // Apply background color
         if (!eqlOptColor(current.bg, new.bg)) {
             if (new.bg) |bg| {
                 try ansi.bgRgb(writer, bg.r, bg.g, bg.b);
@@ -288,7 +266,6 @@ pub const Screen = struct {
             }
         }
 
-        // Apply text attributes
         if (!current.bold and new.bold) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.bold});
         if (!current.dim and new.dim) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.dim});
         if (!current.italic and new.italic) try writer.print(ansi.CSI ++ "{d}m", .{ansi.SGR.italic});

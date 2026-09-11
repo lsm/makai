@@ -131,7 +131,6 @@ fn encodeModelId(allocator: std.mem.Allocator, model_id: []const u8) (std.mem.Al
 }
 
 fn decodeModelId(allocator: std.mem.Allocator, encoded_model_id: []const u8) (std.mem.Allocator.Error || ModelRefError)![]u8 {
-    // Keep decodeModelId defensive even though parseModelRef currently checks this first.
     if (encoded_model_id.len == 0) return error.MissingModelId;
 
     var decoded = std.ArrayList(u8).empty;

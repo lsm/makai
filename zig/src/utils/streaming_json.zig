@@ -1,24 +1,12 @@
-//! Streaming JSON parser for handling partial/incomplete JSON.
-//!
-//! This is useful for parsing tool call arguments during streaming,
-//! before the complete JSON is received.
-//!
-//! Based on the approach from partial-json npm package:
-//! https://www.npmjs.com/package/partial-json
 
 const std = @import("std");
 
-/// Error types for streaming JSON parsing
 pub const StreamingJsonError = error{
-    /// The JSON is completely malformed (not just incomplete)
     MalformedJson,
-    /// Out of memory
     OutOfMemory,
-    /// Invalid UTF-8
     InvalidUtf8,
 };
 
-/// Options for what types are allowed to be partial
 pub const AllowPartial = struct {
     str: bool = true,
     num: bool = true,
@@ -27,7 +15,6 @@ pub const AllowPartial = struct {
     null: bool = true,
     bool: bool = true,
 
-    /// Allow all types to be partial (default)
     pub const all = AllowPartial{
         .str = true,
         .num = true,
@@ -37,7 +24,6 @@ pub const AllowPartial = struct {
         .bool = true,
     };
 
-    /// Don't allow any partial types (only complete values)
     pub const none = AllowPartial{
         .str = false,
         .num = false,
@@ -48,7 +34,6 @@ pub const AllowPartial = struct {
     };
 };
 
-/// State tracker for the parser
 const ParserState = struct {
     json: []const u8,
     index: usize,
@@ -83,14 +68,11 @@ const ParserState = struct {
     }
 };
 
-/// Parse potentially incomplete JSON, returning best-guess value as std.json.Value
 pub fn parsePartial(allocator: std.mem.Allocator, json: []const u8) StreamingJsonError!std.json.Value {
     return parsePartialWithOptions(allocator, json, AllowPartial.all);
 }
 
-/// Parse potentially incomplete JSON with specific partial options
 pub fn parsePartialWithOptions(allocator: std.mem.Allocator, json: []const u8, allow: AllowPartial) StreamingJsonError!std.json.Value {
-    // Trim whitespace
     const trimmed = std.mem.trim(u8, json, " \t\n\r");
     if (trimmed.len == 0) {
         return StreamingJsonError.MalformedJson;
@@ -105,13 +87,10 @@ pub fn parsePartialWithOptions(allocator: std.mem.Allocator, json: []const u8, a
     return parseValue(allocator, &state);
 }
 
-/// Parse with a specific type (using the inferred complete JSON)
 pub fn parsePartialTyped(comptime T: type, allocator: std.mem.Allocator, json: []const u8) StreamingJsonError!T {
     const value = try parsePartial(allocator, json);
     defer freeJsonValue(allocator, value);
 
-    // Parse the value into the target type
-    // We need to serialize the value back to JSON and parse it as the target type
     var buf = try std.ArrayList(u8).initCapacity(allocator, json.len + 32);
     defer buf.deinit(allocator);
 
@@ -127,7 +106,6 @@ pub fn parsePartialTyped(comptime T: type, allocator: std.mem.Allocator, json: [
     return parsed;
 }
 
-/// Simple JSON stringifier for std.json.Value
 fn stringifyValue(value: std.json.Value, writer: anytype) !void {
     switch (value) {
         .null => try writer.writeAll("null"),
@@ -164,7 +142,6 @@ fn stringifyValue(value: std.json.Value, writer: anytype) !void {
             while (iter.next()) |entry| {
                 if (!first) try writer.writeByte(',');
                 first = false;
-                // Stringify key
                 try stringifyValue(.{ .string = entry.key_ptr.* }, writer);
                 try writer.writeByte(':');
                 try stringifyValue(entry.value_ptr.*, writer);
@@ -174,7 +151,6 @@ fn stringifyValue(value: std.json.Value, writer: anytype) !void {
     }
 }
 
-/// Parse any JSON value
 fn parseValue(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonError!std.json.Value {
     state.skipWhitespace();
 
@@ -196,7 +172,6 @@ fn parseValue(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
     };
 }
 
-/// Unescape a JSON string content
 fn unescapeString(allocator: std.mem.Allocator, content: []const u8) StreamingJsonError![]const u8 {
     var result = try std.ArrayList(u8).initCapacity(allocator, content.len);
     errdefer result.deinit(allocator);
@@ -205,7 +180,6 @@ fn unescapeString(allocator: std.mem.Allocator, content: []const u8) StreamingJs
     while (i < content.len) {
         if (content[i] == '\\') {
             if (i + 1 >= content.len) {
-                // Incomplete escape at end - just stop
                 break;
             }
             const escaped = content[i + 1];
@@ -219,28 +193,23 @@ fn unescapeString(allocator: std.mem.Allocator, content: []const u8) StreamingJs
                 'b' => try result.append(allocator, 0x08),
                 'f' => try result.append(allocator, 0x0c),
                 'u' => {
-                    // Unicode escape \uXXXX
                     if (i + 5 >= content.len) {
-                        // Incomplete unicode escape - skip
                         break;
                     }
                     const hex = content[i + 2 .. i + 6];
-                    const code_point = std.fmt.parseInt(u21, hex, 16) catch 0xFFFD; // replacement char on error
+                    const code_point = std.fmt.parseInt(u21, hex, 16) catch 0xFFFD;
 
-                    // Convert to UTF-8
                     var utf8_buf: [4]u8 = undefined;
                     const utf8_len = std.unicode.utf8Encode(code_point, &utf8_buf) catch blk: {
-                        // Use replacement character on error
                         utf8_buf[0] = 0xEF;
                         utf8_buf[1] = 0xBF;
                         utf8_buf[2] = 0xBD;
                         break :blk 3;
                     };
                     try result.appendSlice(allocator, utf8_buf[0..utf8_len]);
-                    i += 4; // Skip XXXX (we'll add 2 more below)
+                    i += 4;
                 },
                 else => {
-                    // Unknown escape - just keep the character
                     try result.append(allocator, escaped);
                 },
             }
@@ -254,16 +223,14 @@ fn unescapeString(allocator: std.mem.Allocator, content: []const u8) StreamingJs
     return result.toOwnedSlice(allocator);
 }
 
-/// Parse a string value
 fn parseString(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonError!std.json.Value {
     std.debug.assert(state.currentChar() == '"');
-    state.advance(); // Skip opening quote
+    state.advance();
 
     const start = state.index;
     var escape = false;
     var needs_unescaping = false;
 
-    // Find the end of the string
     while (state.index < state.json.len) {
         const c = state.json[state.index];
         if (escape) {
@@ -277,7 +244,6 @@ fn parseString(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
         state.advance();
     }
 
-    // Check if we found the closing quote
     const has_closing_quote = state.currentChar() == '"';
     const end = state.index;
 
@@ -285,42 +251,34 @@ fn parseString(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
         return StreamingJsonError.MalformedJson;
     }
 
-    // Get the string content
     var content = state.json[start..end];
 
-    // Handle incomplete escape sequences at the end
     if (!has_closing_quote and content.len > 0 and content[content.len - 1] == '\\') {
-        // Remove the trailing backslash
         content = content[0 .. content.len - 1];
     }
 
-    // Skip closing quote if present
     if (has_closing_quote) {
         state.advance();
     }
 
-    // Unescape if needed
     if (needs_unescaping) {
         const unescaped = try unescapeString(allocator, content);
         return std.json.Value{ .string = unescaped };
     } else {
-        // No escapes, just dupe the string
         const str = try allocator.dupe(u8, content);
         return std.json.Value{ .string = str };
     }
 }
 
-/// Parse an object
 fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonError!std.json.Value {
     std.debug.assert(state.currentChar() == '{');
-    state.advance(); // Skip opening brace
+    state.advance();
 
     var obj = std.json.ObjectMap.init(allocator);
     errdefer obj.deinit();
 
     state.skipWhitespace();
 
-    // Handle empty object or end of input
     if (state.index >= state.json.len) {
         if (state.allow.obj) {
             return std.json.Value{ .object = obj };
@@ -336,7 +294,6 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
     while (true) {
         state.skipWhitespace();
 
-        // Check for end of input
         if (state.index >= state.json.len) {
             if (state.allow.obj) {
                 return std.json.Value{ .object = obj };
@@ -344,13 +301,11 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
             return StreamingJsonError.MalformedJson;
         }
 
-        // Check for end of object
         if (state.currentChar() == '}') {
             state.advance();
             return std.json.Value{ .object = obj };
         }
 
-        // Parse key
         if (state.currentChar() != '"') {
             if (state.allow.obj) {
                 return std.json.Value{ .object = obj };
@@ -369,7 +324,6 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
 
         state.skipWhitespace();
 
-        // Check for colon
         if (state.index >= state.json.len) {
             allocator.free(key);
             if (state.allow.obj) {
@@ -385,11 +339,10 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
             }
             return StreamingJsonError.MalformedJson;
         }
-        state.advance(); // Skip colon
+        state.advance();
 
         state.skipWhitespace();
 
-        // Parse value
         const value = parseValue(allocator, state) catch {
             allocator.free(key);
             if (state.allow.obj) {
@@ -402,7 +355,6 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
 
         state.skipWhitespace();
 
-        // Check for comma or end
         if (state.index >= state.json.len) {
             if (state.allow.obj) {
                 return std.json.Value{ .object = obj };
@@ -412,7 +364,6 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
 
         if (state.currentChar() == ',') {
             state.advance();
-            // Continue to next key-value pair
         } else if (state.currentChar() == '}') {
             state.advance();
             return std.json.Value{ .object = obj };
@@ -425,17 +376,15 @@ fn parseObject(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonE
     }
 }
 
-/// Parse an array
 fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonError!std.json.Value {
     std.debug.assert(state.currentChar() == '[');
-    state.advance(); // Skip opening bracket
+    state.advance();
 
     var arr = std.json.Array.init(allocator);
     errdefer arr.deinit();
 
     state.skipWhitespace();
 
-    // Handle empty array or end of input
     if (state.index >= state.json.len) {
         if (state.allow.arr) {
             return std.json.Value{ .array = arr };
@@ -451,7 +400,6 @@ fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
     while (true) {
         state.skipWhitespace();
 
-        // Check for end of input
         if (state.index >= state.json.len) {
             if (state.allow.arr) {
                 return std.json.Value{ .array = arr };
@@ -459,13 +407,11 @@ fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
             return StreamingJsonError.MalformedJson;
         }
 
-        // Check for end of array (empty slot after comma)
         if (state.currentChar() == ']') {
             state.advance();
             return std.json.Value{ .array = arr };
         }
 
-        // Parse value
         const value = parseValue(allocator, state) catch {
             if (state.allow.arr) {
                 return std.json.Value{ .array = arr };
@@ -477,7 +423,6 @@ fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
 
         state.skipWhitespace();
 
-        // Check for comma or end
         if (state.index >= state.json.len) {
             if (state.allow.arr) {
                 return std.json.Value{ .array = arr };
@@ -487,7 +432,6 @@ fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
 
         if (state.currentChar() == ',') {
             state.advance();
-            // Continue to next value
         } else if (state.currentChar() == ']') {
             state.advance();
             return std.json.Value{ .array = arr };
@@ -500,7 +444,6 @@ fn parseArray(allocator: std.mem.Allocator, state: *ParserState) StreamingJsonEr
     }
 }
 
-/// Parse null
 fn parseNull(state: *ParserState) StreamingJsonError!std.json.Value {
     const remaining = state.remaining();
 
@@ -509,7 +452,6 @@ fn parseNull(state: *ParserState) StreamingJsonError!std.json.Value {
         return std.json.Value.null;
     }
 
-    // Check for partial null
     if (state.allow.null) {
         const partial_nulls = [_][]const u8{ "nul", "nu", "n" };
         for (partial_nulls) |partial| {
@@ -523,7 +465,6 @@ fn parseNull(state: *ParserState) StreamingJsonError!std.json.Value {
     return StreamingJsonError.MalformedJson;
 }
 
-/// Parse true
 fn parseTrue(state: *ParserState) StreamingJsonError!std.json.Value {
     const remaining = state.remaining();
 
@@ -532,7 +473,6 @@ fn parseTrue(state: *ParserState) StreamingJsonError!std.json.Value {
         return std.json.Value{ .bool = true };
     }
 
-    // Check for partial true
     if (state.allow.bool) {
         const partial_trues = [_][]const u8{ "tru", "tr", "t" };
         for (partial_trues) |partial| {
@@ -546,7 +486,6 @@ fn parseTrue(state: *ParserState) StreamingJsonError!std.json.Value {
     return StreamingJsonError.MalformedJson;
 }
 
-/// Parse false
 fn parseFalse(state: *ParserState) StreamingJsonError!std.json.Value {
     const remaining = state.remaining();
 
@@ -555,7 +494,6 @@ fn parseFalse(state: *ParserState) StreamingJsonError!std.json.Value {
         return std.json.Value{ .bool = false };
     }
 
-    // Check for partial false
     if (state.allow.bool) {
         const partial_falses = [_][]const u8{ "fals", "fal", "fa", "f" };
         for (partial_falses) |partial| {
@@ -569,16 +507,13 @@ fn parseFalse(state: *ParserState) StreamingJsonError!std.json.Value {
     return StreamingJsonError.MalformedJson;
 }
 
-/// Parse a number
 fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
     const start = state.index;
 
-    // Handle negative sign
     if (state.currentChar() == '-') {
         state.advance();
     }
 
-    // Parse digits before decimal
     while (state.index < state.json.len) {
         const c = state.json[state.index];
         switch (c) {
@@ -587,7 +522,6 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
         }
     }
 
-    // Parse decimal part
     if (state.index < state.json.len and state.json[state.index] == '.') {
         state.advance();
         while (state.index < state.json.len) {
@@ -599,11 +533,9 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
         }
     }
 
-    // Parse exponent
     if (state.index < state.json.len and (state.json[state.index] == 'e' or state.json[state.index] == 'E')) {
         state.advance();
 
-        // Handle exponent sign
         if (state.index < state.json.len and (state.json[state.index] == '+' or state.json[state.index] == '-')) {
             state.advance();
         }
@@ -619,7 +551,6 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
 
     const num_str = state.json[start..state.index];
 
-    // Handle incomplete numbers
     if (num_str.len == 0 or (num_str.len == 1 and num_str[0] == '-')) {
         if (state.allow.num) {
             return std.json.Value{ .integer = 0 };
@@ -627,23 +558,19 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
         return StreamingJsonError.MalformedJson;
     }
 
-    // Handle numbers ending with 'e' or 'E' (incomplete exponent)
     const last_char = num_str[num_str.len - 1];
     if (last_char == 'e' or last_char == 'E') {
         if (state.allow.num) {
-            // Remove the trailing 'e' or 'E'
             const trimmed = num_str[0 .. num_str.len - 1];
             return parseNumberString(trimmed);
         }
         return StreamingJsonError.MalformedJson;
     }
 
-    // Handle numbers ending with 'e+' or 'e-'
     if (num_str.len >= 2) {
         const second_last = num_str[num_str.len - 2];
         if ((second_last == 'e' or second_last == 'E') and (last_char == '+' or last_char == '-')) {
             if (state.allow.num) {
-                // Remove the trailing exponent sign and 'e'
                 const trimmed = num_str[0 .. num_str.len - 2];
                 return parseNumberString(trimmed);
             }
@@ -651,10 +578,8 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
         }
     }
 
-    // Handle numbers ending with '.'
     if (last_char == '.') {
         if (state.allow.num) {
-            // Remove the trailing '.'
             const trimmed = num_str[0 .. num_str.len - 1];
             return parseNumberString(trimmed);
         }
@@ -664,13 +589,10 @@ fn parseNumber(state: *ParserState) StreamingJsonError!std.json.Value {
     return parseNumberString(num_str);
 }
 
-/// Parse a number string into a JSON value
 fn parseNumberString(num_str: []const u8) StreamingJsonError!std.json.Value {
-    // Try integer first
     if (std.fmt.parseInt(i64, num_str, 10)) |int_val| {
         return std.json.Value{ .integer = int_val };
     } else |_| {
-        // Try float
         if (std.fmt.parseFloat(f64, num_str)) |float_val| {
             return std.json.Value{ .float = float_val };
         } else |_| {
@@ -679,7 +601,6 @@ fn parseNumberString(num_str: []const u8) StreamingJsonError!std.json.Value {
     }
 }
 
-/// Helper function to free a JSON value recursively
 pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     switch (value) {
         .string => |s| allocator.free(s),
@@ -702,10 +623,6 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         else => {},
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "parse complete JSON string" {
     const allocator = std.testing.allocator;
@@ -788,22 +705,18 @@ test "parse partial JSON array" {
 test "parse JSON numbers" {
     const allocator = std.testing.allocator;
 
-    // Integer
     const int_result = try parsePartial(allocator, "42");
     try std.testing.expect(int_result == .integer);
     try std.testing.expectEqual(@as(i64, 42), int_result.integer);
 
-    // Float
     const float_result = try parsePartial(allocator, "3.14");
     try std.testing.expect(float_result == .float);
     try std.testing.expectApproxEqAbs(@as(f64, 3.14), float_result.float, 0.001);
 
-    // Negative
     const neg_result = try parsePartial(allocator, "-10");
     try std.testing.expect(neg_result == .integer);
     try std.testing.expectEqual(@as(i64, -10), neg_result.integer);
 
-    // Scientific notation
     const sci_result = try parsePartial(allocator, "1e5");
     try std.testing.expect(sci_result == .float);
     try std.testing.expectApproxEqAbs(@as(f64, 100000.0), sci_result.float, 0.001);
@@ -812,17 +725,14 @@ test "parse JSON numbers" {
 test "parse partial JSON numbers" {
     const allocator = std.testing.allocator;
 
-    // Number ending with decimal point
     const decimal_result = try parsePartial(allocator, "3.");
     try std.testing.expect(decimal_result == .integer);
     try std.testing.expectEqual(@as(i64, 3), decimal_result.integer);
 
-    // Number ending with 'e'
     const exp_result = try parsePartial(allocator, "1e");
     try std.testing.expect(exp_result == .integer);
     try std.testing.expectEqual(@as(i64, 1), exp_result.integer);
 
-    // Just negative sign
     const neg_result = try parsePartial(allocator, "-");
     try std.testing.expect(neg_result == .integer);
     try std.testing.expectEqual(@as(i64, 0), neg_result.integer);
@@ -909,11 +819,9 @@ test "parse escaped characters in string" {
 test "parse incomplete escaped string" {
     const allocator = std.testing.allocator;
 
-    // String ending with backslash (incomplete escape)
     const result = try parsePartial(allocator, "\"hello\\");
     defer freeJsonValue(allocator, result);
 
-    // Should handle gracefully - either return "hello" or "hello\"
     try std.testing.expect(result == .string);
 }
 
@@ -991,7 +899,6 @@ test "parse typed partial JSON" {
         active: bool,
     };
 
-    // This test uses only value types (no allocated strings)
     const result = try parsePartialTyped(TestStruct, allocator, "{\"value\": 42, \"active\": true}");
 
     try std.testing.expectEqual(@as(i32, 42), result.value);
@@ -1001,17 +908,14 @@ test "parse typed partial JSON" {
 test "parse tool call arguments - typical streaming case" {
     const allocator = std.testing.allocator;
 
-    // Simulate streaming tool call arguments
     const partial1 = try parsePartial(allocator, "{\"location\": \"San");
     const partial2 = try parsePartial(allocator, "{\"location\": \"San Francisco");
     const partial3 = try parsePartial(allocator, "{\"location\": \"San Francisco\"");
 
-    // All should parse successfully with increasing content
     try std.testing.expect(partial1 == .object);
     try std.testing.expect(partial2 == .object);
     try std.testing.expect(partial3 == .object);
 
-    // Clean up
     freeJsonValue(allocator, partial1);
     freeJsonValue(allocator, partial2);
     freeJsonValue(allocator, partial3);

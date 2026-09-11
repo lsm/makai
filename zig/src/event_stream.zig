@@ -9,8 +9,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         pub const usable_capacity = RING_BUFFER_SIZE - 1;
 
         ring_buffer: [RING_BUFFER_SIZE]T,
-        /// Published flags ensure data is visible before consumers read.
-        /// Each slot has a flag that is set to true after data is written.
         published: [RING_BUFFER_SIZE]std.atomic.Value(bool),
         head: std.atomic.Value(usize),
         tail: std.atomic.Value(usize),
@@ -21,17 +19,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
-        /// When true, deinit waits for markThreadDone() from a producer thread.
         wait_for_thread_on_deinit: bool = false,
-        /// When true, events in this stream are (or will be) deep-copied before being
-        /// stored and should be freed in deinit(). When false (default), events contain
-        /// borrowed string slices and must NOT be freed by the stream.
         owns_events: bool = false,
-        /// Optional clone function used when owns_events is true. When set, push() will
-        /// deep-copy the event before storing it, so a producer thread may free its
-        /// temporary buffers immediately after pushing. This makes the stream safe for
-        /// protocol-server forwarding where the producer thread may exit before the
-        /// consumer has drained all events.
         clone_event_fn: ?*const fn (std.mem.Allocator, T) error{OutOfMemory}!T = null,
 
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -51,9 +40,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             };
         }
 
-        /// Deinitialize a single generic event value. Used both for events that were
-        /// cloned but never stored in the ring buffer and for draining remaining events
-        /// during deinit().
         fn deinitGenericEvent(self: *Self, event: *T) void {
             const is_assistant_message_event = comptime blk: {
                 if (@hasDecl(ai_types, "AssistantMessageEvent")) {
@@ -84,11 +70,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 std.Io.Threaded.global_single_threaded.io();
         }
 
-        /// Zig 0.16 routes futex operations through the active `std.Io` context.
-        /// The EventStream still uses a monotonically increasing futex word so
-        /// wake/wait semantics match the previous `std.Thread.Futex` design:
-        /// waiters sleep only while the observed word remains unchanged, and
-        /// every push/completion/thread-done transition increments before wake.
         fn wake(self: *Self, max_waiters: u32) void {
             defaultIo().futexWake(u32, &self.futex.raw, max_waiters);
         }
@@ -97,10 +78,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defaultIo().futexWaitUncancelable(u32, &self.futex.raw, expected);
         }
 
-        /// Timed waits now use `std.Io.Timeout` on the boot clock. Timeout and
-        /// spurious-wake errors are intentionally collapsed here because callers
-        /// re-check `thread_done` and their monotonic deadline after every wait,
-        /// preserving the public bool-returning timeout behavior.
         fn waitTimeoutMs(self: *Self, expected: u32, timeout_ms: u64) void {
             const capped_ms = @min(timeout_ms, @as(u64, std.math.maxInt(i64)));
             defaultIo().futexWaitTimeout(u32, &self.futex.raw, expected, .{ .duration = .{
@@ -115,29 +92,18 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.wait_for_thread_on_deinit) {
-                // Wake any blocking producer before waiting for it. Without this,
-                // a full queue can leave the producer stuck in pushBlocking() until
-                // this wait times out, after which deinit poisons memory that the
-                // producer may still touch.
                 self.completed.store(true, .release);
                 _ = self.futex.fetchAdd(1, .release);
                 self.wake(std.math.maxInt(u32));
                 _ = self.waitForThread(120_000);
             }
 
-            // Drain any remaining events in the ring buffer. The helper respects
-            // the `owns_events` flag: borrowed events (default) are not freed,
-            // while owned events are deep-copied on push and freed here. This matches
-            // the protocol-server path where the producer thread may exit before the
-            // consumer has drained all events.
             while (self.poll()) |event| {
                 var ev = event;
                 self.deinitGenericEvent(&ev);
             }
 
             if (self.result) |*result| {
-                // Only call deinit if R has a deinit method
-                // Use comptime to check if R is a type that can have decls
                 const has_deinit = comptime blk: {
                     const info = @typeInfo(R);
                     switch (info) {
@@ -152,29 +118,13 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 }
             }
 
-            // Free error message (completeWithError always dupes it)
             if (self.err_msg) |msg| {
                 self.allocator.free(msg);
             }
 
-            // Poison freed memory to catch use-after-free in debug builds
             self.* = undefined;
         }
 
-        /// Push an event to the stream.
-        ///
-        /// By default the event's string fields (delta, content, id, name, etc.) are
-        /// treated as BORROWED references. The stream does NOT take ownership and will
-        /// NOT free them in deinit(). The caller must ensure the backing memory outlives
-        /// the event's consumption from the stream (typically by managing buffer lifetimes
-        /// in the producer thread).
-        ///
-        /// When `owns_events` is true and `clone_event_fn` is set, push() will deep-copy
-        /// the event before storing it. The copy is owned by the stream and freed in
-        /// deinit() (or by the consumer that polls it). This lets producer threads free
-        /// their temporary buffers immediately after pushing, which is required for
-        /// protocol-server forwarding where the producer may exit before the consumer
-        /// has drained all events.
         pub fn push(self: *Self, event: T) !void {
             var owned_event: ?T = null;
             defer if (owned_event) |*e| self.deinitGenericEvent(e);
@@ -190,11 +140,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     return error.QueueFull;
                 }
 
-                // If the stream owns events and has a clone function, deep-copy the event
-                // before claiming a slot. Doing this before the CAS ensures that an
-                // OutOfMemory error does not leave a reserved but unpublished slot,
-                // which would wedge consumers waiting at that tail position. The clone
-                // is reused on subsequent loop iterations if the CAS fails.
                 if (self.owns_events) {
                     if (self.clone_event_fn) |clone_fn| {
                         if (owned_event == null) {
@@ -203,26 +148,22 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     }
                 }
 
-                // Try to claim this slot
                 if (self.head.cmpxchgWeak(current_head, next_head, .acquire, .acquire)) |_| {
                     continue;
                 }
 
-                // We claimed slot at current_head - now write the data.
                 var event_to_store = event;
                 if (self.owns_events) {
                     if (self.clone_event_fn) |clone_fn| {
                         _ = clone_fn;
                         if (owned_event) |*owned| {
                             event_to_store = owned.*;
-                            owned_event = null; // ownership transferred to the ring buffer
+                            owned_event = null;
                         }
                     }
                 }
                 self.ring_buffer[current_head] = event_to_store;
 
-                // Mark the slot as published with release semantics
-                // This ensures the write above is visible before the flag
                 self.published[current_head].store(true, .release);
 
                 _ = self.futex.fetchAdd(1, .release);
@@ -232,11 +173,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
         }
 
-        /// Push an event, waiting for the consumer to make room when the ring is full.
-        ///
-        /// Use this for ordered producer streams where dropping an event would corrupt
-        /// the logical stream. UI projection layers that can tolerate loss should still
-        /// prefer an explicit drop-oldest policy at that boundary.
         pub fn pushBlocking(self: *Self, event: T) bool {
             while (true) {
                 self.push(event) catch |err| switch (err) {
@@ -266,16 +202,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
 
-            // Free previous error message if this stream was already completed
-            // with an error (e.g., provider thread completed before abort).
             if (self.err_msg) |old| {
                 self.allocator.free(old);
                 self.err_msg = null;
             }
 
-            // Always dupe the message so the stream owns its memory
-            // This allows callers to free their copy immediately after this call
-            // On OOM, store null (losing the error message is better than crashing)
             self.err_msg = self.allocator.dupe(u8, msg) catch null;
             self.completed.store(true, .release);
 
@@ -313,12 +244,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return true;
         }
 
-        /// Wait until the stream is completed (terminal result or error
-        /// published), up to timeout_ms. Returns true if completed, false on
-        /// timeout. Some producers mark their thread done immediately before
-        /// the final complete()/completeWithError() call, so waitForThread
-        /// alone does not imply the result is published; consumers that read
-        /// the result or free the stream must also gate on this.
         pub fn waitForCompletion(self: *Self, timeout_ms: u64) bool {
             const start_time = monotonicNanos();
             const timeout_ns = @as(i128, timeout_ms) * 1_000_000;
@@ -354,15 +279,12 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 return null;
             }
 
-            // Spin-wait for the slot to be published (data visible)
-            // This is safe because push() marks published before waking consumers
             while (!self.published[current_tail].load(.acquire)) {
                 std.Thread.yield() catch {};
             }
 
             const event = self.ring_buffer[current_tail];
 
-            // Clear published flag for slot reuse and advance tail
             self.published[current_tail].store(false, .release);
             self.tail.store((current_tail + 1) & RING_BUFFER_MASK, .release);
 
@@ -378,14 +300,12 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             const current_head = self.head.load(.acquire);
 
             while (count < buffer.len and current_tail != current_head) {
-                // Spin-wait for the slot to be published (data visible)
                 while (!self.published[current_tail].load(.acquire)) {
                     std.Thread.yield() catch {};
                 }
 
                 buffer[count] = self.ring_buffer[current_tail];
 
-                // Clear published flag for slot reuse
                 self.published[current_tail].store(false, .release);
                 current_tail = (current_tail + 1) & RING_BUFFER_MASK;
                 count += 1;
@@ -398,13 +318,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return count;
         }
 
-        /// Block until the next event is available, or until the stream completes.
-        ///
-        /// Returns null once the stream has completed AND all queued events have
-        /// been drained — treat that null as the completion signal, then take the
-        /// result with `cloneResult()` (or check `getError()`). Do NOT rely on
-        /// receiving a `done` event: several providers complete the stream via
-        /// `complete()` without ever pushing a `.done` event.
         pub fn wait(self: *Self) ?T {
             var futex_value = self.futex.load(.acquire);
 
@@ -415,14 +328,12 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 const current_head = self.head.load(.acquire);
 
                 if (current_tail != current_head) {
-                    // Spin-wait for the slot to be published (data visible)
                     while (!self.published[current_tail].load(.acquire)) {
                         std.Thread.yield() catch {};
                     }
 
                     const event = self.ring_buffer[current_tail];
 
-                    // Clear published flag for slot reuse and advance tail
                     self.published[current_tail].store(false, .release);
                     self.tail.store((current_tail + 1) & RING_BUFFER_MASK, .release);
                     self.mutex.unlock(defaultIo());
@@ -464,18 +375,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defer self.mutex.unlock(defaultIo());
             const current_head = self.head.load(.acquire);
             const current_tail = self.tail.load(.acquire);
-            // Wrapping subtraction is required: head can be less than tail once
-            // the ring has wrapped, which would underflow checked usize math.
             const used = (current_head -% current_tail) & RING_BUFFER_MASK;
             return (RING_BUFFER_SIZE - 1) - used;
         }
 
-        /// Borrowed view of the completed result.
-        ///
-        /// The returned value aliases the stream's internal copy: never call
-        /// `AssistantMessage.deinit()` on it, and never use it after `deinit()`
-        /// (which frees the internal copy). Use `cloneResult()` to take a
-        /// caller-owned copy instead.
         pub fn getResult(self: *Self) ?R {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
@@ -483,25 +386,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return self.result;
         }
 
-        /// Deep-copy the completed result of an `AssistantMessageStream`.
-        ///
-        /// This is the one-call safe way to take the final result: the returned
-        /// message owns deep copies of every string (`is_owned = true`), stays
-        /// valid after `deinit()`, and is the only result value the consumer
-        /// should call `AssistantMessage.deinit()` on.
-        ///
-        /// Returns null when the stream has not completed or carries an error
-        /// (`getError()` non-null — check it; a stream can hold both an error
-        /// and a late result after an abort, and the error wins). Only
-        /// available on streams whose result type is `AssistantMessage`.
         pub fn cloneResult(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!?ai_types.AssistantMessage {
             comptime if (R != ai_types.AssistantMessage) {
                 @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
             };
-            // Snapshot err_msg and result under one lock: reading them through
-            // separate critical sections could observe "no error" before an
-            // abort's completeWithError() and a late complete() after it,
-            // returning a "success" from a state where the error must win.
             self.mutex.lockUncancelable(defaultIo());
             const snapshot = self.result;
             const err = self.err_msg;
@@ -522,10 +410,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
 pub const AssistantMessageStream = EventStream(ai_types.AssistantMessageEvent, ai_types.AssistantMessage);
 
-/// Alias for AssistantMessageStream (same type, different name for clarity)
 pub const AssistantMessageEventStream = AssistantMessageStream;
 
-// Tests
 test "EventStream push and poll" {
     const TestStream = EventStream(u32, bool);
     var stream = TestStream.init(std.testing.allocator);
@@ -596,7 +482,6 @@ test "AssistantMessageStream basic usage" {
     var stream = AssistantMessageStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Create a partial message for the start event
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -613,7 +498,6 @@ test "AssistantMessageStream basic usage" {
     try std.testing.expect(event != null);
     try std.testing.expect(std.meta.activeTag(event.?) == .start);
 
-    // Complete with a result
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -632,12 +516,9 @@ test "AssistantMessageStream basic usage" {
 }
 
 test "AssistantMessageStream deinit drains unpollled events" {
-    // This test verifies that deinit() properly frees memory in events
-    // that were pushed but not polled before the stream is destroyed.
     var stream = AssistantMessageStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Create a start event - partial message has no heap allocations
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -650,8 +531,6 @@ test "AssistantMessageStream deinit drains unpollled events" {
     const start_event = ai_types.AssistantMessageEvent{ .start = .{ .partial = partial } };
     try stream.push(start_event);
 
-    // Do NOT poll the event - deinit() should drain and free it
-
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -663,7 +542,6 @@ test "AssistantMessageStream deinit drains unpollled events" {
     };
     stream.complete(result);
 
-    // deinit() will drain events and clean up
 }
 
 test "EventStream push returns QueueFull when ring buffer exhausted" {
@@ -671,7 +549,6 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Capacity is RING_BUFFER_SIZE - 1 because head==tail means empty.
     for (0..TestStream.usable_capacity) |i| {
         try stream.push(@intCast(i));
     }
@@ -682,21 +559,10 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
 }
 
 test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit" {
-    // Demonstrates the documented consumer flow end-to-end under the testing
-    // allocator (which fails the test on any leak):
-    //   1. drain events with wait() until it returns null — that null is the
-    //      completion signal; providers are NOT required to push a `done` event
-    //   2. deep-copy anything you keep: delta and tool_call strings in events
-    //      are BORROWED from provider-managed buffers
-    //   3. take the result with cloneResult(): the copy is fully owned
-    //      (is_owned = true) and stays valid after the stream is deinit'd
     const allocator = std.testing.allocator;
 
     var stream = AssistantMessageStream.init(allocator);
 
-    // --- producer side: mock provider ---
-    // Events carry borrowed slices (string literals here, standing in for a
-    // provider streaming out of its own buffers) with a borrowed partial.
     const partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -727,9 +593,6 @@ test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit
         .partial = partial,
     } });
 
-    // Completed results must be heap-owned: providers dupe every string and
-    // set is_owned = true (see docs/zig-stream-memory-ownership.md), because
-    // EventStream.deinit() calls AssistantMessage.deinit() on the result.
     const result_content = try allocator.alloc(ai_types.AssistantContent, 2);
     result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "hello world") } };
     result_content[1] = .{ .tool_call = .{
@@ -748,7 +611,6 @@ test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit
         .is_owned = true,
     });
 
-    // --- consumer side: the documented safe flow ---
     var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
 
@@ -761,11 +623,7 @@ test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit
     var saw_done_event = false;
     while (stream.wait()) |event| {
         switch (event) {
-            // Delta strings are borrowed: copy them if you keep them.
             .text_delta => |d| try text.appendSlice(allocator, d.delta),
-            // tool_call strings are borrowed (they share storage with the
-            // completed result's blocks): deep-copy with cloneToolCall. The
-            // errdefer releases the copy if the append itself fails.
             .toolcall_end => |tc| {
                 var owned = try ai_types.cloneToolCall(allocator, tc.tool_call);
                 errdefer ai_types.deinitToolCall(allocator, &owned);
@@ -775,14 +633,11 @@ test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit
             else => {},
         }
     }
-    // wait() returned null: the stream completed without a `done` event.
     try std.testing.expect(!saw_done_event);
     try std.testing.expect(stream.getError() == null);
 
-    // One-call result extraction: a fully owned copy that outlives the stream.
     var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
 
-    // The stream can be deinit'd from here on; `result` stays valid.
     stream.deinit();
 
     try std.testing.expectEqualStrings("hello world", text.items);
@@ -815,9 +670,6 @@ test "AssistantMessageStream cloneResult returns an independent deep copy" {
 
     var copy = (try stream.cloneResult(allocator)) orelse return error.NoResult;
 
-    // The copy has its own backing memory (checked before deinit poisons the
-    // stream), so both the stream's internal result and the copy can be
-    // deinit'd without double-freeing.
     const internal = stream.getResult().?;
     try std.testing.expectEqualStrings("ok", copy.content[0].text.text);
     try std.testing.expect(
@@ -839,9 +691,6 @@ test "AssistantMessageStream cloneResult returns null on error-completed stream"
     try std.testing.expect((try stream.cloneResult(allocator)) == null);
     try std.testing.expectEqualStrings("boom", stream.getError().?);
 
-    // A late complete() on top of an error publishes a result while the error
-    // stays set (see `completion_after_error_is_stable`). The one-call API
-    // must keep returning null so the failure is not masked by a result.
     const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
     result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "late") } };
     stream.complete(.{
@@ -861,12 +710,6 @@ test "AssistantMessageStream cloneResult returns null on error-completed stream"
 }
 
 test "AssistantMessageStream owned events: consumer frees each polled event" {
-    // Streams configured with owns_events = true (e.g. OpenAI Completions, or
-    // any provider started with requires_owned_stream_events) deep-copy events
-    // on push and transfer ownership of each polled event to the consumer:
-    // polled events must be freed with deinitAssistantMessageEvent. Events
-    // still queued at deinit() are freed by the stream. The testing allocator
-    // fails this test if either side is missed.
     const allocator = std.testing.allocator;
 
     var stream = AssistantMessageStream.init(allocator);
@@ -883,9 +726,6 @@ test "AssistantMessageStream owned events: consumer frees each polled event" {
         .timestamp = 0,
     };
 
-    // Both events are deep-copied into stream-owned storage by push().
-    // The first is polled by the consumer (freed per iteration); the second
-    // stays queued (freed by deinit).
     try stream.push(.{ .text_delta = .{
         .content_index = 0,
         .delta = "consumed",
@@ -997,7 +837,6 @@ test "EventStream ring buffer wrap-around preserves order" {
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Force head/tail wrap-around across the ring.
     for (0..TestStream.usable_capacity + 44) |i| {
         try stream.push(@intCast(i));
         const v = stream.poll().?;
@@ -1012,15 +851,12 @@ test "EventStream freeSlots stays correct after ring wrap-around" {
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Cycle more than a full ring so head wraps past tail.
     for (0..TestStream.usable_capacity + 145) |i| {
         try stream.push(@intCast(i));
         _ = stream.poll().?;
-        // freeSlots must remain full capacity after every push/poll pair.
         try std.testing.expectEqual(@as(usize, TestStream.usable_capacity), stream.freeSlots());
     }
 
-    // Now leave a few in flight and re-check to exercise head < tail.
     for (0..10) |_| try stream.push(0);
     try std.testing.expectEqual(@as(usize, TestStream.usable_capacity - 10), stream.freeSlots());
 }
@@ -1051,8 +887,6 @@ const DelayedCompleteCtx = struct {
     stream: *EventStream(u32, u32),
 
     fn run(self: *@This()) void {
-        // Producer ordering used by several providers: mark the thread done
-        // first, then publish the final result.
         self.stream.markThreadDone();
         std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .boot) catch {};
         self.stream.complete(42);
@@ -1064,16 +898,12 @@ test "EventStream waitForCompletion gates on result publication" {
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // An uncompleted stream times out.
     try std.testing.expect(!stream.waitForCompletion(1));
 
     var ctx = DelayedCompleteCtx{ .stream = &stream };
     const th = try std.Thread.spawn(.{}, DelayedCompleteCtx.run, .{&ctx});
     defer th.join();
 
-    // waitForThread returns as soon as the producer marks done, which here
-    // happens before the result is published; waitForCompletion must block
-    // until complete() has run.
     try std.testing.expect(stream.waitForThread(2_000));
     try std.testing.expect(stream.waitForCompletion(2_000));
     try std.testing.expectEqual(@as(u32, 42), stream.getResult().?);

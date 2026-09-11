@@ -1,30 +1,24 @@
-//! Layout joining utilities for combining multiple text blocks.
-//! Provides horizontal and vertical joining with alignment options.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const measure = @import("measure.zig");
 
-/// Vertical alignment for horizontal joins
 pub const VAlign = enum {
     top,
     middle,
     bottom,
 };
 
-/// Horizontal alignment for vertical joins
 pub const HAlign = enum {
     left,
     center,
     right,
 };
 
-/// Join multiple strings horizontally (side by side)
 pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return try allocator.dupe(u8, "");
     if (parts.len == 1) return try allocator.dupe(u8, parts[0]);
 
-    // Calculate dimensions
     var max_height: usize = 0;
     var widths = try allocator.alloc(usize, parts.len);
     defer allocator.free(widths);
@@ -36,7 +30,6 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
 
     if (max_height == 0) max_height = 1;
 
-    // Split all parts into lines
     var all_lines = try allocator.alloc([][]const u8, parts.len);
     defer {
         for (all_lines) |lines| {
@@ -54,7 +47,6 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
         all_lines[i] = try lines_list.toOwnedSlice();
     }
 
-    // Build result
     var result: Writer.Allocating = .init(allocator);
     const writer = &result.writer;
 
@@ -66,7 +58,6 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
             const part_height = lines.len;
             const w = widths[part_idx];
 
-            // Calculate offset based on alignment
             const offset: usize = switch (valign) {
                 .top => 0,
                 .middle => (max_height - part_height) / 2,
@@ -81,7 +72,6 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
             if (line_idx) |idx| {
                 const line = lines[idx];
                 try writer.writeAll(line);
-                // Pad to width
                 const line_width = measure.width(line);
                 if (line_width < w) {
                     for (0..(w - line_width)) |_| {
@@ -89,7 +79,6 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
                     }
                 }
             } else {
-                // Empty line
                 for (0..w) |_| {
                     try writer.writeByte(' ');
                 }
@@ -100,12 +89,10 @@ pub fn horizontal(allocator: std.mem.Allocator, valign: VAlign, parts: []const [
     return result.toOwnedSlice();
 }
 
-/// Join multiple strings vertically (stacked)
 pub fn vertical(allocator: std.mem.Allocator, halign: HAlign, parts: []const []const u8) ![]const u8 {
     if (parts.len == 0) return try allocator.dupe(u8, "");
     if (parts.len == 1) return try allocator.dupe(u8, parts[0]);
 
-    // Calculate max width
     var max_width: usize = 0;
     for (parts) |part| {
         max_width = @max(max_width, measure.maxLineWidth(part));
@@ -158,7 +145,6 @@ pub fn vertical(allocator: std.mem.Allocator, halign: HAlign, parts: []const []c
     return result.toOwnedSlice();
 }
 
-/// Join with a separator
 pub fn horizontalSep(
     allocator: std.mem.Allocator,
     valign: VAlign,
@@ -168,7 +154,6 @@ pub fn horizontalSep(
     if (parts.len == 0) return try allocator.dupe(u8, "");
     if (parts.len == 1) return try allocator.dupe(u8, parts[0]);
 
-    // Create new parts array with separators
     var with_seps = try allocator.alloc([]const u8, parts.len * 2 - 1);
     defer allocator.free(with_seps);
 
@@ -182,7 +167,6 @@ pub fn horizontalSep(
     return horizontal(allocator, valign, with_seps[0 .. parts.len * 2 - 1]);
 }
 
-/// Join with a separator
 pub fn verticalSep(
     allocator: std.mem.Allocator,
     halign: HAlign,
@@ -192,7 +176,6 @@ pub fn verticalSep(
     if (parts.len == 0) return try allocator.dupe(u8, "");
     if (parts.len == 1) return try allocator.dupe(u8, parts[0]);
 
-    // Create new parts array with separators
     var with_seps = try allocator.alloc([]const u8, parts.len * 2 - 1);
     defer allocator.free(with_seps);
 

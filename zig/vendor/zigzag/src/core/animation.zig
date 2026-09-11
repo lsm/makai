@@ -1,11 +1,8 @@
-//! Animation and tween system.
-//! Provides easing functions and a Tween for interpolating values over time.
 
 const std = @import("std");
 const Color = @import("../style/color.zig").Color;
 const progress_mod = @import("../components/progress.zig");
 
-/// Easing functions that map t in [0,1] to an output in [0,1].
 pub const Easing = enum {
     linear,
     ease_in,
@@ -57,7 +54,6 @@ pub const Easing = enum {
     }
 };
 
-/// A tween that interpolates a f64 value from `start` to `end` over `duration_ns`.
 pub const Tween = struct {
     start_val: f64,
     end_val: f64,
@@ -79,7 +75,6 @@ pub const Tween = struct {
         ping_pong,
     };
 
-    /// Create a new tween.
     pub fn init(from: f64, to: f64, duration_ms: u64) Tween {
         return .{
             .start_val = from,
@@ -92,29 +87,24 @@ pub const Tween = struct {
         };
     }
 
-    /// Set easing function.
     pub fn setEasing(self: *Tween, easing: Easing) void {
         self.easing = easing;
     }
 
-    /// Set loop mode.
     pub fn setLoop(self: *Tween, mode: LoopMode) void {
         self.loop_mode = mode;
     }
 
-    /// Start the tween.
     pub fn start(self: *Tween) void {
         self.state = .running;
         self.elapsed_ns = 0;
     }
 
-    /// Reset to beginning.
     pub fn reset(self: *Tween) void {
         self.elapsed_ns = 0;
         self.state = .idle;
     }
 
-    /// Update with delta time in nanoseconds.
     pub fn update(self: *Tween, delta_ns: u64) void {
         if (self.state != .running) return;
 
@@ -136,13 +126,11 @@ pub const Tween = struct {
         }
     }
 
-    /// Get the current interpolated value.
     pub fn value(self: *const Tween) f64 {
         if (self.duration_ns == 0) return self.end_val;
 
         var t: f64 = @as(f64, @floatFromInt(self.elapsed_ns)) / @as(f64, @floatFromInt(self.duration_ns));
 
-        // Ping-pong: reverse in second half
         if (self.loop_mode == .ping_pong and t > 1.0) {
             t = 2.0 - t;
         }
@@ -152,34 +140,28 @@ pub const Tween = struct {
         return self.start_val + (self.end_val - self.start_val) * eased;
     }
 
-    /// Get value as integer.
     pub fn intValue(self: *const Tween) i64 {
         return @intFromFloat(self.value());
     }
 
-    /// Check if finished (only relevant for .once mode).
     pub fn isFinished(self: *const Tween) bool {
         return self.state == .finished;
     }
 
-    /// Check if running.
     pub fn isRunning(self: *const Tween) bool {
         return self.state == .running;
     }
 
-    /// Get normalized progress [0, 1].
     pub fn progress(self: *const Tween) f64 {
         if (self.duration_ns == 0) return 1.0;
         return @min(1.0, @as(f64, @floatFromInt(self.elapsed_ns)) / @as(f64, @floatFromInt(self.duration_ns)));
     }
 };
 
-/// Interpolate between two colors using a tween.
 pub fn tweenColor(start: Color, end: Color, t: f64) Color {
     return progress_mod.interpolateColor(start, end, @max(0.0, @min(1.0, t)));
 }
 
-/// Convenience: lerp between two f64 values.
 pub fn lerp(a: f64, b: f64, t: f64) f64 {
     return a + (b - a) * @max(0.0, @min(1.0, t));
 }

@@ -11,9 +11,6 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 const PipeTransport = in_process.SerializedPipe;
 
 const ExecutionContext = struct {
-    // Single in-process dispatch context for synchronous LocalToolProtocol pump.
-    // Recursive LocalToolProtocol.execute calls on same thread would clobber this
-    // state; do not add nested dispatch without replacing this bridge.
     threadlocal var current: ExecutionContext = .{};
 
     cancel_token: ?ai_types.CancelToken = null,

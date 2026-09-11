@@ -1,15 +1,6 @@
-//! Fuzzy string matching utility.
-//!
-//! Provides character-subsequence scoring used by filterable components like
-//! `List`, `Dropdown`, and `CommandPalette`. The scoring rewards consecutive
-//! matches and word-start positions so that "fb" ranks "file_browser" above
-//! "find_buffer".
 
 const std = @import("std");
 
-/// Score a subsequence match. Returns 0 when `pattern` is not a subsequence of
-/// `text`. Comparison is case-sensitive: use `scoreIgnoreCase` if you want to
-/// ignore case without allocating.
 pub fn score(text: []const u8, pattern: []const u8) i32 {
     if (pattern.len == 0) return 1;
     if (text.len == 0) return 0;
@@ -36,8 +27,6 @@ pub fn score(text: []const u8, pattern: []const u8) i32 {
     return total;
 }
 
-/// Like `score` but compares ASCII characters case-insensitively without
-/// allocating. Non-ASCII bytes are compared exactly.
 pub fn scoreIgnoreCase(text: []const u8, pattern: []const u8) i32 {
     if (pattern.len == 0) return 1;
     if (text.len == 0) return 0;
@@ -64,9 +53,6 @@ pub fn scoreIgnoreCase(text: []const u8, pattern: []const u8) i32 {
     return total;
 }
 
-/// Return the byte positions in `text` that match characters of `pattern` in
-/// order. Useful for highlighting matched characters. Returns `null` if
-/// `pattern` is not a subsequence.
 pub fn matchPositions(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -101,8 +87,6 @@ pub const Ranked = struct {
     score: i32,
 };
 
-/// Score every haystack entry against `pattern` and return the ones with a
-/// positive score, sorted by score descending. Caller owns the returned slice.
 pub fn rank(
     allocator: std.mem.Allocator,
     haystack: []const []const u8,
@@ -140,8 +124,6 @@ test "non-subsequence returns zero" {
 }
 
 test "consecutive matches score higher than scattered" {
-    // Both have the 'h' at a word-start, so the difference comes from the
-    // second character: consecutive in "hello", scattered in "hxexy".
     const consec = score("hello", "he");
     const split = score("hxexy", "he");
     try std.testing.expect(consec > split);
@@ -165,7 +147,5 @@ test "rank sorts by score descending" {
     const ranked = try rank(allocator, &items, "app", false);
     defer allocator.free(ranked);
     try std.testing.expect(ranked.len >= 2);
-    // "apple" and "application" both start with "app"; first-place tie is
-    // valid, but "ape" (partial) should lose if present.
     for (ranked) |r| try std.testing.expect(r.score > 0);
 }

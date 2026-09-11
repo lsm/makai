@@ -9,13 +9,11 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "github_copilot e2e: basic text generation" {
-    // Check for GitHub Copilot credentials
     try test_helpers.skipGitHubCopilotTest(testing.allocator);
 
     var creds = (try test_helpers.getFreshGitHubCopilotCredentials(testing.allocator)) orelse return error.SkipZigTest;
     defer creds.deinit(testing.allocator);
 
-    // Use base_url from token, or fall back to default
     const base_url = creds.base_url orelse "https://api.individual.githubcopilot.com";
 
     var registry = api_registry.ApiRegistry.init(testing.allocator);
@@ -57,7 +55,6 @@ test "github_copilot e2e: basic text generation" {
         compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
-    // Allow detached provider thread to complete deferred cleanup
     compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {
@@ -75,7 +72,6 @@ test "github_copilot e2e: basic text generation" {
 }
 
 test "github_copilot e2e: streaming events sequence" {
-    // Check for GitHub Copilot credentials
     try test_helpers.skipGitHubCopilotTest(testing.allocator);
 
     var creds = (try test_helpers.getFreshGitHubCopilotCredentials(testing.allocator)) orelse return error.SkipZigTest;
@@ -136,7 +132,6 @@ test "github_copilot e2e: streaming events sequence" {
         }
     }
 
-    // Allow detached provider thread to complete deferred cleanup
     compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {

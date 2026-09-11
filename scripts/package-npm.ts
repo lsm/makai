@@ -1,9 +1,3 @@
-/**
- * Assembles npm packages from compiled binaries.
- * Takes binaries from dist/bin/ and creates publishable packages in dist/npm/.
- *
- * Usage: node scripts/package-npm.ts [--version 0.1.0]
- */
 
 import { mkdirSync, copyFileSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -71,20 +65,16 @@ for (const { target, os, cpu, binary } of PLATFORMS) {
   console.log(`  Created ${pkgName}`);
 }
 
-// Create main makai package
 const mainDir = join(NPM_DIR, "makai");
 mkdirSync(mainDir, { recursive: true });
 
-// Copy launcher script
 copyFileSync(join(ROOT, "bin", "makai.js"), join(mainDir, "makai.js"));
 chmodSync(join(mainDir, "makai.js"), 0o755);
 
-// Copy SDK files
 const srcDir = join(ROOT, "dist", "src");
 const destSrcDir = join(mainDir, "dist", "src");
 mkdirSync(destSrcDir, { recursive: true });
 
-// Read existing package.json and update for packaging
 const mainPkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
 mainPkg.version = VERSION;
 mainPkg.bin = { makai: "makai.js" };
@@ -102,7 +92,6 @@ writeFileSync(
   JSON.stringify(mainPkg, null, 2)
 );
 
-// Copy dist/src contents
 function copyDir(src: string, dest: string) {
   mkdirSync(dest, { recursive: true });
   for (const entry of require("fs").readdirSync(src, { withFileTypes: true })) {
@@ -117,7 +106,6 @@ function copyDir(src: string, dest: string) {
 }
 copyDir(srcDir, destSrcDir);
 
-// Copy README
 copyFileSync(join(ROOT, "README.md"), join(mainDir, "README.md"));
 
 console.log(`  Created makai (main package)`);

@@ -209,10 +209,6 @@ fn flushWord(writer: *std.Io.Writer, word: *std.ArrayList(u8), word_width: usize
     word.clearRetainingCapacity();
 }
 
-/// Word-wrap `text` to `max_width` while preserving line-oriented block prefixes
-/// produced by ZigZag's markdown renderer (list bullets, code-block bars, ordered
-/// list numbers, and plain leading spaces). ANSI sequences are treated as zero-width
-/// and are never split; words that exceed the available width are hard-split.
 pub fn wrapTextPreservingPrefix(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
     if (max_width == 0 or text.len == 0) return allocator.dupe(u8, text);
 
@@ -305,14 +301,11 @@ fn wrapLineWithPrefix(
     if (prefix_fits) {
         try writer.writeAll(prefix.first_bytes);
     } else if (prefix.content_start < line.len) {
-        // The prefix alone is too wide for the viewport. Show as much of it as
-        // fits, then continue the content on the next line without a prefix.
         const truncated = try truncateLineToWidth(allocator, prefix.first_bytes, max_width);
         defer allocator.free(truncated);
         try writer.writeAll(truncated);
         try writer.writeByte('\n');
     } else {
-        // The line is only a prefix; truncate it to the viewport.
         const truncated = try truncateLineToWidth(allocator, prefix.first_bytes, max_width);
         defer allocator.free(truncated);
         try writer.writeAll(truncated);
@@ -354,7 +347,6 @@ fn wrapLineWithPrefix(
         const c = line[i];
         if (c == ' ' or c == '\t') {
             if (!word_has_visible) {
-                // Preserve spaces that belong to a style-only prefix or indentation.
                 try word.appendSlice(allocator, " ");
                 word_width += 1;
             } else {
@@ -490,7 +482,6 @@ fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !vo
         }
         return;
     }
-    // SCS: ESC ( ) * + — followed by one more byte
     if (second >= '(' and second <= '+') {
         if (index.* < text.len) {
             try writer.writeByte(text[index.*]);
@@ -498,7 +489,6 @@ fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !vo
         }
         return;
     }
-    // DCS: ESC P — followed by string until ST (ESC \) or BEL
     if (second == 'P') {
         while (index.* < text.len) {
             const c = text[index.*];

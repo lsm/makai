@@ -1,5 +1,3 @@
-//! Program runtime for the ZigZag TUI framework.
-//! Implements the Model-Update-View pattern with an event loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,9 +22,7 @@ const PendingImage = union(enum) {
     place_cached: command.PlaceCachedImage,
 };
 
-/// Program runtime that manages the application lifecycle
 pub fn Program(comptime Model: type) type {
-    // Ensure Model has required declarations
     comptime {
         if (!@hasDecl(Model, "Msg")) {
             @compileError("Model must have a 'Msg' type declaration");
@@ -57,15 +53,8 @@ pub fn Program(comptime Model: type) type {
         running: std.atomic.Value(bool),
         message_queue: MessageQueue,
         main_thread_id: std.Thread.Id,
-        /// Boot-clock epoch from which `last_frame_time` and `context.elapsed` are measured.
-        /// `.boot` includes time the system was suspended, giving a monotonic reading
-        /// without gaps on resume.
         clock_epoch: std.Io.Clock.Timestamp,
         last_frame_time: u64,
-        /// Anchor for absolute frame pacing. Separate from `clock_epoch` so we can
-        /// rebase after suspend/resume or a long-overrun frame without disturbing
-        /// user-visible `context.elapsed` / `context.frame` (which `pending_tick`
-        /// and `every` depend on).
         pacing_epoch: std.Io.Clock.Timestamp,
         pacing_frame_offset: u64,
         pending_tick: ?u64,
@@ -80,7 +69,6 @@ pub fn Program(comptime Model: type) type {
         paste_pending_end_prefix: std.array_list.Managed(u8),
         paste_active: bool,
 
-        /// Message filter function
         filter: ?*const fn (UserMsg) ?UserMsg,
 
         const Self = @This();
@@ -133,7 +121,6 @@ pub fn Program(comptime Model: type) type {
             }
         };
 
-        /// Initialize the program.
         pub fn init(
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -142,7 +129,6 @@ pub fn Program(comptime Model: type) type {
             return initWithOptions(allocator, io, environ_map, .{});
         }
 
-        /// Initialize with custom options.
         pub fn initWithOptions(
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -181,14 +167,11 @@ pub fn Program(comptime Model: type) type {
                 .filter = null,
             };
 
-            // `self` is returned by value, so don't capture an arena allocator here.
-            // It would point at this function's stack copy and dangle after return.
             self.context = Context.init(allocator, allocator, io, &self.environment);
 
             return self;
         }
 
-        /// Clean up resources
         pub fn deinit(self: *Self) void {
             if (self.terminal) |*term| {
                 term.deinit();
@@ -202,42 +185,24 @@ pub fn Program(comptime Model: type) type {
             self.paste_pending_end_prefix.deinit();
             self.arena.deinit();
 
-            // Call model's deinit if it exists
             if (@hasDecl(Model, "deinit")) {
                 self.model.deinit();
             }
         }
 
-        /// Set a message filter function
         pub fn setFilter(self: *Self, f: ?*const fn (UserMsg) ?UserMsg) void {
             self.filter = f;
         }
 
-        /// Run the program with the built-in event loop.
-        /// For custom event loops, use `start()` + `tick()` instead.
         pub fn run(self: *Self) !void {
             try self.start();
 
-            // Main event loop
             while (self.running.load(.acquire)) {
                 try self.tick();
             }
         }
 
-        /// Initialize the terminal and model without entering the event loop.
-        /// After calling this, drive the program manually by calling `tick()`
-        /// in your own loop. Check `isRunning()` to know when to stop.
-        ///
-        /// Example:
-        /// ```
-        /// try program.start();
-        /// while (program.isRunning()) {
-        ///     try program.tick();
-        ///     // ... do other work between frames ...
-        /// }
-        /// ```
         pub fn start(self: *Self) !void {
-            // Initialize logger if configured
             if (self.options.log_file) |log_path| {
                 self.logger = Logger.init(self.io, log_path) catch null;
                 if (self.logger != null) {
@@ -245,7 +210,6 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Initialize terminal
             self.terminal = try Terminal.init(self.io, &self.environment, .{
                 .alt_screen = self.options.alt_screen,
                 .hide_cursor = !self.options.cursor,
@@ -259,12 +223,10 @@ pub fn Program(comptime Model: type) type {
                 .osc52 = self.options.osc52,
             });
 
-            // Set title if provided
             if (self.options.title) |title| {
                 try self.terminal.?.setTitle(title);
             }
 
-            // Get initial size
             const size = try self.terminal.?.getSize();
             self.context.width = size.cols;
             self.context.height = size.rows;
@@ -287,19 +249,16 @@ pub fn Program(comptime Model: type) type {
 
             self.resetFrameAllocator();
 
-            // Initialize the model
             const init_cmd = self.model.init(&self.context);
             try self.processCommand(init_cmd);
 
             self.running.store(true, .release);
         }
 
-        /// Returns true if the program is still running.
         pub fn isRunning(self: *const Self) bool {
             return self.running.load(.acquire);
         }
 
-        /// Execute a single frame: poll input, process events, render.
         pub fn tick(self: *Self) !void {
             const tick_start = self.elapsedNs();
             const actual_delta: u64 = if (self.context.frame == 0) 0 else tick_start - self.last_frame_time;
@@ -309,20 +268,16 @@ pub fn Program(comptime Model: type) type {
             self.context.elapsed = tick_start;
             self.context.frame += 1;
 
-            // Drain queued messages before resetting the frame arena. This preserves
-            // payloads created from the previous frame allocator until delivery.
             try self.drainMessageQueue();
             if (!self.isRunning()) return;
 
             self.resetFrameAllocator();
 
-            // Check for resize
             if (self.terminal.?.checkResize()) {
                 const size = try self.terminal.?.getSize();
                 self.context.width = size.cols;
                 self.context.height = size.rows;
 
-                // Only send window_size message if the user model supports it
                 if (@hasField(UserMsg, "window_size")) {
                     const cmd = self.dispatchToModel(.{ .window_size = .{
                         .width = size.cols,
@@ -333,7 +288,6 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Non-blocking drain; input typed during pacing sits in the TTY buffer.
             var input_buf: [256]u8 = undefined;
             const bytes_read = try self.terminal.?.readInput(&input_buf, 0);
 
@@ -352,11 +306,9 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Handle pending tick
             if (self.pending_tick) |tick_ns| {
                 if (self.context.elapsed >= tick_ns) {
                     self.pending_tick = null;
-                    // Deliver tick to user's update if Model.Msg has a tick variant
                     if (@hasField(UserMsg, "tick")) {
                         const user_msg = UserMsg{ .tick = .{
                             .timestamp = @intCast(tick_start),
@@ -369,7 +321,6 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Handle repeating tick
             if (self.every_interval) |interval| {
                 if (self.context.elapsed - self.last_every_tick >= interval) {
                     self.last_every_tick = self.context.elapsed;
@@ -385,27 +336,21 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Render
             try self.render();
             try self.flushPendingImage();
 
-            // Pace at end of tick; first tick skips so initial paint is immediate.
             const min_frame_time_ns: u64 = if (self.options.fps > 0)
                 @divFloor(std.time.ns_per_s, self.options.fps)
             else
-                16_666_666; // ~60fps default
+                16_666_666;
             const frames_since_anchor = self.context.frame - self.pacing_frame_offset;
             if (frames_since_anchor > 1) {
                 const deadline_offset_ns: u64 = frames_since_anchor * min_frame_time_ns;
-                // If we've fallen far behind the schedule (long-overrun frame, or
-                // boot-clock advanced past the anchor while suspended), rebase the
-                // anchor instead of burst-rendering frames to "catch up."
                 const elapsed_since_anchor = self.pacingElapsedNs();
                 if (elapsed_since_anchor > deadline_offset_ns + 4 * min_frame_time_ns) {
                     self.pacing_epoch = std.Io.Clock.Timestamp.now(self.io, .boot);
                     self.pacing_frame_offset = self.context.frame;
                 } else {
-                    // Absolute deadline so sleep overshoot doesn't compound.
                     const deadline: std.Io.Clock.Timestamp = self.pacing_epoch.addDuration(.{
                         .raw = .{ .nanoseconds = @intCast(deadline_offset_ns) },
                         .clock = .boot,
@@ -529,7 +474,6 @@ pub fn Program(comptime Model: type) type {
             return 0;
         }
 
-        /// Dispatch a message to the model, applying the filter if set
         fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
             if (self.filter) |f| {
                 if (f(user_msg)) |filtered_msg| {
@@ -541,14 +485,12 @@ pub fn Program(comptime Model: type) type {
         }
 
         fn processKeyEvent(self: *Self, key: keyboard.KeyEvent) ?UserCmd {
-            // Check for Ctrl+C to quit
             if (key.modifiers.ctrl) {
                 switch (key.key) {
                     .char => |c| {
                         if (c == 'c') {
                             return .quit;
                         }
-                        // Handle Ctrl+Z for suspend
                         if (c == 'z' and self.options.suspend_enabled) {
                             self.performSuspend();
                             return null;
@@ -558,13 +500,11 @@ pub fn Program(comptime Model: type) type {
                 }
             }
 
-            // Handle paste events
             if (key.key == .paste) {
                 if (@hasField(UserMsg, "paste")) {
                     const user_msg = UserMsg{ .paste = key.key.paste };
                     return self.dispatchToModel(user_msg);
                 }
-                // If model doesn't handle paste, send as individual key events
                 if (@hasField(UserMsg, "key")) {
                     const user_msg = UserMsg{ .key = key };
                     return self.dispatchToModel(user_msg);
@@ -572,7 +512,6 @@ pub fn Program(comptime Model: type) type {
                 return null;
             }
 
-            // Convert to user message if Model.Msg has a key variant
             if (@hasField(UserMsg, "key")) {
                 const user_msg = UserMsg{ .key = key };
                 return self.dispatchToModel(user_msg);
@@ -600,36 +539,28 @@ pub fn Program(comptime Model: type) type {
             return null;
         }
 
-        /// Perform suspend (Ctrl+Z) — POSIX only
         fn performSuspend(self: *Self) void {
             if (builtin.os.tag == .windows) return;
 
-            // Cleanup terminal
             if (self.terminal) |*term| {
                 term.cleanup();
             }
 
-            // Raise SIGTSTP to suspend process
             if (builtin.os.tag != .windows) {
                 const posix = std.posix;
                 _ = posix.raise(posix.SIG.TSTP) catch {};
             }
 
-            // When we resume (after `fg`), re-setup terminal
             if (self.terminal) |*term| {
                 term.setup() catch {};
             }
 
-            // Avoid a large post-resume frame delta, and rebase the pacing anchor
-            // so we don't burst-render to "catch up" the suspended interval.
             self.last_frame_time = self.elapsedNs();
             self.pacing_epoch = std.Io.Clock.Timestamp.now(self.io, .boot);
             self.pacing_frame_offset = self.context.frame;
 
-            // Force re-render
             self.last_view_hash = 0;
 
-            // Dispatch resumed message if model supports it
             if (@hasField(UserMsg, "resumed")) {
                 const cmd = self.dispatchToModel(.{ .resumed = {} });
                 self.processCommand(cmd) catch {};
@@ -961,7 +892,6 @@ pub fn Program(comptime Model: type) type {
             return @intCast(value);
         }
 
-        /// Nanoseconds elapsed on the boot clock since `clock_epoch`.
         fn elapsedNs(self: *const Self) u64 {
             const dur = self.clock_epoch.untilNow(self.io);
             const ns = dur.raw.nanoseconds;
@@ -969,7 +899,6 @@ pub fn Program(comptime Model: type) type {
             return @intCast(ns);
         }
 
-        /// Nanoseconds elapsed on the boot clock since `pacing_epoch`.
         fn pacingElapsedNs(self: *const Self) u64 {
             const dur = self.pacing_epoch.untilNow(self.io);
             const ns = dur.raw.nanoseconds;
@@ -990,14 +919,11 @@ pub fn Program(comptime Model: type) type {
         fn render(self: *Self) !void {
             const view_output = self.model.view(&self.context);
 
-            // Compute hash of view output
             const view_hash = std.hash.Wyhash.hash(0, view_output);
 
-            // Only redraw if view changed
             if (view_hash != self.last_view_hash) {
                 const writer = self.terminal.?.writer();
 
-                // Start synchronized output (prevents tearing on supporting terminals)
                 try writer.writeAll(ansi.sync_start);
 
                 const view_line_count = countLines(view_output);
@@ -1014,11 +940,9 @@ pub fn Program(comptime Model: type) type {
                         self.context.height - @as(u16, @intCast(clamped_capacity)) + 1;
                     try ansi.cursorTo(writer, start_row, 1);
                 } else {
-                    // Move cursor home (don't clear entire screen to reduce flicker)
                     try writer.writeAll(ansi.cursor_home);
                 }
 
-                // Write each line, clearing to end of line
                 var lines = std.mem.splitScalar(u8, view_output, '\n');
                 var first = true;
                 var line_count: usize = 0;
@@ -1030,7 +954,6 @@ pub fn Program(comptime Model: type) type {
                     line_count += 1;
                 }
 
-                // Clear remaining lines if previous content was taller
                 const visible_line_count = if (self.options.inline_bottom_viewport)
                     @min(line_count, @as(usize, self.context.height))
                 else
@@ -1048,12 +971,10 @@ pub fn Program(comptime Model: type) type {
                 }
                 self.last_line_count = visible_line_count;
 
-                // End synchronized output
                 try writer.writeAll(ansi.sync_end);
 
                 try self.terminal.?.flush();
 
-                // Save hash for comparison
                 self.last_view_hash = view_hash;
             }
         }
@@ -1067,11 +988,6 @@ pub fn Program(comptime Model: type) type {
             return count;
         }
 
-        /// Send a message to the model.
-        ///
-        /// Same-thread sends dispatch immediately, preserving the original
-        /// synchronous payload lifetime contract for stack/frame-backed data.
-        /// Background-thread sends enqueue for main-thread delivery.
         pub fn send(self: *Self, m: UserMsg) !void {
             if (std.Thread.getCurrentId() == self.main_thread_id) {
                 const cmd = self.dispatchToModel(m);
@@ -1082,7 +998,6 @@ pub fn Program(comptime Model: type) type {
             try self.message_queue.push(m);
         }
 
-        /// Stop the program
         pub fn quit(self: *Self) void {
             self.running.store(false, .release);
         }

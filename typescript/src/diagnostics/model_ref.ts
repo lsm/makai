@@ -26,7 +26,6 @@ export type ParsedModelRef = {
   modelId: string;
 };
 
-// Intentionally parser-only for diagnostics per spec §3.1; formatter remains server-side canonicalization.
 export function parseModelRef(modelRef: string): ParsedModelRef {
   const slashIndex = modelRef.indexOf("/");
   if (slashIndex === -1) {

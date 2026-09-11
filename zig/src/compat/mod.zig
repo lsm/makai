@@ -1,16 +1,3 @@
-//! Makai-owned I/O compatibility seams for Zig 0.16.0.
-//!
-//! These modules intentionally expose Makai-owned wrapper boundaries, not raw
-//! `std.Io`, matching `docs/zig-0.16.0-io-architecture-decision.md`.
-//! Implementations route through the selected Zig 0.16 `std.Io.Threaded`/default
-//! context plumbing without forcing callers to thread `std.Io` through Makai
-//! public APIs.
-//!
-//! Names intentionally follow the task's stable helper list where it is more
-//! specific than the architecture note's examples (`monotonicNanos`, `sleepNs`,
-//! `getCwd`, `resolveAddress`, `tcpListen`). The examples in the architecture
-//! decision remain guidance; this skeleton records the concrete names that
-//! follow-up PRs will migrate without exposing raw `std.Io`.
 
 const std = @import("std");
 
@@ -42,10 +29,6 @@ fn runtimeEnviron() std.process.Environ {
     return .{ .block = .{ .slice = @ptrCast(c_environ[0..env_count :null]) } };
 }
 
-/// `Io.Threaded`'s memoized environ scan only carries `HOME` on targets whose
-/// `Environ.String` struct has the field; Windows and WASI use an empty struct
-/// there, so the comptime `environString("HOME")` lookup must stay behind this
-/// guard or cross-compiling for Windows fails with "no field named 'HOME'".
 const environ_scan_has_home = @hasField(std.Io.Threaded.Environ.String, "HOME");
 
 pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -57,11 +40,6 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             }
         }
         if (builtin.os.tag == .windows) {
-            // Windows has no HOME convention; resolve the home directory
-            // through USERPROFILE, then HOMEDRIVE ++ HOMEPATH. A plain HOME
-            // (e.g. set by Git Bash) is still honored as a last resort by
-            // the generic lookup below. Allocation failures propagate; only
-            // a genuinely absent home directory falls through.
             if (getWindowsHomeDir(allocator)) |home| {
                 return home;
             } else |err| switch (err) {
@@ -77,11 +55,6 @@ fn getWindowsHomeDir(allocator: std.mem.Allocator) ![]u8 {
     return getHomeDirFromEnviron(allocator, runtimeEnviron());
 }
 
-/// Windows home-directory resolution: `USERPROFILE` first, then
-/// `HOMEDRIVE` ++ `HOMEPATH` (e.g. "C:" ++ "\Users\name"). Takes the environ
-/// explicitly so tests can feed synthetic values on any host. Only
-/// `error.EnvironmentVariableMissing` moves the search to the next candidate;
-/// allocation failures propagate to the caller.
 fn getHomeDirFromEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
     if (std.process.Environ.getAlloc(environ, allocator, "USERPROFILE")) |value| {
         return value;
@@ -127,11 +100,6 @@ test "getEnvVarOwned HOME matches the environ lookup" {
     }
 }
 
-// The remaining tests exercise the Windows home-dir resolution against a
-// synthetic environ. The synthetic block below is a `PosixBlock` shape, so
-// the test bodies are guarded on the block actually being one (Windows,
-// WASI/emscripten without libc, and freestanding use `GlobalBlock` instead)
-// and skip elsewhere.
 test "windows home resolution prefers USERPROFILE over HOMEDRIVE/HOMEPATH" {
     if (@hasField(std.process.Environ.Block, "slice")) {
         const allocator = std.testing.allocator;
@@ -173,7 +141,6 @@ test "windows home resolution fails without USERPROFILE and HOMEDRIVE/HOMEPATH" 
             getHomeDirFromEnviron(allocator, empty_env),
         );
 
-        // HOMEDRIVE alone must not leak its allocation when HOMEPATH is missing.
         const drive_only = [_]?[*:0]const u8{ "HOMEDRIVE=C:", null };
         const drive_env: std.process.Environ = .{ .block = .{ .slice = drive_only[0..1 :null] } };
         try std.testing.expectError(

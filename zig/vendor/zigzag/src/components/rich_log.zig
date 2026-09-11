@@ -1,12 +1,3 @@
-//! Rich log widget — append-only, virtualized, level-aware.
-//!
-//! Stores a bounded ring buffer of log entries with severity levels and
-//! optional timestamps. Renders only the visible window so cost stays O(rows)
-//! regardless of buffer size. Supports follow-mode (auto-scroll to tail),
-//! per-level styling, level filters, and substring search highlighting.
-//!
-//! Distinct from Viewport (raw text) and Toast (transient notification): this
-//! is the right widget for a long-running app's persistent log/audit pane.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -47,7 +38,6 @@ pub const Level = enum {
 
 pub const Entry = struct {
     level: Level,
-    /// Unix nanoseconds, populated by `append` from `std.Io.Timestamp.now(io, .real)`.
     timestamp_ns: i128,
     text: []u8,
 };
@@ -55,31 +45,23 @@ pub const Entry = struct {
 pub const RichLog = struct {
     allocator: std.mem.Allocator,
 
-    /// Ring buffer of entries.
     entries: std.array_list.Managed(Entry),
-    /// Maximum entries retained; older entries are dropped on append.
     capacity: usize,
 
-    /// Indices into `entries` after applying min_level + search filter.
-    /// Recomputed lazily.
     visible: std.array_list.Managed(usize),
     visible_dirty: bool,
 
-    /// Display configuration.
     width: u16,
     height: u16,
     y_offset: usize,
     follow: bool,
 
-    /// Filtering.
     min_level: Level,
     search_term: std.array_list.Managed(u8),
 
-    /// Display options.
     show_timestamps: bool,
     show_level: bool,
 
-    /// Styling.
     timestamp_style: Style,
     level_styles: [5]Style,
     text_style: Style,
@@ -164,7 +146,6 @@ pub const RichLog = struct {
         self.visible_dirty = true;
     }
 
-    /// Append an entry, dropping the oldest if at capacity.
     pub fn append(self: *RichLog, io: std.Io, level: Level, text: []const u8) !void {
         const owned = try self.allocator.dupe(u8, text);
         if (self.entries.items.len >= self.capacity) {
@@ -180,7 +161,6 @@ pub const RichLog = struct {
         if (self.follow) self.scrollToEnd();
     }
 
-    /// Append using std.fmt-style formatting.
     pub fn appendFmt(self: *RichLog, io: std.Io, level: Level, comptime fmt: []const u8, args: anytype) !void {
         const formatted = try std.fmt.allocPrint(self.allocator, fmt, args);
         defer self.allocator.free(formatted);
@@ -303,7 +283,6 @@ pub const RichLog = struct {
             try w.writeByte(' ');
         }
 
-        // Render text with optional search highlighting.
         if (self.search_term.items.len == 0) {
             const styled = try self.text_style.render(allocator, entry.text);
             defer allocator.free(styled);
@@ -337,7 +316,6 @@ pub const RichLog = struct {
 
 fn formatTimestamp(allocator: std.mem.Allocator, ns: i128) ![]u8 {
     const seconds_total: i64 = @intCast(@divTrunc(ns, std.time.ns_per_s));
-    // HH:MM:SS in UTC.
     const sec_in_day: u32 = @intCast(@mod(seconds_total, 86400));
     const hh = sec_in_day / 3600;
     const mm = (sec_in_day % 3600) / 60;
@@ -390,7 +368,6 @@ test "follow mode auto-scrolls" {
         try log.appendFmt(std.testing.io, .info, "line {d}", .{i});
     }
     try log.refresh();
-    // Last two entries should fit; offset should be 3.
     try std.testing.expectEqual(@as(usize, 3), log.y_offset);
 }
 

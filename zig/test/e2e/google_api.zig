@@ -52,7 +52,6 @@ test "google e2e: generative ai (cheap model)" {
         compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
-    // Allow detached provider thread to complete deferred cleanup
     compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {

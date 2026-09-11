@@ -1,5 +1,3 @@
-//! Keybinding management component.
-//! Provides structured key binding definitions with matching and help integration.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -9,20 +7,17 @@ const KeyEvent = keys.KeyEvent;
 const Modifiers = keys.Modifiers;
 const Help = @import("help.zig").Help;
 
-/// A single key binding with description and enabled state
 pub const KeyBinding = struct {
     key_event: KeyEvent,
     description: []const u8,
     short_desc: ?[]const u8 = null,
     enabled: bool = true,
 
-    /// Check if a key event matches this binding
     pub fn matches(self: *const KeyBinding, event: KeyEvent) bool {
         if (!self.enabled) return false;
         return self.key_event.eql(event);
     }
 
-    /// Get a display string for the key
     pub fn keyDisplay(self: *const KeyBinding, allocator: std.mem.Allocator) ![]const u8 {
         var result: Writer.Allocating = .init(allocator);
         const writer = &result.writer;
@@ -45,7 +40,6 @@ pub const KeyBinding = struct {
     }
 };
 
-/// A collection of key bindings with matching and management
 pub const KeyMap = struct {
     bindings: std.array_list.Managed(KeyBinding),
 
@@ -59,12 +53,10 @@ pub const KeyMap = struct {
         self.bindings.deinit();
     }
 
-    /// Add a key binding
     pub fn add(self: *KeyMap, binding: KeyBinding) !void {
         try self.bindings.append(binding);
     }
 
-    /// Add a simple character binding
     pub fn addChar(self: *KeyMap, c: u21, description: []const u8) !void {
         try self.bindings.append(.{
             .key_event = KeyEvent.char(c),
@@ -72,7 +64,6 @@ pub const KeyMap = struct {
         });
     }
 
-    /// Add a ctrl+character binding
     pub fn addCtrl(self: *KeyMap, c: u21, description: []const u8) !void {
         try self.bindings.append(.{
             .key_event = KeyEvent.ctrl(c),
@@ -80,7 +71,6 @@ pub const KeyMap = struct {
         });
     }
 
-    /// Find the first matching binding for an event
     pub fn match(self: *const KeyMap, event: KeyEvent) ?*const KeyBinding {
         for (self.bindings.items) |*binding| {
             if (binding.matches(event)) return binding;
@@ -88,7 +78,6 @@ pub const KeyMap = struct {
         return null;
     }
 
-    /// Enable or disable a binding by description
     pub fn setEnabled(self: *KeyMap, description: []const u8, enabled: bool) void {
         for (self.bindings.items) |*binding| {
             if (std.mem.eql(u8, binding.description, description)) {
@@ -97,7 +86,6 @@ pub const KeyMap = struct {
         }
     }
 
-    /// Convert to Help.Binding format for use with Help component
     pub fn toHelpBindings(self: *const KeyMap, allocator: std.mem.Allocator) ![]Help.Binding {
         var result = std.array_list.Managed(Help.Binding).init(allocator);
         for (self.bindings.items) |*binding| {

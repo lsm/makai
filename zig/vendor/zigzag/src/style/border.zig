@@ -1,11 +1,8 @@
-//! Border styles for terminal UI elements.
-//! Provides various border character sets and drawing functions.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 const measure = @import("../layout/measure.zig");
 
-/// Border character set
 pub const BorderChars = struct {
     top_left: []const u8,
     top_right: []const u8,
@@ -19,7 +16,6 @@ pub const BorderChars = struct {
     middle_bottom: []const u8,
     cross: []const u8,
 
-    /// No border
     pub const none = BorderChars{
         .top_left = "",
         .top_right = "",
@@ -34,7 +30,6 @@ pub const BorderChars = struct {
         .cross = "",
     };
 
-    /// Normal single-line border
     pub const normal = BorderChars{
         .top_left = "┌",
         .top_right = "┐",
@@ -49,7 +44,6 @@ pub const BorderChars = struct {
         .cross = "┼",
     };
 
-    /// Rounded corners
     pub const rounded = BorderChars{
         .top_left = "╭",
         .top_right = "╮",
@@ -64,7 +58,6 @@ pub const BorderChars = struct {
         .cross = "┼",
     };
 
-    /// Double-line border
     pub const double = BorderChars{
         .top_left = "╔",
         .top_right = "╗",
@@ -79,7 +72,6 @@ pub const BorderChars = struct {
         .cross = "╬",
     };
 
-    /// Thick/bold border
     pub const thick = BorderChars{
         .top_left = "┏",
         .top_right = "┓",
@@ -94,7 +86,6 @@ pub const BorderChars = struct {
         .cross = "╋",
     };
 
-    /// ASCII-only border (compatible with all terminals)
     pub const ascii = BorderChars{
         .top_left = "+",
         .top_right = "+",
@@ -109,7 +100,6 @@ pub const BorderChars = struct {
         .cross = "+",
     };
 
-    /// Block border using full block characters
     pub const block = BorderChars{
         .top_left = "█",
         .top_right = "█",
@@ -124,7 +114,6 @@ pub const BorderChars = struct {
         .cross = "█",
     };
 
-    /// Hidden border (uses spaces)
     pub const hidden = BorderChars{
         .top_left = " ",
         .top_right = " ",
@@ -139,7 +128,6 @@ pub const BorderChars = struct {
         .cross = " ",
     };
 
-    /// Dashed border
     pub const dashed = BorderChars{
         .top_left = "┌",
         .top_right = "┐",
@@ -154,7 +142,6 @@ pub const BorderChars = struct {
         .cross = "┼",
     };
 
-    /// Dotted border
     pub const dotted = BorderChars{
         .top_left = "┌",
         .top_right = "┐",
@@ -169,7 +156,6 @@ pub const BorderChars = struct {
         .cross = "┼",
     };
 
-    /// Inner half block border (uses inner half-block characters)
     pub const inner_half_block = BorderChars{
         .top_left = "▗",
         .top_right = "▖",
@@ -184,7 +170,6 @@ pub const BorderChars = struct {
         .cross = "█",
     };
 
-    /// Outer half block border (uses outer half-block characters)
     pub const outer_half_block = BorderChars{
         .top_left = "▛",
         .top_right = "▜",
@@ -199,7 +184,6 @@ pub const BorderChars = struct {
         .cross = "█",
     };
 
-    /// Markdown-style border (uses pipe and dashes)
     pub const markdown = BorderChars{
         .top_left = "|",
         .top_right = "|",
@@ -215,7 +199,6 @@ pub const BorderChars = struct {
     };
 };
 
-/// Sides specification for borders
 pub const Sides = struct {
     top: bool = true,
     right: bool = true,
@@ -232,7 +215,6 @@ pub const Sides = struct {
     pub const none = Sides{ .top = false, .right = false, .bottom = false, .left = false };
 };
 
-/// Draw a border around content
 pub fn drawBorder(
     allocator: std.mem.Allocator,
     content: []const u8,
@@ -246,7 +228,6 @@ pub fn drawBorder(
 
     const inner_width = if (sides.left and sides.right) width -| 2 else if (sides.left or sides.right) width -| 1 else width;
 
-    // Top border
     if (sides.top) {
         if (sides.left) try writer.writeAll(chars.top_left);
         for (0..inner_width) |_| {
@@ -256,13 +237,11 @@ pub fn drawBorder(
         try writer.writeByte('\n');
     }
 
-    // Content lines with side borders
     var lines = std.mem.splitScalar(u8, content, '\n');
     var line_count: usize = 0;
     while (lines.next()) |line| : (line_count += 1) {
         if (sides.left) try writer.writeAll(chars.vertical);
 
-        // Write the line, padding to inner_width
         const visible_width = visibleWidth(line);
         try writer.writeAll(line);
         if (visible_width < inner_width) {
@@ -275,7 +254,6 @@ pub fn drawBorder(
         try writer.writeByte('\n');
     }
 
-    // Pad remaining lines if needed
     while (line_count < height -| (if (sides.top) @as(usize, 1) else 0) -| (if (sides.bottom) @as(usize, 1) else 0)) : (line_count += 1) {
         if (sides.left) try writer.writeAll(chars.vertical);
         for (0..inner_width) |_| {
@@ -285,7 +263,6 @@ pub fn drawBorder(
         try writer.writeByte('\n');
     }
 
-    // Bottom border
     if (sides.bottom) {
         if (sides.left) try writer.writeAll(chars.bottom_left);
         for (0..inner_width) |_| {
@@ -297,7 +274,6 @@ pub fn drawBorder(
     return result.toOwnedSlice();
 }
 
-/// Calculate visible width (excluding ANSI sequences), with proper Unicode width.
 fn visibleWidth(str: []const u8) usize {
     return measure.width(str);
 }
