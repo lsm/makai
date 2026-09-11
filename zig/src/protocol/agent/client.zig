@@ -331,6 +331,10 @@ pub const AgentProtocolClient = struct {
         return self.startSession(sid, config_json, system_prompt, false);
     }
 
+    pub fn sendAgentStartWithSessionExclusive(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
+        return self.startSession(sid, config_json, system_prompt, true);
+    }
+
     fn startSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8, id_exclusive: bool) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
 
@@ -5133,6 +5137,30 @@ test "AgentProtocolClient stop probe requires an exclusive registration's correl
     const generated = try admitExclusiveSession(&harness);
     _ = try client.sendAgentMessage(generated, "{\"m\":1}", null);
     try std.testing.expect((try client.sendAgentStopProbing(generated, "timeout")) != null);
+}
+
+test "AgentProtocolClient exclusive caller-supplied start admits the session (#210 gap 7)" {
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSessionExclusive(sid, "{}", null);
+    var started = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started.deinit(std.testing.allocator);
+    try client.processEnvelope(started);
+    try std.testing.expect(client.isSessionAdmitted(sid));
+
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    try std.testing.expect((try client.sendAgentStopProbing(sid, "timeout")) != null);
 }
 
 test "AgentProtocolClient stop probe requires a recorded message send (#210 gap 7)" {

@@ -669,7 +669,7 @@ pub const TuiRuntime = struct {
                 const system_prompt = try self.workspaceSystemPrompt();
                 defer self.allocator.free(system_prompt);
                 const sid = agent_protocol_types.generateSessionId();
-                _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
+                _ = try client.sendAgentStartWithSessionExclusive(sid, config_json, system_prompt);
                 self.remote_pending_session_id = sid;
                 self.remote_client = client;
                 client_moved = true;
@@ -1672,7 +1672,7 @@ pub const TuiRuntime = struct {
             const system_prompt = try self.workspaceSystemPrompt();
             defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
+            _ = try client.sendAgentStartWithSessionExclusive(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
         }
         const timeout_ns = self.remote_session_timeout_ms * std.time.ns_per_ms;
@@ -1834,7 +1834,7 @@ pub const TuiRuntime = struct {
             const system_prompt = try self.workspaceSystemPrompt();
             defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
+            _ = try client.sendAgentStartWithSessionExclusive(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
             return;
         }
@@ -5732,6 +5732,36 @@ test "cancel after receive disconnect defers SSE reconnect to before the next se
     try std.testing.expectError(error.RemoteAgentStartFailed, runtime.ensureRemoteSession());
     try std.testing.expect(!runtime.remote_sse_reconnect_needed);
     try std.testing.expectEqual(writes_before + 1, mock.writes.items.len);
+}
+
+test "remote teardown stop probe arms through the admitted registration within a bounded driver budget" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    var start_env = try agent_envelope.deserializeEnvelope(mock.writes.items[0], std.testing.allocator);
+    defer start_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_env.message_id,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    try runtime.ensureRemoteSession();
+    const client = &(runtime.remote_client orelse unreachable);
+    try std.testing.expect(client.isSessionAdmitted(runtime.remote_session_id.?));
+
+    _ = try tui_session.submitTurn("turn");
+    try std.testing.expect((try client.sendAgentStopProbing(sid, "teardown")) != null);
+    try std.testing.expect(client.hasActiveStopProbe(sid));
+
+    runtime.driveRemoteStopProbe(client, sid);
+    try std.testing.expect(client.hasActiveStopProbe(sid));
 }
 
 test "remote submit pump failure completes stream" {
