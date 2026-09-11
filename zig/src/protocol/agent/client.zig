@@ -340,10 +340,13 @@ pub const AgentProtocolClient = struct {
         });
         defer self.allocator.free(start_json);
         const prior_admission = self.admitted_by_session.get(sid);
-        try self.admitted_by_session.put(sid, .{ .exclusive_id = id_exclusive });
         const prior_epoch = self.trackerEpoch(sid);
         try self.setTrackerValue(sid, seq + 1);
         self.sequence = seq; // compatibility mirror
+        self.admitted_by_session.put(sid, .{ .exclusive_id = id_exclusive }) catch |err| {
+            self.restoreTrackerState(sid, seq, prior_epoch);
+            return err;
+        };
         self.recordPendingSend(sid, msg_id, seq, .start, seq, 0) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
             self.restoreTrackerState(sid, seq, prior_epoch);
@@ -1119,6 +1122,7 @@ pub const AgentProtocolClient = struct {
         }
 
         const rejected = list.items[index];
+        if (rejected.kind == .start) _ = self.admitted_by_session.remove(session_id);
         // A rejected RESYNCING stop's pre-resync prior joins the session's
         // revert bound BEFORE the record leaves the list: the store is
         // fallible, and a failure after the removal would strand the
@@ -4526,6 +4530,35 @@ test "AgentProtocolClient admission evidence requires an exclusive id's own corr
     defer stopped_env.deinit(allocator);
     try client.processEnvelope(stopped_env);
     try std.testing.expect(!client.isSessionAdmitted(sid4));
+}
+
+test "AgentProtocolClient rejected start retires its admission reservation (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null);
+    try std.testing.expect(client.admitted_by_session.get(sid) != null);
+
+    var busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already exists") } },
+    };
+    defer busy.deinit(allocator);
+    try client.processEnvelope(busy);
+
+    try std.testing.expect(client.admitted_by_session.get(sid) == null);
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+    if (client.pending_sends_by_session.get(sid)) |pending| {
+        try std.testing.expectEqual(@as(usize, 0), pending.items.len);
+    }
 }
 
 test "AgentProtocolClient stale correlated agent_error does not fail the live session (#210 gap 7)" {
