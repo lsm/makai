@@ -1135,9 +1135,9 @@ Rules:
   counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
-  silently). Slices to follow in the series:
-  the pending-record lifecycle and stale-reply guards, the bounded stop probe
-  for unknown outcomes, and the TUI teardown integration
+  silently). The pending-record lifecycle and stale-reply guards, and the
+  bounded stop probe for unknown outcomes (§13.4.1), are landed; the TUI
+  teardown integration remains in the series
   (`[in progress — #210 gap 7 re-sliced from #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
@@ -1408,10 +1408,26 @@ server eviction (rule 6), and holds no transcript and no persistence.
    or the acceptance may have failed with the counter rolled back to its
    PRE-SEND value. A cleanup stop therefore tries the pre-send sequence and, if
    rejected with a correlated `invalid_request`, the post-send value; acceptance
-   at either settles cleanup. Both current clients advance before the outcome is
-   known and send only the advanced value, so their cleanup stop fails in the
-   rolled-back case and the owned session leaks indefinitely; the fix (probing,
-   or rollback/explicit-sequence control) is `[planned — #210 gap 7]`. A start
+   at either settles cleanup. The tracker advances before the outcome is known,
+   so a cleanup stop sent only at the advanced value fails in the rolled-back
+   case and leaks the owned session indefinitely; a probing client instead walks
+   a bounded, DISCRETE, ascending candidate set of the counter states its
+   unresolved sends can still occupy — the floor (the lowest such state: the
+   minimum sequence and pre-send value across the unresolved `agent_message`
+   sends and the tracker, raised to the session's proven floor), one past each
+   unresolved message's sequence, every tracked send's pre-send high-water, and
+   the tracker. The set is never a dense interval: long-lived settled traffic
+   can leave the true counter far above the floor, and sweeping every
+   intervening integer would outlive any bounded teardown driver. Each
+   correlated `invalid_request` advances to the next candidate — one stop per
+   candidate — `agent_not_found` or `session_expired` ends the probe as
+   session-gone, and exhausting the set retires it; probe replies are cleanup
+   mechanics and MUST NOT surface as run errors. Probing requires §6.1
+   ownership evidence: an exclusive client-generated id whose
+   request-correlated `agent_started` this client observed. Without that
+   evidence, or with no recorded `agent_message` whose outcome is unresolved, a
+   client MUST send nothing and leak the registration to the idle TTL rather
+   than risk stopping a foreign session (`[current — #210 gap 7]`). A start
    rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
