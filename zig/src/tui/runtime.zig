@@ -308,6 +308,7 @@ pub const TuiRuntime = struct {
     remote_pending_session_id: ?agent_protocol_types.SessionId = null,
     remote_error_emitted: bool = false,
     remote_reconnect_attempted: bool = false,
+    remote_sse_reconnect_needed: bool = false,
     remote_session_timeout_ms: u64 = 5_000,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
@@ -675,6 +676,7 @@ pub const TuiRuntime = struct {
                 self.started = true;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
+                self.remote_sse_reconnect_needed = false;
                 self.pumpRemoteIncoming() catch |err| {
                     // Cancel the WebSocket reader before closing the sender so the
                     // close path cannot clear buffers while receive() is using them.
@@ -732,7 +734,12 @@ pub const TuiRuntime = struct {
         if (self.remote_client) |*client| {
             const stop_sid = self.remote_session_id orelse self.remote_pending_session_id;
             if (stop_sid) |sid| {
-                _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                if (client.sendAgentStopProbing(sid, "client disconnect")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                    }
+                } else |_| {}
+                self.driveRemoteStopProbe(client, sid);
                 client.removeSessionState(sid);
             }
             // Cancel and join the WebSocket reader before closing the sender so
@@ -908,9 +915,10 @@ pub const TuiRuntime = struct {
                 };
                 try self.remote_messages.append(self.allocator, user_message);
                 message_appended = true;
+                const submitted_index = self.remote_messages.items.len - 1;
                 var message_sent = false;
                 errdefer if (!message_sent) {
-                    var mutable = self.remote_messages.pop().?;
+                    var mutable = self.remote_messages.orderedRemove(submitted_index);
                     mutable.deinit(self.allocator);
                 };
                 try self.sendRemoteMessages(self.remote_messages.items, true);
@@ -1089,8 +1097,13 @@ pub const TuiRuntime = struct {
         if (self.local_agent) |*local| local.abort();
         if (self.remote_client) |*client| {
             if (self.remote_session_id orelse self.remote_pending_session_id) |sid| {
-                _ = client.sendAgentStop(sid, "cancelled") catch {};
-                self.pumpRemoteIncoming() catch {};
+                if (client.sendAgentStopProbing(sid, "cancelled")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(sid, "cancelled") catch {};
+                    }
+                } else |_| {}
+                self.pumpRemoteIncomingForTeardown();
+                self.driveRemoteStopProbe(client, sid);
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);
                 self.remote_session_id = null;
@@ -1418,6 +1431,37 @@ pub const TuiRuntime = struct {
         return out;
     }
 
+    fn driveRemoteStopProbe(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient, sid: agent_protocol_types.SessionId) void {
+        const deadline_ns = (compat.time.monotonicNanos() catch return) + 150 * std.time.ns_per_ms;
+        while (client.hasActiveStopProbe(sid)) {
+            self.pumpRemoteIncomingForTeardown();
+            if (!client.hasActiveStopProbe(sid)) break;
+            const now_ns = compat.time.monotonicNanos() catch break;
+            if (now_ns >= deadline_ns) break;
+            compat.time.sleepNs(5 * std.time.ns_per_ms);
+        }
+    }
+
+    fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) void {
+        var receiver = &(self.remote_receiver orelse return);
+        const client = &(self.remote_client orelse return);
+        switch (receiver.read(self.allocator) catch return) {
+            .line => |line| {
+                defer self.allocator.free(line);
+                var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return;
+                defer env.deinit(self.allocator);
+                if (env.version != 1) return;
+                client.processEnvelope(env) catch return;
+                self.drainRemoteClientEvents(client) catch return;
+                self.syncRemoteSessionFromClient(client) catch return;
+            },
+            .pending => {},
+            .disconnected => {
+                self.remote_sse_reconnect_needed = true;
+            },
+        }
+    }
+
     fn pumpRemoteIncoming(self: *TuiRuntime) !void {
         var receiver = &(self.remote_receiver orelse return error.NoRemoteTransportConfigured);
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
@@ -1432,8 +1476,8 @@ pub const TuiRuntime = struct {
                     defer env.deinit(self.allocator);
                     if (env.version != 1) return error.ProtocolVersionMismatch;
                     try client.processEnvelope(env);
-                    try self.syncRemoteSessionFromClient(client);
                     try self.drainRemoteClientEvents(client);
+                    try self.syncRemoteSessionFromClient(client);
                 },
                 .pending => return,
                 .disconnected => {
@@ -1482,7 +1526,7 @@ pub const TuiRuntime = struct {
         if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection(false);
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
-        var sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+        const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
         const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), messages, self.remoteSerializableTools());
         defer self.allocator.free(message_json);
         self.resetEventStreamForTurn();
@@ -1499,22 +1543,31 @@ pub const TuiRuntime = struct {
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
 
-        var reconnected_once = false;
-        while (true) {
-            const result = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
-                const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
-                if (self.remote_config_websocket_owned and reconnectable and !reconnected_once) {
-                    reconnected_once = true;
-                    try self.ensureRemoteWebSocketConnection(true);
-                    try self.ensureRemoteSession();
-                    sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
-                    continue;
-                }
-                return err;
-            };
-            _ = result;
-            break;
-        }
+        _ = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
+            const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
+            if (self.remote_config_websocket_owned and reconnectable) {
+                const old_sid = sid;
+                self.clearWebSocketRemote();
+                self.reconnectWebSocketRemote() catch {
+                    client.sender = null;
+                    client.removeSessionState(old_sid);
+                    self.remote_session_id = null;
+                    self.remote_pending_session_id = null;
+                    return err;
+                };
+                client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
+                if (client.sendAgentStopProbing(old_sid, "send failed")) |probe_id| {
+                    if (probe_id == null) {
+                        _ = client.sendAgentStop(old_sid, "send failed") catch {};
+                    }
+                } else |_| {}
+                self.driveRemoteStopProbe(client, old_sid);
+                client.removeSessionState(old_sid);
+                self.remote_session_id = null;
+                self.remote_pending_session_id = null;
+            }
+            return err;
+        };
 
         if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {
@@ -1605,6 +1658,12 @@ pub const TuiRuntime = struct {
     }
 
     fn ensureRemoteSession(self: *TuiRuntime) !void {
+        if (self.remote_sse_reconnect_needed) {
+            if (self.remote_config_sse_client) |sse_client| {
+                try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+            }
+            self.remote_sse_reconnect_needed = false;
+        }
         if (self.remote_session_id != null) return;
         if (self.remote_pending_session_id == null) {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
@@ -4018,6 +4077,7 @@ const RemoteMock = struct {
     disconnected: bool = false,
     sender_closed: bool = false,
     receiver_closed: bool = false,
+    fail_writes: bool = false,
 
     fn init() RemoteMock {
         return .{ .writes = std.ArrayList([]u8).empty, .reads = std.ArrayList([]u8).empty };
@@ -4040,6 +4100,7 @@ const RemoteMock = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *RemoteMock = @ptrCast(@alignCast(ctx));
+        if (self.fail_writes) return error.BrokenPipe;
         try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
     }
 
@@ -5000,6 +5061,73 @@ test "remote manual submit waits for terminal result after agent_end" {
     try std.testing.expect(!runtime.remote_turn_in_flight);
 }
 
+test "remote reconnect failure after a broken send defangs the client and drops the dead session" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try runtime.ensureRemoteSession();
+
+    runtime.remote_config_websocket_owned = true;
+    const ws_client = try std.testing.allocator.create(websocket_transport.WebSocketClient);
+    ws_client.* = websocket_transport.WebSocketClient.init(std.testing.allocator);
+    runtime.websocket_client = ws_client;
+    mock.fail_writes = true;
+    try std.testing.expectError(error.BrokenPipe, tui_session.submitTurn("turn"));
+
+    try std.testing.expect(runtime.remote_client.?.sender == null);
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+
+    mock.fail_writes = false;
+    tui_session.cancel();
+}
+
+test "remote correlated agent_not_found surfaces the error before the session state is dropped" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try tui_session.submitTurn("running");
+    try std.testing.expect(runtime.remote_turn_in_flight);
+
+    const sid = runtime.remote_session_id.?;
+    var message_env = try agent_envelope.deserializeEnvelope(mock.writes.items[1], std.testing.allocator);
+    defer message_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = message_env.message_id,
+        .timestamp = 0,
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+    });
+    _ = tui_session.streamEvents();
+
+    try std.testing.expect(!runtime.remote_turn_in_flight);
+    try std.testing.expect(runtime.event_stream.isDone());
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expectError(error.RemoteAgentStartFailed, tui_session.submitTurn("next"));
+}
+
 test "remote pumps terminal result without queued work" {
     var mock = RemoteMock.init();
     defer mock.deinit(std.testing.allocator);
@@ -5560,6 +5688,50 @@ test "remote disconnect attempts reconnect then emits terminal error" {
         if (ev == .agent_end and ev.agent_end.reason == .@"error") saw_error_end = true;
     }
     try std.testing.expect(saw_error_end);
+}
+
+test "cancel after receive disconnect defers SSE reconnect to before the next session registration" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    try runtime.ensureRemoteSession();
+    try std.testing.expect(!runtime.remote_sse_reconnect_needed);
+
+    mock.disconnected = true;
+    runtime.cancel();
+    try std.testing.expect(runtime.remote_sse_reconnect_needed);
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+    try std.testing.expect(runtime.started);
+
+    mock.disconnected = false;
+    const sse_client = try std.testing.allocator.create(sse_transport.SseHttpClient);
+    sse_client.* = sse_transport.SseHttpClient.init(std.testing.allocator);
+    runtime.remote_config_sse_client = sse_client;
+    const writes_before = mock.writes.items.len;
+    try std.testing.expectError(error.InvalidUrl, runtime.ensureRemoteSession());
+    try std.testing.expectEqual(writes_before, mock.writes.items.len);
+    try std.testing.expect(runtime.remote_sse_reconnect_needed);
+    try std.testing.expect(runtime.remote_pending_session_id == null);
+
+    runtime.remote_config_sse_client = null;
+    sse_client.deinit();
+    std.testing.allocator.destroy(sse_client);
+    runtime.remote_session_timeout_ms = 1;
+    try std.testing.expectError(error.RemoteAgentStartFailed, runtime.ensureRemoteSession());
+    try std.testing.expect(!runtime.remote_sse_reconnect_needed);
+    try std.testing.expectEqual(writes_before + 1, mock.writes.items.len);
 }
 
 test "remote submit pump failure completes stream" {
