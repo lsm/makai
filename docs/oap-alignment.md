@@ -18,9 +18,16 @@ Frame Routing, V1.1") defines the semantics summarized here.
   session-lifecycle pass itself was verified against `67ad514`
   ("fix(agent): send agent_stop on session teardown — terminal, error, and
   auth-retry paths (#200)"). The §13.1/§13.5 wire-key (rename) claims pin to the
-  #198 rename's landing on `main` (the rename PR; update this pin with its merge
-  sha on landing). Every `[current]` claim in §13 and every status
-  below was verified against one of these revisions.
+  #198 rename's landing on `main` — PR #211, merged as `65a28fb`
+  ("fix(agent): rename agent_start payload key resume_session_id → session_id
+  (#198)"). The §13.1 client-side sequence-discipline and §13.4.1
+  cleanup-probing claims pin to the gap-7 client sequence-control slices landed
+  on `main`: the TS SDK half PR #215 (`ec2bc2d`), and the Zig client slices S1
+  `2efce28` (#216), S2a `f578903` (#218), S2b-1 `560f635` (#226), S2b-2
+  `a8a6c07` (#227), S2b-3 `8925a8c` (#231), S3 `e4c568b` (#232), S4 `f5fd0b5`
+  (#239), S5 `d61f6dd` (#240) — every slice of the series has landed. Every
+  `[current]` claim in §13 and every status below was verified against one of
+  these revisions.
 - OAP references:
   - Decision 0001 — "Agent-Control v0.1 Executable Core" (accepted 2026-09-06):
     typed identity domains, one-foreground-run-per-session, deterministic run event
@@ -55,9 +62,9 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 
 | OAP term | Makai construct | Status | Notes |
 | --- | --- | --- | --- |
-| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias (both makai clients emit it transitionally alongside the canonical key for the same reason). |
+| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias (both makai clients emit it transitionally alongside the canonical key for the same reason). Idle-TTL eviction is silent and no frame carries a registration generation, so a reused id's holder is not provable from the wire — `RESIDUAL-1`; the session-gone answer's own attribution is `RESIDUAL-2`. |
 | endpoint / participant identity | none | deviating: no endpoint or participant exists to address | Required for OAP initialization and reverse-interaction ownership; a makai introduction needs its own spec pass. |
-| `submission_id` / `run_id` split | none — one `agent_message` per run in SDK usage | absent by design (v1) | No admission receipt: `agent_message` has no synchronous reply. A run is identified operationally by `(session_id, settlement frame)`. Candidate future revision if the adapter needs stable run identity; nothing queued. |
+| `submission_id` / `run_id` split | none — one `agent_message` per run in SDK usage | absent by design (v1) | No admission receipt: `agent_message` has no synchronous reply. A run is identified operationally by `(session_id, settlement frame)`. Candidate future revision if the adapter needs stable run identity; nothing queued. The absence is load-bearing: `agent_result` carries no run identity, so settlement-based bookkeeping attributes a settlement by insertion order — `RESIDUAL-5`. |
 | `message_id` / `in_reply_to` / `sequence` | envelope fields of the same names | aligned (`in_reply_to`), deviating: sequence scope (see identity table) | Per §13.1/§13.3. |
 | monotonic outbound `sequence` across ALL server frames | allocated frames draw the per-session counter; echo replies (`session_info`, `pong`, `tool_list_response`) copy the request's inbound sequence verbatim and request-validation `agent_error` envelopes carry `sequence: 0` | deviating: permanent — echo replies | Decision (b) of #204: the echo is kept deliberately. It is a correlation echo (a consumer can match a reply to its request by sequence without `in_reply_to`), not an ordering allocation; re-allocating echo replies from the per-session counter (option (a)) would break any consumer relying on that echo and buy only cross-class monotonicity, which consumers are already forbidden to assume (§13.1: "consumers MUST NOT order echo replies against allocated frames by sequence"). Adapters renumber per OAP run sequence from native receive order and never order echo replies by sequence. |
 | admission (`session.message.submit.response` before stream) | server ACCEPTS `agent_message` by enqueueing it; rejected writes (unknown session / bad sequence / `.processing`) return a request-correlated validation `agent_error` and admit nothing | deviating: no admission receipt | OAP separates "the endpoint accepted the submission" from execution; makai acceptance has no positive frame — observable only through subsequent run output on an EXCLUSIVE, quiescent route (shared/reused-id output is uncorrelated and can belong to another run, §13.3.2) or the PROBABILISTIC absence of a correlated rejection (an allocation failure in the acceptance path escapes without one), so adapters MUST bound waits and treat expiry as an unknown outcome (§13.4.1/§13.4.6). |
@@ -75,9 +82,46 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | process exit before settlement | transport rejects the registered frame wait; reads queued behind the transport read lock surface the death as their response timeout; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule; adapters must keep timeout handling for lock-queued reads rather than expecting prompt rejection for every concurrent request. |
 | stdin EOF while a run waits on a distributed `tool_result` | the host latches the disconnect; the wait fails with a typed error and the run settles through the failure pair (`tool_execution_error` settlement), then the process drains and exits | aligned (#210 gap 4) | §13.2.7 rule 7: EOF-cancel applies to the tool-waiting case — the tool host IS the disconnected client. A `tool_result` delivered before EOF wins its wait (checked before the latch); a run needing client input after EOF settles failed, never success (§13.4.6), with pending tool requests dropped unpublished; provider-executing runs keep being pumped toward settlement until they need client input. Late frames from the cancelled run settle nothing — the pump's disconnect classification publishes the failure pair once and the run is removed, working with (not around) the §13.4.5 generation guard. |
 
-## P0 makai follow-ups (queued)
+## Documented residuals
 
-These implement the `[planned]` rules of spec §13; each lands as its own PR:
+The residual classes accumulated by gap 7 (#210) and its neighbours. Grep
+`RESIDUAL-` for the full set. Most are unresolvable on the wire: no frame
+carries a registration or run generation (spec §13.4.5), so the paired
+situations there are indistinguishable at a client's inputs, only the
+generation tokens of a future wire revision close them, and adapters MUST treat
+them as documented uncertainty rather than protocol guarantees. Two entries are
+different in kind, and both are recorded because mishandling them is silent:
+`RESIDUAL-2` is already locally solvable from `in_reply_to`, and `RESIDUAL-6` is
+a mechanism-COVERAGE gap — a landed reconciliation not yet applied on one
+transport — fixable with no wire change at all.
+
+| Residual | Spec | What cannot be told apart | Recorded mitigation |
+| --- | --- | --- | --- |
+| `RESIDUAL-1` stale admission after a silent TTL eviction | §6.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §6.1's admission evidence bounds the teardown stop's blast radius: an exclusive client-generated id is the only sufficient form until generation tokens exist, and it qualifies only while the client has not allowed that id to be removed and re-registered. |
+| `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Locally resolvable, NOT wire-bound: a session-gone answer carries `in_reply_to` naming the exact request, so it is attributable IF the sender kept per-request registration provenance. A purely id-keyed pending list cannot tell the old registration's delayed answer from the current registration's own — the first delayed `agent_not_found` matches the still-registered record and clears state the re-registration just established. | Tag pending sends with the registration epoch and discard a reply whose epoch predates the id's re-registration. The Zig client approximates this by clearing the session's pending-send list together with its counter/control state on a session-gone answer, so a later copy matches nothing; the id-keyed store is a local bookkeeping limit, not a wire gap. |
+| `RESIDUAL-3` stale trailing output misattributed to a reused id | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. The hazard is not marker bookkeeping: when the stale frame is an `agent_result` the attempt parses and RETURNS the previous run's response, and stale events can be yielded on the `stream()` path — wrong returned data, not merely a missed acceptance signal. | The alternative is not "no leak": leaving the marker set routes teardown through `stopAgentWithSequenceProbe`, so the trade is one extra bounded probe against a wrong-result hazard — and the clear is kept, both because returned data must come from this attempt and because the probe is the marker's own consumer. Closing it needs an identity the wire lacks (run identity on the settlement frame, `RESIDUAL-5`'s remedy). |
+| `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's failure-pair teardown AWAITS a single immediate-pass drain of the queued backlog before the id is reused; its abort paths (`drain: "background"` in `run()`/`stream()`) deliberately leave the same drain running un-awaited, so a same-id retry can register while it is still consuming the backlog and race it. The TUI's teardown pump does not close the window either: it consumes parked frames only while driving the probe (bounded, exiting the moment the probe settles) and performs no post-settlement drain. Not draining at all would reinstate the parked-output poisoning of the next same-id run, so this is a policy trade rather than a fix — the window closes only with the generation tokens. |
+| `RESIDUAL-5` settlement-based retirement needs run identity | §13.1, §13.3.2 | `agent_result` carries no run identity, so retiring the settled run's pending record attributes the settlement to the OLDEST pending message (insertion order) and the proven floor rises only to the minimum pending-message sequence + 1. | A mis-attribution errs toward surfacing a duplicate rather than swallowing a failure — the self-correcting direction; a run identity on the settlement frame would close it. |
+| `RESIDUAL-6` SSE ambiguous message writes unreconciled | §13.2.6 (TUI teardown) | On SSE, every failed `sendRemoteMessages` POST skips the ambiguous-write reconciliation — it is gated on the websocket-owned path — so BOTH failure modes leave an unknown admission outcome unreconciled: the partial write (`ConnectionFailed`, proves nothing) and the complete write whose response headers failed (`HttpPostFailed`, proves transmission). A later result can then arrive orphaned, and the next submission's rejection depends on which branch applied — the partial/no-delivery case (client advanced, server not) is rejected `invalid_request`, because the server compares the sequence against its expected value BEFORE the `.processing` state, while a fully-transmitted request whose run is still processing is rejected `agent_busy`. | Pre-existing coverage gap, unchanged by the TUI teardown — pre-teardown main did strictly less (returned the error with no probe and no session drop). The websocket case IS reconciled. Closing it needs the SSE ambiguity set decided (the two modes carry different evidence) and the probe-stop + session-drop factored into a shared helper; tracked in #242, not wire-bound. |
+
+`RESIDUAL-3` and `RESIDUAL-4` share the downstream-buffer shape the spec records
+at §6.1 and §13.4.5: frames already buffered downstream of a removed
+registration carry no generation and stay attributable to whatever registration
+holds the id next, so a drain's timing is a policy trade rather than a fix.
+`RESIDUAL-1` needs the same registration generation but NOT that buffering — no
+frame from the removed registration has to be parked: the id is re-registered
+before our next outbound message, whose counter matches the fresh registration's
+restart, so only ownership/generation evidence separates the two. `RESIDUAL-5`
+needs neither draining nor a registration generation — it can occur entirely
+within one live registration, with several message sends pending and an
+uncorrelated `agent_result` unable to say which run settled, so it needs run
+identity on the settlement frame.
+
+## P0 makai follow-ups
+
+These implemented the `[planned]` rules of spec §13, each as its own PR; the
+per-item status is the record of what landed. An item is still open exactly
+where its spec claims remain `[planned]`.
 
 1. #201 — LANDED: `in_reply_to`-aware frame routing in the transport (implements
    §13.3.1; `correlate` wait option, reply-queue parking for registered requests,
@@ -85,7 +129,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    pre-acceptance `agent_started` correlation check). Overlapping same-session
    calls now each receive their own replies; the pre-#201 modes (duplicate
    timing out, established run destroyed, wrong request proceeding) are closed.
-2. #204/#210 — server enforcement gaps the spec marks `[planned]`. LANDED (first
+2. #204/#210 — server enforcement gaps filed against §13's `[planned]` rules. LANDED (first
    slice, #209): envelope/payload session-id agreement rejection (all four
    session-scoped handlers plus the stdio host's stop validation), the
    echo-reply sequence decision — decision (b): echo kept as a permanent
@@ -132,14 +176,33 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    dropped); the outgoing-sequence counter update is no longer swallowed
    (no duplicate wire sequences); and a stop's reply fields are built
    BEFORE the session removal, with run cancellation + tool-bridge cleanup
-   running even when the reply's own publication fails. Still open:
-   gap 7 — client sequence control in BOTH clients — `AgentProtocolClient`
-   (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
-   (its tracker advances before the outcome is known) — where "control" includes
-   bounded probing of BOTH counter states after an uncorrelated outcome (pre-send,
-   then post-send on a correlated `invalid_request`): rollback alone is wrong when
-   the message was actually accepted and output was merely delayed or lost.
-   Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
+   running even when the reply's own publication fails. Gap 7 — client sequence
+   control in BOTH clients — is LANDED for the TypeScript SDK in #215 (merged
+   `ec2bc2d`): the tracker marks the `agent_message` send unresolved at send,
+   rolls back on a correlated rejection, and, while the outcome is unresolved,
+   tears down through `stopAgentWithSequenceProbe` — a bounded two-state probe
+   (pre-send stop, then the post-send value on a correlated `invalid_request`,
+   correlated reads, acceptance at either) awaited on the failure-pair path,
+   which then AWAITS a single immediate-pass drain of the queued backlog before
+   the id is reused. The abort paths (`drain: "background"` in `run()` and
+   `stream()`) deliberately leave that drain running un-awaited, so a same-id
+   retry can register while it is still consuming the backlog — the trade
+   RESIDUAL-4 records.
+   LANDED for the Zig client (S1 `2efce28`, S2a `f578903`, S2b-1/2/3
+   `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`, S4 `f5fd0b5`, S5 `d61f6dd`): the
+   `AgentProtocolClient` tracks every outstanding send, rolls the tracker back
+   MONOTONICALLY on a correlated `agent_error`/`nack` (an older unresolved
+   send's floor is never lost), drops the counter state on a correlated
+   `agent_not_found`/`session_expired`, never advances on stop sends, and
+   exposes the explicit-sequence control surface (`peekNextSequence`,
+   `sendAgentMessageWithSequence`, `sendAgentStopWithSequence`,
+   `sendAgentStopProbing`) alongside the S2b/S3 duplicate-evidence, ancestry,
+   proven-floor, and pending-record guards. The Zig client's own bounded
+   two-state stop probe landed in S4 `f5fd0b5` (#239), gated on §6.1 ownership
+   evidence and walking a discrete candidate set, and the TUI teardown
+   integration landed in S5 `d61f6dd` (#240). No gap-7 work remains open here.
+   Same-sequence retries and unknown-outcome cleanup are supported in both
+   clients (§13.1/§13.4.1).
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused
