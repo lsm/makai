@@ -917,10 +917,7 @@ pub const TuiRuntime = struct {
                 message_appended = true;
                 const submitted_index = self.remote_messages.items.len - 1;
                 var message_sent = false;
-                errdefer if (!message_sent) {
-                    var mutable = self.remote_messages.orderedRemove(submitted_index);
-                    mutable.deinit(self.allocator);
-                };
+                errdefer if (!message_sent) self.rollbackRemoteMessagesFrom(submitted_index);
                 try self.sendRemoteMessages(self.remote_messages.items, true);
                 message_sent = true;
             },
@@ -1602,15 +1599,19 @@ pub const TuiRuntime = struct {
         }
         var sent = false;
         const appended_index: ?usize = if (consumed_queue != null) self.remote_messages.items.len - 1 else null;
-        errdefer if (!sent and consumed_queue != null) {
-            var appended = self.remote_messages.orderedRemove(appended_index.?);
-            appended.deinit(self.allocator);
-        };
+        errdefer if (!sent and consumed_queue != null) self.rollbackRemoteMessagesFrom(appended_index.?);
         try self.sendRemoteMessages(self.remote_messages.items, consumed_queue != null);
         sent = true;
         if (consumed_queue) |queue| {
             var removed = queue.orderedRemove(0);
             removed.deinit(self.allocator);
+        }
+    }
+
+    fn rollbackRemoteMessagesFrom(self: *TuiRuntime, index: usize) void {
+        while (self.remote_messages.items.len > index) {
+            var extra = self.remote_messages.pop().?;
+            extra.deinit(self.allocator);
         }
     }
 
