@@ -599,7 +599,10 @@ pub const AgentProtocolClient = struct {
         reason_owned_by_map = true;
         candidates_owned_by_map = true;
 
-        self.writeEnvelopeJson(stop_json) catch {};
+        self.writeEnvelopeJson(stop_json) catch |err| {
+            self.retireStopProbe(session_id);
+            return err;
+        };
         return msg_id;
     }
 
@@ -883,6 +886,10 @@ pub const AgentProtocolClient = struct {
             list.deinit(self.allocator);
         }
         _ = self.admitted_by_session.remove(session_id);
+        self.retireStopProbe(session_id);
+    }
+
+    fn retireStopProbe(self: *Self, session_id: agent_types.SessionId) void {
         if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
             var probe = entry.value;
             probe.reason.deinit(self.allocator);
@@ -892,43 +899,31 @@ pub const AgentProtocolClient = struct {
 
     fn handleProbeReply(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !bool {
         const reply_to = in_reply_to orelse return false;
-        const probe = self.stop_probes_by_session.get(session_id) orelse return false;
+        const probe = self.stop_probes_by_session.getPtr(session_id) orelse return false;
         if (!std.mem.eql(u8, &reply_to, &probe.first_msg_id)) return false;
 
         const retry = probe.next_index < probe.candidates.len and (if (code) |c| c == .invalid_request else false);
         const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
-        const next_index = probe.next_index;
-        const candidates = probe.candidates;
-        var reason = probe.reason;
-        _ = self.stop_probes_by_session.remove(session_id);
-        var candidates_owned_here = true;
-        var reason_owned_here = true;
-        defer {
-            if (candidates_owned_here) self.allocator.free(candidates);
-            if (reason_owned_here) reason.deinit(self.allocator);
-        }
         if (retry) {
+            const next_index = probe.next_index;
             const retry_msg_id = agent_types.generateUlid();
             var retry_payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
             defer retry_payload.deinit(self.allocator);
-            retry_payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason.slice()));
+            retry_payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, probe.reason.slice()));
             const retry_json = try self.serializeEnvelopeForSend(.{
                 .session_id = session_id,
                 .message_id = retry_msg_id,
-                .sequence = candidates[next_index],
+                .sequence = probe.candidates[next_index],
                 .timestamp = compat.time.nowMillis(),
                 .payload = retry_payload,
             });
             defer self.allocator.free(retry_json);
-            try self.stop_probes_by_session.put(session_id, .{
-                .first_msg_id = retry_msg_id,
-                .candidates = candidates,
-                .next_index = next_index + 1,
-                .reason = reason,
-            });
-            candidates_owned_here = false;
-            reason_owned_here = false;
-            self.writeEnvelopeJson(retry_json) catch {};
+            probe.first_msg_id = retry_msg_id;
+            probe.next_index = next_index + 1;
+            self.writeEnvelopeJson(retry_json) catch |err| {
+                self.retireStopProbe(session_id);
+                return err;
+            };
         } else if (session_gone) {
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.proven_floor_by_session.remove(session_id);
@@ -5319,4 +5314,115 @@ test "AgentProtocolClient stop probe sweeps one-past each unresolved message (#2
     try rejectCorrelatedWithInvalidRequest(allocator, client, sid, third_stop.message_id);
     try std.testing.expectEqual(@as(usize, 6), harness.writes.items.len);
     try std.testing.expect(!client.hasActiveStopProbe(sid));
+}
+
+const FailingWriteSender = struct {
+    attempts: usize = 0,
+
+    fn writeFn(ctx: *anyopaque, _: []const u8) !void {
+        const self: *FailingWriteSender = @ptrCast(@alignCast(ctx));
+        self.attempts += 1;
+        return error.WriteFailed;
+    }
+
+    fn flushFn(_: *anyopaque) !void {}
+};
+
+fn failingSender(state: *FailingWriteSender) transport.AsyncSender {
+    return .{
+        .context = @ptrCast(state),
+        .write_fn = FailingWriteSender.writeFn,
+        .flush_fn = FailingWriteSender.flushFn,
+    };
+}
+
+test "AgentProtocolClient stop probe write failure retires the probe and stays retryable (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const writes_before = harness.writes.items.len;
+
+    var failing = FailingWriteSender{};
+    client.setSender(failingSender(&failing));
+    try std.testing.expectError(error.WriteFailed, client.sendAgentStopProbing(sid, "timeout"));
+    try std.testing.expectEqual(@as(usize, 1), failing.attempts);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(writes_before, harness.writes.items.len);
+
+    harness.wire();
+    _ = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    try std.testing.expect(client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(writes_before + 1, harness.writes.items.len);
+    var stop_env = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer stop_env.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), stop_env.sequence);
+}
+
+test "AgentProtocolClient rejected probe retry keeps the probe when the retry cannot be serialized (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    const writes_before = harness.writes.items.len;
+
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection.deinit(allocator);
+
+    client.sender = null;
+    try std.testing.expectError(error.NoSender, client.processEnvelope(rejection));
+    try std.testing.expect(client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(writes_before, harness.writes.items.len);
+
+    harness.wire();
+    try client.processEnvelope(rejection);
+    try std.testing.expectEqual(writes_before + 1, harness.writes.items.len);
+    var retry_stop = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer retry_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 3), retry_stop.sequence);
+}
+
+test "AgentProtocolClient stop probe retry write failure retires the probe and surfaces the error (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+
+    var failing = FailingWriteSender{};
+    client.setSender(failingSender(&failing));
+
+    var rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = probe_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer rejection.deinit(allocator);
+    try std.testing.expectError(error.WriteFailed, client.processEnvelope(rejection));
+    try std.testing.expectEqual(@as(usize, 1), failing.attempts);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
 }
