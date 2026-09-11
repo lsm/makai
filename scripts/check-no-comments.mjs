@@ -12,11 +12,16 @@
 // non-allowlisted file — CI), `--stats` (per-file counts), and write
 // mode (default, or `--write`: strip + tidy orphaned blank lines).
 // `--check` is ratcheted by scripts/no-comments-allowlist.txt: files
-// seeded there pass while the gap-7 series lands; entries whose file is
-// clean or untracked are stale and fail.
+// seeded there pass while the gap-7 series lands, and the list may only
+// shrink — entries whose file is clean or untracked are stale, entries
+// absent from the comparison revision (--base's commit, else HEAD^1, the
+// seed itself excepted) are additions, and both fail. Removing the list
+// requires leaving <allowlist>.retired behind, which closes seeding for
+// good.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
@@ -310,6 +315,106 @@ export function loadAllowlist(path) {
   return parseAllowlist(readFileSync(path, "utf8"));
 }
 
+// The comparison commit for ratchet diffs: the requested --base revision
+// itself (a pull request's base sha, or a push's pre-update sha — the start
+// of the submitted range). Deliberately not its merge-base with HEAD: under
+// a force push to divergent history the merge-base is some older common
+// ancestor, and ratchet state recorded between that ancestor and the old tip
+// (a retirement marker, a removed allowlist entry) would never be inspected,
+// so the force push could undo the latch unnoticed. An explicit --base that
+// does not resolve to a commit — force-pushed away, all-zero, shallow clone
+// — is an error: narrowing to HEAD^1 instead would hide an addition made and
+// stripped earlier in the same range. With no --base, HEAD^1 is the
+// comparison commit; null when there is none (root commit), where the
+// allowlist is necessarily new and seeds.
+export function resolveBaseCommit(cwd, baseRev = null) {
+  if (baseRev) {
+    try {
+      return git(["rev-parse", "--verify", `${baseRev}^{commit}`], cwd).trim();
+    } catch {
+      throw new Error(
+        `--base ${baseRev} does not resolve to a commit — refusing to narrow the ratchet to HEAD^1`,
+      );
+    }
+  }
+  try {
+    return git(["rev-parse", "--verify", "HEAD^1"], cwd).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Entries of the allowlist as committed at the comparison commit, or null
+// when there is no comparison commit or the file is not there — the seed
+// case, where the allowlist is new in this change and every entry is taken
+// as given. ratchetViolation is what keeps seeding closed after retirement.
+export function baseAllowlistEntries(allowlistPath, cwd, baseCommit) {
+  if (!baseCommit) return null;
+  let root;
+  try {
+    root = git(["rev-parse", "--show-toplevel"], cwd).trim();
+  } catch {
+    return null;
+  }
+  const rel = relative(root, resolve(cwd, allowlistPath));
+  if (rel.startsWith("..")) return null;
+  try {
+    return parseAllowlist(git(["show", `${baseCommit}:${rel}`], cwd));
+  } catch {
+    return null;
+  }
+}
+
+// The ratchet is a one-way latch. The planned one-time strip removes the
+// allowlist and leaves a `<allowlist>.retired` marker in its place; from
+// then on seeding is closed — the marker cannot be removed and the
+// allowlist cannot be recreated — so a fresh seed of arbitrary dirty paths
+// can never reopen the bypass. Returns a violation message or null.
+export function ratchetViolation(allowlistPath, cwd, baseCommit = null) {
+  const marker = `${allowlistPath}.retired`;
+  const allowlistExists = existsSync(allowlistPath);
+  const markerExists = existsSync(marker);
+  if (markerExists && allowlistExists) {
+    return "ratchet is retired but an allowlist is present — seeding is closed; remove the allowlist";
+  }
+  if (markerExists) return null;
+  let root;
+  try {
+    root = git(["rev-parse", "--show-toplevel"], cwd).trim();
+  } catch {
+    return null;
+  }
+  const markerRel = relative(root, resolve(cwd, marker));
+  const allowlistRel = relative(root, resolve(cwd, allowlistPath));
+  if (markerRel.startsWith("..")) return null;
+  const revs = baseCommit ? ["HEAD", baseCommit] : ["HEAD"];
+  // A marker that existed in HEAD (working-tree removal) or at the
+  // comparison commit (committed removal) but is absent now undoes the
+  // retirement.
+  for (const rev of revs) {
+    try {
+      git(["cat-file", "-e", `${rev}:${markerRel}`], cwd);
+      return "ratchet retirement cannot be undone — the retired marker was removed";
+    } catch {
+      // marker not present at this revision
+    }
+  }
+  // Removing the allowlist requires the marker: without it a later change
+  // could recreate the file and seed freely, since no base allowlist and no
+  // marker would exist.
+  if (!allowlistExists) {
+    for (const rev of revs) {
+      try {
+        git(["cat-file", "-e", `${rev}:${allowlistRel}`], cwd);
+        return `allowlist removed without the retirement marker — create ${marker} so seeding stays closed`;
+      } catch {
+        // allowlist not present at this revision
+      }
+    }
+  }
+  return null;
+}
+
 // A tracked file deleted from the working tree before staging (git
 // ls-files still lists it) is not dirty — skipping it lets the stale-entry
 // logic report its allowlist entry instead of crashing on ENOENT.
@@ -322,7 +427,7 @@ function readIfExists(file) {
   }
 }
 
-export function checkFiles(files, allowlist) {
+export function checkFiles(files, allowlist, baseEntries = null) {
   const offending = [];
   const ratcheted = [];
   const stats = [];
@@ -341,7 +446,8 @@ export function checkFiles(files, allowlist) {
     }
   }
   const stale = [...allowlist].filter((p) => !dirty.has(p)).sort();
-  return { offending, ratcheted, stale, stats, dirtyCount: dirty.size, commentTotal: stats.reduce((a, s) => a + s.count, 0) };
+  const additions = baseEntries === null ? [] : [...allowlist].filter((p) => !baseEntries.has(p)).sort();
+  return { offending, ratcheted, stale, additions, stats, dirtyCount: dirty.size, commentTotal: stats.reduce((a, s) => a + s.count, 0) };
 }
 
 function listFiles(args) {
@@ -364,20 +470,38 @@ function main() {
   const stats = args.includes("--stats");
   const allowlistIdx = args.indexOf("--allowlist");
   const allowlistPath = allowlistIdx !== -1 ? args[allowlistIdx + 1] : DEFAULT_ALLOWLIST;
+  const baseIdx = args.indexOf("--base");
+  const baseRev = baseIdx !== -1 ? args[baseIdx + 1] : null;
   const files = listFiles(args);
   const allowlist = loadAllowlist(allowlistPath);
 
   if (check) {
-    const result = checkFiles(files, allowlist);
+    let baseCommit;
+    try {
+      baseCommit = resolveBaseCommit(process.cwd(), baseRev);
+    } catch (err) {
+      process.stdout.write(`${err.message}\n`);
+      process.exit(1);
+    }
+    const violation = ratchetViolation(allowlistPath, process.cwd(), baseCommit);
+    if (violation) {
+      process.stdout.write(`${violation}\n`);
+      process.exit(1);
+    }
+    const result = checkFiles(files, allowlist, baseAllowlistEntries(allowlistPath, process.cwd(), baseCommit));
     for (const file of result.offending) process.stdout.write(`comments remain: ${file}\n`);
     for (const path of result.stale) {
       process.stdout.write(`stale allowlist entry (clean or untracked): ${path}\n`);
     }
+    for (const path of result.additions) {
+      process.stdout.write(`allowlist addition not permitted (the ratchet may only shrink): ${path}\n`);
+    }
     process.stdout.write(
       `files with comments: ${result.dirtyCount} (${result.ratcheted.length} ratcheted), ` +
-        `offending: ${result.offending.length}, stale entries: ${result.stale.length}\n`,
+        `offending: ${result.offending.length}, stale entries: ${result.stale.length}` +
+        `, added entries: ${result.additions.length}\n`,
     );
-    if (result.offending.length > 0 || result.stale.length > 0) {
+    if (result.offending.length > 0 || result.stale.length > 0 || result.additions.length > 0) {
       process.exit(1);
     }
     return;

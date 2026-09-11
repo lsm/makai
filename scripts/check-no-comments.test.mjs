@@ -1,7 +1,8 @@
 // Self-tests for check-no-comments.mjs (#233): Zig lexer literal fixtures,
 // exemption patterns for both languages, the ported TypeScript scanner's
-// regex/template regression corpus, and plain ratchet behavior. Run with
-// `node --test scripts/check-no-comments.test.mjs`.
+// regex/template regression corpus, and ratchet closure behavior (base
+// cascade, additions vs the comparison commit, fail-closed base,
+// retirement latch). Run with `node --test scripts/check-no-comments.test.mjs`.
 
 import { execSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -332,6 +333,175 @@ function gitCommit(repo) {
   execSync("git -c user.name=test -c user.email=test@test add -A", { cwd: repo });
   execSync("git -c user.name=test -c user.email=test@test commit -qm ratchet", { cwd: repo });
 }
+
+test("ratchet: an allowlist new in this change seeds freely (no comparison commit has it)", () => {
+  const repo = gitRepo("seed-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "dirty.ts"), "// sdk\nconst a = 1;\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\ndirty.ts\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig", "dirty.ts"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 0, run.stdout);
+  assert.ok(run.stdout.includes("(2 ratcheted)"), run.stdout);
+  assert.ok(run.stdout.includes("added entries: 0"), run.stdout);
+});
+
+test("ratchet: allowlist entries absent from the comparison commit are rejected additions", () => {
+  const repo = gitRepo("additions-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.ts"), "// sdk\nconst a = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\ndirty.ts\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig", "dirty.ts"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("allowlist addition not permitted"), run.stdout);
+  assert.ok(run.stdout.includes("dirty.ts"), run.stdout);
+  assert.ok(run.stdout.includes("added entries: 1"), run.stdout);
+});
+
+function headSha(repo) {
+  return execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf8" }).trim();
+}
+
+// Three commits with sneaky.ts allowlisted in the middle one: comparing
+// against HEAD^1 sees the entry as pre-existing, so only the true start of
+// the range exposes it.
+function rangeRepo(name) {
+  const repo = gitRepo(name);
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  const rootSha = headSha(repo);
+  writeFileSync(join(repo, "sneaky.ts"), "// mid-range\nconst a = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\nsneaky.ts\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 2;\n");
+  gitCommit(repo);
+  return { repo, rootSha };
+}
+
+const rangeArgs = [
+  SCRIPT,
+  "--check",
+  "--allowlist",
+  "allowlist.txt",
+  "--files",
+  "dirty.zig",
+  "sneaky.ts",
+];
+
+test("ratchet: --base catches an addition hidden earlier in a multi-commit range", () => {
+  const { repo, rootSha } = rangeRepo("range-repo");
+  const viaParent = spawnSync(process.execPath, rangeArgs, { cwd: repo });
+  assert.equal(viaParent.status, 0, viaParent.stdout);
+  const viaBase = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--base", rootSha, ...rangeArgs.slice(2)],
+    { cwd: repo },
+  );
+  assert.equal(viaBase.status, 1, viaBase.stdout);
+  assert.ok(viaBase.stdout.includes("allowlist addition not permitted"), viaBase.stdout);
+  assert.ok(viaBase.stdout.includes("sneaky.ts"), viaBase.stdout);
+});
+
+test("ratchet: an unresolvable --base fails closed instead of narrowing to HEAD^1", () => {
+  // The same range HEAD^1 accepts above must not pass when the base it was
+  // asked to compare against is gone: silence there would hide the addition.
+  const { repo } = rangeRepo("dangling-base-repo");
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--base", "0".repeat(40), ...rangeArgs.slice(2)],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("does not resolve to a commit"), run.stdout);
+  assert.ok(run.stdout.includes("refusing to narrow the ratchet to HEAD^1"), run.stdout);
+});
+
+test("ratchet: --base is read as given, not reduced to its merge base", () => {
+  // A force push replaces the old tip with divergent history: the start of
+  // the pushed range is the old tip itself. Reducing it to the merge base
+  // (a shared ancestor) skips everything committed between that ancestor
+  // and the old tip, so a retirement recorded there goes unseen and the
+  // force push re-enables seeding without failing.
+  const repo = gitRepo("divergent-base-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  const ancestor = headSha(repo);
+  rmSync(join(repo, "allowlist.txt"));
+  writeFileSync(join(repo, "allowlist.txt.retired"), "");
+  gitCommit(repo);
+  const prePush = headSha(repo);
+  execSync(`git checkout -q -b rewritten ${ancestor}`, { cwd: repo });
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 2;\n");
+  gitCommit(repo);
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--base", prePush, "--allowlist", "allowlist.txt", "--files", "dirty.zig"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("cannot be undone"), run.stdout);
+});
+
+test("ratchet: retirement is a one-way latch that closes seeding", () => {
+  const repo = gitRepo("retired-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "const x = 1;\n");
+  rmSync(join(repo, "allowlist.txt"));
+  writeFileSync(join(repo, "allowlist.txt.retired"), "");
+  gitCommit(repo);
+  const run = () =>
+    spawnSync(
+      process.execPath,
+      [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig"],
+      { cwd: repo },
+    );
+
+  const retired = run();
+  assert.equal(retired.status, 0, retired.stdout);
+
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  const recreated = run();
+  assert.equal(recreated.status, 1, recreated.stdout);
+  assert.ok(recreated.stdout.includes("seeding is closed"), recreated.stdout);
+
+  rmSync(join(repo, "allowlist.txt"));
+  rmSync(join(repo, "allowlist.txt.retired"));
+  const unretired = run();
+  assert.equal(unretired.status, 1, unretired.stdout);
+  assert.ok(unretired.stdout.includes("cannot be undone"), unretired.stdout);
+});
+
+test("ratchet: removing the allowlist without the retirement marker fails", () => {
+  const repo = gitRepo("no-marker-repo");
+  writeFileSync(join(repo, "dirty.zig"), "// carve\nconst x = 1;\n");
+  writeFileSync(join(repo, "allowlist.txt"), "dirty.zig\n");
+  gitCommit(repo);
+  writeFileSync(join(repo, "dirty.zig"), "const x = 1;\n");
+  rmSync(join(repo, "allowlist.txt"));
+  const run = spawnSync(
+    process.execPath,
+    [SCRIPT, "--check", "--allowlist", "allowlist.txt", "--files", "dirty.zig"],
+    { cwd: repo },
+  );
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("without the retirement marker"), run.stdout);
+});
 
 function loadAllowlistFrom(paths) {
   const file = join(workDir, "allowlist.txt");
