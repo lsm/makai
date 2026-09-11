@@ -76,8 +76,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      # Full history so the ratchet can resolve the submitted range's start
+      # (the pull request's base sha, or a push's pre-update sha) — a
+      # shallow clone would leave that commit unfetched, and an explicitly
+      # requested base that cannot resolve is a hard error in the checker.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -91,7 +97,12 @@ jobs:
         run: node --test scripts/check-no-comments.test.mjs
 
       - name: Check zero-comments policy
-        run: node scripts/check-no-comments.mjs --check
+        run: node scripts/check-no-comments.mjs --check --base "$BASE_SHA"
+        env:
+          # The PR base sha or the push's pre-update sha: the start of the
+          # submitted range, so an allowlist addition anywhere in it is
+          # caught. Empty falls through to the checker's HEAD^1 comparison.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
 
   ts-sdk-e2e:
     name: TS SDK E2E
