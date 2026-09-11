@@ -1007,7 +1007,9 @@ Rules:
   value equality; the undo applies only to a stop that actually MOVED
   the tracker — an ordinary stop, or an explicit one resynced onto the
   current value, made no move, and its rejection only lifts the tracker
-  to the proven floor) — to the pre-resync tracker CAPPED by the still-pending messages'
+  to the proven floor — and a stop carrying the tracker's current value
+  writes nothing at all, asserting no newer counter state that could
+  supersede a pending mirror's ownership) — to the pre-resync tracker CAPPED by the still-pending messages'
   floor (the pre-resync value may itself be an unresolved send's
   optimistic mirror), max the proven floor (below); the refuted resync's
   revert bound is durably recorded — an allocation failure surfaces
@@ -1058,7 +1060,10 @@ Rules:
   mismatched payload, a competing different-payload record at the
   sequence, a non-retry MESSAGE, or an ancestry that was never
   admissible — every same-payload copy was sent below an
-  already-proven floor, so nothing could have run or settled and the
+  already-proven floor (the protocol's INTRINSIC post-start floor
+  included: a session's sequence 1 is consumed by its agent_start, so
+  a MESSAGE at 1 is never admissible even when the started reply was
+  lost), so nothing could have run or settled and the
   duplicate must surface however the retry bit reads (the check judges
   the SOURCE's send-time floor, min-inherited down the retry chain: a
   retry recorded after the floor rose past the sequence keeps the
