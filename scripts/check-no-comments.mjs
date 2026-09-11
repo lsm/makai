@@ -38,8 +38,7 @@ function git(args, cwd) {
 // (`eslint-disable-policy` is not a directive ESLint processes).
 const TS_KEEP_PATTERNS = [
   /^#!/,
-  /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
-  /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error|nocheck|check)(?=[\s:]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error)(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*biome-ignore(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*eslint-disable(?:-(?:next-)?line)?(?=[\s,]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*eslint-enable(?=[\s,]|$)/,
@@ -63,6 +62,21 @@ const DEFAULT_ALLOWLIST = fileURLToPath(new URL("no-comments-allowlist.txt", imp
 // ---------------------------------------------------------------------------
 
 const TS_LINE_TERMINATOR = /[\n\r\u2028\u2029]/;
+
+// @ts-check/@ts-nocheck and /// <reference>-style directives are file-scoped
+// TypeScript trivia: the compiler processes them only as single-line comments
+// in the file's leading trivia — a shebang and other comments may precede
+// them, executable code may not. Outside that window every placement (block
+// pragmas, mid-file, post-code) is an ordinary comment and counts.
+// @ts-ignore/@ts-expect-error stay on the always-exempt list above because
+// they are line-scoped suppressions, not file-wide pragmas. The window is
+// tracked by the scanner itself as it walks left to right (leadingTrivia in
+// collectTsCommentRanges), never by stripping delimiter-shaped text out of
+// the raw prefix — a block delimiter inside a line comment would fool that.
+const TS_LEADING_PATTERNS = [
+  /^\/\/\s*@ts-(?:nocheck|check)(?=[\s:]|$)/,
+  /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
+];
 
 function parse(text, fileName) {
   return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -94,6 +108,10 @@ function collectTsCommentRanges(text, fileName) {
   let spanIdx = 0;
   let i = 0;
   const n = text.length;
+  // True while everything consumed so far is shebang/comments/whitespace:
+  // the file's leading trivia. Literal spans and any other code close it,
+  // comments never do, and the shebang skip below leaves it open.
+  let leadingTrivia = true;
   // The shebang line is a protected span: a `//` inside it (e.g. a Deno
   // `--allow-net=https://…` flag) is not a comment, and keep-patterns can
   // never see it anyway because matching starts at the `//`.
@@ -108,12 +126,17 @@ function collectTsCommentRanges(text, fileName) {
     }
     if (span && i >= span.start) {
       i = span.end;
+      leadingTrivia = false;
       continue;
     }
     if (text[i] === "/" && text[i + 1] === "/") {
       let j = i + 2;
       while (j < n && !TS_LINE_TERMINATOR.test(text[j])) j++;
-      if (!TS_KEEP_PATTERNS.some((p) => p.test(text.slice(i, j)))) ranges.push({ start: i, end: j });
+      const slice = text.slice(i, j);
+      const kept =
+        TS_KEEP_PATTERNS.some((p) => p.test(slice)) ||
+        (leadingTrivia && TS_LEADING_PATTERNS.some((p) => p.test(slice)));
+      if (!kept) ranges.push({ start: i, end: j });
       i = j;
       continue;
     }
@@ -130,6 +153,7 @@ function collectTsCommentRanges(text, fileName) {
       i = end;
       continue;
     }
+    if (!/\s/.test(text[i])) leadingTrivia = false;
     i++;
   }
   return ranges;
