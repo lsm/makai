@@ -976,31 +976,69 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-2 of the
+  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-3 of the
   client sequence-control series]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
   `agent_error` OR `nack` whose `in_reply_to` names the client's own send)
   rolls the
-  tracker back to the rejected send's own sequence, so a corrected retry
-  reuses it (every outstanding send is tracked and the rollback takes the
-  MINIMUM — an older unresolved send's floor is never lost to a younger
-  send's rejection); a correlated `agent_not_found` (or `session_expired`)
+  tracker back, so a corrected retry reuses the sequence (every outstanding
+  send is tracked and the rollback floor carries every still-unresolved
+  MESSAGE record's pre-send tracker and sequence — the counter the server
+  holds in the all-rejected world, so an older unresolved send's floor is
+  never lost to a younger send's rejection; a pending START's floor is
+  never taken, since a non-session-gone rejection proves the counter is
+  past it); a correlated `agent_busy` floors to EXACTLY the rejected
+  sequence instead — the server validates the inbound sequence before the
+  processing state, so a busy answer proves every lower sequence was
+  consumed; a correlated `agent_not_found` (or `session_expired`)
   drops the counter state instead, since the session is gone server-side.
   Stop sends never advance the tracker: an accepted stop consumes the
   counter with the session, and a rejected stop leaves the expected value
   in place for its retry; stops are tracked requests too, so a
   session-gone answer discovered through a stop drops the counter state
-  for the re-registration. A settlement retires the settled run's own
-  message record (the oldest pending message), keeping a long-lived
-  session's records bounded by its unresolved sends rather than its
-  history. Explicit-sequence sends `[current — #210 gap 7]`:
-  `sendAgentMessageWithSequence` carries a caller-supplied counter value
-  (recovery paths that know the server's state are not forced to guess);
+  for the re-registration. An explicit STOP RESYNCS the tracker to its
+  caller-supplied value without advancing past it, and its correlated
+  rejection undoes the resync — when the tracker still holds the stop's
+  value (a pending mirror counts as the owner of that value only while
+  it is LIVE — its own write was the LAST tracker write of any kind:
+  another send's mirror or resync, or a reconciliation's floor or
+  restore, supersedes it, so ownership follows write ordering, never
+  value equality; the undo applies only to a stop that actually MOVED
+  the tracker — an ordinary stop, or an explicit one resynced onto the
+  current value, made no move, and its rejection only lifts the tracker
+  to the proven floor — and a stop carrying the tracker's current value
+  writes nothing at all, asserting no newer counter state that could
+  supersede a pending mirror's ownership) — to the pre-resync tracker CAPPED by the still-pending messages'
+  floor (the pre-resync value may itself be an unresolved send's
+  optimistic mirror), max the proven floor (below); the refuted resync's
+  revert bound is durably recorded — an allocation failure surfaces
+  rather than being forgotten, or a later stop's rejection would restore
+  a prior this resync had contaminated; wherever the undo is
+  skipped, a tracker sitting below the proven floor (a stop's own
+  duplicate_sequence step included) is still raised to it. A settlement retires
+  the settled run's own message record (the oldest pending message),
+  keeping a long-lived session's records bounded by its unresolved sends
+  rather than its history; the settlement also raises the proven floor to
+  the MINIMUM pending-message sequence + 1 — the settled run is only
+  KNOWN to be one of the pending messages (the insertion-order
+  attribution is a heuristic; agent_result carries no run identity,
+  §13.3.2), so the heuristically retired record's own sequence proves
+  nothing — and the tracker follows the floor, restoring progress a
+  stale rewind (a delayed busy answer's parity floor for a retry that
+  was actually accepted) had pulled below.
+  Explicit-sequence sends `[current — #210 gap 7]`:
+  `sendAgentMessageWithSequence` and `sendAgentStopWithSequence` carry a
+  caller-supplied counter value (recovery paths that know the server's
+  state are not forced to guess);
   the tracker mirrors it optimistically but restores its PRE-SEND state
-  when the pre-wire bookkeeping fails (nothing reached the wire),
-  `maxInt(u64)` is rejected before any mutation (a start against a
-  tracker already at the maximum is rejected the same way), and a
+  when the pre-wire bookkeeping fails (nothing reached the wire — the
+  value AND its write epoch, so a still-pending mirror's ownership
+  survives the rollback),
+  `maxInt(u64)` is rejected before any mutation for the MESSAGE variant
+  (a start against a tracker already at the maximum is rejected the same
+  way; a STOP may carry the maximum itself — a stop never computes
+  `sequence + 1`, so the ceiling teardown is sendable), and a
   correlated rejection restores the record's pre-send tracker rather
   than the send's own optimistic regression (a backward explicit send's
   regression must not pin the tracker below the server) — except
@@ -1017,12 +1055,28 @@ Rules:
   a still-unresolved message (same sequence AND payload digest, via
   `sendAgentMessageWithSequence`; an empty `options_json` digests
   identically to absence — the wire treats them the same) retires
-  silently with the tracker restored to `sequence + 1`, while a
+  silently with the tracker restored to `sequence + 1` MAX the session's
+  proven floor (see below), while a
   mismatched payload, a competing different-payload record at the
-  sequence, or a non-retry MESSAGE keeps the proven step (`sequence + 1`)
+  sequence, a non-retry MESSAGE, or an ancestry that was never
+  admissible — every same-payload copy was sent below an
+  already-proven floor (the protocol's INTRINSIC post-start floor
+  included: a session's sequence 1 is consumed by its agent_start, so
+  a MESSAGE at 1 is never admissible even when the started reply was
+  lost), so nothing could have run or settled and the
+  duplicate must surface however the retry bit reads (the check judges
+  the SOURCE's send-time floor, min-inherited down the retry chain: a
+  retry recorded after the floor rose past the sequence keeps the
+  silent path while its source predates the floor, and a SETTLED
+  source demonstrably ran the payload there, outranking the floor
+  heuristic) keeps the proven step
+  (`sequence + 1`)
   and SURFACES through the error bookkeeping — nothing of that envelope
-  will ever settle; a START or STOP duplicate runs the ordinary rejection
-  rollback instead and surfaces likewise. The silent path's retry
+  will ever settle; a START duplicate runs the ordinary rejection
+  rollback instead and surfaces likewise, while a STOP duplicate still
+  records its counter-past proof (the proven step `sequence + 1`) before
+  running the ordinary stop-rejection path and surfacing. The silent
+  path's retry
   provenance is a lattice over the pending records, not the send-time bit
   alone: a record's retry bit derives from an EARLIER same-sequence
   same-payload record whose own source chain is intact, and every
@@ -1054,12 +1108,35 @@ Rules:
   sequence, so those payloads never ran there (under a mis-attribution
   the break errs toward a surfaced duplicate, the self-correcting
   direction, where a mis-granted settled bit would silently swallow a
-  failure). A higher true counter than the restore is reached one
+  failure). The client keeps a monotone PROVEN FLOOR per session: every
+  reconciliation that establishes a sound lower bound — a busy answer's
+  exact parity, an all-rejected floor, a duplicate answer's proven step
+  (for a message OR a tracked stop), a settlement's minimum-candidate
+  step, a stop-undo's capped restore, an accepted start's consumed
+  sequence — maxes it, and every later floor or restore maxes with it
+  (the counter never moves backward, so a bound once proven stays
+  proven; optimistic mirrors from unresolved sends never participate —
+  an unresolved stop's resync is caller-asserted, and message-rejection
+  floors carry the stop's PRE-RESEND prior so the caller's value cannot
+  be laundered into the floor through later snapshots). Recording a
+  floor propagates allocation failures — a bound is never silently
+  dropped once its envelope has been accepted for processing, since a
+  forgotten floor can wedge the tracker on a consumed sequence; the
+  tracker's own rise to the floor stays best-effort, healing through
+  duplicate evidence — and each reconciliation's floor is stored BEFORE the
+  matched pending record retires, so a storage failure leaves the
+  envelope retryable instead of stranded with the refuted optimistic
+  state). An accepted start additionally INVALIDATES
+  pending message records below its seeded floor: the start
+  demonstrably consumed those sequences, so no same-payload source
+  could have run — records sent before the started reply was processed
+  snapshot the older floor and would otherwise stay silently eligible
+  for a failure whose settlement can never arrive. A higher true
+  counter than the restore is reached one
   step per round trip (the next send at the restored value is answered
   `duplicate_sequence` in turn, and as a same-payload retry it retires
   silently). Slices to follow in the series:
-  the proven-floor and stop-undo reconciliation for restored progress, the
-  pending-record lifecycle and stale-reply guards, the bounded stop probe
+  the pending-record lifecycle and stale-reply guards, the bounded stop probe
   for unknown outcomes, and the TUI teardown integration
   (`[in progress — #210 gap 7 re-sliced from #213]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
