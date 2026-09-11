@@ -1102,7 +1102,7 @@ pub const TuiRuntime = struct {
                         _ = client.sendAgentStop(sid, "cancelled") catch {};
                     }
                 } else |_| {}
-                self.pumpRemoteIncomingForTeardown();
+                _ = self.pumpRemoteIncomingForTeardown();
                 self.driveRemoteStopProbe(client, sid);
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);
@@ -1434,7 +1434,7 @@ pub const TuiRuntime = struct {
     fn driveRemoteStopProbe(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient, sid: agent_protocol_types.SessionId) void {
         const deadline_ns = (compat.time.monotonicNanos() catch return) + 150 * std.time.ns_per_ms;
         while (client.hasActiveStopProbe(sid)) {
-            self.pumpRemoteIncomingForTeardown();
+            if (!self.pumpRemoteIncomingForTeardown()) break;
             if (!client.hasActiveStopProbe(sid)) break;
             const now_ns = compat.time.monotonicNanos() catch break;
             if (now_ns >= deadline_ns) break;
@@ -1442,24 +1442,26 @@ pub const TuiRuntime = struct {
         }
     }
 
-    fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) void {
-        var receiver = &(self.remote_receiver orelse return);
-        const client = &(self.remote_client orelse return);
-        switch (receiver.read(self.allocator) catch return) {
+    fn pumpRemoteIncomingForTeardown(self: *TuiRuntime) bool {
+        var receiver = &(self.remote_receiver orelse return false);
+        const client = &(self.remote_client orelse return false);
+        switch (receiver.read(self.allocator) catch return false) {
             .line => |line| {
                 defer self.allocator.free(line);
-                var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return;
+                var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch return false;
                 defer env.deinit(self.allocator);
-                if (env.version != 1) return;
-                client.processEnvelope(env) catch return;
-                self.drainRemoteClientEvents(client) catch return;
-                self.syncRemoteSessionFromClient(client) catch return;
+                if (env.version != 1) return false;
+                client.processEnvelope(env) catch return false;
+                self.drainRemoteClientEvents(client) catch return false;
+                self.syncRemoteSessionFromClient(client) catch return false;
             },
             .pending => {},
             .disconnected => {
                 self.remote_sse_reconnect_needed = true;
+                return false;
             },
         }
+        return true;
     }
 
     fn pumpRemoteIncoming(self: *TuiRuntime) !void {
