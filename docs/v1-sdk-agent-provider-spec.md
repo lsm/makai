@@ -976,9 +976,9 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slices 1–3 of the
+  Zig client sequence discipline `[current — #210 gap 7, slices 1–4 of the
   client sequence-control series: S1 #216, S2a #218, S2b-1 #226, S2b-2 #227,
-  S2b-3 #231, S3 #232]`: the `AgentProtocolClient` mirrors the
+  S2b-3 #231, S3 #232, S4 #239]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
   `agent_error` OR `nack` whose `in_reply_to` names the client's own send)
@@ -1692,7 +1692,9 @@ The deviations ledger in [`docs/oap-alignment.md`](oap-alignment.md) is the
 convergence contract between makai and OAP: adapter #3 (lsm/open-agent-protocol#3)
 maps against it, and per that issue's feedback rule, an adapter mismatch resolves as
 either an OAP revision or a makai change — never silent adapter-side compensation.
-The ledger also carries the greppable catalogue of wire-unobservable residuals
-(`RESIDUAL-1` … `RESIDUAL-5`): protocol behaviors this section cannot resolve
-because no frame carries a registration or run generation (§13.4.5). They are
-documented uncertainty, not guarantees an adapter may rely on.
+The ledger also carries the greppable catalogue of documented residuals
+(`RESIDUAL-1` … `RESIDUAL-5`). Most are wire-unobservable — this section cannot
+resolve them because no frame carries a registration or run generation
+(§13.4.5) — and are documented uncertainty rather than guarantees an adapter
+may rely on; `RESIDUAL-2` is the exception, locally solvable from `in_reply_to`
+and recorded as a caution.

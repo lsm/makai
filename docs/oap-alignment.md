@@ -26,8 +26,8 @@ Frame Routing, V1.1") defines the semantics summarized here.
   `2efce28` (#216), S2a `f578903` (#218), S2b-1 `560f635` (#226), S2b-2
   `a8a6c07` (#227), S2b-3 `8925a8c` (#231), S3 `e4c568b` (#232), S4 `f5fd0b5`
   (#239). The remaining Zig slice — #224 (TUI teardown integration) — has not
-  landed, so the claim it owns stays in progress in §13.1. Every `[current]` claim in §13 and every status
-  below was verified against one of these revisions.
+  landed, so its §13.1 claim stays in progress. Every `[current]` claim in §13
+  and every status below was verified against one of these revisions.
 - OAP references:
   - Decision 0001 — "Agent-Control v0.1 Executable Core" (accepted 2026-09-06):
     typed identity domains, one-foreground-run-per-session, deterministic run event
@@ -62,7 +62,7 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 
 | OAP term | Makai construct | Status | Notes |
 | --- | --- | --- | --- |
-| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias (both makai clients emit it transitionally alongside the canonical key for the same reason). Idle-TTL eviction is silent and no frame carries a registration generation, so a reused id's holder is not provable from the wire — `RESIDUAL-1`, `RESIDUAL-2`. |
+| `session_id` (stable session scope) | agent session container keyed by NanoID session id | aligned | Multi-message containers by design (`publishAgentResult` → `.ready`); no persistence, so stability is process-lifetime only. The `agent_start` payload key was renamed `resume_session_id` → `session_id` (#198); the old key is accepted as a permanent legacy alias (both makai clients emit it transitionally alongside the canonical key for the same reason). Idle-TTL eviction is silent and no frame carries a registration generation, so a reused id's holder is not provable from the wire — `RESIDUAL-1`; the session-gone answer's own attribution is `RESIDUAL-2`. |
 | endpoint / participant identity | none | deviating: no endpoint or participant exists to address | Required for OAP initialization and reverse-interaction ownership; a makai introduction needs its own spec pass. |
 | `submission_id` / `run_id` split | none — one `agent_message` per run in SDK usage | absent by design (v1) | No admission receipt: `agent_message` has no synchronous reply. A run is identified operationally by `(session_id, settlement frame)`. Candidate future revision if the adapter needs stable run identity; nothing queued. The absence is load-bearing: `agent_result` carries no run identity, so settlement-based bookkeeping attributes a settlement by insertion order — `RESIDUAL-5`. |
 | `message_id` / `in_reply_to` / `sequence` | envelope fields of the same names | aligned (`in_reply_to`), deviating: sequence scope (see identity table) | Per §13.1/§13.3. |
@@ -82,19 +82,22 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | process exit before settlement | transport rejects the registered frame wait; reads queued behind the transport read lock surface the death as their response timeout; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule; adapters must keep timeout handling for lock-queued reads rather than expecting prompt rejection for every concurrent request. |
 | stdin EOF while a run waits on a distributed `tool_result` | the host latches the disconnect; the wait fails with a typed error and the run settles through the failure pair (`tool_execution_error` settlement), then the process drains and exits | aligned (#210 gap 4) | §13.2.7 rule 7: EOF-cancel applies to the tool-waiting case — the tool host IS the disconnected client. A `tool_result` delivered before EOF wins its wait (checked before the latch); a run needing client input after EOF settles failed, never success (§13.4.6), with pending tool requests dropped unpublished; provider-executing runs keep being pumped toward settlement until they need client input. Late frames from the cancelled run settle nothing — the pump's disconnect classification publishes the failure pair once and the run is removed, working with (not around) the §13.4.5 generation guard. |
 
-## Wire-unobservable residuals
+## Documented residuals
 
-Protocol behaviors the wire cannot resolve: no frame carries a registration or
-run generation (spec §13.4.5), so each pair below is indistinguishable at a
-client's inputs. Closing any of them needs the generation tokens of a future
-wire revision — none is adapter-compensable, and adapters MUST treat them as
-documented uncertainty rather than protocol guarantees. Grep `RESIDUAL-` for
-the full set.
+The residual classes accumulated by gap 7 (#210) and its neighbours. Grep
+`RESIDUAL-` for the full set. All but `RESIDUAL-2` are unresolvable on the
+wire: no frame carries a registration or run generation (spec §13.4.5), so the
+paired situations there are indistinguishable at a client's inputs, only the
+generation tokens of a future wire revision close them, and adapters MUST
+treat them as documented uncertainty rather than protocol guarantees.
+`RESIDUAL-2` is different in kind — `in_reply_to` already makes it locally
+solvable — and is recorded here because mishandling it silently clears newer
+control state.
 
-| Residual | Spec | What is indistinguishable on the wire | Recorded mitigation |
+| Residual | Spec | What cannot be told apart | Recorded mitigation |
 | --- | --- | --- | --- |
-| `RESIDUAL-1` stale admission after a silent TTL eviction | §13.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §13.1's admission evidence bounds the teardown stop's blast radius; an exclusive client-generated id remains the only sufficient ownership evidence until generation tokens exist. |
-| `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Eviction MUST NOT be distinguishable from stop by error code, and a session-gone answer is matched by request correlation alone — a delayed `agent_not_found`/`session_expired` can be attributed to whatever registration currently holds the id. | The Zig client clears the session's pending-send list together with its counter/control state, so a later copy of the answer matches nothing, and the `agent_error` arm drops correlated replies naming no tracked send. The clearing itself is not generation-bound. |
+| `RESIDUAL-1` stale admission after a silent TTL eviction | §6.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §6.1's admission evidence bounds the teardown stop's blast radius: an exclusive client-generated id is the only sufficient form until generation tokens exist, and it qualifies only while the client has not allowed that id to be removed and re-registered. |
+| `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Locally resolvable, NOT wire-bound: a session-gone answer carries `in_reply_to` naming the exact request, so it is attributable IF the sender kept per-request registration provenance. A purely id-keyed pending list cannot tell the old registration's delayed answer from the current registration's own — the first delayed `agent_not_found` matches the still-registered record and clears state the re-registration just established. | Tag pending sends with the registration epoch and discard a reply whose epoch predates the id's re-registration. The Zig client approximates this by clearing the session's pending-send list together with its counter/control state on a session-gone answer, so a later copy matches nothing; the id-keyed store is a local bookkeeping limit, not a wire gap. |
 | `RESIDUAL-3` stale trailing run output clearing the TS acceptance marker | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. | The marker carries the SDK's teardown semantics (abort and failure-pair paths stop at the advanced counter); never clearing would reinstate the unbounded leak, so the clear is kept and the ambiguity recorded. |
 | `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's teardown drains queued session output before the id is reused, with a single immediate pass (erring toward route cleanliness); not draining reinstates the parked-output poisoning of the next same-id run. |
 | `RESIDUAL-5` settlement-based retirement needs run identity | §13.1, §13.3.2 | `agent_result` carries no run identity, so retiring the settled run's pending record attributes the settlement to the OLDEST pending message (insertion order) and the proven floor rises only to the minimum pending-message sequence + 1. | A mis-attribution errs toward surfacing a duplicate rather than swallowing a failure — the self-correcting direction; a run identity on the settlement frame would close it. |
@@ -170,8 +173,8 @@ where its spec claims remain `[planned]`.
    (pre-send stop, then the post-send value on a correlated `invalid_request`,
    correlated reads, acceptance at either) awaited on both `run()` and
    `stream()` error paths, with the post-probe backlog drained before id reuse.
-   LANDED for the Zig client except its two remaining slices (S1 `2efce28`,
-   S2a `f578903`, S2b-1/2/3 `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`): the
+   LANDED for the Zig client (S1 `2efce28`, S2a `f578903`, S2b-1/2/3
+   `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`, S4 `f5fd0b5`): the
    `AgentProtocolClient` tracks every outstanding send, rolls the tracker back
    MONOTONICALLY on a correlated `agent_error`/`nack` (an older unresolved
    send's floor is never lost), drops the counter state on a correlated
