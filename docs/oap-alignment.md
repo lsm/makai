@@ -98,18 +98,22 @@ control state.
 | --- | --- | --- | --- |
 | `RESIDUAL-1` stale admission after a silent TTL eviction | §6.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §6.1's admission evidence bounds the teardown stop's blast radius: an exclusive client-generated id is the only sufficient form until generation tokens exist, and it qualifies only while the client has not allowed that id to be removed and re-registered. |
 | `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Locally resolvable, NOT wire-bound: a session-gone answer carries `in_reply_to` naming the exact request, so it is attributable IF the sender kept per-request registration provenance. A purely id-keyed pending list cannot tell the old registration's delayed answer from the current registration's own — the first delayed `agent_not_found` matches the still-registered record and clears state the re-registration just established. | Tag pending sends with the registration epoch and discard a reply whose epoch predates the id's re-registration. The Zig client approximates this by clearing the session's pending-send list together with its counter/control state on a session-gone answer, so a later copy matches nothing; the id-keyed store is a local bookkeeping limit, not a wire gap. |
-| `RESIDUAL-3` stale trailing run output clearing the TS acceptance marker | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. | The marker carries the SDK's teardown semantics (abort and failure-pair paths stop at the advanced counter); never clearing would reinstate the unbounded leak, so the clear is kept and the ambiguity recorded. |
+| `RESIDUAL-3` stale trailing output misattributed to a reused id | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. The hazard is not marker bookkeeping: when the stale frame is an `agent_result` the attempt parses and RETURNS the previous run's response, and stale events can be yielded on the `stream()` path — wrong returned data, not merely a missed acceptance signal. | The alternative is not "no leak": leaving the marker set routes teardown through `stopAgentWithSequenceProbe`, so the trade is one extra bounded probe against a wrong-result hazard — and the clear is kept, both because returned data must come from this attempt and because the probe is the marker's own consumer. Closing it needs an identity the wire lacks (run identity on the settlement frame, `RESIDUAL-5`'s remedy). |
 | `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's failure-pair teardown AWAITS a single immediate-pass drain of the queued backlog before the id is reused; its abort paths (`drain: "background"` in `run()`/`stream()`) deliberately leave the same drain running un-awaited, so a same-id retry can register while it is still consuming the backlog and race it. Not draining at all would reinstate the parked-output poisoning of the next same-id run, so this is a policy trade rather than a fix — the window closes only with the generation tokens. |
 | `RESIDUAL-5` settlement-based retirement needs run identity | §13.1, §13.3.2 | `agent_result` carries no run identity, so retiring the settled run's pending record attributes the settlement to the OLDEST pending message (insertion order) and the proven floor rises only to the minimum pending-message sequence + 1. | A mis-attribution errs toward surfacing a duplicate rather than swallowing a failure — the self-correcting direction; a run identity on the settlement frame would close it. |
 
-The common shape of `RESIDUAL-1`, `RESIDUAL-3` and `RESIDUAL-4` is the
-downstream-buffer class the spec records at §6.1 and §13.4.5: frames already
-buffered downstream of a removed registration carry no generation and stay
-attributable to whatever registration holds the id next. `RESIDUAL-5` is NOT of
-that class — it can occur entirely within one live registration, with several
-message sends pending and an uncorrelated `agent_result` unable to say which run
-settled — so neither draining nor registration generations address it; it needs
-run identity on the settlement frame.
+`RESIDUAL-3` and `RESIDUAL-4` share the downstream-buffer shape the spec records
+at §6.1 and §13.4.5: frames already buffered downstream of a removed
+registration carry no generation and stay attributable to whatever registration
+holds the id next, so a drain's timing is a policy trade rather than a fix.
+`RESIDUAL-1` needs the same registration generation but NOT that buffering — no
+frame from the removed registration has to be parked: the id is re-registered
+before our next outbound message, whose counter matches the fresh registration's
+restart, so only ownership/generation evidence separates the two. `RESIDUAL-5`
+needs neither draining nor a registration generation — it can occur entirely
+within one live registration, with several message sends pending and an
+uncorrelated `agent_result` unable to say which run settled, so it needs run
+identity on the settlement frame.
 
 ## P0 makai follow-ups
 
