@@ -1599,8 +1599,9 @@ pub const TuiRuntime = struct {
             }
         }
         var sent = false;
+        const appended_index: ?usize = if (consumed_queue != null) self.remote_messages.items.len - 1 else null;
         errdefer if (!sent and consumed_queue != null) {
-            var appended = self.remote_messages.pop().?;
+            var appended = self.remote_messages.orderedRemove(appended_index.?);
             appended.deinit(self.allocator);
         };
         try self.sendRemoteMessages(self.remote_messages.items, consumed_queue != null);
