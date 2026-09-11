@@ -170,6 +170,14 @@ pub const AgentProtocolClient = struct {
     /// (its own write was the last) from one a later write — of any
     /// kind — has superseded (#210 gap 7).
     tracker_epoch_by_session: std.AutoHashMap(agent_types.SessionId, u64),
+    /// Sessions whose `agent_started` this client observed for its OWN
+    /// tracked start (§6.1 admission evidence; #210 gap 7). Reserved
+    /// `false` when an `agent_start` is sent, flipped `true` only by a
+    /// reply correlated to that start, and cleared by every teardown
+    /// path — an unknown-outcome teardown stop may reconcile against the
+    /// session only while this evidence stands (the bounded probe's
+    /// ownership gate; §6.1's leak-over-destroy stance).
+    admitted_by_session: std.AutoHashMap(agent_types.SessionId, bool),
 
     const Self = @This();
 
@@ -185,6 +193,7 @@ pub const AgentProtocolClient = struct {
             .proven_floor_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .stop_revert_bound_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .tracker_epoch_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
+            .admitted_by_session = std.AutoHashMap(agent_types.SessionId, bool).init(allocator),
         };
     }
 
@@ -216,6 +225,7 @@ pub const AgentProtocolClient = struct {
         self.proven_floor_by_session.deinit();
         self.stop_revert_bound_by_session.deinit();
         self.tracker_epoch_by_session.deinit();
+        self.admitted_by_session.deinit();
 
         self.* = undefined;
     }
@@ -327,13 +337,33 @@ pub const AgentProtocolClient = struct {
             .payload = payload,
         });
         defer self.allocator.free(start_json);
+        // Reserve the admission slot BEFORE the wire and before any tracker
+        // mutation: the agent_started arm then flips the flag IN PLACE, so
+        // processing the server's acceptance cannot fail at the admission
+        // recording — an OOM there would error processEnvelope with the
+        // session live server-side and stoppable only through the teardown
+        // probe (#210 gap 7). The put is BLIND on purpose: a new start
+        // attempt re-arms the evidence (false — in flight, not yet
+        // admitted), so a stale `true` from an earlier registration of the
+        // id cannot survive into a registration the re-start is replacing —
+        // the id may have been removed and re-registered by a foreign
+        // caller in between (§6.1's removed-and-re-registered bound).
+        const prior_admission = self.admitted_by_session.get(sid);
+        try self.admitted_by_session.put(sid, false);
         const prior_epoch = self.trackerEpoch(sid);
         try self.setTrackerValue(sid, seq + 1);
         self.sequence = seq; // compatibility mirror
         self.recordPendingSend(sid, msg_id, seq, .start, seq, 0) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
-            // start reuses `seq` instead of running ahead of the server.
+            // start reuses `seq` instead of running ahead of the server, and
+            // the admission slot to its pre-send value (absent stays absent)
+            // — a failed attempt proves nothing either way (#210 gap 7).
             self.restoreTrackerState(sid, seq, prior_epoch);
+            if (prior_admission) |prior_flag| {
+                self.admitted_by_session.put(sid, prior_flag) catch {};
+            } else {
+                _ = self.admitted_by_session.remove(sid);
+            }
             return err;
         };
 
@@ -550,6 +580,25 @@ pub const AgentProtocolClient = struct {
                 // subsequent ordinary send (#210 gap 7).
                 if (self.pendingSendFor(p.session_id, env.in_reply_to)) |start| {
                     if (start.kind == .start) {
+                        // §6.1 admission evidence (#210 gap 7): the reply
+                        // names this client's OWN tracked start, so this
+                        // registration's acceptance is proven. A delayed or
+                        // unsolicited started — from an OLDER registration
+                        // on a reused id, or a FOREIGN caller's registration
+                        // that won the race for a caller-supplied id —
+                        // carries no ownership proof and must not arm the
+                        // teardown stop against a session this client does
+                        // not own; it settles in the adopted-start branch
+                        // below without the flip. The slot was reserved at
+                        // send time, so the flip writes in place (the put
+                        // fallback is belt-and-braces against the
+                        // reservation sites and the record sites drifting
+                        // apart; unreachable while the invariant holds).
+                        if (self.admitted_by_session.getPtr(p.session_id)) |flag| {
+                            flag.* = true;
+                        } else {
+                            try self.admitted_by_session.put(p.session_id, true);
+                        }
                         try self.noteProvenFloor(p.session_id, start.sequence + 1);
                         self.invalidateBelowFloorAfterStart(p.session_id);
                     }
@@ -612,6 +661,17 @@ pub const AgentProtocolClient = struct {
                 try self.setSessionResult(env.session_id, json);
             },
             .agent_error => |e| {
+                // A CORRELATED reply naming a request this client does not
+                // track is a delayed rejection from an OLDER registration on
+                // a reused id: request-scoped, not a failure of the current
+                // session — recording it would mark the healthy current turn
+                // complete+failed and abort it in the TUI. The
+                // counter/control mutation in handleCorrelatedRejection is
+                // already gated on current-request ownership; this guard
+                // extends it to the terminal bookkeeping (mirroring the nack
+                // arm's guard). Uncorrelated frames still settle below
+                // (§13.4.2's settlement shape) (#210 gap 7).
+                if (env.in_reply_to != null and !self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                 // Roll the tracker back BEFORE the fallible error bookkeeping:
                 // the rejection envelope is already consumed, so an allocation
                 // failure in the diagnostics must not leave the optimistic
@@ -742,15 +802,30 @@ pub const AgentProtocolClient = struct {
                 _ = self.stop_revert_bound_by_session.remove(p.session_id);
                 _ = self.tracker_epoch_by_session.remove(p.session_id);
                 // The session is gone with its counter — the tracked
-                // requests (the accepted stop included) are meaningless.
-                if (self.pending_sends_by_session.fetchRemove(p.session_id)) |entry| {
-                    var list = entry.value;
-                    list.deinit(self.allocator);
-                }
+                // requests (the accepted stop included) and the admission
+                // evidence are meaningless (#210 gap 7).
+                self.clearSessionControlState(p.session_id);
                 try self.session_complete_flags.put(p.session_id, true);
             },
             else => {},
         }
+    }
+
+    /// Tears down a session's request-tracking control state — the
+    /// pending-send records and the §6.1 admission slot (#210 gap 7).
+    /// Every path that ends a registration client-side converges here
+    /// (the agent_stopped acceptance, a session-gone correlated
+    /// rejection, removeSessionState), so the sets they clear cannot
+    /// drift apart. The admission slot is part of the teardown on
+    /// purpose: a slot left `true` for a removed id would claim
+    /// ownership of whatever registration occupies the id next — the
+    /// probe's §6.1 bound is "not since removed and re-registered".
+    fn clearSessionControlState(self: *Self, session_id: agent_types.SessionId) void {
+        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
+            var list = entry.value;
+            list.deinit(self.allocator);
+        }
+        _ = self.admitted_by_session.remove(session_id);
     }
 
     /// Retires the pending-send record whose request a reply names (e.g. the
@@ -1081,17 +1156,21 @@ pub const AgentProtocolClient = struct {
         // agent_not_found (or session_expired — the idle-TTL eviction answer)
         // means the session is gone server-side, so its tracked sequence
         // state is meaningless. Drop it — a re-registration of the id must
-        // start at sequence 1, not the stale optimistic counter.
+        // start at sequence 1, not the stale optimistic counter. The ACTIVE
+        // IDENTITY clears too (mirroring the agent_stopped arm): with it
+        // left set, the TUI's session sync keeps the vanished registration
+        // as the live one and every later turn skips agent_start in favor of
+        // messages into the void (#210 gap 7).
         const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
         if (session_gone) {
+            if (self.session_id) |active| {
+                if (std.mem.eql(u8, active[0..], session_id[0..])) self.session_id = null;
+            }
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.proven_floor_by_session.remove(session_id);
             _ = self.stop_revert_bound_by_session.remove(session_id);
             _ = self.tracker_epoch_by_session.remove(session_id);
-            if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-                var pending_list = entry.value;
-                pending_list.deinit(self.allocator);
-            }
+            self.clearSessionControlState(session_id);
             return;
         }
 
@@ -1315,6 +1394,18 @@ pub const AgentProtocolClient = struct {
         return self.session_complete_flags.get(session_id) orelse false;
     }
 
+    /// Whether this client observed a request-correlated `agent_started`
+    /// for the session's registration (§6.1 admission evidence; #210 gap
+    /// 7): reserved false at the start send, flipped only by a reply
+    /// naming this client's own tracked start, cleared by every teardown
+    /// path. An unknown-outcome teardown stop may reconcile against the
+    /// session only while this stands — an unobserved start proves no
+    /// ownership of whatever registration the id holds (§6.1's
+    /// leak-over-destroy stance).
+    pub fn isSessionAdmitted(self: *Self, session_id: agent_types.SessionId) bool {
+        return self.admitted_by_session.get(session_id) orelse false;
+    }
+
     pub fn getLastErrorForSession(self: *Self, session_id: agent_types.SessionId) ?[]const u8 {
         if (self.session_last_errors.get(session_id)) |err| {
             const msg = err.slice();
@@ -1337,10 +1428,7 @@ pub const AgentProtocolClient = struct {
         _ = self.stop_revert_bound_by_session.remove(session_id);
         _ = self.tracker_epoch_by_session.remove(session_id);
         _ = self.session_complete_flags.remove(session_id);
-        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-            var list = entry.value;
-            list.deinit(self.allocator);
-        }
+        self.clearSessionControlState(session_id);
 
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
@@ -4418,4 +4506,351 @@ test "AgentProtocolClient a no-op stop does not supersede a pending mirror's own
     var next_env = try harness.envelopeAt(4); // start, stop, at-six, teardown, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), next_env.sequence);
+}
+
+test "AgentProtocolClient only a request-correlated agent_started records admission evidence (#210 gap 7)" {
+    // §6.1 admission evidence is OWNERSHIP proof: a started with no tie to
+    // this client's own tracked start (a lenient peer's uncorrelated reply,
+    // or a reply naming a FOREIGN start on a reused caller-supplied id)
+    // proves nothing about who owns the registration the id holds, and must
+    // not arm the teardown stop against it. Only the reply correlated to
+    // the tracked start flips the slot; the teardown clears it.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    // Phase 1: a lenient peer's uncorrelated started.
+    const sid1 = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid1, "{}", null); // seq 1
+    try std.testing.expect(!client.isSessionAdmitted(sid1)); // reserved false, in flight
+    var uncorrelated = agent_types.Envelope{
+        .session_id = sid1,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid1 } },
+    };
+    defer uncorrelated.deinit(allocator);
+    try client.processEnvelope(uncorrelated);
+    try std.testing.expect(!client.isSessionAdmitted(sid1)); // adopted, not owned
+
+    // Phase 2: a started replying to a FOREIGN start id (a reused
+    // caller-supplied id's other registrant) — equally unowned.
+    const sid2 = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid2, "{}", null); // seq 1
+    var foreign = agent_types.Envelope{
+        .session_id = sid2,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = agent_types.generateUlid(), // not this client's start
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid2 } },
+    };
+    defer foreign.deinit(allocator);
+    try client.processEnvelope(foreign);
+    try std.testing.expect(!client.isSessionAdmitted(sid2));
+
+    // Phase 3: the reply correlated to this client's own start flips the
+    // slot, and the agent_stopped teardown clears it with the rest.
+    const sid3 = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid3, "{}", null); // seq 1
+    try std.testing.expect(!client.isSessionAdmitted(sid3));
+    var started_env = agent_types.Envelope{
+        .session_id = sid3,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid3 } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expect(client.isSessionAdmitted(sid3));
+
+    const stop_id = try client.sendAgentStop(sid3, "done"); // stop@2, tracked
+    var stopped_env = agent_types.Envelope{
+        .session_id = sid3,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid3, .reason = OwnedSlice(u8).initBorrowed("done") } },
+    };
+    defer stopped_env.deinit(allocator);
+    try client.processEnvelope(stopped_env);
+    try std.testing.expect(!client.isSessionAdmitted(sid3)); // gone with the session
+}
+
+test "AgentProtocolClient stale correlated agent_error does not fail the live session (#210 gap 7)" {
+    // A delayed correlated agent_error replying to an OLDER registration's
+    // request (reused id, reply arrives during the new run): the
+    // counter/control mutation was already gated on current-request
+    // ownership — the TERMINAL bookkeeping must be too, or the healthy
+    // current turn is marked complete+failed and the TUI aborts it.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, unresolved
+
+    // Stale rejection naming an untracked request: request-scoped, dropped.
+    var stale = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "stale rejection") } },
+    };
+    defer stale.deinit(allocator);
+    try client.processEnvelope(stale);
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.session_id != null); // identity untouched
+
+    // A rejection naming the PENDING message still fails the session.
+    var ours = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer ours.deinit(allocator);
+    try client.processEnvelope(ours);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient correlated agent_not_found clears state only for a request of the current registration (#210 gap 7)" {
+    // The rejection must name a request this client tracks for the CURRENT
+    // registration. A tracked send's not_found clears the stale counter,
+    // control state, AND the active identity (with the identity left set,
+    // the TUI's session sync keeps the vanished registration as the live
+    // one and later turns never re-start); a DELAYED not_found from an
+    // older registration's stop — whose id the client never tracked,
+    // arriving after the reused id's new agent_started — must leave the
+    // new registration's state alone, or its next message would start at
+    // sequence 1 against the live server session.
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+    var first_started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer first_started_env.deinit(allocator);
+    try client.processEnvelope(first_started_env);
+    try std.testing.expect(client.session_id != null);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+
+    // Tracked request answered agent_not_found: the session is gone, drop
+    // the sequence, control state, AND the active identity.
+    var tracked_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer tracked_rejection.deinit(allocator);
+    try client.processEnvelope(tracked_rejection);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id == null);
+
+    // The id is re-registered (start + started + message): the CURRENT
+    // registration's state is live again...
+    _ = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1, tracker 2
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 2, tracker 3
+
+    // ...so a delayed not_found replying to the OLD registration's
+    // untracked stop id must NOT wipe it.
+    const stale_stop_id = agent_types.generateUlid();
+    var stale_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stale_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer stale_rejection.deinit(allocator);
+    try client.processEnvelope(stale_rejection);
+
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id != null); // identity untouched by the stale reply
+    try std.testing.expect(!client.isSessionComplete(sid)); // nor is the turn failed
+}
+
+test "AgentProtocolClient correlated session_expired clears state like agent_not_found (#210 gap 7)" {
+    // The idle-TTL eviction answer is as gone as not_found: the identity,
+    // counter, and admission evidence drop so the next turn re-registers
+    // instead of skipping agent_start and messaging into the void — and so
+    // the eviction's stale admission cannot arm a later teardown stop
+    // against whatever registration occupies the id next (§6.1's
+    // removed-and-re-registered bound).
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expect(client.isSessionAdmitted(sid));
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+    try std.testing.expect(client.session_id != null);
+
+    var expired = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .session_expired, .message = try allocator.dupe(u8, "session expired") } },
+    };
+    defer expired.deinit(allocator);
+    try client.processEnvelope(expired);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id == null);
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+}
+
+test "AgentProtocolClient plain stop replies reach the session-gone and rejection handling (#210 gap 7)" {
+    // Ordinary stops are tracked requests: their OWN replies pass the
+    // stale-reply guard instead of being dropped as foreign frames — a
+    // not_found answer to a plain stop clears the identity and counter, and
+    // a rejection surfaces an observable failure.
+    const allocator = std.testing.allocator;
+
+    // Phase 1: the stop's agent_not_found answer clears the session state.
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = start_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+        const stop_id = try client.sendAgentStop(sid, "done"); // stop@3, tracked
+
+        var gone = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+        };
+        defer gone.deinit(allocator);
+        try client.processEnvelope(gone);
+
+        try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+        try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+        try std.testing.expect(client.session_id == null);
+    }
+
+    // Phase 2: the stop's rejection keeps the tracker (a stop never advances
+    // it) and records the failure the caller can observe.
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        const start_id = try client.sendAgentStartWithSession(sid, "{}", null); // seq 1
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = start_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
+        const stop_id = try client.sendAgentStop(sid, "done");
+
+        var rejected = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+        };
+        defer rejected.deinit(allocator);
+        try client.processEnvelope(rejected);
+
+        try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid)); // unchanged: a stop never advances the counter
+        try std.testing.expect(client.getLastErrorForSession(sid) != null); // observable
+        try std.testing.expect(client.isSessionComplete(sid));
+    }
 }

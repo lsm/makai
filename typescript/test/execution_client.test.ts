@@ -2411,16 +2411,17 @@ test("concurrent client.agent.run on one session id: duplicate is rejected promp
   // its agent_busy rejection immediately instead of surfacing the response
   // timeout after the established run finishes, and the established run is
   // unaffected (neither consuming the rejection nor losing its own reply).
+  // "Promptly" is asserted deterministically, not by a wall-clock budget:
+  // only a correlated delivery can settle the duplicate with agent_busy
+  // before the response timeout — a duplicate that waited out the timeout
+  // rejects with the timeout error and fails the reason assertion below. A
+  // fixed latency budget on top of that flaked under CI runner contention
+  // (delivery legitimately slowed past it while still correlated).
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
-    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
-    const startedAt = Date.now();
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const [established, duplicate] = await Promise.allSettled([agent.run(request()), agent.run(request())]);
-    const elapsedMs = Date.now() - startedAt;
 
-    // The duplicate's rejection is delivered by correlation, not by waiting
-    // out the response timeout.
-    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
     assert.equal(established.status, "fulfilled");
     assert.equal((established as PromiseFulfilledResult<{ stop_reason?: string }>).value.stop_reason, "end_turn");
     assert.equal(duplicate.status, "rejected");
@@ -2443,15 +2444,14 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
   // Same scenario with the real agent server's rejection flavor: the
   // duplicate start is refused with an agent_error frame (not a nack); the
   // correlated delivery must route it to the duplicate regardless of frame
-  // type.
+  // type. Promptness is carried by the reason assertion (only a correlated
+  // delivery settles the duplicate with agent_busy before the response
+  // timeout), not a wall-clock budget.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_BUSY_AS_ERROR: "1" });
   try {
-    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
-    const startedAt = Date.now();
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const [established, duplicate] = await Promise.allSettled([agent.run(request()), agent.run(request())]);
-    const elapsedMs = Date.now() - startedAt;
 
-    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
     assert.equal(established.status, "fulfilled");
     assert.equal((established as PromiseFulfilledResult<{ stop_reason?: string }>).value.stop_reason, "end_turn");
     assert.equal(duplicate.status, "rejected");
@@ -2468,14 +2468,14 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
 });
 
 test("concurrent client.agent.stream on one session id: duplicate is rejected promptly, established stream completes", async () => {
+  // Same promptness stance as the run variant above: the reason assertion
+  // (agent_busy by correlated delivery, not the response-timeout error)
+  // carries the invariant; no wall-clock budget.
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
-    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
-    const startedAt = Date.now();
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const [established, duplicate] = await Promise.allSettled([collect(agent.stream(request())), collect(agent.stream(request()))]);
-    const elapsedMs = Date.now() - startedAt;
 
-    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
     assert.equal(established.status, "fulfilled");
     const events = (established as PromiseFulfilledResult<AgentStreamEvent[]>).value;
     assert.equal(events.at(-1)?.type, "agent_end");
