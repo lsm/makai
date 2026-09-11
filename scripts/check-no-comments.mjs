@@ -41,9 +41,11 @@ const TS_KEEP_PATTERNS = [
   /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*@ts-(?:ignore|expect-error|nocheck|check)(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*biome-ignore(?=[\s:]|$)/,
-  /^(?:\/\/|\/\*+)[\s*]*eslint-(?:disable|enable)(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*eslint-disable(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*eslint-enable(?=[\s,]|$)/,
   /^\/\*+[\s*]*eslint-env(?=[\s,]|$)/,
-  /^(?:\/\/|\/\*+)[\s*]*oxlint-(?:disable|enable)(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*oxlint-disable(?:-(?:next-)?line)?(?=[\s,]|$)/,
+  /^(?:\/\/|\/\*+)[\s*]*oxlint-enable(?=[\s,]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*@public(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore(?=[\s]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*knip-ignore(?=[\s:]|$)/,
@@ -448,9 +450,10 @@ function listFiles(args) {
     const end = rest.findIndex((a) => a.startsWith("--"));
     return rest.slice(0, end === -1 ? rest.length : end).filter(Boolean);
   }
-  return git(["ls-files", "*.zig", "*.ts"])
-    .split("\n")
-    .map((f) => f.trim())
+  // -z emits NUL-delimited names without C-quoting non-ASCII paths or
+  // touching embedded whitespace, so every tracked filename reads exactly.
+  return git(["ls-files", "-z", "*.zig", "*.ts"])
+    .split("\0")
     .filter(Boolean);
 }
 

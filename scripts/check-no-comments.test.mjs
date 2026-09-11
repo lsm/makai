@@ -233,6 +233,7 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
     "// biome-ignore lint/suspicious/noExplicitAny: fixture\nconst a = 1\n",
     "// eslint-disable-next-line no-console\nconst a = 1\n",
     "// eslint-disable-line\nconst a = 1\n",
+    "/* eslint-enable */\nconst a = 1\n",
     "// oxlint-disable-next-line\nconst a = 1\n",
     "/* eslint-disable no-console, no-alert */\nconst a = 1\n",
     "/* eslint-env browser, node */\nconst a = 1\n",
@@ -253,6 +254,9 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("/* eslint enables linting */\nconst a = 1\n"), 1);
   assert.equal(tsCount("// eslint-plugin-react is not needed here\nconst a = 1\n"), 1);
   assert.equal(tsCount("// eslint-disable-policy discussion\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// eslint-enable-line\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// eslint-enable-next-line no-console\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// oxlint-enable-next-line\nconst a = 1\n"), 1);
   assert.equal(tsCount("// @ts-ignore-policy notes\nconst a = 1\n"), 1);
   assert.equal(tsCount("// biome-ignore-policy draft\nconst a = 1\n"), 1);
   assert.equal(tsCount("// v8 ignore-all the things\nconst a = 1\n"), 1);
@@ -518,4 +522,13 @@ test("cli: --stats reports per-file counts without writing", () => {
   assert.equal(run.status, 0, run.stdout);
   assert.ok(run.stdout.includes(`${dirtyZig}: 1`));
   assert.equal(readFileSync(dirtyZig, "utf8"), before);
+});
+
+test("cli: non-ASCII tracked filenames are read exactly from git ls-files -z", () => {
+  const repo = gitRepo("unicode-repo");
+  writeFileSync(join(repo, "café.zig"), "// carve\nconst x = 1;\n");
+  gitCommit(repo);
+  const run = spawnSync(process.execPath, [SCRIPT, "--check", "--allowlist", "none.txt"], { cwd: repo });
+  assert.equal(run.status, 1, run.stdout);
+  assert.ok(run.stdout.includes("comments remain: café.zig"), run.stdout);
 });
