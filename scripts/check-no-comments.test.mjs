@@ -288,6 +288,11 @@ test("ts: @ts-check/@ts-nocheck are exempt only as leading single-line pragmas",
   assert.equal(tsCount("const a = 1\n// @ts-nocheck\nconst b = 2\n"), 1);
   assert.equal(tsCount("const a = 1\n// @ts-check\nconst b = 2\n"), 1);
   assert.equal(tsCount('const a = "// @ts-check"\n// @ts-nocheck\nconst b = 2\n'), 1);
+  assert.equal(tsCount("#!/usr/bin/env node\r// @ts-check\nconst a = 1\n"), 0);
+  const interleaved = '// @ts-ignore /*\nconst x = 1; // @ts-ignore */\n// @ts-check\n';
+  const foundInterleaved = findComments(interleaved, "x.ts");
+  assert.equal(foundInterleaved.length, 1);
+  assert.ok(interleaved.slice(foundInterleaved[0].start, foundInterleaved[0].end).startsWith("// @ts-check"));
 });
 
 test("ts: /// directives are exempt only in the file's leading trivia", () => {
@@ -313,6 +318,7 @@ test("ts: /// directives are exempt only in the file's leading trivia", () => {
   assert.equal(tsCount('#!/usr/bin/env node\nconst a = 1\n/// <reference types="node" />\n'), 1);
   assert.equal(tsCount('const a = 1/// <reference types="node" />\n'), 1);
   assert.equal(tsCount('const a = 1\n/// <amd-module name="x" />\n'), 1);
+  assert.equal(tsCount("#!/usr/bin/env node\u2028/// <reference types=\"node\" />\nconst a = 1\n"), 0);
 });
 
 let workDir;

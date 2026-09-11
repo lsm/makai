@@ -69,20 +69,14 @@ const TS_LINE_TERMINATOR = /[\n\r\u2028\u2029]/;
 // them, executable code may not. Outside that window every placement (block
 // pragmas, mid-file, post-code) is an ordinary comment and counts.
 // @ts-ignore/@ts-expect-error stay on the always-exempt list above because
-// they are line-scoped suppressions, not file-wide pragmas.
+// they are line-scoped suppressions, not file-wide pragmas. The window is
+// tracked by the scanner itself as it walks left to right (leadingTrivia in
+// collectTsCommentRanges), never by stripping delimiter-shaped text out of
+// the raw prefix — a block delimiter inside a line comment would fool that.
 const TS_LEADING_PATTERNS = [
   /^\/\/\s*@ts-(?:nocheck|check)(?=[\s:]|$)/,
   /^\/\/\/\s*<(?:reference|amd-dependency|amd-module)(?=[\s]|$)/,
 ];
-const STRIP_BLOCK_COMMENTS = /\/\*[\s\S]*?\*\//g;
-const STRIP_LINE_COMMENTS = new RegExp("//[^\\n\\r\\u2028\\u2029]*", "g");
-
-function isLeadingTrivia(text, start) {
-  let before = text.slice(0, start);
-  if (before.startsWith("#!")) before = before.slice(before.indexOf("\n") + 1);
-  before = before.replace(STRIP_BLOCK_COMMENTS, "").replace(STRIP_LINE_COMMENTS, "");
-  return /^\s*$/.test(before);
-}
 
 function parse(text, fileName) {
   return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -114,6 +108,10 @@ function collectTsCommentRanges(text, fileName) {
   let spanIdx = 0;
   let i = 0;
   const n = text.length;
+  // True while everything consumed so far is shebang/comments/whitespace:
+  // the file's leading trivia. Literal spans and any other code close it,
+  // comments never do, and the shebang skip below leaves it open.
+  let leadingTrivia = true;
   // The shebang line is a protected span: a `//` inside it (e.g. a Deno
   // `--allow-net=https://…` flag) is not a comment, and keep-patterns can
   // never see it anyway because matching starts at the `//`.
@@ -128,6 +126,7 @@ function collectTsCommentRanges(text, fileName) {
     }
     if (span && i >= span.start) {
       i = span.end;
+      leadingTrivia = false;
       continue;
     }
     if (text[i] === "/" && text[i + 1] === "/") {
@@ -136,7 +135,7 @@ function collectTsCommentRanges(text, fileName) {
       const slice = text.slice(i, j);
       const kept =
         TS_KEEP_PATTERNS.some((p) => p.test(slice)) ||
-        (TS_LEADING_PATTERNS.some((p) => p.test(slice)) && isLeadingTrivia(text, i));
+        (leadingTrivia && TS_LEADING_PATTERNS.some((p) => p.test(slice)));
       if (!kept) ranges.push({ start: i, end: j });
       i = j;
       continue;
@@ -154,6 +153,7 @@ function collectTsCommentRanges(text, fileName) {
       i = end;
       continue;
     }
+    if (!/\s/.test(text[i])) leadingTrivia = false;
     i++;
   }
   return ranges;
