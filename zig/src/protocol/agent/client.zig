@@ -34,6 +34,11 @@ pub const QueuedEvent = struct {
 /// own value).
 const PendingSendKind = enum { start, message, stop };
 
+const SessionAdmission = struct {
+    exclusive_id: bool = false,
+    started_observed: bool = false,
+};
+
 const PendingSend = struct {
     msg_id: agent_types.Ulid,
     sequence: u64,
@@ -170,6 +175,7 @@ pub const AgentProtocolClient = struct {
     /// (its own write was the last) from one a later write — of any
     /// kind — has superseded (#210 gap 7).
     tracker_epoch_by_session: std.AutoHashMap(agent_types.SessionId, u64),
+    admitted_by_session: std.AutoHashMap(agent_types.SessionId, SessionAdmission),
 
     const Self = @This();
 
@@ -185,6 +191,7 @@ pub const AgentProtocolClient = struct {
             .proven_floor_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .stop_revert_bound_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .tracker_epoch_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
+            .admitted_by_session = std.AutoHashMap(agent_types.SessionId, SessionAdmission).init(allocator),
         };
     }
 
@@ -216,6 +223,7 @@ pub const AgentProtocolClient = struct {
         self.proven_floor_by_session.deinit();
         self.stop_revert_bound_by_session.deinit();
         self.tracker_epoch_by_session.deinit();
+        self.admitted_by_session.deinit();
 
         self.* = undefined;
     }
@@ -296,10 +304,14 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const sid = agent_types.generateSessionId();
-        return self.sendAgentStartWithSession(sid, config_json, system_prompt);
+        return self.startSession(sid, config_json, system_prompt, true);
     }
 
     pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
+        return self.startSession(sid, config_json, system_prompt, false);
+    }
+
+    fn startSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8, id_exclusive: bool) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
 
         // Build the fallible payload BEFORE any tracker mutation (see
@@ -327,13 +339,22 @@ pub const AgentProtocolClient = struct {
             .payload = payload,
         });
         defer self.allocator.free(start_json);
+        const prior_admission = self.admitted_by_session.get(sid);
         const prior_epoch = self.trackerEpoch(sid);
         try self.setTrackerValue(sid, seq + 1);
         self.sequence = seq; // compatibility mirror
+        self.admitted_by_session.put(sid, .{ .exclusive_id = id_exclusive }) catch |err| {
+            self.restoreTrackerState(sid, seq, prior_epoch);
+            return err;
+        };
         self.recordPendingSend(sid, msg_id, seq, .start, seq, 0) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
-            // start reuses `seq` instead of running ahead of the server.
             self.restoreTrackerState(sid, seq, prior_epoch);
+            if (prior_admission) |prior_slot| {
+                self.admitted_by_session.put(sid, prior_slot) catch {};
+            } else {
+                _ = self.admitted_by_session.remove(sid);
+            }
             return err;
         };
 
@@ -550,6 +571,9 @@ pub const AgentProtocolClient = struct {
                 // subsequent ordinary send (#210 gap 7).
                 if (self.pendingSendFor(p.session_id, env.in_reply_to)) |start| {
                     if (start.kind == .start) {
+                        if (self.admitted_by_session.getPtr(p.session_id)) |slot| {
+                            slot.started_observed = true;
+                        }
                         try self.noteProvenFloor(p.session_id, start.sequence + 1);
                         self.invalidateBelowFloorAfterStart(p.session_id);
                     }
@@ -612,6 +636,7 @@ pub const AgentProtocolClient = struct {
                 try self.setSessionResult(env.session_id, json);
             },
             .agent_error => |e| {
+                if (env.in_reply_to != null and !self.replyNamesPendingSend(env.session_id, env.in_reply_to)) return;
                 // Roll the tracker back BEFORE the fallible error bookkeeping:
                 // the rejection envelope is already consumed, so an allocation
                 // failure in the diagnostics must not leave the optimistic
@@ -742,15 +767,19 @@ pub const AgentProtocolClient = struct {
                 _ = self.stop_revert_bound_by_session.remove(p.session_id);
                 _ = self.tracker_epoch_by_session.remove(p.session_id);
                 // The session is gone with its counter — the tracked
-                // requests (the accepted stop included) are meaningless.
-                if (self.pending_sends_by_session.fetchRemove(p.session_id)) |entry| {
-                    var list = entry.value;
-                    list.deinit(self.allocator);
-                }
+                self.clearSessionControlState(p.session_id);
                 try self.session_complete_flags.put(p.session_id, true);
             },
             else => {},
         }
+    }
+
+    fn clearSessionControlState(self: *Self, session_id: agent_types.SessionId) void {
+        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
+            var list = entry.value;
+            list.deinit(self.allocator);
+        }
+        _ = self.admitted_by_session.remove(session_id);
     }
 
     /// Retires the pending-send record whose request a reply names (e.g. the
@@ -1088,14 +1117,12 @@ pub const AgentProtocolClient = struct {
             _ = self.proven_floor_by_session.remove(session_id);
             _ = self.stop_revert_bound_by_session.remove(session_id);
             _ = self.tracker_epoch_by_session.remove(session_id);
-            if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-                var pending_list = entry.value;
-                pending_list.deinit(self.allocator);
-            }
+            self.clearSessionControlState(session_id);
             return;
         }
 
         const rejected = list.items[index];
+        if (rejected.kind == .start) _ = self.admitted_by_session.remove(session_id);
         // A rejected RESYNCING stop's pre-resync prior joins the session's
         // revert bound BEFORE the record leaves the list: the store is
         // fallible, and a failure after the removal would strand the
@@ -1315,6 +1342,11 @@ pub const AgentProtocolClient = struct {
         return self.session_complete_flags.get(session_id) orelse false;
     }
 
+    pub fn isSessionAdmitted(self: *Self, session_id: agent_types.SessionId) bool {
+        const slot = self.admitted_by_session.get(session_id) orelse return false;
+        return slot.exclusive_id and slot.started_observed;
+    }
+
     pub fn getLastErrorForSession(self: *Self, session_id: agent_types.SessionId) ?[]const u8 {
         if (self.session_last_errors.get(session_id)) |err| {
             const msg = err.slice();
@@ -1337,10 +1369,7 @@ pub const AgentProtocolClient = struct {
         _ = self.stop_revert_bound_by_session.remove(session_id);
         _ = self.tracker_epoch_by_session.remove(session_id);
         _ = self.session_complete_flags.remove(session_id);
-        if (self.pending_sends_by_session.fetchRemove(session_id)) |entry| {
-            var list = entry.value;
-            list.deinit(self.allocator);
-        }
+        self.clearSessionControlState(session_id);
 
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
@@ -4418,4 +4447,354 @@ test "AgentProtocolClient a no-op stop does not supersede a pending mirror's own
     var next_env = try harness.envelopeAt(4); // start, stop, at-six, teardown, next
     defer next_env.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), next_env.sequence);
+}
+
+test "AgentProtocolClient admission evidence requires an exclusive id's own correlated agent_started (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid1 = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid1, "{}", null);
+    try std.testing.expect(!client.isSessionAdmitted(sid1));
+    var uncorrelated = agent_types.Envelope{
+        .session_id = sid1,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid1 } },
+    };
+    defer uncorrelated.deinit(allocator);
+    try client.processEnvelope(uncorrelated);
+    try std.testing.expect(!client.isSessionAdmitted(sid1));
+    try std.testing.expect(!(client.admitted_by_session.get(sid1) orelse SessionAdmission{}).started_observed);
+
+    const sid2 = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid2, "{}", null);
+    var foreign = agent_types.Envelope{
+        .session_id = sid2,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid2 } },
+    };
+    defer foreign.deinit(allocator);
+    try client.processEnvelope(foreign);
+    try std.testing.expect(!client.isSessionAdmitted(sid2));
+    try std.testing.expect(!(client.admitted_by_session.get(sid2) orelse SessionAdmission{}).started_observed);
+
+    const sid3 = agent_types.generateSessionId();
+    const supplied_start_id = try client.sendAgentStartWithSession(sid3, "{}", null);
+    var supplied_started = agent_types.Envelope{
+        .session_id = sid3,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = supplied_start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid3 } },
+    };
+    defer supplied_started.deinit(allocator);
+    try client.processEnvelope(supplied_started);
+    try std.testing.expect((client.admitted_by_session.get(sid3) orelse SessionAdmission{}).started_observed);
+    try std.testing.expect(!client.isSessionAdmitted(sid3));
+
+    const start_id = try client.sendAgentStart("{}", null);
+    var generated_start_env = try harness.envelopeAt(3);
+    defer generated_start_env.deinit(allocator);
+    const sid4 = generated_start_env.session_id;
+    var started_env = agent_types.Envelope{
+        .session_id = sid4,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid4 } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expect(client.isSessionAdmitted(sid4));
+
+    const stop_id = try client.sendAgentStop(sid4, "done");
+    var stopped_env = agent_types.Envelope{
+        .session_id = sid4,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .in_reply_to = stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stopped = .{ .session_id = sid4, .reason = OwnedSlice(u8).initBorrowed("done") } },
+    };
+    defer stopped_env.deinit(allocator);
+    try client.processEnvelope(stopped_env);
+    try std.testing.expect(!client.isSessionAdmitted(sid4));
+}
+
+test "AgentProtocolClient rejected start retires its admission reservation (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null);
+    try std.testing.expect(client.admitted_by_session.get(sid) != null);
+
+    var busy = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = try allocator.dupe(u8, "session already exists") } },
+    };
+    defer busy.deinit(allocator);
+    try client.processEnvelope(busy);
+
+    try std.testing.expect(client.admitted_by_session.get(sid) == null);
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+    if (client.pending_sends_by_session.get(sid)) |pending| {
+        try std.testing.expectEqual(@as(usize, 0), pending.items.len);
+    }
+}
+
+test "AgentProtocolClient stale correlated agent_error does not fail the live session (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null);
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+
+    var stale = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = agent_types.generateUlid(),
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "stale rejection") } },
+    };
+    defer stale.deinit(allocator);
+    try client.processEnvelope(stale);
+    try std.testing.expect(client.getLastErrorForSession(sid) == null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.session_id != null);
+
+    var ours = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+    };
+    defer ours.deinit(allocator);
+    try client.processEnvelope(ours);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient correlated agent_not_found clears state only for a request of the current registration (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    _ = try client.sendAgentStartWithSession(sid, "{}", null);
+    var first_started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer first_started_env.deinit(allocator);
+    try client.processEnvelope(first_started_env);
+    try std.testing.expect(client.session_id != null);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+
+    var tracked_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer tracked_rejection.deinit(allocator);
+    try client.processEnvelope(tracked_rejection);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id != null);
+
+    _ = try client.sendAgentStartWithSession(sid, "{}", null);
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null);
+
+    const stale_stop_id = agent_types.generateUlid();
+    var stale_rejection = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = stale_stop_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer stale_rejection.deinit(allocator);
+    try client.processEnvelope(stale_rejection);
+
+    try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+    try std.testing.expect(client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id != null);
+    try std.testing.expect(!client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient correlated session_expired clears state like agent_not_found (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = agent_types.generateSessionId();
+    const start_id = try client.sendAgentStartWithSession(sid, "{}", null);
+    var started_env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .in_reply_to = start_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    };
+    defer started_env.deinit(allocator);
+    try client.processEnvelope(started_env);
+    try std.testing.expect((client.admitted_by_session.get(sid) orelse SessionAdmission{}).started_observed);
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    try std.testing.expect(client.session_id != null);
+
+    var expired = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .session_expired, .message = try allocator.dupe(u8, "session expired") } },
+    };
+    defer expired.deinit(allocator);
+    try client.processEnvelope(expired);
+
+    try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+    try std.testing.expect(client.session_id != null);
+    try std.testing.expect(client.admitted_by_session.get(sid) == null);
+    try std.testing.expect(!client.isSessionAdmitted(sid));
+}
+
+test "AgentProtocolClient plain stop replies reach the session-gone and rejection handling (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        const start_id = try client.sendAgentStartWithSession(sid, "{}", null);
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = start_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+        const stop_id = try client.sendAgentStop(sid, "done");
+
+        var gone = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+        };
+        defer gone.deinit(allocator);
+        try client.processEnvelope(gone);
+
+        try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+        try std.testing.expect(!client.pending_sends_by_session.contains(sid));
+        try std.testing.expect(client.session_id != null);
+    }
+
+    {
+        var harness = Gap7Harness.init();
+        defer harness.deinit();
+        harness.wire();
+        const client = &harness.client;
+
+        const sid = agent_types.generateSessionId();
+        const start_id = try client.sendAgentStartWithSession(sid, "{}", null);
+        var started_env = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 1,
+            .in_reply_to = start_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_started = .{ .session_id = sid } },
+        };
+        defer started_env.deinit(allocator);
+        try client.processEnvelope(started_env);
+        _ = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+        const stop_id = try client.sendAgentStop(sid, "done");
+
+        var rejected = agent_types.Envelope{
+            .session_id = sid,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = stop_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{ .code = .invalid_request, .message = try allocator.dupe(u8, "invalid sequence") } },
+        };
+        defer rejected.deinit(allocator);
+        try client.processEnvelope(rejected);
+
+        try std.testing.expectEqual(@as(u64, 3), client.peekNextSequence(sid));
+        try std.testing.expect(client.getLastErrorForSession(sid) != null);
+        try std.testing.expect(client.isSessionComplete(sid));
+    }
 }
