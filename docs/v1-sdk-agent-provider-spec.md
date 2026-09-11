@@ -1693,8 +1693,9 @@ convergence contract between makai and OAP: adapter #3 (lsm/open-agent-protocol#
 maps against it, and per that issue's feedback rule, an adapter mismatch resolves as
 either an OAP revision or a makai change — never silent adapter-side compensation.
 The ledger also carries the greppable catalogue of documented residuals
-(`RESIDUAL-1` … `RESIDUAL-5`). Most are wire-unobservable — this section cannot
+(`RESIDUAL-1` … `RESIDUAL-6`). Most are wire-unobservable — this section cannot
 resolve them because no frame carries a registration or run generation
 (§13.4.5) — and are documented uncertainty rather than guarantees an adapter
-may rely on; `RESIDUAL-2` is the exception, locally solvable from `in_reply_to`
-and recorded as a caution.
+may rely on. Two are exceptions, recorded because mishandling them is silent:
+`RESIDUAL-2`, locally solvable from `in_reply_to`, and `RESIDUAL-6`, a
+mechanism-COVERAGE gap on the SSE transport that needs no wire change at all.
