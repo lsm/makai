@@ -3,6 +3,9 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const common = @import("tools/common");
+const build_options = @import("build_options");
+
+const mcp_client_info_json = std.fmt.comptimePrint("{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"makai\",\"version\":\"{s}\"}}}}", .{build_options.version});
 
 pub const McpServerConfig = struct {
     name: []u8,
@@ -285,7 +288,7 @@ pub const McpBridge = struct {
 
     pub fn discover(self: *McpBridge) !void {
         for (self.servers.items, 0..) |*server, server_index| {
-            var initialize_response = try server.sendRequest(self.allocator, "initialize", "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"makai\",\"version\":\"0.1.0\"}}", null, mcp_discovery_timeout_ms);
+            var initialize_response = try server.sendRequest(self.allocator, "initialize", mcp_client_info_json, null, mcp_discovery_timeout_ms);
             defer initialize_response.deinit();
             try validateRpcResult(initialize_response.value);
             try server.sendNotification(self.allocator, "notifications/initialized", "{}");
@@ -825,7 +828,7 @@ test "MCP preserves partial buffered frame across requests" {
     defer bridge.deinit();
     try bridge.loadConfigJson(config_json);
     var server = &bridge.servers.items[0];
-    var initialize_response = try server.sendRequest(std.testing.allocator, "initialize", "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"makai\",\"version\":\"0.1.0\"}}", null, mcp_discovery_timeout_ms);
+    var initialize_response = try server.sendRequest(std.testing.allocator, "initialize", mcp_client_info_json, null, mcp_discovery_timeout_ms);
     defer initialize_response.deinit();
     try validateRpcResult(initialize_response.value);
     try server.sendNotification(std.testing.allocator, "notifications/initialized", "{}");

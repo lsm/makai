@@ -29,12 +29,12 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@makai/cli-darwin-arm64": "0.2.0",
-    "@makai/cli-darwin-x64": "0.2.0",
-    "@makai/cli-linux-arm64": "0.2.0",
-    "@makai/cli-linux-x64": "0.2.0",
-    "@makai/cli-win32-x64": "0.2.0",
-    "@makai/cli-win32-arm64": "0.2.0"
+    "@makai/cli-darwin-arm64": "*",
+    "@makai/cli-darwin-x64": "*",
+    "@makai/cli-linux-arm64": "*",
+    "@makai/cli-linux-x64": "*",
+    "@makai/cli-win32-x64": "*",
+    "@makai/cli-win32-arm64": "*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
