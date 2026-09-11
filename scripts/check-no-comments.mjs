@@ -46,6 +46,12 @@ const TS_KEEP_PATTERNS = [
   /^(?:\/\/|\/\*+)[\s*]*oxlint-disable(?:-(?:next-)?line)?(?=[\s,]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*oxlint-enable(?=[\s,]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*@public(?=[\s:]|$)/,
+  // JSDoc `@deprecated` is machine-read: tsc copies it into the emitted
+  // .d.ts, so stripping it would silently un-deprecate a public alias for
+  // consumers and editors. Unlike the line-scoped directives above, a JSDoc
+  // tag may follow a description in the same block, so match the tag
+  // anywhere in the comment rather than only at its start.
+  /^(?:\/\/|\/\*)[\s\S]*?@deprecated(?=[\s:]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*(?:v8|istanbul|c8) ignore(?=[\s]|$)/,
   /^(?:\/\/|\/\*+)[\s*]*knip-ignore(?=[\s:]|$)/,
 ];

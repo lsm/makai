@@ -240,6 +240,9 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
     "/* eslint-env browser, node */\nconst a = 1\n",
     "// oxlint-disable-next-line\nconst a = 1\n",
     "// @public\nconst a = 1\n",
+    "/** @deprecated Use NewOptions. */\nconst a = 1\n",
+    "/**\n * Legacy options.\n * @deprecated Use NewOptions.\n */\nconst a = 1\n",
+    "// @deprecated Use NewOptions.\nconst a = 1\n",
     "// knip-ignore\nconst a = 1\n",
     "/* v8 ignore next */\nconst a = 1\n",
     "// istanbul ignore next\nconst a = 1\n",
@@ -265,6 +268,8 @@ test("ts: functional directives are exempt, lookalikes are not", () => {
   assert.equal(tsCount("// consider biome-ignore later\nconst a = 1\n"), 1);
   assert.equal(tsCount("// coverage uses v8 ignore below\nconst a = 1\n"), 1);
   assert.equal(tsCount("// we removed knip-ignore usage\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// @deprecated-policy draft\nconst a = 1\n"), 1);
+  assert.equal(tsCount("// this API is deprecated\nconst a = 1\n"), 1);
   assert.equal(tsCount("/// <summary>documentation</summary>\nconst a = 1\n"), 1);
 });
 

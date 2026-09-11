@@ -19,6 +19,7 @@ export type MakaiStdioClientOptions = {
   logger?: MakaiLogger;
 };
 
+/** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
 export type MakaiClientOptions = MakaiStdioClientOptions;
 
 export class StdioProtocolError extends Error {
@@ -506,6 +507,7 @@ export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "comma
   resolver?: BinaryResolverOptions;
 };
 
+/** @deprecated Use CreateMakaiStdioClientOptions. Kept for backward compatibility. */
 export type CreateMakaiClientOptions = CreateMakaiStdioClientOptions;
 
 export async function createMakaiStdioClient(
