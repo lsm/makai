@@ -18,8 +18,15 @@ Frame Routing, V1.1") defines the semantics summarized here.
   session-lifecycle pass itself was verified against `67ad514`
   ("fix(agent): send agent_stop on session teardown — terminal, error, and
   auth-retry paths (#200)"). The §13.1/§13.5 wire-key (rename) claims pin to the
-  #198 rename's landing on `main` (the rename PR; update this pin with its merge
-  sha on landing). Every `[current]` claim in §13 and every status
+  #198 rename's landing on `main` — PR #211, merged as `65a28fb`
+  ("fix(agent): rename agent_start payload key resume_session_id → session_id
+  (#198)"). The §13.1 client-side sequence-discipline and §13.4.1
+  cleanup-probing claims pin to the gap-7 client sequence-control slices landed
+  on `main`: the TS SDK half PR #215 (`ec2bc2d`), and the Zig client slices S1
+  `2efce28` (#216), S2a `f578903` (#218), S2b-1 `560f635` (#226), S2b-2
+  `a8a6c07` (#227), S2b-3 `8925a8c` (#231), S3 `e4c568b` (#232), S4 `f5fd0b5`
+  (#239). The remaining Zig slice — #224 (TUI teardown integration) — has not
+  landed, so the claim it owns stays in progress in §13.1. Every `[current]` claim in §13 and every status
   below was verified against one of these revisions.
 - OAP references:
   - Decision 0001 — "Agent-Control v0.1 Executable Core" (accepted 2026-09-06):
@@ -75,9 +82,32 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | process exit before settlement | transport rejects the registered frame wait; reads queued behind the transport read lock surface the death as their response timeout; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule; adapters must keep timeout handling for lock-queued reads rather than expecting prompt rejection for every concurrent request. |
 | stdin EOF while a run waits on a distributed `tool_result` | the host latches the disconnect; the wait fails with a typed error and the run settles through the failure pair (`tool_execution_error` settlement), then the process drains and exits | aligned (#210 gap 4) | §13.2.7 rule 7: EOF-cancel applies to the tool-waiting case — the tool host IS the disconnected client. A `tool_result` delivered before EOF wins its wait (checked before the latch); a run needing client input after EOF settles failed, never success (§13.4.6), with pending tool requests dropped unpublished; provider-executing runs keep being pumped toward settlement until they need client input. Late frames from the cancelled run settle nothing — the pump's disconnect classification publishes the failure pair once and the run is removed, working with (not around) the §13.4.5 generation guard. |
 
-## P0 makai follow-ups (queued)
+## Wire-unobservable residuals
 
-These implement the `[planned]` rules of spec §13; each lands as its own PR:
+Protocol behaviors the wire cannot resolve: no frame carries a registration or
+run generation (spec §13.4.5), so each pair below is indistinguishable at a
+client's inputs. Closing any of them needs the generation tokens of a future
+wire revision — none is adapter-compensable, and adapters MUST treat them as
+documented uncertainty rather than protocol guarantees. Grep `RESIDUAL-` for
+the full set.
+
+| Residual | Spec | What is indistinguishable on the wire | Recorded mitigation |
+| --- | --- | --- | --- |
+| `RESIDUAL-1` stale admission after a silent TTL eviction | §13.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §13.1's admission evidence bounds the teardown stop's blast radius; an exclusive client-generated id remains the only sufficient ownership evidence until generation tokens exist. |
+| `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Eviction MUST NOT be distinguishable from stop by error code, and a session-gone answer is matched by request correlation alone — a delayed `agent_not_found`/`session_expired` can be attributed to whatever registration currently holds the id. | The Zig client clears the session's pending-send list together with its counter/control state, so a later copy of the answer matches nothing, and the `agent_error` arm drops correlated replies naming no tracked send. The clearing itself is not generation-bound. |
+| `RESIDUAL-3` stale trailing run output clearing the TS acceptance marker | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. | The marker carries the SDK's teardown semantics (abort and failure-pair paths stop at the advanced counter); never clearing would reinstate the unbounded leak, so the clear is kept and the ambiguity recorded. |
+| `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's teardown drains queued session output before the id is reused, with a single immediate pass (erring toward route cleanliness); not draining reinstates the parked-output poisoning of the next same-id run. |
+| `RESIDUAL-5` settlement-based retirement needs run identity | §13.1, §13.3.2 | `agent_result` carries no run identity, so retiring the settled run's pending record attributes the settlement to the OLDEST pending message (insertion order) and the proven floor rises only to the minimum pending-message sequence + 1. | A mis-attribution errs toward surfacing a duplicate rather than swallowing a failure — the self-correcting direction; a run identity on the settlement frame would close it. |
+
+The common shape is the downstream-buffer class the spec records at §6.1 and
+§13.4.5: frames already buffered downstream of a removed registration carry no
+generation and stay attributable to whatever registration holds the id next.
+
+## P0 makai follow-ups
+
+These implemented the `[planned]` rules of spec §13, each as its own PR; the
+per-item status is the record of what landed. An item is still open exactly
+where its spec claims remain `[planned]`.
 
 1. #201 — LANDED: `in_reply_to`-aware frame routing in the transport (implements
    §13.3.1; `correlate` wait option, reply-queue parking for registered requests,
@@ -85,7 +115,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    pre-acceptance `agent_started` correlation check). Overlapping same-session
    calls now each receive their own replies; the pre-#201 modes (duplicate
    timing out, established run destroyed, wrong request proceeding) are closed.
-2. #204/#210 — server enforcement gaps the spec marks `[planned]`. LANDED (first
+2. #204/#210 — server enforcement gaps filed against §13's `[planned]` rules. LANDED (first
    slice, #209): envelope/payload session-id agreement rejection (all four
    session-scoped handlers plus the stdio host's stop validation), the
    echo-reply sequence decision — decision (b): echo kept as a permanent
@@ -132,14 +162,28 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    dropped); the outgoing-sequence counter update is no longer swallowed
    (no duplicate wire sequences); and a stop's reply fields are built
    BEFORE the session removal, with run cancellation + tool-bridge cleanup
-   running even when the reply's own publication fails. Still open:
-   gap 7 — client sequence control in BOTH clients — `AgentProtocolClient`
-   (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
-   (its tracker advances before the outcome is known) — where "control" includes
-   bounded probing of BOTH counter states after an uncorrelated outcome (pre-send,
-   then post-send on a correlated `invalid_request`): rollback alone is wrong when
-   the message was actually accepted and output was merely delayed or lost.
-   Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
+   running even when the reply's own publication fails. Gap 7 — client sequence
+   control in BOTH clients — is LANDED for the TypeScript SDK in #215 (merged
+   `ec2bc2d`): the tracker marks the `agent_message` send unresolved at send,
+   rolls back on a correlated rejection, and, while the outcome is unresolved,
+   tears down through `stopAgentWithSequenceProbe` — a bounded two-state probe
+   (pre-send stop, then the post-send value on a correlated `invalid_request`,
+   correlated reads, acceptance at either) awaited on both `run()` and
+   `stream()` error paths, with the post-probe backlog drained before id reuse.
+   LANDED for the Zig client except its two remaining slices (S1 `2efce28`,
+   S2a `f578903`, S2b-1/2/3 `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`): the
+   `AgentProtocolClient` tracks every outstanding send, rolls the tracker back
+   MONOTONICALLY on a correlated `agent_error`/`nack` (an older unresolved
+   send's floor is never lost), drops the counter state on a correlated
+   `agent_not_found`/`session_expired`, never advances on stop sends, and
+   exposes the explicit-sequence control surface (`peekNextSequence`,
+   `sendAgentMessageWithSequence`, `sendAgentStopWithSequence`,
+   `sendAgentStopProbing`) alongside the S2b/S3 duplicate-evidence, ancestry,
+   proven-floor, and pending-record guards. The Zig client's own bounded
+   two-state stop probe landed in S4 `f5fd0b5` (#239), gated on §6.1 ownership
+   evidence and walking a discrete candidate set. Still open: the TUI teardown
+   integration (#224, S5). Same-sequence retries and unknown-outcome cleanup
+   are supported in both clients (§13.1/§13.4.1).
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused

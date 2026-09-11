@@ -976,8 +976,9 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
-  Zig client sequence discipline `[current — #210 gap 7, slices 1–2b-3 of the
-  client sequence-control series]`: the `AgentProtocolClient` mirrors the
+  Zig client sequence discipline `[current — #210 gap 7, slices 1–3 of the
+  client sequence-control series: S1 #216, S2a #218, S2b-1 #226, S2b-2 #227,
+  S2b-3 #231, S3 #232]`: the `AgentProtocolClient` mirrors the
   server's counter optimistically — the tracker advances at SEND, before the
   outcome is known — and reconciles on evidence. A CORRELATED rejection (an
   `agent_error` OR `nack` whose `in_reply_to` names the client's own send)
@@ -1023,7 +1024,8 @@ Rules:
   the MINIMUM pending-message sequence + 1 — the settled run is only
   KNOWN to be one of the pending messages (the insertion-order
   attribution is a heuristic; agent_result carries no run identity,
-  §13.3.2), so the heuristically retired record's own sequence proves
+  §13.3.2 — residual `RESIDUAL-5` in the ledger's residual catalogue), so the
+  heuristically retired record's own sequence proves
   nothing — and the tracker follows the floor, restoring progress a
   stale rewind (a delayed busy answer's parity floor for a retry that
   was actually accepted) had pulled below.
@@ -1142,7 +1144,9 @@ Rules:
   teardown driver pump an in-flight stop probe to settlement, the
   ambiguous-write reconciliation that stops the old registration instead of
   resending it, and the session-gone identity clear — are landed
-  (`[current — #210 gap 7 re-sliced from #213]`).
+  (`[current — #210 gap 7]`). The probe's admission gate and the teardown's
+  backlog drain carry residuals `RESIDUAL-1` and `RESIDUAL-4` in the ledger's
+  residual catalogue.
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
@@ -1431,7 +1435,10 @@ server eviction (rule 6), and holds no transcript and no persistence.
    request-correlated `agent_started` this client observed. Without that
    evidence, or with no recorded `agent_message` whose outcome is unresolved, a
    client MUST send nothing and leak the registration to the idle TTL rather
-   than risk stopping a foreign session (`[current — #210 gap 7]`). A start
+   than risk stopping a foreign session (`[current — #210 gap 7]`). The probe's
+   admission gate cannot prove current-registration ownership (`RESIDUAL-1`),
+   and its post-probe drain cannot attribute parked frames (`RESIDUAL-4`) — see
+   the ledger's residual catalogue. A start
    rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
@@ -1476,7 +1483,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
        quiescent drain — stop, then consume the settlement — before surfacing
        the error, and `stream()` already drained via its terminal teardown;
        the residual race for a settlement arriving after the bounded drain
-       remains, as in §13.4.5).
+       remains, as in §13.4.5 — residual `RESIDUAL-3`).
        Publication failures are transactional `[current — #210 gap 5]` —
        settle-or-propagate exactly once through every publication path, with
        the failure surfacing as the host's typed runtime error frame rather
@@ -1685,3 +1692,7 @@ The deviations ledger in [`docs/oap-alignment.md`](oap-alignment.md) is the
 convergence contract between makai and OAP: adapter #3 (lsm/open-agent-protocol#3)
 maps against it, and per that issue's feedback rule, an adapter mismatch resolves as
 either an OAP revision or a makai change — never silent adapter-side compensation.
+The ledger also carries the greppable catalogue of wire-unobservable residuals
+(`RESIDUAL-1` … `RESIDUAL-5`): protocol behaviors this section cannot resolve
+because no frame carries a registration or run generation (§13.4.5). They are
+documented uncertainty, not guarantees an adapter may rely on.
