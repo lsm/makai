@@ -52,6 +52,13 @@ jobs:
             archive: zip
             binary_name: makai.exe
             npm_target: win32-x64
+          - runner: windows-latest
+            target: aarch64-windows
+            os_name: windows
+            arch_name: arm64
+            archive: zip
+            binary_name: makai.exe
+            npm_target: win32-arm64
 
     steps:
       - name: Checkout code

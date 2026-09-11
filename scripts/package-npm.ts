@@ -18,6 +18,7 @@ const PLATFORMS = [
   { target: "linux-arm64", os: "linux", cpu: "arm64", binary: "makai-linux-arm64" },
   { target: "linux-x64", os: "linux", cpu: "x64", binary: "makai-linux-x64" },
   { target: "win32-x64", os: "win32", cpu: "x64", binary: "makai-win32-x64" },
+  { target: "win32-arm64", os: "win32", cpu: "arm64", binary: "makai-win32-arm64" },
 ];
 
 console.log(`Packaging npm packages (version ${VERSION})...\n`);

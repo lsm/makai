@@ -5,21 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-09-05
-
-### Added
-
-- Initial release of Makai, a unified multi-provider AI streaming abstraction layer.
-- **Zig core library**: lock-free event queues, type-safe tagged unions, streaming JSON parser, SSE parser, and provider implementations for Anthropic, OpenAI (Completions & Responses), Google (Generative AI & Vertex), Azure OpenAI, AWS Bedrock (stub), and Ollama.
-- **Distributed protocol**: client-server wire protocol with envelope-based messaging, partial serialization/reconstruction, and in-process/stdio/SSE/WebSocket transports.
-- **Agent loop**: tool execution lifecycle with distributed runtime support.
-- **OAuth flows**: GitHub Copilot, Anthropic, Google, and OpenAI Codex OAuth with PKCE.
-- **TypeScript SDK**: stdio client transport, high-level APIs for provider completions, streaming, agent runs, auth flows, and model discovery.
-- **CLI**: `makai` binary with auth and stdio protocol support.
-
 ## Unreleased
 
+## [0.2.0] - 2026-09-11
+
 ### Added
+
+- Implemented gap 5 of the #204 remainder — transactional publication with exactly-once settlement (#214): the stdio host's publication paths (tool-request publication, outbox delivery, the final pipe-to-stdout drain, ordinary event publication) now settle-or-propagate exactly once — a processed terminal is never re-published, publication failures propagate instead of being swallowed, and the drain hands a frame off before advancing its read position.
+
+- Added full client sequence control to the agent protocol's clients — the `#210` gap-7 slice series, completing the TS SDK half (#215) and the Zig client slices (#216, #218, #226, #227, #231, #232, #239, #240): clients mirror the server's per-session counter optimistically and reconcile on evidence — tracked pending sends roll back monotonically on correlated `agent_error`/`nack` rejections (an older unresolved send's floor is never lost), `duplicate_sequence` answers retire a retry's record with exactly one proven counter step (same-sequence same-payload retries only, payload-digest matched, with competing-payload and provenance-broken masks), a monotone proven floor records every sound lower bound (busy parity, all-rejected floors, settlement minimums, accepted starts) that optimistic regressions cannot erase, a bounded two-state stop probe resolves unknown send outcomes (pre-send stop, then the post-send value on a correlated `invalid_request`), and explicit-sequence send surfaces (`sendAgentMessageWithSequence`, `sendAgentStopWithSequence`, `peekNextSequence`) support recovery flows. The TUI integrates the same machinery with drain-before-sync pump ordering, ownership-guarded teardown probe drivers, ambiguous-write reconciliation (probe-stop + session-drop on an unresolvable write), and session-gone identity clearing backed by an exclusive-id registration variant (`sendAgentStartWithSessionExclusive`). Spec §13.1/§13.4.1 markers are `[current]`.
+
+- Added the gap-7 spec/ledger reconciliation (#238/#225, closing #213 as superseded): every §13 claim in [`docs/v1-sdk-agent-provider-spec.md`](docs/v1-sdk-agent-provider-spec.md) is `[current]` against the landed slices, [`docs/oap-alignment.md`](docs/oap-alignment.md) pins ledger provenance to each merge sha, and the greppable residual catalogue (`RESIDUAL-1`…`RESIDUAL-6`, with the SSE coverage gap tracked in #242) documents the wire-unobservable ambiguities adapters must treat as documented uncertainty rather than guarantees.
+
+- Added a Windows ARM64 release target (`aarch64-windows`): release binaries, sha256 checksums, and the `@makai/cli-win32-arm64` npm platform package join the existing five targets, completing arm64+amd64 coverage across Linux, macOS, and Windows; CI's cross-compile smoke job compiles it on every PR so regressions surface before a tag (#196 follow-up).
+
+- Added the zero-comments policy toolchain (#228/#229; #236, #237, #241, #243): `scripts/check-no-comments.mjs` enforces zero comments across all tracked `.zig` and `.ts` sources — TypeScript scanned via the TS parser's literal spans, Zig via a state-machine lexer over string/multiline/char literals — exempting functional directives only (`// zig fmt: off|on`; TS shebangs, file-leading `@ts-check`/`@ts-nocheck`/`/// <reference>`-family only, position-independent `@ts-ignore`/`@ts-expect-error`, lint/coverage pragmas, functional `@deprecated`). Enforced by a dedicated CI job. The grandfather allowlist was retired in the same release (#243 stripped ~13.4k comment lines across 230 files) and its one-way latch (`no-comments-allowlist.txt.retired`) permanently closes re-seeding.
 
 - Implemented gaps 4 and 6 of the #204 remainder for the agent protocol stdio host (spec §13.2.7 rule 7, §13.1/§13.3.4; issue #210, which stays open for gaps 5 and 7): **EOF-cancel for distributed-tool waits** — when `runStdioMode` observes stdin EOF (receive stream done AND its ring drained, so a `tool_result` delivered before EOF still wins its wait, including via the wait's post-latch re-check), the tool bridge latches the connection disconnected, `executeStdioToolViaAgentProtocol` fails its parked wait with a typed `error.ClientDisconnected`, flags the run and sets its cancel token, and the run pump settles the run through the failure pair (settlement `agent_error` with code `tool_execution_error`, no trailing `agent_end` per §3.5, session marked `.error`) instead of a success `agent_result` — the process drains `hasActiveAgentRuns()` and exits instead of hanging until killed. Pending tool requests queued after EOF are dropped unpublished, and §13.2.7's other outcome is preserved: a provider-executing run keeps being pumped toward settlement. **Stale `tool_result` correlation for reused `tool_call_id`s** — in-flight bridge keys now record the published `tool_execute`'s `message_id` (a new execution supersedes any leaked key for the same id, closing the §13.4.4 stop-failure residual), and only a reply whose `in_reply_to` names it settles the wait; mismatched, absent, and unsolicited replies are discarded with the host's `unknown_envelope` runtime error. The TS SDK already replies through `buildAgentReplyEnvelope` (`in_reply_to` always set), so conforming clients are unaffected. Result CONSUMPTION is generation-bound too (§13.4.5): in-flight keys carry the publishing run's registration generation, and `popResult` settles only the waiting execution's own key — a stopped registration's late, preempted wait can neither consume the re-registered id's correctly-correlated result nor remove its key. Spec §13 and the `docs/oap-alignment.md` ledger updated to `[current]`/aligned for both gaps.
 
@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `npm run check:declarations`: rebuilds the SDK into a clean `dist/`, then verifies the `makai` npm tarball ships `*.d.ts` declarations under `dist/src` (including `dist/src/index.d.ts` and a matching declaration for every shipped `.js`) and that a fresh-install consumer project type-checks cleanly under strict TS with `skipLibCheck` disabled. Wired into CI (`ts-sdk-e2e`) and the release packaging job so a build without declarations can no longer ship (#184).
 
 ### Changed
+
+- Renamed the `agent_start` payload key `resume_session_id` → `session_id` (#198, #211): `session_id` is a correlation/container key, never a resume handle (spec §13). Both makai emitters (the TS SDK's `buildAgentStartPayload` and the Zig serializer) send BOTH keys with the same value transitionally, and the server's dual-key parse prefers `session_id` while accepting the legacy `resume_session_id` permanently, so mixed-version clients and servers interoperate.
 
 - Upgraded the Zig toolchain requirement from Zig 0.15.2 to Zig 0.16.0.
 - Removed the unused `libxev` Zig package declaration; `zig/build.zig.zon` now declares no external Zig package dependencies.
@@ -54,4 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration Notes
 
+- The `agent_start` payload key rename (`resume_session_id` → `session_id`, #198/#211) is wire-compatible: the server accepts both keys permanently and both makai clients dual-emit during the transition. Raw-protocol integrations written against the old key keep working; migrate to `session_id` at your convenience (it is canonical when both keys are present).
 - See [`docs/zig-0.16.0-downstream-migration.md`](docs/zig-0.16.0-downstream-migration.md) for downstream source migration guidance for Makai Zig consumers.
+
+## [0.1.0] - 2026-09-05
+
+### Added
+
+- Initial release of Makai, a unified multi-provider AI streaming abstraction layer.
+- **Zig core library**: lock-free event queues, type-safe tagged unions, streaming JSON parser, SSE parser, and provider implementations for Anthropic, OpenAI (Completions & Responses), Google (Generative AI & Vertex), Azure OpenAI, AWS Bedrock (stub), and Ollama.
+- **Distributed protocol**: client-server wire protocol with envelope-based messaging, partial serialization/reconstruction, and in-process/stdio/SSE/WebSocket transports.
+- **Agent loop**: tool execution lifecycle with distributed runtime support.
+- **OAuth flows**: GitHub Copilot, Anthropic, Google, and OpenAI Codex OAuth with PKCE.
+- **TypeScript SDK**: stdio client transport, high-level APIs for provider completions, streaming, agent runs, auth flows, and model discovery.
+- **CLI**: `makai` binary with auth and stdio protocol support.
