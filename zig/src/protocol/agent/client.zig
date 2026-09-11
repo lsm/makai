@@ -1267,6 +1267,9 @@ pub const AgentProtocolClient = struct {
         // start at sequence 1, not the stale optimistic counter.
         const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
         if (session_gone) {
+            if (self.session_id) |active| {
+                if (std.mem.eql(u8, active[0..], session_id[0..])) self.session_id = null;
+            }
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.proven_floor_by_session.remove(session_id);
             _ = self.stop_revert_bound_by_session.remove(session_id);
@@ -4800,7 +4803,7 @@ test "AgentProtocolClient correlated agent_not_found clears state only for a req
 
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
-    try std.testing.expect(client.session_id != null);
+    try std.testing.expect(client.session_id == null);
 
     _ = try client.sendAgentStartWithSession(sid, "{}", null);
     var started_env = agent_types.Envelope{
@@ -4870,7 +4873,7 @@ test "AgentProtocolClient correlated session_expired clears state like agent_not
 
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
-    try std.testing.expect(client.session_id != null);
+    try std.testing.expect(client.session_id == null);
     try std.testing.expect(client.admitted_by_session.get(sid) == null);
     try std.testing.expect(!client.isSessionAdmitted(sid));
 }
@@ -4912,7 +4915,7 @@ test "AgentProtocolClient plain stop replies reach the session-gone and rejectio
 
         try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
         try std.testing.expect(!client.pending_sends_by_session.contains(sid));
-        try std.testing.expect(client.session_id != null);
+        try std.testing.expect(client.session_id == null);
     }
 
     {
