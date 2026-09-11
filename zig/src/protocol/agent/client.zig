@@ -746,7 +746,7 @@ pub const AgentProtocolClient = struct {
                 // failure in the diagnostics must not leave the optimistic
                 // counter and pending record in place against a server that
                 // rejected them (#210 gap 7).
-                try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
+                const session_gone = try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, e.code);
                 // Allocate the replacement BEFORE releasing the previous
                 // value: a failed dupe must not leave last_error undefined
                 // (a later update or deinit would double-free).
@@ -754,6 +754,7 @@ pub const AgentProtocolClient = struct {
                 self.last_error.deinit(self.allocator);
                 self.last_error = OwnedSlice(u8).initOwned(error_copy);
                 try self.setSessionError(env.session_id, e.message);
+                if (session_gone) self.clearGoneSessionIdentity(env.session_id);
             },
             .nack => |n| {
                 // A correlated nack is a request rejection like a correlated
@@ -855,13 +856,14 @@ pub const AgentProtocolClient = struct {
                 }
                 // Rollback first, then fallible bookkeeping (see the
                 // agent_error arm).
-                try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
+                const session_gone = try self.handleCorrelatedRejection(env.session_id, env.in_reply_to, agentCodeFromNack(n.error_code));
                 // Allocate the replacement BEFORE releasing the previous
                 // value (same ordering rule as the agent_error arm).
                 const reason_copy = try self.allocator.dupe(u8, n.reason.slice());
                 self.last_error.deinit(self.allocator);
                 self.last_error = OwnedSlice(u8).initOwned(reason_copy);
                 try self.setSessionError(env.session_id, n.reason.slice());
+                if (session_gone) self.clearGoneSessionIdentity(env.session_id);
             },
             .agent_stopped => |p| {
                 if (self.stop_probes_by_session.get(p.session_id)) |probe| {
@@ -882,6 +884,16 @@ pub const AgentProtocolClient = struct {
             },
             else => {},
         }
+    }
+
+    fn clearGoneSessionIdentity(self: *Self, session_id: agent_types.SessionId) void {
+        const active = self.session_id orelse return;
+        if (!std.mem.eql(u8, active[0..], session_id[0..])) return;
+        self.session_id = null;
+        self.last_error.deinit(self.allocator);
+        self.last_error = OwnedSlice(u8).initBorrowed("");
+        self.last_result_json.deinit(self.allocator);
+        self.last_result_json = OwnedSlice(u8).initBorrowed("");
     }
 
     fn clearSessionControlState(self: *Self, session_id: agent_types.SessionId) void {
@@ -1252,10 +1264,10 @@ pub const AgentProtocolClient = struct {
     /// was recorded), and the rollback takes the MINIMUM of the tracker and
     /// the rejected send's sequence: an older unresolved send's floor must
     /// never be lost to a younger send's rejection.
-    fn handleCorrelatedRejection(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !void {
-        const reply_to = in_reply_to orelse return;
+    fn handleCorrelatedRejection(self: *Self, session_id: agent_types.SessionId, in_reply_to: ?agent_types.Ulid, code: ?agent_types.AgentErrorCode) !bool {
+        const reply_to = in_reply_to orelse return false;
 
-        const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
+        const list = self.pending_sends_by_session.getPtr(session_id) orelse return false;
         var matched: ?usize = null;
         for (list.items, 0..) |pending, index| {
             if (std.mem.eql(u8, &reply_to, &pending.msg_id)) {
@@ -1263,7 +1275,7 @@ pub const AgentProtocolClient = struct {
                 break;
             }
         }
-        const index = matched orelse return;
+        const index = matched orelse return false;
 
         // agent_not_found (or session_expired — the idle-TTL eviction answer)
         // means the session is gone server-side, so its tracked sequence
@@ -1271,15 +1283,12 @@ pub const AgentProtocolClient = struct {
         // start at sequence 1, not the stale optimistic counter.
         const session_gone = if (code) |c| c == .agent_not_found or c == .session_expired else false;
         if (session_gone) {
-            if (self.session_id) |active| {
-                if (std.mem.eql(u8, active[0..], session_id[0..])) self.session_id = null;
-            }
             _ = self.next_sequence_by_session.remove(session_id);
             _ = self.proven_floor_by_session.remove(session_id);
             _ = self.stop_revert_bound_by_session.remove(session_id);
             _ = self.tracker_epoch_by_session.remove(session_id);
             self.clearSessionControlState(session_id);
-            return;
+            return true;
         }
 
         const rejected = list.items[index];
@@ -1325,7 +1334,7 @@ pub const AgentProtocolClient = struct {
                 if (self.peekNextSequence(session_id) < self.provenFloor(session_id)) {
                     self.setTrackerValue(session_id, self.provenFloor(session_id)) catch {};
                 }
-                return;
+                return false;
             }
             // The pre-resync prior stored above is the
             // world-if-this-stop-rejected: any snapshot taken while this
@@ -1382,7 +1391,7 @@ pub const AgentProtocolClient = struct {
                     self.setTrackerValue(session_id, self.provenFloor(session_id)) catch {};
                 }
             }
-            return;
+            return false;
         }
         // A correlated `agent_busy` proves the server's counter EQUALS the
         // rejected sequence: the server validates the inbound sequence
@@ -1405,7 +1414,7 @@ pub const AgentProtocolClient = struct {
             // (#210 gap 7).
             if (rejected.kind == .message) self.rederiveProvenanceAt(session_id, rejected.sequence);
             try self.setTrackerValue(session_id, parity);
-            return;
+            return false;
         }
         // The rollback restores the counter the server RETAINED — the
         // record's pre-send tracker — rather than min'ing the send's own
@@ -1482,6 +1491,7 @@ pub const AgentProtocolClient = struct {
             self.rederiveProvenanceAt(session_id, rejected.sequence);
         }
         try self.setTrackerValue(session_id, floor);
+        return false;
     }
 
     pub fn popEvent(self: *Self) ?QueuedEvent {
@@ -4880,6 +4890,35 @@ test "AgentProtocolClient correlated session_expired clears state like agent_not
     try std.testing.expect(client.session_id == null);
     try std.testing.expect(client.admitted_by_session.get(sid) == null);
     try std.testing.expect(!client.isSessionAdmitted(sid));
+}
+
+test "AgentProtocolClient session-gone clears the legacy mirror but keeps the session error (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    const msg_id = try client.sendAgentMessage(sid, "{\"m\":1}", null);
+    var gone = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 0,
+        .in_reply_to = msg_id,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = try allocator.dupe(u8, "session not found") } },
+    };
+    defer gone.deinit(allocator);
+    try client.processEnvelope(gone);
+
+    try std.testing.expect(client.session_id == null);
+    try std.testing.expect(client.getLastErrorForSession(sid) != null);
+    try std.testing.expect(client.getLastError() == null);
+
+    _ = try client.sendAgentStartWithSession(sid, "{}", null);
+    try std.testing.expect(client.getLastError() == null);
+    try std.testing.expect(client.getLastResultJson() == null);
 }
 
 test "AgentProtocolClient plain stop replies reach the session-gone and rejection handling (#210 gap 7)" {

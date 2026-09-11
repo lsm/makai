@@ -1572,7 +1572,7 @@ pub const TuiRuntime = struct {
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
         };
-        if (client.getLastErrorForSession(sid) != null) {
+        if (client.getLastErrorForSession(sid) != null or self.remote_error_emitted) {
             if (emit_tail_prompt) self.discardRemoteTailPromptEvent();
             return error.RemoteMessageRejected;
         }
@@ -4082,6 +4082,7 @@ const RemoteMock = struct {
     sender_closed: bool = false,
     receiver_closed: bool = false,
     fail_writes: bool = false,
+    reject_message_writes: bool = false,
 
     fn init() RemoteMock {
         return .{ .writes = std.ArrayList([]u8).empty, .reads = std.ArrayList([]u8).empty };
@@ -4106,6 +4107,21 @@ const RemoteMock = struct {
         const self: *RemoteMock = @ptrCast(@alignCast(ctx));
         if (self.fail_writes) return error.BrokenPipe;
         try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
+        if (!self.reject_message_writes) return;
+        var env = agent_envelope.deserializeEnvelope(data, std.testing.allocator) catch return;
+        defer env.deinit(std.testing.allocator);
+        switch (env.payload) {
+            .agent_message => {},
+            else => return,
+        }
+        try queueEnvelope(self, std.testing.allocator, .{
+            .session_id = env.session_id,
+            .message_id = agent_protocol_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = env.message_id,
+            .timestamp = 0,
+            .payload = .{ .agent_error = .{ .code = .agent_not_found, .message = "session not found" } },
+        });
     }
 
     fn flushFn(_: *anyopaque) !void {}
@@ -5766,6 +5782,53 @@ test "remote teardown stop probe arms through the admitted registration within a
 
     runtime.driveRemoteStopProbe(client, sid);
     try std.testing.expect(client.hasActiveStopProbe(sid));
+}
+
+test "remote failed submit rolls back the whole appended suffix" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    try runtime.ensureRemoteSession();
+    try runtime.remote_messages.append(std.testing.allocator, try makeRemoteUserMessage(std.testing.allocator, "prior"));
+
+    mock.fail_writes = true;
+    try std.testing.expectError(error.BrokenPipe, tui_session.submitTurn("turn"));
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .user);
+}
+
+test "remote synchronous session-gone rejection during the post-send pump returns a rejection" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    try runtime.ensureRemoteSession();
+
+    mock.reject_message_writes = true;
+    try std.testing.expectError(error.RemoteMessageRejected, tui_session.submitTurn("turn"));
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_messages.items.len == 0);
 }
 
 test "remote submit pump failure completes stream" {
