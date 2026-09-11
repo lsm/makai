@@ -5148,7 +5148,7 @@ test "AgentProtocolClient stop probe requires a recorded message send (#210 gap 
     try std.testing.expect(!client.hasActiveStopProbe(sid));
 }
 
-test "AgentProtocolClient stop probe drops session control state on a gone session (#210 gap 7)" {
+test "AgentProtocolClient stop probe drops control state but defers completion on a gone session (#210 gap 7)" {
     const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
@@ -5175,6 +5175,39 @@ test "AgentProtocolClient stop probe drops session control state on a gone sessi
     try std.testing.expect(!client.pending_sends_by_session.contains(sid));
     try std.testing.expect(!client.isSessionAdmitted(sid));
     try std.testing.expectEqual(@as(u64, 1), client.peekNextSequence(sid));
+    try std.testing.expect(!client.isSessionComplete(sid));
+}
+
+test "AgentProtocolClient stop probe floor rides above the proven floor (#210 gap 7)" {
+    const allocator = std.testing.allocator;
+    var harness = Gap7Harness.init();
+    defer harness.deinit();
+    harness.wire();
+    const client = &harness.client;
+
+    const sid = try admitExclusiveSession(&harness);
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":1}", null, 3);
+
+    var settlement = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 4,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer settlement.deinit(allocator);
+    try client.processEnvelope(settlement);
+
+    _ = try client.sendAgentMessageWithSequence(sid, "{\"m\":2}", null, 2);
+
+    const probe_id = (try client.sendAgentStopProbing(sid, "timeout")).?;
+    var first_stop = try harness.envelopeAt(harness.writes.items.len - 1);
+    defer first_stop.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), first_stop.sequence);
+
+    try rejectCorrelatedWithInvalidRequest(allocator, client, sid, probe_id);
+    try std.testing.expect(!client.hasActiveStopProbe(sid));
+    try std.testing.expectEqual(@as(usize, 4), harness.writes.items.len);
 }
 
 test "AgentProtocolClient delayed agent_stopped for another request preserves the active probe (#210 gap 7)" {
