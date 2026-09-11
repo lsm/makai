@@ -14,6 +14,7 @@ const PLATFORM_MAP = {
   "linux-arm64": "@makai/cli-linux-arm64",
   "linux-x64": "@makai/cli-linux-x64",
   "win32-x64": "@makai/cli-win32-x64",
+  "win32-arm64": "@makai/cli-win32-arm64",
 };
 
 const platformKey = `${process.platform}-${process.arch}`;
