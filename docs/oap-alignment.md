@@ -25,9 +25,9 @@ Frame Routing, V1.1") defines the semantics summarized here.
   on `main`: the TS SDK half PR #215 (`ec2bc2d`), and the Zig client slices S1
   `2efce28` (#216), S2a `f578903` (#218), S2b-1 `560f635` (#226), S2b-2
   `a8a6c07` (#227), S2b-3 `8925a8c` (#231), S3 `e4c568b` (#232), S4 `f5fd0b5`
-  (#239). The remaining Zig slice — #224 (TUI teardown integration) — has not
-  landed, so its §13.1 claim stays in progress. Every `[current]` claim in §13
-  and every status below was verified against one of these revisions.
+  (#239), S5 `d61f6dd` (#240) — every slice of the series has landed. Every
+  `[current]` claim in §13 and every status below was verified against one of
+  these revisions.
 - OAP references:
   - Decision 0001 — "Agent-Control v0.1 Executable Core" (accepted 2026-09-06):
     typed identity domains, one-foreground-run-per-session, deterministic run event
@@ -85,22 +85,24 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 ## Documented residuals
 
 The residual classes accumulated by gap 7 (#210) and its neighbours. Grep
-`RESIDUAL-` for the full set. All but `RESIDUAL-2` are unresolvable on the
-wire: no frame carries a registration or run generation (spec §13.4.5), so the
-paired situations there are indistinguishable at a client's inputs, only the
-generation tokens of a future wire revision close them, and adapters MUST
-treat them as documented uncertainty rather than protocol guarantees.
-`RESIDUAL-2` is different in kind — `in_reply_to` already makes it locally
-solvable — and is recorded here because mishandling it silently clears newer
-control state.
+`RESIDUAL-` for the full set. Most are unresolvable on the wire: no frame
+carries a registration or run generation (spec §13.4.5), so the paired
+situations there are indistinguishable at a client's inputs, only the
+generation tokens of a future wire revision close them, and adapters MUST treat
+them as documented uncertainty rather than protocol guarantees. Two entries are
+different in kind, and both are recorded because mishandling them is silent:
+`RESIDUAL-2` is already locally solvable from `in_reply_to`, and `RESIDUAL-6` is
+a mechanism-COVERAGE gap — a landed reconciliation not yet applied on one
+transport — fixable with no wire change at all.
 
 | Residual | Spec | What cannot be told apart | Recorded mitigation |
 | --- | --- | --- | --- |
 | `RESIDUAL-1` stale admission after a silent TTL eviction | §6.1, §13.2.6 | Eviction emits no frame, so an id admitted under one registration may be evicted and re-registered by another caller before our next message; a message of ours accepted by that fresh registration (its counter restarts and can match ours) is the same bytes as our own registration accepting it. | §6.1's admission evidence bounds the teardown stop's blast radius: an exclusive client-generated id is the only sufficient form until generation tokens exist, and it qualifies only while the client has not allowed that id to be removed and re-registered. |
 | `RESIDUAL-2` delayed `agent_not_found` across re-registration | §13.1, §13.2.6 | Locally resolvable, NOT wire-bound: a session-gone answer carries `in_reply_to` naming the exact request, so it is attributable IF the sender kept per-request registration provenance. A purely id-keyed pending list cannot tell the old registration's delayed answer from the current registration's own — the first delayed `agent_not_found` matches the still-registered record and clears state the re-registration just established. | Tag pending sends with the registration epoch and discard a reply whose epoch predates the id's re-registration. The Zig client approximates this by clearing the session's pending-send list together with its counter/control state on a session-gone answer, so a later copy matches nothing; the id-keyed store is a local bookkeeping limit, not a wire gap. |
 | `RESIDUAL-3` stale trailing output misattributed to a reused id | §13.4.2 | Consumed run output is the strongest acceptance tie the wire affords, so the TS attempt clears its unresolved marker on frames reaching its own correlated post-acceptance waits; a stale trailing frame from a previous run on a quickly reused id can reach those waits and clear the marker without proving THIS attempt was accepted. The hazard is not marker bookkeeping: when the stale frame is an `agent_result` the attempt parses and RETURNS the previous run's response, and stale events can be yielded on the `stream()` path — wrong returned data, not merely a missed acceptance signal. | The alternative is not "no leak": leaving the marker set routes teardown through `stopAgentWithSequenceProbe`, so the trade is one extra bounded probe against a wrong-result hazard — and the clear is kept, both because returned data must come from this attempt and because the probe is the marker's own consumer. Closing it needs an identity the wire lacks (run identity on the settlement frame, `RESIDUAL-5`'s remedy). |
-| `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's failure-pair teardown AWAITS a single immediate-pass drain of the queued backlog before the id is reused; its abort paths (`drain: "background"` in `run()`/`stream()`) deliberately leave the same drain running un-awaited, so a same-id retry can register while it is still consuming the backlog and race it. Not draining at all would reinstate the parked-output poisoning of the next same-id run, so this is a policy trade rather than a fix — the window closes only with the generation tokens. |
+| `RESIDUAL-4` post-probe backlog-drain unattributability | §13.4.1 | A correlated wait is served ahead of the session queue, so the probe's reply can overtake the attempt's still-parked output; frames parking between the stop's acceptance and the drain's reads may be the just-stopped run's trailing output or a racing re-registration's output. | The TS SDK's failure-pair teardown AWAITS a single immediate-pass drain of the queued backlog before the id is reused; its abort paths (`drain: "background"` in `run()`/`stream()`) deliberately leave the same drain running un-awaited, so a same-id retry can register while it is still consuming the backlog and race it. The TUI's teardown pump does not close the window either: it consumes parked frames only while driving the probe (bounded, exiting the moment the probe settles) and performs no post-settlement drain. Not draining at all would reinstate the parked-output poisoning of the next same-id run, so this is a policy trade rather than a fix — the window closes only with the generation tokens. |
 | `RESIDUAL-5` settlement-based retirement needs run identity | §13.1, §13.3.2 | `agent_result` carries no run identity, so retiring the settled run's pending record attributes the settlement to the OLDEST pending message (insertion order) and the proven floor rises only to the minimum pending-message sequence + 1. | A mis-attribution errs toward surfacing a duplicate rather than swallowing a failure — the self-correcting direction; a run identity on the settlement frame would close it. |
+| `RESIDUAL-6` SSE ambiguous message writes unreconciled | §13.2.6 (TUI teardown) | On SSE, every failed `sendRemoteMessages` POST skips the ambiguous-write reconciliation — it is gated on the websocket-owned path — so BOTH failure modes leave an unknown admission outcome unreconciled: the partial write (`ConnectionFailed`, proves nothing) and the complete write whose response headers failed (`HttpPostFailed`, proves transmission). A later result can then arrive orphaned, or the next submission can hit `agent_busy` on an invalid sequence. | Pre-existing coverage gap, unchanged by the TUI teardown — pre-teardown main did strictly less (returned the error with no probe and no session drop). The websocket case IS reconciled. Closing it needs the SSE ambiguity set decided (the two modes carry different evidence) and the probe-stop + session-drop factored into a shared helper; tracked in #242, not wire-bound. |
 
 `RESIDUAL-3` and `RESIDUAL-4` share the downstream-buffer shape the spec records
 at §6.1 and §13.4.5: frames already buffered downstream of a removed
@@ -183,7 +185,7 @@ where its spec claims remain `[planned]`.
    correlated reads, acceptance at either) awaited on both `run()` and
    `stream()` error paths, with the post-probe backlog drained before id reuse.
    LANDED for the Zig client (S1 `2efce28`, S2a `f578903`, S2b-1/2/3
-   `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`, S4 `f5fd0b5`): the
+   `560f635`/`a8a6c07`/`8925a8c`, S3 `e4c568b`, S4 `f5fd0b5`, S5 `d61f6dd`): the
    `AgentProtocolClient` tracks every outstanding send, rolls the tracker back
    MONOTONICALLY on a correlated `agent_error`/`nack` (an older unresolved
    send's floor is never lost), drops the counter state on a correlated
@@ -193,9 +195,10 @@ where its spec claims remain `[planned]`.
    `sendAgentStopProbing`) alongside the S2b/S3 duplicate-evidence, ancestry,
    proven-floor, and pending-record guards. The Zig client's own bounded
    two-state stop probe landed in S4 `f5fd0b5` (#239), gated on §6.1 ownership
-   evidence and walking a discrete candidate set. Still open: the TUI teardown
-   integration (#224, S5). Same-sequence retries and unknown-outcome cleanup
-   are supported in both clients (§13.1/§13.4.1).
+   evidence and walking a discrete candidate set, and the TUI teardown
+   integration landed in S5 `d61f6dd` (#240). No gap-7 work remains open here.
+   Same-sequence retries and unknown-outcome cleanup are supported in both
+   clients (§13.1/§13.4.1).
 3. #205 — TS SDK teardown guards (ownership-evidence stop and failure-pair drain
    IMPLEMENTED; tool-execution tracking pending): the ownership-evidence stop on
    unknown start outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused
