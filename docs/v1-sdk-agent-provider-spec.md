@@ -1137,8 +1137,9 @@ Rules:
   `duplicate_sequence` in turn, and as a same-payload retry it retires
   silently). The pending-record lifecycle and stale-reply guards, the
   bounded stop probe for unknown outcomes (§13.4.1), and the TUI teardown
-  integration — drain-before-sync in the remote pump, the bounded teardown
-  driver that pumps an in-flight stop probe to settlement, the
+  integration — drain-before-sync in the remote pump, the exclusive-id
+  registration whose admission is the §6.1 evidence that lets the bounded
+  teardown driver pump an in-flight stop probe to settlement, the
   ambiguous-write reconciliation that stops the old registration instead of
   resending it, and the session-gone identity clear — are landed
   (`[current — #210 gap 7 re-sliced from #213]`).
