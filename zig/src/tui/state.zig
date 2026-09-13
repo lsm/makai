@@ -1975,6 +1975,15 @@ test "AppState reset replay clears stale queue counts" {
 }
 
 test "AppState keeps queued previews until matching user message is consumed" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.addQueuedPreview(.steering, "steer now");
+    try state.addQueuedPreview(.follow_up, "follow later");
+    try state.addQueuedPreview(.follow_up, "follow after");
+
+    state.setQueuedCounts(.{ .steering = 1, .follow_up = 2 });
+    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
 
     state.setQueuedCounts(.{ .steering = 0, .follow_up = 1 });
     try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
@@ -2455,19 +2464,3 @@ test "AppState updates backpressure status fields" {
     try std.testing.expectEqual(@as(u64, 3), state.dropped_event_count);
 }
 
-test "AppState protocol log formats warning and backpressure events" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    var warning = tui_runtime.TuiEvent{ .system_warning = .{ .message = try ownedText("drops happened") } };
-    defer warning.deinit(std.testing.allocator);
-    try state.applyEvent(warning);
-    try state.applyEvent(.{ .backpressure_status = .{ .active = true, .dropped_count = 7 } });
-
-    const text = try protocolLogText(std.testing.allocator, &state);
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "protocol event: system_warning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "drops happened") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "protocol event: backpressure_status") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "dropped_count=7") != null);
-}

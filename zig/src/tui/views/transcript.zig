@@ -243,7 +243,7 @@ fn appendToolSummary(
         } else {
             try writer.print(", {d} artifact{s}", .{ tool.artifact_count, if (tool.artifact_count == 1) "" else "s" });
         }
-        try writer.writeAll(", open/view/filter");
+        try writer.writeAll(", filter via artifact_retrieve");
     }
     try writer.writeByte(']');
     if (tool.expanded) {
