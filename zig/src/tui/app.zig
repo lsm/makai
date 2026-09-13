@@ -2731,6 +2731,7 @@ test "App submit abort when streaming cancels and reports transcript" {
 
 test "App submit abort when streaming via runtime-only cancels and reports transcript" {
     const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
     runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -3402,6 +3403,7 @@ test "App drain does not auto-resume queued steering after error turn" {
 
 test "TuiModel streaming Alt+Enter queues follow-up" {
     const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
     runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
@@ -3896,6 +3898,7 @@ test "resume selected session clears delete reset flags" {
 
 test "resume selected session allows runtime without protocol" {
     const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
     runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();

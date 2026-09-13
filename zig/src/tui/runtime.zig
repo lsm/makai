@@ -293,7 +293,7 @@ pub const TuiRuntime = struct {
         self.started = false;
     }
 
-    pub fn canSteer(self: *const TuiRuntime) bool {
+    pub fn canSteer(_: *const TuiRuntime) bool {
         return true;
     }
 

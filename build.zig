@@ -959,8 +959,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
-            .{ .name = "tui_config", .module = tui_config_mod },
-            .{ .name = "transports/sse", .module = sse_transport_mod },
         },
     });
 
@@ -1333,19 +1331,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "transport", .module = transport_mod },
                 .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
                 .{ .name = "stdio", .module = stdio_transport_mod },
-            },
-        }),
-    });
-
-    const e2e_tui_websocket_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/test/e2e/tui_websocket.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "compat", .module = compat_mod },
-                .{ .name = "ai_types", .module = ai_types_mod },
-                .{ .name = "tui_runtime", .module = tui_runtime_mod },
             },
         }),
     });
@@ -1992,8 +1977,6 @@ pub fn build(b: *std.Build) void {
     test_e2e_protocol_step.dependOn(&e2e_provider_base_url_test_run.step);
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
 
-    const test_e2e_tui_websocket_step = b.step("test-e2e-tui-websocket", "Run TUI WebSocket remote backend E2E test (mock-based)");
-    test_e2e_tui_websocket_step.dependOn(&b.addRunArtifact(e2e_tui_websocket_test).step);
 
     const test_e2e_distributed_fullstack_step = b.step("test-e2e-distributed-fullstack", "Run distributed fullstack E2E tests (mock-based)");
     test_e2e_distributed_fullstack_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
@@ -2011,7 +1994,6 @@ pub fn build(b: *std.Build) void {
     test_e2e_step.dependOn(test_e2e_provider_protocol_fullstack_ollama_step);
     test_e2e_step.dependOn(test_e2e_provider_protocol_fullstack_github_step);
     test_e2e_step.dependOn(test_e2e_protocol_step);
-    test_e2e_step.dependOn(test_e2e_tui_websocket_step);
 
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
     test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
