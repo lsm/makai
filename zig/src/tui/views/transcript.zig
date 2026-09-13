@@ -8,8 +8,6 @@ const tui_markdown = @import("tui_markdown");
 const AppState = tui_state.AppState;
 const TranscriptKind = tui_state.TranscriptKind;
 const TranscriptEntry = tui_state.TranscriptEntry;
-const ProtocolEventEntry = tui_state.ProtocolEventEntry;
-const TimestampDisplay = tui_state.TimestampDisplay;
 
 pub const Options = struct {
     width: usize = 80,
@@ -66,7 +64,7 @@ pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) 
         }
         const row_start = current_line;
         const selected = selected_visible_index == i;
-        const row = try renderEntry(allocator, entry, options.width, state.timestamp_display, selected);
+        const row = try renderEntry(allocator, entry, options.width, selected);
         defer allocator.free(row);
         try all_writer.writeAll(row);
         current_line += tui_text.lineCount(row);
@@ -119,7 +117,7 @@ pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) 
     return padTopToHeight(allocator, composed, options.height);
 }
 
-pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize, ts_mode: TimestampDisplay) ![]u8 {
+pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
     var display = DisplayEntry{
         .kind = entry.kind,
         .text = entry.text.items,
@@ -127,49 +125,30 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     };
-    return renderEntry(allocator, &display, width, ts_mode, false);
+    return renderEntry(allocator, &display, width, false);
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
-    switch (state.transcript_mode) {
-        .everything => {
-            for (state.protocol_events.items) |*entry| try appendProtocolEvent(allocator, entries, entry);
-            for (state.transcript.items, 0..) |*entry, idx| try appendOriginal(allocator, entries, entry, idx);
-            try appendDebugToolState(allocator, arena, state, entries, true);
-            try appendTelemetryState(allocator, arena, state, entries);
-        },
-        .verbose => {
-            for (state.transcript.items, 0..) |*entry, idx| {
-                if (entry.kind == .thinking and !state.show_thinking) continue;
-                if (isLowValueSystem(entry)) continue;
-                try appendOriginal(allocator, entries, entry, idx);
-            }
-            try appendDebugToolState(allocator, arena, state, entries, false);
-        },
-        .balanced => {
-            var tool_index: usize = 0;
-            var i: usize = 0;
-            while (i < state.transcript.items.len) {
-                const entry = &state.transcript.items[i];
-                if (entry.kind == .thinking and !state.show_thinking) {
-                    i += 1;
-                    continue;
-                }
-                if (isLowValueSystem(entry)) {
-                    i += 1;
-                    continue;
-                }
-                if (entry.kind == .tool) {
-                    const cluster_start = i;
-                    while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
-                    tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
-                    continue;
-                }
-                try appendOriginal(allocator, entries, entry, i);
-                i += 1;
-            }
-        },
-        .chat => try appendConversationEntries(allocator, arena, state, entries),
+    var tool_index: usize = 0;
+    var i: usize = 0;
+    while (i < state.transcript.items.len) {
+        const entry = &state.transcript.items[i];
+        if (entry.kind == .thinking and !state.show_thinking) {
+            i += 1;
+            continue;
+        }
+        if (isLowValueSystem(entry)) {
+            i += 1;
+            continue;
+        }
+        if (entry.kind == .tool) {
+            const cluster_start = i;
+            while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
+            tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
+            continue;
+        }
+        try appendOriginal(allocator, entries, entry, i);
+        i += 1;
     }
 }
 
@@ -229,51 +208,8 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
     });
 }
 
-fn appendProtocolEvent(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const ProtocolEventEntry) !void {
-    try entries.append(allocator, .{
-        .kind = .system,
-        .text = entry.text,
-        .timestamp_ms = entry.timestamp_ms,
-    });
-}
-
 fn isLowValueSystem(entry: *const TranscriptEntry) bool {
     return tui_state.isLowValueSystem(entry);
-}
-
-fn appendDebugToolState(
-    allocator: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    state: *const AppState,
-    entries: *std.ArrayList(DisplayEntry),
-    full_output: bool,
-) !void {
-    if (state.tools.items.len == 0) return;
-    for (state.tools.items) |tool| {
-        var out: std.Io.Writer.Allocating = .init(arena);
-        const writer = &out.writer;
-        try writer.print("tool state: {s} [{s}]\nname: {s}\nid: {s}\nargs: {s}", .{ tool.label, @tagName(tool.status), tool.name, tool.id, tool.args_json });
-        if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
-            try writer.print("\nbytes: raw={d} returned={d}", .{ tool.raw_total_bytes, tool.returned_total_bytes });
-            if (tool.estimated_returned_tokens > 0) try writer.print(" tokens~{d}", .{tool.estimated_returned_tokens});
-        }
-        if (tool.artifact_refs.len > 0) try writer.print("\nartifacts: {s}", .{tool.artifact_refs});
-        if (tool.output.items.len > 0) {
-            if (full_output) {
-                try writer.print("\noutput:\n{s}", .{tool.output.items});
-            } else {
-                try writer.print("\noutput: {d} bytes", .{tool.output.items.len});
-                const preview = try truncateForSummary(arena, tool.output.items, 160);
-                if (preview.len > 0) try writer.print("\npreview: {s}", .{preview});
-            }
-        }
-        try entries.append(allocator, .{
-            .kind = .tool,
-            .text = out.written(),
-            .timestamp_ms = 0,
-            .tool_name = tool.name,
-        });
-    }
 }
 
 fn appendToolSummary(
@@ -381,99 +317,6 @@ fn sanitizeAndClipToolDescription(allocator: std.mem.Allocator, text: []const u8
     return out.toOwnedSlice();
 }
 
-fn appendTelemetryState(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
-    if (state.telemetry.total_bytes == 0 and state.telemetry.estimated_tokens == 0 and state.telemetry.message_count == 0 and state.telemetry.tool_count == 0) return;
-    const text = try std.fmt.allocPrint(arena, "context usage: system={d}B messages={d}B tools={d}B total={d}B ~{d} tokens messages={d} tools={d}", .{
-        state.telemetry.system_prompt_bytes,
-        state.telemetry.message_bytes,
-        state.telemetry.tool_definition_bytes,
-        state.telemetry.total_bytes,
-        state.telemetry.estimated_tokens,
-        state.telemetry.message_count,
-        state.telemetry.tool_count,
-    });
-    try entries.append(allocator, .{ .kind = .system, .text = text, .timestamp_ms = 0 });
-}
-
-const ConversationStats = struct {
-    thinking_blocks: usize = 0,
-    tool_blocks: usize = 0,
-    system_blocks: usize = 0,
-    last_timestamp_ms: i64 = 0,
-
-    fn any(self: ConversationStats) bool {
-        return self.thinking_blocks > 0 or self.tool_blocks > 0;
-    }
-
-    fn add(self: *ConversationStats, entry: *const TranscriptEntry) void {
-        switch (entry.kind) {
-            .thinking => self.thinking_blocks += 1,
-            .tool => self.tool_blocks += 1,
-            .system => self.system_blocks += 1,
-            else => {},
-        }
-        if (entry.timestamp_ms > 0) self.last_timestamp_ms = entry.timestamp_ms;
-    }
-
-    fn reset(self: *ConversationStats) void {
-        self.* = .{};
-    }
-};
-
-fn appendConversationEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
-    var stats: ConversationStats = .{};
-    for (state.transcript.items, 0..) |*entry, idx| {
-        switch (entry.kind) {
-            .user, .assistant => {
-                try flushConversationStats(allocator, arena, entries, &stats);
-                try appendOriginal(allocator, entries, entry, idx);
-            },
-            .@"error" => {
-                try flushConversationStats(allocator, arena, entries, &stats);
-                try appendOriginal(allocator, entries, entry, idx);
-            },
-            .thinking, .tool, .system => stats.add(entry),
-        }
-    }
-    try flushConversationStats(allocator, arena, entries, &stats);
-}
-
-fn flushConversationStats(allocator: std.mem.Allocator, arena: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), stats: *ConversationStats) !void {
-    if (!stats.any()) return;
-    const text = try formatConversationActivity(arena, stats.*);
-    try entries.append(allocator, .{
-        .kind = .system,
-        .text = text,
-        .timestamp_ms = stats.last_timestamp_ms,
-    });
-    stats.reset();
-}
-
-fn formatConversationActivity(allocator: std.mem.Allocator, stats: ConversationStats) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    const writer = &out.writer;
-    try writer.writeAll("Background:");
-    var wrote = false;
-    if (stats.tool_blocks > 0) {
-        try writer.print(" {d} tool{s}", .{ stats.tool_blocks, if (stats.tool_blocks == 1) "" else "s" });
-        wrote = true;
-    }
-    if (stats.thinking_blocks > 0) {
-        if (wrote) try writer.writeAll(",");
-        try writer.print(" {d} reasoning step{s}", .{ stats.thinking_blocks, if (stats.thinking_blocks == 1) "" else "s" });
-    }
-    return out.toOwnedSlice();
-}
-
-fn truncateForSummary(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
-    if (text.len <= max_bytes) return allocator.dupe(u8, text);
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.writeAll(text[0..max_bytes]);
-    try out.writer.writeAll("...");
-    return out.toOwnedSlice();
-}
-
 fn padTopToHeight(allocator: std.mem.Allocator, text: []const u8, height: usize) ![]const u8 {
     if (height == 0) return allocator.dupe(u8, "");
     const lines = tui_text.lineCount(text);
@@ -507,7 +350,7 @@ const EntryLayout = struct {
     width: usize,
 };
 
-fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, ts_mode: TimestampDisplay, selected: bool) ![]u8 {
+fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, selected: bool) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -515,7 +358,7 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     const align_right = entry.kind == .user;
     const header_layout = entryHeaderLayout(entry.kind, width);
     const body_layout = entryBodyLayout(entry.kind, width);
-    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width, ts_mode);
+    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width);
     const header = try indentBlock(arena, header_inner, header_layout.left);
 
     const body_inner: []const u8 = switch (entry.kind) {
@@ -631,12 +474,12 @@ fn renderToolRow(allocator: std.mem.Allocator, tool_name: []const u8, text: []co
     return styled;
 }
 
-fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize, ts_mode: TimestampDisplay) ![]u8 {
+fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
     const name = if (kind == .tool and title.len > 0) title else roleName(kind);
     const raw_label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(kind), name });
     const role_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolRole(tool_name) else tui_theme.role(kind);
     const styled_label = try role_style.render(allocator, raw_label);
-    const clock = try formatTimestamp(allocator, ts_ms, ts_mode, width);
+    const clock = try formatTimestamp(allocator, ts_ms);
 
     var time_raw: []const u8 = "";
     var styled_time: []const u8 = "";
@@ -729,34 +572,14 @@ fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64, mode: TimestampDisplay, width: usize) ![]u8 {
+fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64) ![]u8 {
     if (ts_ms <= 0) return allocator.dupe(u8, "");
     const secs: u64 = @intCast(@divFloor(ts_ms, 1000));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
     const day_secs = epoch_seconds.getDaySeconds();
     const hh = day_secs.getHoursIntoDay();
     const mm = day_secs.getMinutesIntoHour();
-    const ss = day_secs.getSecondsIntoMinute();
-    return switch (mode) {
-        .off => allocator.dupe(u8, ""),
-        .clock => std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm }),
-        .full => blk: {
-            if (width < 28) {
-                break :blk try std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm });
-            }
-            const epoch_day = epoch_seconds.getEpochDay();
-            const year_day = epoch_day.calculateYearDay();
-            const month_day = year_day.calculateMonthDay();
-            const month: u4 = @intFromEnum(month_day.month);
-            const day: u5 = month_day.day_index;
-            if (width >= 40) {
-                break :blk try std.fmt.allocPrint(allocator, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-                    year_day.year, month, day + 1, hh, mm, ss,
-                });
-            }
-            break :blk try std.fmt.allocPrint(allocator, "{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ month, day + 1, hh, mm });
-        },
-    };
+    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm });
 }
 
 fn roleName(kind: TranscriptKind) []const u8 {
@@ -916,87 +739,29 @@ test "transcript aligns error card content with role label text" {
     try std.testing.expectEqual(label_col, text_col);
 }
 
-test "transcript renders date and time in full timestamp mode" {
+test "transcript renders clock timestamp" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.timestamp_display = .full;
-    try state.appendUserMessage("hello");
+    try state.appendUserMessage("hi");
     for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "2026-05-28 14:32:00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "14:32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2026") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "05-28") == null);
 }
 
-test "transcript timestamp hidden in off mode" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.timestamp_display = .off;
-    try state.appendUserMessage("hello");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 60, .height = 8 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "01:02") == null);
-}
-
-test "single entry helper honors timestamp display mode" {
+test "single entry helper renders clock timestamp" {
     var entry = try TranscriptEntry.init(std.testing.allocator, .assistant, "hello");
     defer entry.deinit(std.testing.allocator);
     entry.timestamp_ms = 1779978720 * 1000;
 
-    const full = try renderTranscriptEntry(std.testing.allocator, &entry, 80, .full);
-    defer std.testing.allocator.free(full);
-    try std.testing.expect(std.mem.indexOf(u8, full, "2026-05-28 14:32:00") != null);
-
-    const off = try renderTranscriptEntry(std.testing.allocator, &entry, 80, .off);
-    defer std.testing.allocator.free(off);
-    try std.testing.expect(std.mem.indexOf(u8, off, "14:32") == null);
-}
-
-test "transcript full timestamp drops year on narrow terminals" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.timestamp_display = .full;
-    try state.appendUserMessage("hi");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 32, .height = 8 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "05-28 14:32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2026") == null);
-}
-
-test "transcript full timestamp falls back to clock on very narrow terminals" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.timestamp_display = .full;
-    try state.appendUserMessage("hi");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 18, .height = 8 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "14:32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "05-28") == null);
-}
-
-test "transcript clock mode renders only time" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.timestamp_display = .clock;
-    try state.appendUserMessage("hi");
-    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "14:32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2026") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "05-28") == null);
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 80);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "14:32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "2026") == null);
 }
 
 test "transcript preserves multiline entries" {
@@ -1038,31 +803,9 @@ test "transcript empty visible state does not advertise removed Ctrl R shortcut"
     try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+R") == null);
 }
 
-test "transcript chat mode consolidates thinking and tool details" {
+test "transcript renders backpressure warning" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.transcript_mode = .chat;
-    try state.appendUserMessage("question");
-    try state.appendTranscript(.thinking, "private plan");
-    try state.appendTranscript(.tool, "shell_execute {\"command\":\"pwd\"}");
-    try state.appendTranscript(.assistant, "answer");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 20 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "question") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "answer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Background: 1 tool, 1 reasoning step") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "hidden=") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "system=") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "private plan") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "shell_execute") == null);
-}
-
-test "transcript chat mode renders backpressure warning" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.transcript_mode = .chat;
     try state.appendTranscript(.@"error", "Warning: 2 events dropped due to backpressure");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 20 });
@@ -1071,10 +814,9 @@ test "transcript chat mode renders backpressure warning" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Warning: 2 events dropped due to backpressure") != null);
 }
 
-test "transcript balanced mode collapses tool events into intent row without card" {
+test "transcript collapses tool events into intent row without card" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.transcript_mode = .balanced;
 
     try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
         std.testing.allocator,
@@ -1108,7 +850,6 @@ test "transcript balanced mode collapses tool events into intent row without car
 test "transcript balanced mode sanitizes tool descriptions" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.transcript_mode = .balanced;
 
     try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
         std.testing.allocator,
@@ -1131,7 +872,6 @@ test "transcript balanced mode sanitizes tool descriptions" {
 test "transcript balanced mode expands latest tool details" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.transcript_mode = .balanced;
 
     try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
         std.testing.allocator,
@@ -1156,7 +896,6 @@ test "transcript balanced mode expands latest tool details" {
 test "transcript balanced mode preserves tool call order across turns" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.transcript_mode = .balanced;
 
     try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
         std.testing.allocator,
@@ -1201,25 +940,6 @@ test "transcript balanced mode preserves tool call order across turns" {
     try std.testing.expect(second_tool < second_answer);
 }
 
-test "transcript everything mode includes low value system and full tool state" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.transcript_mode = .everything;
-    try state.applyEvent(.{ .agent_start = .{} });
-    const tool = try state.upsertToolForTest("call-1", "shell_execute", "{\"command\":\"ls\"}", .done);
-    try tool.output.appendSlice(std.testing.allocator, "full output line");
-    state.telemetry.total_bytes = 42;
-    state.telemetry.estimated_tokens = 10;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 40 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "agent started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "protocol event: agent_start") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "tool state: shell_execute") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "full output line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "context usage") != null);
-}
 
 test "transcript colors tool cards by inferred operation" {
     var state = AppState.init(std.testing.allocator);

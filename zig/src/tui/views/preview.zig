@@ -50,7 +50,6 @@ fn kindText(kind: tui_state.PreviewKind) []const u8 {
     return switch (kind) {
         .diff => "Diff",
         .file => "File",
-        .artifact => "Artifact",
     };
 }
 

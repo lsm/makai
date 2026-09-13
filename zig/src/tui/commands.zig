@@ -1,10 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
-const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
-const tui_config = @import("tui_config");
-const sse_transport = @import("transports/sse");
 
 pub const CommandKind = enum {
     help,
@@ -12,21 +9,11 @@ pub const CommandKind = enum {
     login,
     provider,
     status,
-    sessions,
     @"resume",
-    tools,
     permissions,
-    think,
-    view,
-    compact,
     clear,
-    copy,
-    artifact,
-    @"export",
-    diff,
     abort,
     quit,
-    remote,
 };
 
 pub const Command = struct {
@@ -48,28 +35,18 @@ pub const CommandAction = enum {
     open_model_picker,
     open_login_picker,
     open_permission_picker,
-    open_view_picker,
-    open_thinking_picker,
     start_login_provider,
-    copy_last,
-    copy_all,
-    copy_tool,
-    open_artifact_viewer,
-    open_export_picker,
-    export_file,
 };
 
 pub const CommandResult = struct {
     action: CommandAction = .none,
     output: []u8 = &.{},
     login_provider: []u8 = &.{},
-    export_path: []u8 = &.{},
     is_error: bool = false,
 
     pub fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
         if (self.output.len > 0) allocator.free(self.output);
         if (self.login_provider.len > 0) allocator.free(self.login_provider);
-        if (self.export_path.len > 0) allocator.free(self.export_path);
         self.* = undefined;
     }
 };
@@ -97,22 +74,13 @@ pub const commands = [_]CommandInfo{
     .{ .name = "login", .kind = .login, .usage = "/login [provider]", .description = "Sign in to a provider", .handler = handleLogin },
     .{ .name = "provider", .kind = .provider, .usage = "/provider [name]", .description = "Show or switch active provider", .handler = handleProvider },
     .{ .name = "status", .kind = .status, .usage = "/status", .description = "Show session status", .handler = handleStatus },
-    .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
-    .{ .name = "resume", .kind = .@"resume", .usage = "/resume", .description = "Open saved sessions", .handler = handleResume },
-    .{ .name = "tools", .kind = .tools, .usage = "/tools", .description = "List registered tools", .handler = handleTools },
+    .{ .name = "sessions", .kind = .@"resume", .usage = "/sessions", .description = "Open saved sessions", .handler = handleSessions },
+    .{ .name = "resume", .kind = .@"resume", .usage = "/resume", .description = "Open saved sessions", .handler = handleSessions },
     .{ .name = "permissions", .kind = .permissions, .usage = "/permissions [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
     .{ .name = "perm", .kind = .permissions, .usage = "/perm [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
-    .{ .name = "think", .kind = .think, .usage = "/think [off|low|medium|high|xhigh]", .description = "Pick or set thinking level", .handler = handleThink },
-    .{ .name = "view", .kind = .view, .usage = "/view [everything|verbose|balanced|chat]", .description = "Show or set transcript detail level", .handler = handleView },
-    .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
-    .{ .name = "copy", .kind = .copy, .usage = "/copy [all|tool]", .description = "Copy last reply, transcript, or selected tool output", .handler = handleCopy },
-    .{ .name = "artifact", .kind = .artifact, .usage = "/artifact", .description = "Open the latest artifact in a local viewer", .handler = handleArtifact },
-    .{ .name = "export", .kind = .@"export", .usage = "/export [path.md]", .description = "Export transcript to clipboard or file", .handler = handleExport },
-    .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
-    .{ .name = "remote", .kind = .remote, .usage = "/remote [stdio|sse <url>|ws <url>|auth <token>|header <name> <value>|off]", .description = "Configure remote transport", .handler = handleRemote },
 };
 
 pub fn parse(input: []const u8) ParseError!Command {
@@ -292,23 +260,6 @@ fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
     return .{ .action = .open_session_picker };
 }
 
-fn handleResume(ctx: CommandContext, command: Command) !CommandResult {
-    return try handleSessions(ctx, command);
-}
-
-fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
-    _ = command;
-    const runtime = ctx.runtime orelse return error.NoRuntimeConfigured;
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    try writer.writeAll("registered tools:");
-    for (runtime.tool_registry.list()) |tool| {
-        try writer.print("\n  {s}", .{tool.name});
-        if (tool.short_description) |desc| try writer.print(" - {s}", .{desc});
-    }
-    return .{ .output = try out.toOwnedSlice() };
-}
-
 fn handlePermissions(ctx: CommandContext, command: Command) !CommandResult {
     if (command.arg) |arg| {
         const mode = parsePermissionMode(arg) orelse {
@@ -335,111 +286,9 @@ fn parsePermissionMode(value: []const u8) ?tui_runtime.PermissionMode {
     return null;
 }
 
-fn handleView(ctx: CommandContext, command: Command) !CommandResult {
-    if (command.arg) |arg| {
-        const mode = parseTranscriptMode(arg) orelse {
-            return .{
-                .output = try std.fmt.allocPrint(ctx.allocator, "unknown view mode: {s}", .{arg}),
-                .is_error = true,
-            };
-        };
-        ctx.state.setTranscriptMode(mode);
-        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "view mode set to {s}", .{@tagName(mode)}) };
-    }
-    return .{ .action = .open_view_picker };
-}
-
-fn parseTranscriptMode(value: []const u8) ?tui_state.TranscriptVisibilityMode {
-    if (std.mem.eql(u8, value, "everything")) return .everything;
-    if (std.mem.eql(u8, value, "verbose")) return .verbose;
-    if (std.mem.eql(u8, value, "balanced")) return .balanced;
-    if (std.mem.eql(u8, value, "chat")) return .chat;
-    return null;
-}
-
-fn handleThink(ctx: CommandContext, command: Command) !CommandResult {
-    if (command.arg) |arg| {
-        const level = parseThinkingLevel(arg) orelse {
-            return .{
-                .output = try std.fmt.allocPrint(ctx.allocator, "unknown thinking level: {s}", .{arg}),
-                .is_error = true,
-            };
-        };
-        if (ctx.runtime) |runtime| runtime.setThinkingLevel(level);
-        ctx.state.thinking_level = level;
-        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "thinking level set to {s}", .{@tagName(level)}) };
-    }
-    if (ctx.runtime) |runtime| ctx.state.thinking_level = runtime.thinkingLevel();
-    return .{ .action = .open_thinking_picker };
-}
-
-fn parseThinkingLevel(value: []const u8) ?ai_types.ThinkingLevel {
-    if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "none") or std.mem.eql(u8, value, "disabled")) return .off;
-    if (std.mem.eql(u8, value, "minimal") or std.mem.eql(u8, value, "min")) return .low;
-    if (std.mem.eql(u8, value, "low")) return .low;
-    if (std.mem.eql(u8, value, "medium") or std.mem.eql(u8, value, "med")) return .medium;
-    if (std.mem.eql(u8, value, "high")) return .high;
-    if (std.mem.eql(u8, value, "xhigh") or std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "extra_high") or std.mem.eql(u8, value, "extra-high")) return .xhigh;
-    return null;
-}
-
-fn handleCompact(ctx: CommandContext, command: Command) !CommandResult {
-    _ = command;
-    const session = ctx.session orelse return error.NoRuntimeConfigured;
-    const result = try session.compactMessages();
-    const output = if (result.before == result.after)
-        try std.fmt.allocPrint(ctx.allocator, "conversation context already compact ({d} messages)", .{result.before})
-    else
-        try std.fmt.allocPrint(ctx.allocator, "conversation context compacted: {d} -> {d} messages", .{ result.before, result.after });
-    return .{ .output = output };
-}
-
 fn handleClear(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     return .{ .action = .clear_transcript, .output = try ctx.allocator.dupe(u8, "transcript cleared") };
-}
-
-fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
-    _ = ctx;
-    if (command.arg) |arg| {
-        const trimmed = std.mem.trim(u8, arg, " \t");
-        if (std.mem.eql(u8, trimmed, "all")) {
-            return .{ .action = .copy_all };
-        }
-        if (std.mem.eql(u8, trimmed, "tool")) {
-            return .{ .action = .copy_tool };
-        }
-    }
-    return .{ .action = .copy_last };
-}
-
-fn handleArtifact(ctx: CommandContext, command: Command) !CommandResult {
-    _ = ctx;
-    _ = command;
-    return .{ .action = .open_artifact_viewer };
-}
-
-fn handleExport(ctx: CommandContext, command: Command) !CommandResult {
-    if (command.arg) |path| {
-        return .{ .action = .export_file, .export_path = try ctx.allocator.dupe(u8, path) };
-    }
-    return .{ .action = .open_export_picker };
-}
-
-fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
-    _ = command;
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    var count: usize = 0;
-    for (ctx.state.tools.items) |tool| {
-        if (std.mem.indexOf(u8, tool.name, "write") == null and std.mem.indexOf(u8, tool.name, "edit") == null) continue;
-        if (count == 0) try writer.writeAll("pending file changes from tools:");
-        try writer.print("\n  {s} [{s}]", .{ tool.name, @tagName(tool.status) });
-        if (tool.output.items.len > 0) try writer.print("\n    {s}", .{tool.output.items[0..@min(tool.output.items.len, 160)]});
-        count += 1;
-    }
-    if (count == 0) try writer.writeAll("no pending file changes");
-    return .{ .output = try out.toOwnedSlice() };
 }
 
 fn handleAbort(ctx: CommandContext, command: Command) !CommandResult {
@@ -469,172 +318,6 @@ fn handleQuit(ctx: CommandContext, command: Command) !CommandResult {
     _ = ctx;
     _ = command;
     return .{ .action = .quit };
-}
-
-fn handleRemote(ctx: CommandContext, command: Command) !CommandResult {
-    var store = try tui_config.Store.initDefault(ctx.allocator);
-    defer store.deinit();
-    return try applyRemoteCommand(ctx.allocator, store, command.arg);
-}
-
-fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg: ?[]const u8) !CommandResult {
-    var cfg = try store.load();
-    defer cfg.deinit(allocator);
-
-    var restart_notice = false;
-    if (arg) |value| {
-        var iter = std.mem.splitScalar(u8, value, ' ');
-        const sub = iter.first();
-        const rest = std.mem.trim(u8, iter.rest(), " \t");
-
-        if (std.mem.eql(u8, sub, "stdio")) {
-            if (rest.len > 0) {
-                return .{ .output = try allocator.dupe(u8, "stdio transport uses the current process; no command argument is supported"), .is_error = true };
-            }
-            cfg.remote.enabled = false;
-            restart_notice = true;
-            try replaceRemoteString(allocator, &cfg.remote.transport, "stdio");
-            try replaceRemoteString(allocator, &cfg.remote.command, "");
-            try replaceRemoteString(allocator, &cfg.remote.endpoint, "");
-        } else if (std.mem.eql(u8, sub, "sse")) {
-            if (rest.len == 0) {
-                return .{ .output = try allocator.dupe(u8, "usage: /remote sse <url>"), .is_error = true };
-            }
-            validateUrlScheme(rest, &.{"http"}) catch {
-                return .{ .output = try allocator.dupe(u8, "SSE endpoint must use http scheme (TLS not yet supported)"), .is_error = true };
-            };
-            cfg.remote.enabled = true;
-            restart_notice = true;
-            try replaceRemoteString(allocator, &cfg.remote.transport, "sse");
-            try replaceRemoteString(allocator, &cfg.remote.endpoint, rest);
-            try replaceRemoteString(allocator, &cfg.remote.command, "");
-        } else if (std.mem.eql(u8, sub, "ws") or std.mem.eql(u8, sub, "websocket")) {
-            if (rest.len == 0) {
-                return .{ .output = try allocator.dupe(u8, "usage: /remote ws <url>"), .is_error = true };
-            }
-            validateUrlScheme(rest, &.{ "ws", "wss" }) catch {
-                return .{ .output = try allocator.dupe(u8, "WebSocket endpoint must use ws or wss scheme"), .is_error = true };
-            };
-            return .{ .output = try allocator.dupe(u8, "WebSocket remote transport is not yet supported"), .is_error = true };
-        } else if (std.mem.eql(u8, sub, "auth")) {
-            if (rest.len == 0) {
-                return .{ .output = try allocator.dupe(u8, "usage: /remote auth <token>"), .is_error = true };
-            }
-            if (hasCrLf(rest)) {
-                return .{ .output = try allocator.dupe(u8, "remote auth token must not contain CR/LF"), .is_error = true };
-            }
-            restart_notice = true;
-            try replaceRemoteString(allocator, &cfg.remote.auth_token, rest);
-            try replaceRemoteString(allocator, &cfg.remote.auth_header_value, "");
-        } else if (std.mem.eql(u8, sub, "header")) {
-            const trimmed = std.mem.trim(u8, rest, " \t");
-            var hiter = std.mem.splitScalar(u8, trimmed, ' ');
-            const name = hiter.first();
-            const header_value = std.mem.trim(u8, hiter.rest(), " \t");
-            if (name.len == 0 or header_value.len == 0) {
-                return .{ .output = try allocator.dupe(u8, "usage: /remote header <name> <value>"), .is_error = true };
-            }
-            if (!isValidHeaderName(name) or hasCrLf(header_value)) {
-                return .{ .output = try allocator.dupe(u8, "remote header name/value must not contain CR/LF; name must be a valid HTTP token"), .is_error = true };
-            }
-            restart_notice = true;
-            try replaceRemoteString(allocator, &cfg.remote.auth_token, "");
-            try replaceRemoteString(allocator, &cfg.remote.auth_header_name, name);
-            try replaceRemoteString(allocator, &cfg.remote.auth_header_value, header_value);
-        } else if (std.mem.eql(u8, sub, "off")) {
-            cfg.remote.enabled = false;
-            restart_notice = true;
-        } else {
-            return .{ .output = try std.fmt.allocPrint(allocator, "unknown remote subcommand: {s}", .{sub}), .is_error = true };
-        }
-        try store.save(cfg);
-    }
-
-    if (restart_notice) {
-        const status = try formatRemoteStatus(allocator, cfg.remote);
-        defer allocator.free(status);
-        return .{ .output = try std.fmt.allocPrint(allocator, "{s}\nNote: change applies on next TUI start; active remote sessions keep using the current runtime.", .{status}) };
-    }
-
-    return .{ .output = try formatRemoteStatus(allocator, cfg.remote) };
-}
-
-fn replaceRemoteString(allocator: std.mem.Allocator, field: *[]u8, value: []const u8) !void {
-    const next = try allocator.dupe(u8, value);
-    if (field.len > 0) allocator.free(field.*);
-    field.* = next;
-}
-
-fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
-    if (hasWhitespaceOrControl(url)) return error.InvalidUrl;
-    if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidUrl;
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
-    const scheme = url[0..scheme_end];
-    var matched = false;
-    for (schemes) |allowed| {
-        if (std.mem.eql(u8, scheme, allowed)) {
-            matched = true;
-            break;
-        }
-    }
-    if (!matched) return error.InvalidUrl;
-
-    const after_scheme = url[scheme_end + 3 ..];
-    var authority_end: usize = 0;
-    while (authority_end < after_scheme.len and after_scheme[authority_end] != '/' and after_scheme[authority_end] != '?' and after_scheme[authority_end] != '#') : (authority_end += 1) {}
-    const authority = after_scheme[0..authority_end];
-    if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.InvalidUrl;
-
-    if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) {
-        _ = sse_transport.parseHttpUrl(url) catch return error.InvalidUrl;
-        return;
-    }
-
-    const after = url[scheme_end + 3 ..];
-    var auth_end: usize = 0;
-    while (auth_end < after.len and after[auth_end] != '/' and after[auth_end] != '?' and after[auth_end] != '#') : (auth_end += 1) {}
-    const ws_authority = after[0..auth_end];
-    if (ws_authority.len == 0) return error.InvalidUrl;
-    var host = ws_authority;
-    if (std.mem.lastIndexOfScalar(u8, ws_authority, '@')) |at| host = ws_authority[at + 1 ..];
-    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
-    if (host.len == 0) return error.InvalidUrl;
-}
-
-fn hasWhitespaceOrControl(value: []const u8) bool {
-    for (value) |ch| {
-        if (std.ascii.isWhitespace(ch) or ch < 0x20 or ch == 0x7f) return true;
-    }
-    return false;
-}
-
-fn hasCrLf(value: []const u8) bool {
-    return std.mem.indexOfAny(u8, value, "\r\n") != null;
-}
-
-fn isTchar(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or switch (ch) {
-        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
-
-fn isValidHeaderName(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |ch| if (!isTchar(ch)) return false;
-    return true;
-}
-
-fn formatRemoteStatus(allocator: std.mem.Allocator, remote: tui_config.RemoteConfig) ![]u8 {
-    const status = if (remote.enabled) "enabled" else "disabled";
-    const auth = if (remote.auth_token.len > 0 or remote.auth_header_value.len > 0) "yes" else "no";
-    return try std.fmt.allocPrint(allocator, "remote {s}\ntransport: {s}\nendpoint: {s}\ncommand: {s}\nauth: {s}", .{
-        status,
-        remote.transport,
-        remote.endpoint,
-        remote.command,
-        auth,
-    });
 }
 
 fn currentModel(ctx: CommandContext) ?ai_types.Model {
@@ -679,7 +362,7 @@ test "dispatch reaches command handlers" {
     _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .@"export", .diff, .abort, .quit };
+    const kinds = [_]CommandKind{ .help, .status, .@"resume", .permissions, .clear, .abort, .quit };
     for (kinds) |kind| {
         var result = try dispatch(ctx, .{ .kind = kind });
         defer result.deinit(std.testing.allocator);
@@ -687,16 +370,10 @@ test "dispatch reaches command handlers" {
             try std.testing.expectEqual(CommandAction.quit, result.action);
         } else if (kind == .clear) {
             try std.testing.expectEqual(CommandAction.clear_transcript, result.action);
-        } else if (kind == .sessions) {
+        } else if (kind == .@"resume") {
             try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
         } else if (kind == .permissions) {
             try std.testing.expectEqual(CommandAction.open_permission_picker, result.action);
-        } else if (kind == .think) {
-            try std.testing.expectEqual(CommandAction.open_thinking_picker, result.action);
-        } else if (kind == .view) {
-            try std.testing.expectEqual(CommandAction.open_view_picker, result.action);
-        } else if (kind == .@"export") {
-            try std.testing.expectEqual(CommandAction.open_export_picker, result.action);
         } else {
             try std.testing.expect(result.output.len > 0);
         }
@@ -714,7 +391,7 @@ test "login command can target a provider directly" {
     try std.testing.expectEqualStrings("openai-codex", result.login_provider);
 }
 
-test "resume is an alias for sessions" {
+test "resume opens the session picker when sessions exist" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.addSession("s1", "Saved");
@@ -725,62 +402,16 @@ test "resume is an alias for sessions" {
     try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
 }
 
-const CompactCommandSession = struct {
-    before: usize = 12,
-    after: usize = 9,
-    compact_count: usize = 0,
-
-    fn session(self: *CompactCommandSession) tui_runtime.TuiSession {
-        return .{
-            .ctx = self,
-            .ops = .{
-                .compact_messages = compactMessages,
-                .can_steer = canSteer,
-            },
-        };
-    }
-
-    fn canSteer(ctx: ?*anyopaque) bool {
-        _ = ctx;
-        return false;
-    }
-
-    fn compactMessages(ctx: ?*anyopaque) anyerror!tui_runtime.CompactMessagesResult {
-        const self: *CompactCommandSession = @ptrCast(@alignCast(ctx.?));
-        self.compact_count += 1;
-        return .{ .before = self.before, .after = self.after };
-    }
-};
-
-test "compact command compacts session history" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    var compact = CompactCommandSession{};
-    var session = compact.session();
-
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .compact });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), compact.compact_count);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "12 -> 9") != null);
+test "sessions alias parses to resume" {
+    const command = try parse("/sessions");
+    try std.testing.expectEqual(CommandKind.@"resume", command.kind);
 }
 
-test "sessions opens picker when sessions exist" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.addSession("s1", "Saved");
-
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .sessions });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
-}
-
-test "sessions reports empty store" {
+test "resume reports empty store" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
 
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .sessions });
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume" });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "no saved sessions") != null);
@@ -817,43 +448,6 @@ test "permissions command switches runtime mode" {
     try std.testing.expectEqual(tui_runtime.PermissionMode.ask, state.permission_mode);
 }
 
-test "view command switches transcript visibility mode" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view, .arg = "chat" });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(tui_state.TranscriptVisibilityMode.chat, state.transcript_mode);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "chat") != null);
-
-    var current = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view });
-    defer current.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.open_view_picker, current.action);
-
-    var legacy = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view, .arg = "normal" });
-    defer legacy.deinit(std.testing.allocator);
-    try std.testing.expect(legacy.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, legacy.output, "unknown view mode") != null);
-}
-
-test "think command switches thinking level and opens picker without argument" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
-    defer runtime.deinit();
-
-    var high = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .think, .arg = "high" });
-    defer high.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ai_types.ThinkingLevel.high, state.thinking_level);
-    try std.testing.expectEqual(ai_types.ThinkingLevel.high, runtime.thinkingLevel());
-    try std.testing.expect(std.mem.indexOf(u8, high.output, "thinking level set to high") != null);
-
-    var picker = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .think });
-    defer picker.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.open_thinking_picker, picker.action);
-}
-
 test "perm alias parses as permissions command" {
     const command = try parse("/perm ask");
     try std.testing.expectEqual(CommandKind.permissions, command.kind);
@@ -867,50 +461,6 @@ test "runtime dependent commands dispatch to no-runtime errors" {
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .model, .arg = "model-a" }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .provider }));
-    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .tools }));
-    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .compact }));
-}
-
-test "copy command selects last reply or whole transcript" {
-    try std.testing.expectEqual(CommandKind.copy, (try parse("/copy")).kind);
-
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-
-    var last = try dispatch(ctx, .{ .kind = .copy });
-    defer last.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.copy_last, last.action);
-
-    var all = try dispatch(ctx, .{ .kind = .copy, .arg = "all" });
-    defer all.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.copy_all, all.action);
-
-    var tool = try dispatch(ctx, .{ .kind = .copy, .arg = "tool" });
-    defer tool.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.copy_tool, tool.action);
-}
-
-test "export command opens picker or targets file" {
-    const picker_command = try parse("/export");
-    try std.testing.expectEqual(CommandKind.@"export", picker_command.kind);
-
-    const file_command = try parse("/export custom.md");
-    try std.testing.expectEqual(CommandKind.@"export", file_command.kind);
-    try std.testing.expectEqualStrings("custom.md", file_command.arg.?);
-
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-
-    var picker = try dispatch(ctx, .{ .kind = .@"export" });
-    defer picker.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.open_export_picker, picker.action);
-
-    var file = try dispatch(ctx, .{ .kind = .@"export", .arg = "custom.md" });
-    defer file.deinit(std.testing.allocator);
-    try std.testing.expectEqual(CommandAction.export_file, file.action);
-    try std.testing.expectEqualStrings("custom.md", file.export_path);
 }
 
 test "abort when idle reports idle" {
@@ -1102,362 +652,3 @@ const MockAbortSession = struct {
         if (self.events_initialized) self.events.deinit();
     }
 };
-
-fn remoteTestStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !tui_config.Store {
-    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
-    defer allocator.free(base);
-    try compat.fs.createDir(compat.fs.getCwd(), base);
-    return try tui_config.Store.init(allocator, base);
-}
-
-test "remote command sets sse transport and persists" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: sse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(loaded.remote.enabled);
-    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
-    try std.testing.expectEqualStrings("http://localhost:8080", loaded.remote.endpoint);
-}
-
-test "remote command rejects invalid sse endpoint scheme" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse ftp://localhost:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
-}
-
-test "remote command rejects https sse endpoint until TLS supported" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse https://localhost:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "TLS not yet supported") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects unsupported websocket transport" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "ws ws://localhost:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "WebSocket remote transport is not yet supported") != null);
-}
-
-test "remote command rejects invalid websocket endpoint scheme" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "ws http://localhost:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "WebSocket endpoint must use ws or wss scheme") != null);
-}
-
-test "remote command sets auth token and persists" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "auth secret-token");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("secret-token", loaded.remote.auth_token);
-}
-
-test "remote command rejects auth token injection" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "auth secret\r\nInjected: yes");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "must not contain CR/LF") != null);
-}
-
-test "remote command shows current config" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, null);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "remote") != null);
-}
-
-test "remote command parses as slash command" {
-    const command = try parse("/remote sse http://localhost:8080");
-    try std.testing.expectEqual(CommandKind.remote, command.kind);
-    try std.testing.expectEqualStrings("sse http://localhost:8080", command.arg.?);
-}
-
-test "remote command sets stdio transport without enabling remote" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "stdio");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: stdio") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-    try std.testing.expectEqualStrings("stdio", loaded.remote.transport);
-    try std.testing.expectEqualStrings("", loaded.remote.command);
-    try std.testing.expectEqualStrings("", loaded.remote.endpoint);
-}
-
-test "remote command stdio rejects command argument" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "stdio /bin/foo");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "no command argument is supported") != null);
-}
-
-test "remote command off disables remote" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var sse_result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:8080");
-    defer sse_result.deinit(std.testing.allocator);
-    try std.testing.expect(!sse_result.is_error);
-
-    var off_result = try applyRemoteCommand(std.testing.allocator, store, "off");
-    defer off_result.deinit(std.testing.allocator);
-    try std.testing.expect(!off_result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "disabled") != null);
-    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "applies on next TUI start") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
-}
-
-test "remote command header sets header and clears auth token" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var auth_result = try applyRemoteCommand(std.testing.allocator, store, "auth secret-token");
-    defer auth_result.deinit(std.testing.allocator);
-    try std.testing.expect(!auth_result.is_error);
-
-    var header_result = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc123");
-    defer header_result.deinit(std.testing.allocator);
-    try std.testing.expect(!header_result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, header_result.output, "applies on next TUI start") != null);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("", loaded.remote.auth_token);
-    try std.testing.expectEqualStrings("X-Api-Key", loaded.remote.auth_header_name);
-    try std.testing.expectEqualStrings("abc123", loaded.remote.auth_header_value);
-}
-
-test "remote command rejects header injection" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var bad_name = try applyRemoteCommand(std.testing.allocator, store, "header X-Bad\r\nInjected value");
-    defer bad_name.deinit(std.testing.allocator);
-    try std.testing.expect(bad_name.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, bad_name.output, "must not contain CR/LF") != null);
-
-    var bad_value = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc\r\nInjected: yes");
-    defer bad_value.deinit(std.testing.allocator);
-    try std.testing.expect(bad_value.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, bad_value.output, "must not contain CR/LF") != null);
-}
-
-test "remote command rejects invalid header name" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "header Bad:Name value");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "valid HTTP token") != null);
-}
-
-test "remote command rejects unknown subcommand" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "bogus");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "unknown remote subcommand: bogus") != null);
-}
-
-test "remote command rejects sse endpoint with empty host" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
-}
-
-test "remote command rejects sse endpoint with fragment" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost#events");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with userinfo" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://token@localhost:8080/events");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with whitespace" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost/events extra");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with path-only authority" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http:///events");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with port-only authority" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://:8080");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with malformed port" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:abc");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
-test "remote command rejects sse endpoint with out-of-range port" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try remoteTestStore(std.testing.allocator, &tmp);
-    defer store.deinit();
-
-    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:70000");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.is_error);
-
-    var loaded = try store.load();
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.remote.enabled);
-}
-
