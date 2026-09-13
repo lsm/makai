@@ -228,7 +228,6 @@ pub const ProductionRuntime = struct {
     permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
     initial_model: ?SavedModelRef = null,
-    remote_config: tui_runtime.TuiRemoteConfig = .{},
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -271,12 +270,6 @@ pub const ProductionRuntime = struct {
         }
         errdefer if (initial_model) |*model| model.deinit(allocator);
 
-        var remote_config: tui_runtime.TuiRemoteConfig = .{};
-        if (saved_config) |cfg| {
-            remote_config = try tui_runtime.remoteConfigFromConfig(allocator, cfg);
-        }
-        errdefer remote_config.deinit(allocator);
-
         const runtime = ProductionRuntime{
             .allocator = allocator,
             .registry = registry,
@@ -284,10 +277,8 @@ pub const ProductionRuntime = struct {
             .permission_engine = permission_engine,
             .models = models,
             .initial_model = initial_model,
-            .remote_config = remote_config,
         };
         initial_model = null;
-        remote_config = .{};
         if (saved_config) |*cfg| cfg.deinit(allocator);
         saved_config = null;
         return runtime;
@@ -310,14 +301,12 @@ pub const ProductionRuntime = struct {
             .workspace_root = self.permission_engine.workspace_root,
             .run_async = true,
             .compact_output = true,
-            .remote_config = self.remote_config,
         };
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
         tui_model_catalog.deinitModels(self.allocator, self.models);
         if (self.initial_model) |*model| model.deinit(self.allocator);
-        self.remote_config.deinit(self.allocator);
         self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;
@@ -535,14 +524,11 @@ pub const App = struct {
             }
             if (self.runtime) |runtime| {
                 runtime.cancel();
-                switch (runtime.backend) {
-                    .remote => runtime.replaceMessages(&.{}) catch {},
-                    .local => if (runtime.local_agent) |*local| {
-                        if (local.isIdle()) {
-                            local.clearAllQueues();
-                            local.replaceMessages(&.{}) catch {};
-                        }
-                    },
+                if (runtime.local_agent) |*local| {
+                    if (local.isIdle()) {
+                        local.clearAllQueues();
+                        local.replaceMessages(&.{}) catch {};
+                    }
                 }
             }
             self.discardPendingEvents();
@@ -1040,15 +1026,12 @@ pub const App = struct {
         self.syncBackpressureState();
         if (self.pending_session_reset and !self.state.status.streaming) {
             if (self.runtime) |runtime| {
-                switch (runtime.backend) {
-                    .local => if (runtime.local_agent) |*local| {
-                        if (local.isIdle()) {
-                            local.clearAllQueues();
-                            local.replaceMessages(&.{}) catch {};
-                            self.pending_session_reset = false;
-                        }
-                    },
-                    else => self.pending_session_reset = false,
+                if (runtime.local_agent) |*local| {
+                    if (local.isIdle()) {
+                        local.clearAllQueues();
+                        local.replaceMessages(&.{}) catch {};
+                        self.pending_session_reset = false;
+                    }
                 }
             } else {
                 self.pending_session_reset = false;
@@ -1106,12 +1089,6 @@ pub const App = struct {
         }
     }
 
-    fn steeringAvailable(self: *const App) bool {
-        if (self.runtime) |runtime| return runtime.canSteer();
-        if (self.session) |*session| return session.canSteer();
-        return false;
-    }
-
     fn discardPendingEvents(self: *App) void {
         var session = &(self.session orelse return);
         while (session.popEvent()) |event| {
@@ -1126,13 +1103,10 @@ pub const App = struct {
     fn applyPendingSessionResetSync(self: *App) !void {
         if (!self.pending_session_reset) return;
         if (self.runtime) |runtime| {
-            switch (runtime.backend) {
-                .local => if (runtime.local_agent) |*local| {
-                    if (!local.isIdle()) return error.PendingSessionReset;
-                    local.clearAllQueues();
-                    local.replaceMessages(&.{}) catch {};
-                },
-                else => {},
+            if (runtime.local_agent) |*local| {
+                if (!local.isIdle()) return error.PendingSessionReset;
+                local.clearAllQueues();
+                local.replaceMessages(&.{}) catch {};
             }
         }
         self.pending_session_reset = false;
@@ -1375,10 +1349,7 @@ pub const App = struct {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
-            const tips = if (self.steeringAvailable())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
-            else
-                "Enter submit • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
+            const tips = "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1900,26 +1871,13 @@ pub const TuiModel = struct {
                                     if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
-                            } else if (app.steeringAvailable()) {
+                            } else {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
                                     if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
-                            } else {
-                                const trimmed = std.mem.trim(u8, text, " \t\r\n");
-                                if (std.mem.startsWith(u8, trimmed, "/")) {
-                                    app.submit(text) catch |err| {
-                                        if (err == error.QuitRequested) return .quit;
-                                        if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
-                                        if (err == error.PendingSessionReset) return .none;
-                                        app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                        if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
-                                    };
-                                } else {
-                                    consumed = false;
-                                }
                             }
                         } else {
                             app.submit(text) catch |err| {
@@ -1981,7 +1939,6 @@ pub const TuiModel = struct {
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
-            .steering_available = app.steeringAvailable(),
         }) catch "";
         const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
         if (ctx._terminal != null and app.state.mode == .normal and app.state.focus_pane == .transcript) {
@@ -2773,11 +2730,11 @@ test "App submit abort when streaming cancels and reports transcript" {
 }
 
 test "App submit abort when streaming via runtime-only cancels and reports transcript" {
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     app.runtime = runtime;
-    runtime = undefined;
     app.runtime.?.stream_active = true;
 
     try app.submit("/abort");
@@ -2839,22 +2796,6 @@ test "App welcome uses session count" {
     try app.appendWelcome();
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") == null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/resume") != null);
-}
-
-test "App welcome shows follow-up tips but hides steering tips for remote runtime" {
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    app.runtime = runtime;
-    runtime = undefined;
-    try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
-    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
-
-    try app.appendWelcome();
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter while streaming") == null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter submit") != null);
 }
 
 const MockAppSession = struct {
@@ -3459,34 +3400,12 @@ test "App drain does not auto-resume queued steering after error turn" {
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
 }
 
-test "TuiModel remote streaming Enter is ignored and preserves composer" {
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+test "TuiModel streaming Alt+Enter queues follow-up" {
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     model.app.?.runtime = runtime;
-    runtime = undefined;
-    var mock = MockAppSession{};
-    defer mock.deinit();
-    model.app.?.session = mock.session();
-    model.app.?.state.status.streaming = true;
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
-
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
-    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
-    try std.testing.expectEqualStrings("new turn", model.app.?.state.composer.text());
-    try std.testing.expectEqualStrings("", model.app.?.state.status.last_error);
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.composer.history.items.len);
-}
-
-test "TuiModel remote streaming Alt+Enter still queues follow-up" {
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.runtime = runtime;
-    runtime = undefined;
     var mock = MockAppSession{};
     defer mock.deinit();
     model.app.?.session = mock.session();
@@ -3975,21 +3894,12 @@ test "resume selected session clears delete reset flags" {
     try std.testing.expect(app.quarantine_events);
 }
 
-fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
-    const runtime = try allocator.create(tui_runtime.TuiRuntime);
-    runtime.* = tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote }) catch |err| {
-        allocator.destroy(runtime);
-        return err;
-    };
-    return runtime;
-}
-
-test "resume selected session allows remote runtime" {
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+test "resume selected session allows runtime without protocol" {
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     app.runtime = runtime;
-    runtime = undefined;
 
     try std.testing.expectError(error.NoStoreConfigured, app.resumeSelectedSession());
 
