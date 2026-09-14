@@ -75,10 +75,12 @@ must wrap every `MD_TEXT` event; that is a clean, single choke point.
 
 Vendoring cost is the lowest of the C options: the parser is two files
 (`md4c.c` 6,462 lines + `md4c.h` 407 lines, stdlib-only, no CMake, no config headers —
-"add md4c.[hc] directly to your code base" per upstream). The HTML renderer and entity
-tables (`md4c-html.[ch]`, `entity.[ch]`) are not needed for an ANSI renderer.
-`MD_FLAG_NOHTML` disables raw HTML blocks and spans. Two gaps the renderer slice must
-close deliberately:
+"add md4c.[hc] directly to your code base" per upstream). The HTML renderer
+(`md4c-html.[ch]`) is not needed for an ANSI renderer. `entity.[ch]` is not needed by
+the parser itself, but its MIT data is the natural source of the renderer's entity
+decode table — a complete table means the vendor slice takes four files, or the
+renderer slice carries an equivalent generated Zig table. `MD_FLAG_NOHTML` disables
+raw HTML blocks and spans. Two gaps the renderer slice must close deliberately:
 
 - **Span metadata bypasses text events.** Link destinations, titles, and image sources
   arrive as `MD_ATTRIBUTE` fields on span-detail structs (`MD_SPAN_A_DETAIL.href`,
@@ -128,9 +130,11 @@ Build-cost evidence:
 | x86_64-macos | OK | — |
 
 CI's cross-compile smoke matrix (`cross-compile-smoke`, `.github/workflows/ci.yml:164-179`)
-already builds all five of these release targets on every PR — `aarch64-windows`
-included, on `windows-latest` — so md4c's portability claims are exercised by the
-existing pipeline, not just by this PoC.
+builds all five of these release targets on every PR — `aarch64-windows` included, on
+`windows-latest`. The smoke job compiles the repo checkout (`zig build install`, :202-206),
+which contains no md4c today, so md4c's portability evidence is PoC-only until a vendor
+slice merges — at that point the existing matrix compiles it on all five targets
+automatically, with no CI changes needed.
 
 Lessons the PoC already paid for (the implementation slice inherits them as known
 pitfalls, not surprises): multi-byte prefixes (`│ `, `• `) must be width-accounted, not
@@ -181,16 +185,18 @@ Verdict: no pure-Zig candidate passes; revisit yearly.
 | Vendoring cost | zero (present) | 2 files, no CMake, 6.9k C lines | ~10k C lines + config/CMake shim | n/a |
 | Windows ARM64 | untested | proven via zig cc; target already in CI smoke | presumed fine, unproven | n/a |
 | License | vendored zigzag | MIT | BSD-2 | PolyForm-NC (zigmark) |
-| Test story | 1 test | upstream spec suite + PoC 6/6 | upstream spec suite | n/a |
-| Prod LOC added vs plain render | +368 (fails criteria) | ~600-800 Zig + vendor | ~600-800 Zig + more vendor | n/a |
+| Test story | 1 test | upstream spec suite + PoC 8/8 | upstream spec suite | n/a |
+| Incremental prod LOC vs plain render | integration only (already vendored; fails criteria) | ~600-800 Zig renderer (vendor excluded) | ~600-800 Zig renderer + config shim | n/a |
 
 ## Recommendation
 
 **Vendor md4c (release-0.5.3) and build a SAX→ANSI renderer in the TUI**, in two
 slices per methodology (vendor blob gets its own PR; the renderer is a second):
 
-1. **Vendor slice**: `zig/vendor/md4c/{md4c.c,md4c.h}` + LICENSE, `build.zig` C source
-   wiring, no behavior change (parser unreferenced by prod).
+1. **Vendor slice**: `zig/vendor/md4c/{md4c.c,md4c.h,entity.c,entity.h}` + LICENSE
+   (or drop `entity.[ch]` here and generate a complete Zig entity table in the
+   renderer slice instead), `build.zig` C source wiring, no behavior change (parser
+   unreferenced by prod).
 2. **Renderer slice**: replace the body path in `renderAssistantPlain` for assistant
    entries with the md4c renderer: sanitizer at every text event (port of
    `stripControls`) **and over every emitted span/block metadata attribute**, decode
