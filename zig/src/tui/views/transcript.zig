@@ -20,10 +20,9 @@ const DisplayEntry = struct {
     timestamp_ms: i64,
     tool_name: []const u8 = "",
     title: []const u8 = "",
-    transcript_index: ?usize = null,
 };
 
-pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) ![]const u8 {
+pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Options) ![]const u8 {
     if (options.height == 0) return allocator.dupe(u8, "");
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -42,56 +41,23 @@ pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) 
         return padTopToHeight(allocator, ready_line, options.height);
     }
 
-    const selected_visible_index: ?usize = if (state.focus_pane == .transcript) blk: {
-        const sel = state.selected_message_index orelse break :blk null;
-        if (sel >= state.transcript.items.len) break :blk null;
-        for (visible_entries.items, 0..) |entry, i| {
-            if (entry.transcript_index == sel) break :blk i;
-        }
-        break :blk null;
-    } else null;
-
     var all_rows: std.Io.Writer.Allocating = .init(allocator);
     defer all_rows.deinit();
     const all_writer = &all_rows.writer;
-    var selected_start_line: ?usize = null;
-    var selected_end_line: ?usize = null;
     var current_line: usize = 0;
     for (visible_entries.items, 0..) |*entry, i| {
         if (i > 0) {
             try all_writer.writeAll("\n\n");
             current_line += 1;
         }
-        const row_start = current_line;
-        const selected = selected_visible_index == i;
-        const row = try renderEntry(allocator, entry, options.width, selected);
+        const row = try renderEntry(allocator, entry, options.width);
         defer allocator.free(row);
         try all_writer.writeAll(row);
         current_line += tui_text.lineCount(row);
-        if (selected) {
-            selected_start_line = row_start;
-            selected_end_line = current_line;
-        }
     }
 
     const all_text = all_rows.written();
     const total_lines = current_line;
-
-    if (state.focus_pane == .transcript and state.follow_selection) {
-        state.follow_selection = false;
-        if (selected_start_line) |sel_start| {
-            const sel_end = selected_end_line.?;
-            const reserve_indicator = total_lines > options.height and options.height >= 2;
-            const view_height = if (reserve_indicator) options.height - 1 else options.height;
-            const max_scroll = if (total_lines > view_height) total_lines - view_height else 0;
-            var desired_start = sel_start;
-            if (sel_end > desired_start + view_height) {
-                desired_start = sel_end -| view_height;
-            }
-            if (desired_start > max_scroll) desired_start = max_scroll;
-            state.transcript_scroll = max_scroll - desired_start;
-        }
-    }
 
     const show_indicator = state.transcript_scroll > 0 and total_lines > options.height and options.height >= 2;
     const view_height = if (show_indicator) options.height - 1 else options.height;
@@ -125,7 +91,7 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     };
-    return renderEntry(allocator, &display, width, false);
+    return renderEntry(allocator, &display, width);
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
@@ -147,7 +113,7 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
             tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
             continue;
         }
-        try appendOriginal(allocator, entries, entry, i);
+        try appendOriginal(allocator, entries, entry);
         i += 1;
     }
 }
@@ -164,7 +130,7 @@ fn appendBalancedToolCluster(
     var tool_index = initial_tool_index;
     if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
         for (state.transcript.items[start..end], start..) |*entry, idx| {
-            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry, idx);
+            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry);
         }
         return tool_index;
     }
@@ -197,14 +163,13 @@ fn isToolStartSummary(text: []const u8) bool {
     return quote < @min(ok, failed);
 }
 
-fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry, transcript_index: usize) !void {
+fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
     try entries.append(allocator, .{
         .kind = entry.kind,
         .text = entry.text.items,
         .timestamp_ms = entry.timestamp_ms,
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
-        .transcript_index = transcript_index,
     });
 }
 
@@ -228,7 +193,7 @@ fn appendToolSummary(
 
     var out: std.Io.Writer.Allocating = .init(arena);
     const writer = &out.writer;
-    try writer.writeAll(if (tool.expanded) "\u{25be}" else "\u{25b8}");
+    try writer.writeAll("\u{25b8}");
     if (intent) |value| if (value.len > 0) try writer.print(" {s}", .{value});
     try writer.print(" [{s}", .{status});
     if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
@@ -246,15 +211,6 @@ fn appendToolSummary(
         try writer.writeAll(", filter via artifact_retrieve");
     }
     try writer.writeByte(']');
-    if (tool.expanded) {
-        try writer.print("\n  args: {s}", .{tool.args_json});
-        if (tool.display_preview.len > 0) {
-            try writer.print("\n  output preview:\n{s}", .{tool.display_preview});
-        } else if (tool.output.items.len > 0) {
-            try writer.print("\n  output:\n{s}", .{tool.output.items});
-        }
-        if (tool.artifact_refs.len > 0) try writer.print("\n  artifacts: {s}", .{tool.artifact_refs});
-    }
 
     try entries.append(allocator, .{
         .kind = .tool,
@@ -350,7 +306,7 @@ const EntryLayout = struct {
     width: usize,
 };
 
-fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, selected: bool) ![]u8 {
+fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -394,27 +350,6 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     if (body.len > 0) {
         try writer.writeByte('\n');
         try writer.writeAll(body);
-    }
-    const composed = try out.toOwnedSlice();
-    if (!selected) return composed;
-    const highlighted = try applySelectionToLines(allocator, composed, width);
-    allocator.free(composed);
-    return highlighted;
-}
-
-fn applySelectionToLines(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    const w: u16 = @intCast(@min(width, std.math.maxInt(u16)));
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        if (!first) try writer.writeByte('\n');
-        first = false;
-        const highlighted = try tui_theme.selection().width(w).render(allocator, line);
-        defer allocator.free(highlighted);
-        try writer.writeAll(highlighted);
     }
     return out.toOwnedSlice();
 }
@@ -869,30 +804,6 @@ test "transcript balanced mode sanitizes tool descriptions" {
     try std.testing.expect(std.mem.indexOf(u8, text, "before[2Jafter") != null);
 }
 
-test "transcript balanced mode expands latest tool details" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
-        std.testing.allocator,
-        "call-1",
-        "shell_execute",
-        "Shell Execute",
-        "{\"description\":\"Inspect current directory\",\"command\":\"pwd\"}",
-        .done,
-    ));
-    try state.tools.items[0].output.appendSlice(std.testing.allocator, "stdout:\n/tmp\nstderr:\n");
-    state.toggleLatestToolExpanded();
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect current directory\"");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 20 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25be} Inspect current directory") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "args: {\"description\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "stdout:") != null);
-}
-
 test "transcript balanced mode preserves tool call order across turns" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -1052,55 +963,6 @@ test "transcript keeps one-line viewport within height when scrolled" {
 
     try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(text));
     try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
-}
-
-test "transcript highlights selected message block" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendUserMessage("hello");
-    try state.appendTranscript(.assistant, "world");
-
-    state.focus_pane = .transcript;
-    state.selected_message_index = 0;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") != null);
-}
-
-test "transcript scroll follows selected message" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    for (0..20) |i| {
-        const msg = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
-        defer std.testing.allocator.free(msg);
-        try state.appendTranscript(.assistant, msg);
-    }
-
-    state.focus_pane = .transcript;
-    state.selected_message_index = 0;
-    state.transcript_scroll = 0;
-    state.follow_selection = true;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(state.transcript_scroll > 0);
-}
-
-test "transcript keeps selection visible when focus is not transcript" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.system, "only one");
-    state.focus_pane = .composer;
-    state.selected_message_index = 0;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") == null);
 }
 
 test "transcript renders heading bold without markdown marker" {

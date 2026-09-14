@@ -970,10 +970,7 @@ pub fn build(b: *std.Build) void {
     const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_markdown", .module = tui_markdown_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_menu_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/menu_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
 
@@ -1029,10 +1026,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },
             .{ .name = "tui_view_composer", .module = tui_view_composer_mod },
             .{ .name = "tui_view_status_bar", .module = tui_view_status_bar_mod },
-            .{ .name = "tui_view_tool_panel", .module = tui_view_tool_panel_mod },
-            .{ .name = "tui_view_telemetry", .module = tui_view_telemetry_mod },
             .{ .name = "tui_view_approval", .module = tui_view_approval_mod },
-            .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
             .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
             .{ .name = "tui_view_menu_picker", .module = tui_view_menu_picker_mod },
             .{ .name = "permission", .module = permission_mod },
@@ -1480,10 +1474,7 @@ pub fn build(b: *std.Build) void {
     const tui_view_transcript_test = b.addTest(.{ .root_module = tui_view_transcript_mod });
     const tui_view_composer_test = b.addTest(.{ .root_module = tui_view_composer_mod });
     const tui_view_status_bar_test = b.addTest(.{ .root_module = tui_view_status_bar_mod });
-    const tui_view_tool_panel_test = b.addTest(.{ .root_module = tui_view_tool_panel_mod });
-    const tui_view_telemetry_test = b.addTest(.{ .root_module = tui_view_telemetry_mod });
     const tui_view_approval_test = b.addTest(.{ .root_module = tui_view_approval_mod });
-    const tui_view_preview_test = b.addTest(.{ .root_module = tui_view_preview_mod });
     const tui_view_session_picker_test = b.addTest(.{ .root_module = tui_view_session_picker_mod });
     const tui_view_menu_picker_test = b.addTest(.{ .root_module = tui_view_menu_picker_mod });
     const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
@@ -1736,10 +1727,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
-    test_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
-    test_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
-    test_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
@@ -1912,10 +1900,7 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);

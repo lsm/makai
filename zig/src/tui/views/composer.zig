@@ -154,15 +154,14 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, ma
         return tui_theme.muted().render(allocator, truncated);
     }
     if (state.composer.history.items.len > 0) {
-        const tool_hint = if (state.tools.items.len > 0) " • Ctrl+T tool details" else "";
-        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Shift+Tab thinking level{s}", .{ state.composer.history.items.len, tool_hint });
+        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Shift+Tab thinking level", .{state.composer.history.items.len});
         defer allocator.free(hint);
         const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
         defer allocator.free(truncated);
         return tui_theme.muted().render(allocator, truncated);
     }
     const base_hint = if (state.tools.items.len > 0)
-        "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+T tool details • Ctrl+C quit"
+        "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit"
     else
         "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit";
     const truncated = try tui_text.truncateToWidth(allocator, base_hint, max_width);

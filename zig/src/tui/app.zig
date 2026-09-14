@@ -17,17 +17,14 @@ const tui_text = @import("tui_text");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
-const tool_panel_view = @import("tui_view_tool_panel");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
 const approval_view = @import("tui_view_approval");
-const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
 const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
-const tools_common = @import("tools/common");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -37,128 +34,9 @@ pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
-const artifact_display_preview_read_limit = 256 * 1024;
-const artifact_preview_head_lines = 40;
-const artifact_preview_tail_lines = 20;
 
 fn isSecretLoginPrompt(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "API key") != null or std.mem.indexOf(u8, message, "api key") != null;
-}
-
-fn firstArtifactReference(refs: []const u8) ?[]const u8 {
-    var iter = std.mem.splitSequence(u8, refs, ", ");
-    while (iter.next()) |ref| {
-        const trimmed = std.mem.trim(u8, ref, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        if (std.mem.startsWith(u8, trimmed, ".makai/tool-artifacts/")) return trimmed;
-    }
-    return null;
-}
-
-fn artifactDisplayPreview(allocator: std.mem.Allocator, data: []const u8, raw_total_bytes: u64, reference: []const u8) ![]u8 {
-    const safe_data = try sanitizeTerminalPreviewText(allocator, data);
-    defer allocator.free(safe_data);
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    const line_count = countTextLines(safe_data);
-    const byte_count = if (raw_total_bytes > 0) raw_total_bytes else data.len;
-    try writer.print("raw output preview ({d} bytes, {d} lines)\n", .{ byte_count, line_count });
-    try writer.writeAll("head:\n");
-    try writeFirstTextLines(writer, safe_data, artifact_preview_head_lines);
-    if (line_count > artifact_preview_head_lines + artifact_preview_tail_lines) {
-        try writer.writeAll("\n...\ntail:\n");
-        try writeLastTextLines(allocator, writer, safe_data, artifact_preview_tail_lines);
-    }
-    try writer.print("\nartifact: {s}\nAsk for grep/range to filter without loading full output into context.", .{reference});
-    return out.toOwnedSlice();
-}
-
-fn writeFirstTextLines(writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
-    var emitted: usize = 0;
-    var iter = std.mem.splitScalar(u8, data, '\n');
-    while (iter.next()) |line| {
-        if (emitted >= max_lines) break;
-        try writer.writeAll(line);
-        try writer.writeByte('\n');
-        emitted += 1;
-    }
-}
-
-fn writeLastTextLines(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
-    if (max_lines == 0) return;
-    const capacity = max_lines + 1;
-    var starts = try allocator.alloc(usize, capacity);
-    defer allocator.free(starts);
-    var starts_len: usize = 1;
-    starts[0] = 0;
-    for (data, 0..) |c, i| {
-        if (c == '\n' and i + 1 < data.len) {
-            if (starts_len == capacity) {
-                std.mem.copyForwards(usize, starts[0 .. capacity - 1], starts[1..capacity]);
-                starts_len -= 1;
-            }
-            starts[starts_len] = i + 1;
-            starts_len += 1;
-        }
-    }
-    const start_index = if (starts_len > max_lines) starts_len - max_lines else 0;
-    var i = start_index;
-    while (i < starts_len) : (i += 1) {
-        const start = starts[i];
-        const end = if (i + 1 < starts_len) starts[i + 1] - 1 else data.len;
-        try writer.writeAll(data[start..end]);
-        try writer.writeByte('\n');
-    }
-}
-
-fn countTextLines(text: []const u8) usize {
-    if (text.len == 0) return 0;
-    var lines: usize = 1;
-    for (text) |c| {
-        if (c == '\n') lines += 1;
-    }
-    if (text[text.len - 1] == '\n') lines -= 1;
-    return lines;
-}
-
-fn sanitizeTerminalPreviewText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    var i: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        switch (c) {
-            '\n', '\t' => {
-                try writer.writeByte(c);
-                i += 1;
-                continue;
-            },
-            '\r' => {
-                try writer.writeByte('\n');
-                i += 1;
-                continue;
-            },
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
-                i += 1;
-                continue;
-            },
-            else => {},
-        }
-        const len = std.unicode.utf8ByteSequenceLength(c) catch {
-            i += 1;
-            continue;
-        };
-        if (i + len > text.len) break;
-        _ = std.unicode.utf8Decode(text[i .. i + len]) catch {
-            i += 1;
-            continue;
-        };
-        try writer.writeAll(text[i .. i + len]);
-        i += len;
-    }
-    return out.toOwnedSlice();
 }
 
 pub const ApprovalWaiter = struct {
@@ -494,7 +372,6 @@ pub const App = struct {
         }
         for (loaded.events.items) |*event| {
             try self.applyRuntimeEvent(event.*);
-            self.hydrateToolDisplayPreview(event.*) catch |err| try self.recordError(@errorName(err));
         }
         if (self.session) |*session| session.clearQueuedMessages();
         self.state.clearQueuedPreviews();
@@ -745,7 +622,6 @@ pub const App = struct {
             self.login = null;
         }
         if (self.state.mode == .login_input) self.state.mode = .normal;
-        self.state.focusComposer();
     }
 
     fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
@@ -822,7 +698,6 @@ pub const App = struct {
     fn submitLoginInput(self: *App, text: []const u8) void {
         const session = self.login orelse {
             self.state.mode = .normal;
-            self.state.focusComposer();
             return;
         };
         session.provideInput(text) catch |err| {
@@ -831,7 +706,6 @@ pub const App = struct {
         };
         self.state.login_input_secret = false;
         self.state.mode = .normal;
-        self.state.focusComposer();
     }
 
     fn cancelLogin(self: *App) void {
@@ -840,7 +714,6 @@ pub const App = struct {
         self.state.composer.clear();
         self.state.login_input_secret = false;
         self.state.mode = .normal;
-        self.state.focusComposer();
     }
 
     fn moveMenuSelection(self: *App, delta: isize) void {
@@ -999,7 +872,6 @@ pub const App = struct {
                             if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
                             self.saveEvent(mutable);
                             try self.applyRuntimeEvent(mutable);
-                            try self.hydrateToolDisplayPreview(mutable);
                         }
                     }
                 } else {
@@ -1015,7 +887,6 @@ pub const App = struct {
             if (ev == .agent_end and ev.agent_end.reason == .completed) completed_agent_end = true;
             self.saveEvent(ev);
             try self.applyRuntimeEvent(ev);
-            try self.hydrateToolDisplayPreview(ev);
         }
         self.refreshQueuedCounts();
         self.syncBackpressureState();
@@ -1211,7 +1082,6 @@ pub const App = struct {
 
         if (command.kind == .abort) {
             if (self.approval_waiter) |waiter| waiter.rejectPending();
-            if (self.state.mode == .normal) self.state.focusComposer();
         }
 
         switch (result.action) {
@@ -1298,36 +1168,6 @@ pub const App = struct {
         };
         self.stageClipboard(text);
         self.state.appendTranscript(.system, "copied last reply to clipboard") catch {};
-    }
-
-    fn copyPreview(self: *App) void {
-        if (self.state.preview.content.len == 0) {
-            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
-            return;
-        }
-        self.stageClipboard(self.state.preview.content);
-        self.state.appendTranscript(.system, "copied preview to clipboard") catch {};
-    }
-
-    fn hydrateToolDisplayPreview(self: *App, event: tui_runtime.TuiEvent) !void {
-        switch (event) {
-            .tool_execution_end => |payload| {
-                if (payload.artifact_count == 0) return;
-                const reference = firstArtifactReference(payload.artifact_refs.slice()) orelse return;
-                const data = tools_common.retrieveArtifactPrefix(self.allocator, reference, artifact_display_preview_read_limit) catch return;
-                defer self.allocator.free(data);
-                const preview = try artifactDisplayPreview(self.allocator, data, payload.raw_total_bytes, reference);
-                errdefer self.allocator.free(preview);
-                for (self.state.tools.items) |*tool| {
-                    if (!std.mem.eql(u8, tool.id, payload.tool_call_id.slice())) continue;
-                    if (tool.display_preview.len > 0) self.allocator.free(tool.display_preview);
-                    tool.display_preview = preview;
-                    return;
-                }
-                self.allocator.free(preview);
-            },
-            else => {},
-        }
     }
 
     fn cycleThinkingLevel(self: *App) void {
@@ -1604,7 +1444,6 @@ pub const TuiModel = struct {
             .editor_done => |content| {
                 defer ctx.persistent_allocator.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
-                app.state.focusComposer();
                 return editorReturnCommand();
             },
             .editor_failed => {
@@ -1615,30 +1454,13 @@ pub const TuiModel = struct {
                 if (key.modifiers.ctrl) switch (key.key) {
                     .char => |c| switch (c) {
                         'c' => return .quit,
-                        'k' => {
-                            if (app.state.mode == .normal) {
-                                if (@import("builtin").is_test) {
-                                    app.state.focusPrevPane();
-                                } else if (ctx._terminal != null and app.state.focus_pane == .tools) {
-                                    app.state.focusComposer();
-                                } else {
-                                    app.state.focusPrevPane();
-                                }
-                            }
-                            return .none;
-                        },
                         'g' => {
-                            app.state.focusComposer();
                             if (@import("builtin").is_test) return .none;
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
                         },
-                        't' => {
-                            app.state.toggleLatestToolExpanded();
-                            return .none;
-                        },
                         'y' => {
-                            if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
+                            app.copyLastAssistant();
                             app.flushClipboard(ctx);
                             return .none;
                         },
@@ -1647,11 +1469,11 @@ pub const TuiModel = struct {
                             } else return .none;
                         },
                         'p' => {
-                            if (app.state.mode == .normal and app.state.focus_pane == .composer) _ = app.state.composerHistoryPrev() catch false;
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryPrev() catch false;
                             return .none;
                         },
                         'n' => {
-                            if (app.state.mode == .normal and app.state.focus_pane == .composer) _ = app.state.composerHistoryNext() catch false;
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryNext() catch false;
                             return .none;
                         },
                         else => return .none,
@@ -1782,50 +1604,6 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
-                if (app.state.mode == .preview) {
-                    switch (key.key) {
-                        .up => app.state.preview.scroll += 1,
-                        .down => app.state.preview.scroll -|= 1,
-                        .page_up => app.state.preview.scroll += 10,
-                        .page_down => app.state.preview.scroll -|= 10,
-                        .home => app.state.preview.scroll = 0,
-                        .escape => {
-                            app.state.mode = .normal;
-                            app.state.focusComposer();
-                        },
-                        else => {},
-                    }
-                    return .none;
-                }
-                if (app.state.mode == .normal) {
-                    if (key.key == .tab) {
-                        app.state.focusNextPane();
-                        return .none;
-                    }
-                    if (app.state.focus_pane != .composer) {
-                        switch (key.key) {
-                            .up => app.state.moveSelection(-1),
-                            .down => app.state.moveSelection(1),
-                            .page_up => if (app.state.focus_pane == .transcript) {
-                                app.state.follow_selection = false;
-                                app.state.manual_transcript_paging = true;
-                                app.state.transcript_scroll += 5;
-                            } else {
-                                app.state.moveSelection(-5);
-                            },
-                            .page_down => if (app.state.focus_pane == .transcript) {
-                                app.state.follow_selection = false;
-                                app.state.manual_transcript_paging = true;
-                                app.state.transcript_scroll -|= 5;
-                            } else {
-                                app.state.moveSelection(5);
-                            },
-                            .enter, .escape => app.state.focusComposer(),
-                            else => {},
-                        }
-                        return .none;
-                    }
-                }
                 switch (key.key) {
                     .enter => {
                         if (key.modifiers.shift) {
@@ -1928,17 +1706,8 @@ pub const TuiModel = struct {
             .width = width,
         }) catch "";
         const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
-        if (ctx._terminal != null and app.state.mode == .normal and app.state.focus_pane == .transcript) {
-            if (app.state.tools.items.len > 0) {
-                app.state.focus_pane = .tools;
-                if (app.state.selected_tool_index == null) app.state.selected_tool_index = app.state.tools.items.len - 1;
-            } else {
-                app.state.focusComposer();
-            }
-        }
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
-            .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
             .picker => blk: {
                 var login_items: [App.login_providers.len]menu_picker_view.Item = undefined;
@@ -1978,22 +1747,9 @@ pub const TuiModel = struct {
                 }) catch "";
             },
             .login_input => "",
-            .normal => if (app.state.focus_pane == .tools) blk: {
-                const min_transcript = 3;
-                const panel_chrome = 2;
-                const available = height -| (countLines(status) + countLines(composer) + countLines(queued) + min_transcript + panel_chrome);
-                const tool_panel_height = @min(8, available);
-                if (tool_panel_height < 4) {
-                    app.state.focus_pane = .composer;
-                    break :blk "";
-                }
-                break :blk tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_panel_height }) catch "";
-            } else "",
+            .normal => "",
         };
         if (ctx._terminal != null) {
-            if (app.state.focus_pane == .transcript) {
-                app.state.focusComposer();
-            }
             const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
             const active_height = height -| fixed;
             const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
@@ -2216,13 +1972,9 @@ pub const TuiModel = struct {
         if (mouse.event_type != .press) return;
         switch (mouse.button) {
             .wheel_up => {
-                app.state.manual_transcript_paging = true;
-                app.state.follow_selection = false;
                 app.state.transcript_scroll += 3;
             },
             .wheel_down => {
-                app.state.manual_transcript_paging = true;
-                app.state.follow_selection = false;
                 app.state.transcript_scroll -|= 3;
             },
             else => {},
@@ -2911,16 +2663,6 @@ test "App submit quit command requests quit" {
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
 }
 
-test "artifact previews strip terminal control bytes" {
-    const preview = try artifactDisplayPreview(std.testing.allocator, "head\x1b[2J\nok\x1b]0;title\x07\n", 0, ".makai/tool-artifacts/test");
-    defer std.testing.allocator.free(preview);
-
-    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x07) == null);
-    try std.testing.expect(std.mem.indexOf(u8, preview, "head[2J") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preview, "ok]0;title") != null);
-}
-
 test "App steer and queue follow-up handle fallback empty and session paths" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -3472,7 +3214,6 @@ test "TuiModel allows /abort slash command during approval mode" {
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, model.app.?.state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("Turn aborted.", model.app.?.state.transcript.items[0].text.items);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
 }
 
 test "TuiModel blocks non-abort slash commands during approval mode" {
@@ -3716,143 +3457,16 @@ test "deleting current session clears active session id" {
     try std.testing.expect(app.state.status.session_id.len > 0);
 }
 
-test "TuiModel Tab cycles focus through panes" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-
-    _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.transcript, model.app.?.state.focus_pane);
-    _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.tools, model.app.?.state.focus_pane);
-    _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
-}
-
-test "TuiModel Ctrl+K cycles focus pane backwards" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-
-    const ctrl_k = zz.KeyEvent{ .key = .{ .char = 'k' }, .modifiers = .{ .ctrl = true } };
-
-    _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .tab } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.tools, model.app.?.state.focus_pane);
-    _ = model.update(.{ .key = ctrl_k }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.transcript, model.app.?.state.focus_pane);
-}
-
-test "TuiModel Up and Down move selection within focused pane" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.appendTranscript(.user, "first");
-    try model.app.?.state.appendTranscript(.assistant, "second");
-    try model.app.?.state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "tool", "tool", "{}", .done));
-
-    model.app.?.state.focus_pane = .transcript;
-    model.app.?.state.selected_message_index = 1;
-    _ = model.update(.{ .key = .{ .key = .up } }, undefined);
-    try std.testing.expectEqual(@as(?usize, 0), model.app.?.state.selected_message_index);
-    _ = model.update(.{ .key = .{ .key = .down } }, undefined);
-    try std.testing.expectEqual(@as(?usize, 1), model.app.?.state.selected_message_index);
-
-    model.app.?.state.focus_pane = .tools;
-    model.app.?.state.selected_tool_index = 0;
-    _ = model.update(.{ .key = .{ .key = .down } }, undefined);
-    try std.testing.expectEqual(@as(?usize, 0), model.app.?.state.selected_tool_index);
-}
-
-test "TuiModel Enter and Escape return focus to composer" {
+test "TuiModel PageUp and PageDown scroll the transcript" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     try model.app.?.state.appendTranscript(.user, "x");
-
-    model.app.?.state.focus_pane = .transcript;
-    model.app.?.state.selected_message_index = 0;
-    _ = model.update(.{ .key = .{ .key = .enter } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
-
-    model.app.?.state.focus_pane = .tools;
-    _ = model.update(.{ .key = .{ .key = .escape } }, undefined);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
-}
-
-test "TuiModel composer Enter still submits when focus is composer" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "hello");
-
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
-    try std.testing.expectEqualStrings("hello", model.app.?.state.transcript.items[0].text.items);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
-}
-
-test "TuiModel does not edit composer when transcript is focused" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.appendTranscript(.user, "x");
-    model.app.?.state.focus_pane = .transcript;
-    model.app.?.state.selected_message_index = 0;
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'a' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .space } }, undefined);
-
-    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
-}
-
-test "TuiModel PageUp and PageDown scroll transcript when focused" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.appendTranscript(.user, "x");
-    model.app.?.state.focus_pane = .transcript;
-    model.app.?.state.selected_message_index = 0;
     model.app.?.state.transcript_scroll = 0;
-    model.app.?.state.follow_selection = true;
 
     _ = model.update(.{ .key = .{ .key = .page_up } }, undefined);
     try std.testing.expectEqual(@as(usize, 5), model.app.?.state.transcript_scroll);
-    try std.testing.expect(!model.app.?.state.follow_selection);
-    try std.testing.expect(model.app.?.state.manual_transcript_paging);
     _ = model.update(.{ .key = .{ .key = .page_down } }, undefined);
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript_scroll);
-}
-
-test "TuiModel preview Escape returns focus to composer" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.setPreview(.diff, "diff", "content");
-    model.app.?.state.focus_pane = .tools;
-
-    _ = model.update(.{ .key = .{ .key = .escape } }, undefined);
-
-    try std.testing.expectEqual(tui_state.AppMode.normal, model.app.?.state.mode);
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
-}
-
-test "TuiModel composer history shortcuts require composer focus" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.recordComposerHistory("old prompt");
-    try model.app.?.state.replaceComposerBuffer("draft");
-    model.app.?.state.focus_pane = .transcript;
-
-    const ctrl_p = zz.KeyEvent{ .key = .{ .char = 'p' }, .modifiers = .{ .ctrl = true } };
-    _ = model.update(.{ .key = ctrl_p }, undefined);
-
-    try std.testing.expectEqualStrings("draft", model.app.?.state.composer.text());
-}
-
-test "TuiModel Ctrl+G editor shortcut returns focus to composer" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.state.focus_pane = .transcript;
-
-    const ctrl_g = zz.KeyEvent{ .key = .{ .char = 'g' }, .modifiers = .{ .ctrl = true } };
-    _ = model.update(.{ .key = ctrl_g }, undefined);
-
-    try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
 }
 
 test "resume selected session clears delete reset flags" {
