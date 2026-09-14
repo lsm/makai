@@ -265,7 +265,7 @@ fn skipAnsi(text: []const u8, index: *usize) void {
         }
         return;
     }
-    if (second == ']' or second == 'P') {
+    if (second == ']' or second == 'P' or second == '_' or second == '^' or second == 'X') {
         while (index.* < text.len) {
             const ch = text[index.*];
             index.* += 1;
@@ -477,7 +477,9 @@ fn leaveSpanCb(spantype: c.MD_SPANTYPE, detail: ?*anyopaque, userdata: ?*anyopaq
             c.MD_SPAN_A => {
                 if (self.span_stack.items.len > 0) _ = self.span_stack.pop();
                 const href = self.link_href;
-                const shown = std.fmt.allocPrint(self.allocator, " ({s})", .{href}) catch break :blk;
+                const href_clean = sanitize(self.allocator, href) catch break :blk;
+                defer self.allocator.free(href_clean);
+                const shown = std.fmt.allocPrint(self.allocator, " ({s})", .{href_clean}) catch break :blk;
                 defer self.allocator.free(shown);
                 self.style_dirty = true;
                 self.appendWord(shown, visibleWidth(shown)) catch break :blk;
@@ -629,4 +631,27 @@ test "ordered list numbering" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "3. third\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "4. fourth\x1b[0m") != null);
+}
+
+test "link destination metadata is sanitized" {
+    const src = "[docs](https://example.com/\x1b]0;pwned\x07x)";
+    const out = try renderMarkdownAnsi(std.testing.allocator, src, 60);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b]0;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/x") != null);
+}
+
+test "apc pm sos payloads are consumed to string terminator" {
+    const src = "safe \x1b_hidden\x1b\\ end \x1b^pm\x1b\\ tail \x1bXsos\x1b\\ done\n";
+    const out = try renderMarkdownAnsi(std.testing.allocator, src, 60);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b^") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1bX") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hidden") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "safe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "done") != null);
 }
