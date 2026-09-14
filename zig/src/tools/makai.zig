@@ -23,7 +23,7 @@ const json_writer = @import("json_writer");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
 const tui_app = @import("tui_app");
-const tui_model_catalog = @import("tui_model_catalog");
+const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
 
 pub const VERSION = "0.0.1";
@@ -1164,11 +1164,11 @@ fn modelFromProductionCatalog(
     allocator: std.mem.Allocator,
     parsed: model_ref.ParsedModelRef,
 ) !?ai_types.Model {
-    const models = tui_model_catalog.loadProductionModels(allocator) catch |err| {
+    const models = model_catalog.loadProductionModels(allocator) catch |err| {
         if (err == error.OutOfMemory) return err;
         return null;
     };
-    defer tui_model_catalog.deinitModels(allocator, models);
+    defer model_catalog.deinitModels(allocator, models);
 
     for (models) |model| {
         if (!std.mem.eql(u8, model.provider, parsed.provider_id)) continue;

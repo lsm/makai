@@ -307,7 +307,6 @@ pub const TuiRuntime = struct {
                 .cancel = sessionCancel,
                 .submit_turn = sessionSubmitTurn,
                 .steer = sessionSteer,
-                .queue_follow_up = sessionQueueFollowUp,
                 .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
                 .can_steer = sessionCanSteer,
@@ -459,17 +458,6 @@ pub const TuiRuntime = struct {
         var queued = false;
         errdefer if (!queued) msg.deinit(self.allocator);
         try local.steer(msg);
-        queued = true;
-        try self.resumeQueuedMessagesIfIdle();
-    }
-
-    pub fn queueFollowUp(self: *TuiRuntime, text: []const u8) !void {
-        if (!self.started) return error.RuntimeNotStarted;
-        const local = &(self.local_agent orelse return error.RuntimeNotStarted);
-        var msg = try self.makeUserMessage(text);
-        var queued = false;
-        errdefer if (!queued) msg.deinit(self.allocator);
-        try local.followUp(msg);
         queued = true;
         try self.resumeQueuedMessagesIfIdle();
     }
@@ -1173,11 +1161,6 @@ fn sessionSteer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
     try self.steer(text);
 }
 
-fn sessionQueueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
-    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
-    try self.queueFollowUp(text);
-}
-
 fn sessionClearQueuedMessages(ctx: ?*anyopaque) void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     self.clearQueuedMessages();
@@ -1745,37 +1728,6 @@ test "tool approval approve and reject paths emit tool events" {
     try std.testing.expect(reject_saw_error_tool);
 }
 
-test "runtime queues steering and follow-up messages" {
-    var mock = MockProtocolCtx{ .tool_first = true, .wait_after_tool_first = true };
-    const models = [_]ai_types.Model{test_model_a};
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
-    defer runtime.deinit();
-
-    var tui_session = runtime.createSession();
-    try tui_session.start();
-    try tui_session.submitTurn("first");
-    try tui_session.steer("steer now");
-    try tui_session.queueFollowUp("later");
-
-    if (runtime.local_agent) |*local| local.waitForIdle();
-
-    var user_messages: usize = 0;
-    while (tui_session.waitEvent()) |event| {
-        var ev = event;
-        defer ev.deinit(std.testing.allocator);
-        switch (ev) {
-            .message_end => |payload| {
-                if (payload.role == .user) user_messages += 1;
-            },
-            .agent_end => break,
-            else => {},
-        }
-    }
-    try std.testing.expect(user_messages >= 2);
-    try std.testing.expectEqual(@as(usize, 3), mock.call_count);
-    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
-}
-
 test "runtime idle steering resumes immediately" {
     var mock = MockProtocolCtx{};
     const models = [_]ai_types.Model{test_model_a};
@@ -1846,38 +1798,6 @@ test "runtime active steering continues after plain assistant stop" {
     try std.testing.expect(saw_steering_user);
 }
 
-test "runtime active follow-up continues after plain assistant stop" {
-    var mock = MockProtocolCtx{ .wait_before_text_first = true };
-    const models = [_]ai_types.Model{test_model_a};
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
-    defer runtime.deinit();
-
-    var tui_session = runtime.createSession();
-    try tui_session.start();
-    try tui_session.submitTurn("first");
-    try tui_session.queueFollowUp("follow after response");
-
-    if (runtime.local_agent) |*local| local.waitForIdle();
-
-    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
-    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().follow_up);
-
-    var saw_follow_up_user = false;
-    while (tui_session.popEvent()) |event| {
-        var ev = event;
-        defer ev.deinit(std.testing.allocator);
-        switch (ev) {
-            .message_end => |payload| {
-                if (payload.role == .user and std.mem.eql(u8, payload.text.slice(), "follow after response")) {
-                    saw_follow_up_user = true;
-                }
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_follow_up_user);
-}
-
 test "local runtime reports steering available" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{});
     defer runtime.deinit();
@@ -1894,8 +1814,7 @@ test "runtime clears queued messages before replacing messages" {
     var tui_session = runtime.createSession();
     try tui_session.start();
     try tui_session.steer("steer now");
-    try tui_session.queueFollowUp("later");
-    try std.testing.expectEqual(@as(usize, 2), tui_session.queuedCounts().total());
+    try std.testing.expectEqual(@as(usize, 1), tui_session.queuedCounts().total());
 
     try runtime.replaceMessages(&.{});
 

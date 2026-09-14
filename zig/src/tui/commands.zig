@@ -563,7 +563,6 @@ const MockAbortSession = struct {
                 .cancel = mockCancel,
                 .submit_turn = mockSubmitTurn,
                 .steer = mockSteer,
-                .queue_follow_up = mockQueueFollowUp,
                 .clear_queued_messages = mockClearQueuedMessages,
                 .queued_counts = mockQueuedCounts,
                 .can_steer = mockCanSteer,
@@ -597,11 +596,6 @@ const MockAbortSession = struct {
     }
 
     fn mockSteer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
-        _ = ctx;
-        _ = text;
-    }
-
-    fn mockQueueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         _ = ctx;
         _ = text;
     }

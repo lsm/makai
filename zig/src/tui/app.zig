@@ -10,10 +10,8 @@ const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
-const tui_model_catalog = @import("tui_model_catalog");
+const model_catalog = @import("model_catalog");
 const tui_config = @import("tui_config");
-const tui_theme = @import("tui_theme");
-const tui_text = @import("tui_text");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -69,11 +67,11 @@ pub const ApprovalWaiter = struct {
 };
 
 fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.loadProductionModels, true);
+    return loadRuntimeModelsWithCatalog(allocator, model_catalog.loadProductionModels, true);
 }
 
 fn loadRuntimeModelsFresh(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.refreshProductionModels, false);
+    return loadRuntimeModelsWithCatalog(allocator, model_catalog.refreshProductionModels, false);
 }
 
 fn loadRuntimeModelsWithCatalog(
@@ -85,7 +83,7 @@ fn loadRuntimeModelsWithCatalog(
         try allocator.alloc(ai_types.Model, 0)
     else
         return err;
-    errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
+    errdefer model_catalog.deinitModels(allocator, catalog_models);
 
     const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
     errdefer allocator.free(models);
@@ -120,7 +118,7 @@ pub const ProductionRuntime = struct {
         errdefer permission_engine.deinit();
 
         const models = try loadRuntimeModels(allocator);
-        errdefer tui_model_catalog.deinitModels(allocator, models);
+        errdefer model_catalog.deinitModels(allocator, models);
 
         var saved_config: ?tui_config.Config = null;
         var maybe_store: ?tui_config.Store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
@@ -183,7 +181,7 @@ pub const ProductionRuntime = struct {
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
-        tui_model_catalog.deinitModels(self.allocator, self.models);
+        model_catalog.deinitModels(self.allocator, self.models);
         if (self.initial_model) |*model| model.deinit(self.allocator);
         self.permission_engine.deinit();
         self.registry.deinit();
@@ -204,32 +202,6 @@ const SavedModelRef = struct {
     }
 };
 
-fn loadSavedModelRef(allocator: std.mem.Allocator) !?SavedModelRef {
-    var store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
-        error.HomeNotFound => return null,
-        else => return err,
-    };
-    defer store.deinit();
-    return try loadSavedModelRefFromStore(allocator, store);
-}
-
-fn loadSavedModelRefFromStore(allocator: std.mem.Allocator, store: tui_config.Store) !?SavedModelRef {
-    var cfg = (try store.loadIfExists()) orelse return null;
-    defer cfg.deinit(allocator);
-    if (cfg.model.len == 0) return null;
-    const id = try allocator.dupe(u8, cfg.model);
-    errdefer allocator.free(id);
-    const provider = try allocator.dupe(u8, cfg.provider);
-    errdefer allocator.free(provider);
-    const api = try allocator.dupe(u8, cfg.api);
-    errdefer allocator.free(api);
-    return .{
-        .id = id,
-        .provider = provider,
-        .api = api,
-    };
-}
-
 pub const App = struct {
     allocator: std.mem.Allocator,
     state: tui_state.AppState,
@@ -239,7 +211,6 @@ pub const App = struct {
     login: ?*tui_login.LoginSession = null,
     store: ?session_store.Store = null,
     session_id: []u8 = &.{},
-    session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
     inline_history_flushed: usize = 0,
@@ -320,7 +291,6 @@ pub const App = struct {
     fn ensureSessionId(self: *App) !void {
         if (self.session_id.len > 0) return;
         self.session_id = generateSessionId(self.allocator) catch try self.allocator.dupe(u8, "default");
-        self.session_created_at = compat.time.nowMillis();
         try self.state.status.setSessionId(self.allocator, self.session_id);
     }
 
@@ -337,14 +307,14 @@ pub const App = struct {
         for (metas.items) |meta| {
             const label = try formatSessionLabel(self.allocator, meta);
             defer self.allocator.free(label);
-            try self.state.addSessionWithDetails(meta.session_id, label, meta.model, meta.provider);
+            try self.state.addSession(meta.session_id, label);
         }
     }
 
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        self.state.clampSessionSelectionToFilter();
-        const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        if (self.state.session_index >= self.state.sessions.items.len) return;
+        const selected = self.state.sessions.items[self.state.session_index];
         const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         const id = selected.id;
         var loaded = try store.resumeSession(id, runtime);
@@ -362,7 +332,6 @@ pub const App = struct {
         self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
-        self.session_created_at = loaded.metadata.created_at;
         try self.state.status.setSessionId(self.allocator, self.session_id);
         if (runtime.currentModel()) |model| {
             try self.state.status.setModelWithContext(self.allocator, model.id, model.provider, model.context_window);
@@ -374,63 +343,9 @@ pub const App = struct {
             try self.applyRuntimeEvent(event.*);
         }
         if (self.session) |*session| session.clearQueuedMessages();
-        self.state.clearQueuedPreviews();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
-        self.state.session_delete_confirm = false;
         self.state.mode = .normal;
-    }
-
-    pub fn deleteSelectedSession(self: *App) !void {
-        const store = self.store orelse return error.NoStoreConfigured;
-        self.state.clampSessionSelectionToFilter();
-        const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
-        const id = try self.allocator.dupe(u8, selected.id);
-        defer self.allocator.free(id);
-
-        try store.delete(id);
-        if (std.mem.eql(u8, self.session_id, id)) {
-            if (self.session_id.len > 0) self.allocator.free(self.session_id);
-            self.session_id = &.{};
-            self.session_created_at = 0;
-            try self.state.status.setSessionId(self.allocator, "");
-            if (self.approval_waiter) |waiter| waiter.rejectPending();
-            if (self.session) |*session| {
-                session.cancel();
-                session.clearQueuedMessages();
-            }
-            if (self.runtime) |runtime| {
-                runtime.cancel();
-                if (runtime.local_agent) |*local| {
-                    if (local.isIdle()) {
-                        local.clearAllQueues();
-                        local.replaceMessages(&.{}) catch {};
-                    }
-                }
-            }
-            self.discardPendingEvents();
-            self.state.resetReplayState();
-            self.state.clearQueuedPreviews();
-            self.inline_history_flushed = 0;
-            self.pending_session_reset = true;
-            for (self.quarantine_buffer.items) |*buf_ev| {
-                var mutable = buf_ev.*;
-                mutable.deinit(self.allocator);
-            }
-            self.quarantine_buffer.clearRetainingCapacity();
-            self.quarantine_events = true;
-            self.quarantine_generation = if (self.runtime) |r| r.current_generation else 0;
-        }
-
-        try self.loadSessions();
-        self.state.session_delete_confirm = false;
-        if (self.state.sessions.items.len == 0) {
-            self.state.session_index = 0;
-            self.state.session_scroll = 0;
-        } else if (self.state.session_index >= self.state.sessions.items.len) {
-            self.state.session_index = self.state.sessions.items.len - 1;
-        }
-        TuiModel.ensureSessionSelectionVisible(self);
     }
 
     const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
@@ -691,7 +606,7 @@ pub const App = struct {
         const runtime = self.runtime orelse return;
         const current_model = runtime.currentModel();
         const models = try loadRuntimeModelsFresh(self.allocator);
-        defer tui_model_catalog.deinitModels(self.allocator, models);
+        defer model_catalog.deinitModels(self.allocator, models);
         try runtime.replaceModels(models, current_model);
     }
 
@@ -822,10 +737,7 @@ pub const App = struct {
             .session_id = self.session_id,
             .model = self.state.status.model,
             .provider = self.state.status.provider,
-            .created_at = self.session_created_at,
             .last_active = compat.time.nowMillis(),
-            .turn_count = self.state.status.turn_count,
-            .working_dir = self.working_dir,
         };
     }
 
@@ -932,7 +844,6 @@ pub const App = struct {
     fn appendRuntimeUserMessage(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
-        _ = self.state.consumeQueuedPreviewText(trimmed);
         if (self.state.transcript.items.len > 0) {
             const last = &self.state.transcript.items[self.state.transcript.items.len - 1];
             if (last.kind == .user and std.mem.eql(u8, last.text.items, trimmed)) return;
@@ -949,9 +860,7 @@ pub const App = struct {
 
     fn refreshQueuedCounts(self: *App) void {
         if (self.session) |*session| {
-            const counts = session.queuedCounts();
-            self.state.setQueuedCounts(counts);
-            if (!self.state.status.streaming) self.state.pruneQueuedPreviewsToCounts(counts);
+            self.state.setQueuedCounts(session.queuedCounts());
         }
     }
 
@@ -1017,28 +926,6 @@ pub const App = struct {
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
-            try self.state.addQueuedPreview(.steering, trimmed);
-            self.refreshQueuedCounts();
-            return;
-        }
-        try self.state.appendUserMessage(trimmed);
-    }
-
-    pub fn queueFollowUp(self: *App, text: []const u8) !void {
-        const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (trimmed.len == 0) return;
-        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
-        self.applyPendingSessionResetSync() catch |err| {
-            if (err == error.PendingSessionReset) {
-                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
-                return err;
-            }
-            return err;
-        };
-        try self.ensureSessionId();
-        if (self.session) |*session| {
-            try session.queueFollowUp(trimmed);
-            try self.state.addQueuedPreview(.follow_up, trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -1094,8 +981,6 @@ pub const App = struct {
                 try self.loadSessions();
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
-                self.state.session_filter.clear();
-                self.state.session_delete_confirm = false;
                 self.state.mode = .session_picker;
             },
             .open_model_picker => self.openPicker(.model),
@@ -1180,7 +1065,7 @@ pub const App = struct {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
-            const tips = "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
+            const tips = "Enter submit • Enter while streaming steers • /resume opens sessions • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1247,159 +1132,12 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
     }
 }
 
-var editor_tmp_path: []u8 = &.{};
-var editor_tmp_allocator: ?std.mem.Allocator = null;
-
-const editor_tmp_dir_prefix = "makai-editor-";
-const editor_tmp_file_name = "composer.txt";
-
-fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiModel.Msg) {
-    if (@import("builtin").is_test) return null;
-    if (@import("builtin").os.tag == .windows) return null;
-
-    const content = app.state.composer.buffer.items;
-    const tmp_path = createExternalEditorTempFile(allocator, content) catch return null;
-    errdefer {
-        cleanupExternalEditorTempPath(tmp_path);
-        allocator.free(tmp_path);
-    }
-
-    if (editor_tmp_path.len > 0) {
-        cleanupExternalEditorTempPath(editor_tmp_path);
-        allocator.free(editor_tmp_path);
-    }
-    editor_tmp_path = tmp_path;
-    editor_tmp_allocator = allocator;
-
-    return zz.Cmd(TuiModel.Msg){ .sequence = &.{
-        .exit_alt_screen,
-        .show_cursor,
-        .{ .perform = runEditorPerform },
-    } };
-}
-
 fn encodeHexLower(out: []u8, bytes: []const u8) void {
     const alphabet = "0123456789abcdef";
     for (bytes, 0..) |byte, i| {
         out[i * 2] = alphabet[byte >> 4];
         out[i * 2 + 1] = alphabet[byte & 0x0f];
     }
-}
-
-fn createExternalEditorTempFile(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
-    var random_bytes: [16]u8 = undefined;
-    compat.random.fillSecureBytes(&random_bytes);
-    var random_hex: [32]u8 = undefined;
-    encodeHexLower(&random_hex, &random_bytes);
-
-    const tmp_dir = compat.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
-    defer allocator.free(tmp_dir);
-    const dir_path = try std.fs.path.join(allocator, &.{ tmp_dir, editor_tmp_dir_prefix ++ random_hex });
-    defer allocator.free(dir_path);
-    try std.Io.Dir.createDirAbsolute(defaultIo(), dir_path, @enumFromInt(0o700));
-    errdefer std.Io.Dir.deleteDirAbsolute(defaultIo(), dir_path) catch {};
-
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, editor_tmp_file_name });
-    errdefer allocator.free(file_path);
-
-    var file = try std.Io.Dir.createFileAbsolute(defaultIo(), file_path, .{ .exclusive = true, .truncate = false, .permissions = @enumFromInt(0o600) });
-    errdefer std.Io.Dir.deleteFileAbsolute(defaultIo(), file_path) catch {};
-    defer file.close(defaultIo());
-    try file.writeStreamingAll(defaultIo(), content);
-    return file_path;
-}
-
-fn cleanupExternalEditorTempPath(path: []const u8) void {
-    std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
-    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.deleteDirAbsolute(defaultIo(), dir) catch {};
-}
-
-fn appendEditorArg(parts: *std.ArrayList([]u8), allocator: std.mem.Allocator, buffer: *std.ArrayList(u8)) !void {
-    if (buffer.items.len == 0) return;
-    try parts.append(allocator, try allocator.dupe(u8, buffer.items));
-    buffer.clearRetainingCapacity();
-}
-
-fn buildEditorArgv(allocator: std.mem.Allocator, editor: []const u8, path: []const u8) ![]const []const u8 {
-    var parts: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (parts.items) |part| allocator.free(part);
-        parts.deinit(allocator);
-    }
-    var current: std.ArrayList(u8) = .empty;
-    defer current.deinit(allocator);
-
-    var quote: ?u8 = null;
-    var escape = false;
-    for (editor) |c| {
-        if (escape) {
-            try current.append(allocator, c);
-            escape = false;
-            continue;
-        }
-        if (c == '\\') {
-            escape = true;
-            continue;
-        }
-        if (quote) |q| {
-            if (c == q) {
-                quote = null;
-            } else {
-                try current.append(allocator, c);
-            }
-            continue;
-        }
-        if (c == '\'' or c == '"') {
-            quote = c;
-            continue;
-        }
-        if (std.ascii.isWhitespace(c)) {
-            try appendEditorArg(&parts, allocator, &current);
-            continue;
-        }
-        try current.append(allocator, c);
-    }
-    if (escape) try current.append(allocator, '\\');
-    try appendEditorArg(&parts, allocator, &current);
-    if (parts.items.len == 0) try parts.append(allocator, try allocator.dupe(u8, "vi"));
-    try parts.append(allocator, try allocator.dupe(u8, path));
-    return parts.toOwnedSlice(allocator);
-}
-
-fn freeEditorArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
-    for (argv) |arg| allocator.free(arg);
-    allocator.free(argv);
-}
-
-fn runEditorPerform() ?TuiModel.Msg {
-    if (editor_tmp_path.len == 0) return TuiModel.Msg{ .editor_failed = {} };
-    const allocator = editor_tmp_allocator orelse return TuiModel.Msg{ .editor_failed = {} };
-    const path = editor_tmp_path;
-    defer {
-        cleanupExternalEditorTempPath(path);
-        allocator.free(path);
-        editor_tmp_path = &.{};
-        editor_tmp_allocator = null;
-    }
-
-    const editor_owned = compat.getEnvVarOwned(allocator, "EDITOR") catch
-        (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return TuiModel.Msg{ .editor_failed = {} });
-    defer allocator.free(editor_owned);
-    const argv = buildEditorArgv(allocator, editor_owned, path) catch return TuiModel.Msg{ .editor_failed = {} };
-    defer freeEditorArgv(allocator, argv);
-
-    var child = std.process.spawn(defaultIo(), .{
-        .argv = argv,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch return TuiModel.Msg{ .editor_failed = {} };
-    defer if (child.id != null) child.kill(defaultIo());
-    _ = child.wait(defaultIo()) catch return TuiModel.Msg{ .editor_failed = {} };
-
-    const content = std.Io.Dir.readFileAlloc(.cwd(), defaultIo(), path, allocator, .limited(10 * 1024 * 1024)) catch return TuiModel.Msg{ .editor_failed = {} };
-
-    return TuiModel.Msg{ .editor_done = content };
 }
 
 pub const TuiModel = struct {
@@ -1411,8 +1149,6 @@ pub const TuiModel = struct {
         mouse: zz.MouseEvent,
         tick: struct { timestamp: u64, delta: u64 },
         quit: void,
-        editor_done: []u8,
-        editor_failed: void,
     };
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -1441,39 +1177,13 @@ pub const TuiModel = struct {
     pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
         const app = &(self.app orelse return .none);
         switch (msg) {
-            .editor_done => |content| {
-                defer ctx.persistent_allocator.free(content);
-                app.state.replaceComposerBuffer(content) catch {};
-                return editorReturnCommand();
-            },
-            .editor_failed => {
-                app.recordError("external editor failed") catch {};
-                return editorReturnCommand();
-            },
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
                     .char => |c| switch (c) {
                         'c' => return .quit,
-                        'g' => {
-                            if (@import("builtin").is_test) return .none;
-                            if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
-                            return .none;
-                        },
                         'y' => {
                             app.copyLastAssistant();
                             app.flushClipboard(ctx);
-                            return .none;
-                        },
-                        'd' => {
-                            if (app.state.mode == .session_picker) {
-                            } else return .none;
-                        },
-                        'p' => {
-                            if (app.state.mode == .normal) _ = app.state.composerHistoryPrev() catch false;
-                            return .none;
-                        },
-                        'n' => {
-                            if (app.state.mode == .normal) _ = app.state.composerHistoryNext() catch false;
                             return .none;
                         },
                         else => return .none,
@@ -1517,50 +1227,18 @@ pub const TuiModel = struct {
                     }
                 }
                 if (app.state.mode == .session_picker) {
-                    if (app.state.session_delete_confirm) {
-                        switch (key.key) {
-                            .char => |c| switch (if (c <= std.math.maxInt(u8)) std.ascii.toLower(@as(u8, @intCast(c))) else c) {
-                                'y' => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
-                                'n' => app.state.session_delete_confirm = false,
-                                else => {},
-                            },
-                            .enter => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
-                            .escape => app.state.session_delete_confirm = false,
-                            else => {},
-                        }
-                        return .none;
-                    }
                     switch (key.key) {
                         .up => moveSessionSelection(app, -1),
                         .down => moveSessionSelection(app, 1),
-                        .backspace => updateSessionFilter(app, .backspace, null),
-                        .delete => updateSessionFilter(app, .delete, null),
                         .char => |c| switch (c) {
-                            'k' => updateSessionFilter(app, .char, c),
-                            'j' => updateSessionFilter(app, .char, c),
-                            'd' => {
-                                if (key.modifiers.ctrl and
-                                    app.state.session_index < app.state.filteredSessionCount())
-                                {
-                                    app.state.session_delete_confirm = true;
-                                } else {
-                                    updateSessionFilter(app, .char, c);
-                                }
-                            },
-                            else => updateSessionFilter(app, .char, c),
+                            'k' => moveSessionSelection(app, -1),
+                            'j' => moveSessionSelection(app, 1),
+                            else => {},
                         },
-                        .space => updateSessionFilter(app, .char, ' '),
-                        .left => _ = app.state.session_filter.moveCursorPrev(),
-                        .right => _ = app.state.session_filter.moveCursorNext(),
-                        .home => app.state.session_filter.moveCursorHome(),
-                        .end => app.state.session_filter.moveCursorEnd(),
                         .enter => {
                             app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
                         },
-                        .escape => {
-                            app.state.session_delete_confirm = false;
-                            app.state.mode = .normal;
-                        },
+                        .escape => app.state.mode = .normal,
                         else => {},
                     }
                     return .none;
@@ -1629,21 +1307,12 @@ pub const TuiModel = struct {
                                 if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         } else if (app.state.status.streaming) {
-                            if (key.modifiers.alt) {
-                                app.queueFollowUp(text) catch |err| {
-                                    if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
-                                    if (err == error.PendingSessionReset) return .none;
-                                    app.recordError(@errorName(err)) catch {};
-                                };
-                            } else {
-                                app.steer(text) catch |err| {
-                                    if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
-                                    if (err == error.PendingSessionReset) return .none;
-                                    app.recordError(@errorName(err)) catch {};
-                                };
-                            }
+                            app.steer(text) catch |err| {
+                                if (err == error.QuitRequested) return .quit;
+                                if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                if (err == error.PendingSessionReset) return .none;
+                                app.recordError(@errorName(err)) catch {};
+                            };
                         } else {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
@@ -1705,7 +1374,6 @@ pub const TuiModel = struct {
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
         }) catch "";
-        const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
@@ -1750,28 +1418,21 @@ pub const TuiModel = struct {
             .normal => "",
         };
         if (ctx._terminal != null) {
-            const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
+            const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
             const active_height = height -| fixed;
             const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
-            const live_frame = if (active.len > 0 and queued.len > 0)
-                tui_render.joinVertical(ctx.allocator, &.{ active, extra, queued, composer, status }) catch ""
-            else if (active.len > 0)
+            const live_frame = if (active.len > 0)
                 tui_render.joinVertical(ctx.allocator, &.{ active, extra, composer, status }) catch ""
-            else if (queued.len > 0)
-                tui_render.joinVertical(ctx.allocator, &.{ extra, queued, composer, status }) catch ""
             else
                 tui_render.joinVertical(ctx.allocator, &.{ extra, composer, status }) catch "";
             app.last_inline_view_lines = @max(countLines(live_frame), 1);
             return tui_render.withSynchronizedOutput(ctx.allocator, live_frame) catch live_frame;
         }
 
-        const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
+        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = if (queued.len > 0)
-            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, queued, composer, status }) catch ""
-        else
-            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
+        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
@@ -1838,38 +1499,6 @@ pub const TuiModel = struct {
         }
         const start = if (remaining == 0) line_start + 1 else 0;
         return allocator.dupe(u8, text[start..]);
-    }
-
-    fn renderQueuedShelf(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]const u8 {
-        if (state.queued_previews.items.len == 0) return allocator.dupe(u8, "");
-
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        const max_width = width -| 4;
-        for (state.queued_previews.items, 0..) |preview, i| {
-            if (i > 0) try writer.writeByte('\n');
-            const label = switch (preview.kind) {
-                .steering => "steering",
-                .follow_up => "queued follow-up",
-            };
-            const raw_prefix = try std.fmt.allocPrint(allocator, "  {s} {s}: ", .{ tui_theme.glyph.prompt, label });
-            defer allocator.free(raw_prefix);
-            const prefix_style = switch (preview.kind) {
-                .steering => tui_theme.runningText(),
-                .follow_up => tui_theme.warningText(),
-            };
-            const prefix = try prefix_style.render(allocator, raw_prefix);
-            defer allocator.free(prefix);
-            const body_width = max_width -| tui_text.visibleWidth(raw_prefix);
-            const body = try tui_text.truncateToWidth(allocator, preview.text, body_width);
-            defer allocator.free(body);
-            const styled_body = try tui_theme.bodyStyle(.user).render(allocator, body);
-            defer allocator.free(styled_body);
-            try writer.writeAll(prefix);
-            try writer.writeAll(styled_body);
-        }
-        return out.toOwnedSlice();
     }
 
     fn appendChar(app: *App, c: u21) !void {
@@ -1940,34 +1569,6 @@ pub const TuiModel = struct {
         try term.flush();
     }
 
-    const SessionFilterEdit = enum { backspace, delete, char };
-
-    fn updateSessionFilter(app: *App, edit: SessionFilterEdit, c: ?u21) void {
-        const selected_raw_index = app.state.sessionRawIndexAtFilteredIndex(app.state.session_index);
-        switch (edit) {
-            .backspace => _ = app.state.session_filter.deleteBeforeCursor(),
-            .delete => _ = app.state.session_filter.deleteAfterCursor(),
-            .char => {
-                var buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(c.?, &buf) catch return;
-                app.state.session_filter.insertSlice(app.allocator, buf[0..len]) catch |err| {
-                    app.recordError(@errorName(err)) catch {};
-                    return;
-                };
-            },
-        }
-        if (selected_raw_index) |raw_index| {
-            if (app.state.sessionFilteredIndexForRawIndex(raw_index)) |filtered_index| {
-                app.state.session_index = filtered_index;
-            } else {
-                app.state.clampSessionSelectionToFilter();
-            }
-        } else {
-            app.state.clampSessionSelectionToFilter();
-        }
-        ensureSessionSelectionVisible(app);
-    }
-
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
         if (mouse.event_type != .press) return;
         switch (mouse.button) {
@@ -1998,7 +1599,7 @@ pub const TuiModel = struct {
     }
 
     fn moveSessionSelection(app: *App, delta: isize) void {
-        const n = app.state.filteredSessionCount();
+        const n = app.state.sessions.items.len;
         if (n == 0) {
             app.state.session_index = 0;
             app.state.session_scroll = 0;
@@ -2013,7 +1614,12 @@ pub const TuiModel = struct {
     }
 
     fn ensureSessionSelectionVisible(app: *App) void {
-        app.state.clampSessionSelectionToFilter();
+        if (app.state.sessions.items.len == 0) {
+            app.state.session_index = 0;
+            app.state.session_scroll = 0;
+            return;
+        }
+        if (app.state.session_index >= app.state.sessions.items.len) app.state.session_index = app.state.sessions.items.len - 1;
         const height = sessionPickerHeight(app);
         if (app.state.session_index < app.state.session_scroll) {
             app.state.session_scroll = app.state.session_index;
@@ -2023,7 +1629,7 @@ pub const TuiModel = struct {
     }
 
     fn visibleSessionCount(app: *const App) usize {
-        return @min(app.state.filteredSessionCount() -| app.state.session_scroll, sessionPickerHeight(app));
+        return @min(app.state.sessions.items.len -| app.state.session_scroll, sessionPickerHeight(app));
     }
 
     fn sessionPickerHeight(app: *const App) usize {
@@ -2134,16 +1740,6 @@ fn tuiProgramOptions() zz.Options {
     return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = true };
 }
 
-fn editorReturnCommand() zz.Cmd(TuiModel.Msg) {
-    if (tuiProgramOptions().alt_screen) {
-        return .{ .sequence = &.{
-            .enter_alt_screen,
-            .hide_cursor,
-        } };
-    }
-    return .none;
-}
-
 pub fn tuiProgramOptionsForTest() zz.Options {
     if (!@import("builtin").is_test) @compileError("test-only helper");
     return tuiProgramOptions();
@@ -2199,35 +1795,6 @@ test "TUI program preserves native text selection" {
     try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
 }
 
-test "editor return does not enter alt screen in inline mode" {
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, editorReturnCommand());
-}
-
-test "saved model ref loads from config store" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
-    defer std.testing.allocator.free(base);
-
-    var store = try tui_config.Store.init(std.testing.allocator, base);
-    defer store.deinit();
-    var cfg = try tui_config.Config.defaults(std.testing.allocator);
-    defer cfg.deinit(std.testing.allocator);
-    std.testing.allocator.free(cfg.model);
-    cfg.model = try std.testing.allocator.dupe(u8, "persisted-model");
-    std.testing.allocator.free(cfg.provider);
-    cfg.provider = try std.testing.allocator.dupe(u8, "persisted-provider");
-    std.testing.allocator.free(cfg.api);
-    cfg.api = try std.testing.allocator.dupe(u8, "persisted-api");
-    try store.save(cfg);
-
-    var model_ref = (try loadSavedModelRefFromStore(std.testing.allocator, store)).?;
-    defer model_ref.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("persisted-model", model_ref.id);
-    try std.testing.expectEqualStrings("persisted-provider", model_ref.provider);
-    try std.testing.expectEqualStrings("persisted-api", model_ref.api);
-}
-
 test "App saveEvent keeps debug-visible event types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2238,7 +1805,6 @@ test "App saveEvent keeps debug-visible event types" {
     defer app.deinit();
     app.store = try session_store.Store.init(std.testing.allocator, base);
     app.session_id = try std.testing.allocator.dupe(u8, "save-debug-events");
-    app.session_created_at = 1;
 
     var thinking = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "plan")) } };
     defer thinking.deinit(std.testing.allocator);
@@ -2519,7 +2085,7 @@ test "App welcome uses session count" {
     try app.appendWelcome();
     try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
 
     app.state.clearTranscript();
     try app.state.addSession("s1", "saved");
@@ -2530,7 +2096,6 @@ test "App welcome uses session count" {
 
 const MockAppSession = struct {
     steer_count: usize = 0,
-    queued_follow_up_count: usize = 0,
     submit_count: usize = 0,
     resume_count: usize = 0,
     cancel_count: usize = 0,
@@ -2549,7 +2114,6 @@ const MockAppSession = struct {
                 .cancel = cancel,
                 .submit_turn = submitTurn,
                 .steer = steer,
-                .queue_follow_up = queueFollowUp,
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
                 .can_steer = canSteer,
@@ -2596,13 +2160,6 @@ const MockAppSession = struct {
         const self = ptr(ctx);
         self.steer_count += 1;
         if (self.queued_counts.total() == 0) self.queued_counts.steering += 1;
-    }
-
-    fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
-        _ = text;
-        const self = ptr(ctx);
-        self.queued_follow_up_count += 1;
-        if (self.queued_counts.total() == 0) self.queued_counts.follow_up += 1;
     }
 
     fn clearQueuedMessages(ctx: ?*anyopaque) void {
@@ -2663,7 +2220,7 @@ test "App submit quit command requests quit" {
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
 }
 
-test "App steer and queue follow-up handle fallback empty and session paths" {
+test "App steer handles fallback empty and session paths" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
 
@@ -2671,36 +2228,17 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqualStrings("steer fallback", app.state.transcript.items[0].text.items);
 
-    try app.queueFollowUp("\tfollow fallback\n");
-    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
-    try std.testing.expectEqualStrings("follow fallback", app.state.transcript.items[1].text.items);
-
     try app.steer("   ");
-    try app.queueFollowUp("\n\t");
-    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
 
     app.state.clearTranscript();
-    var mock = MockAppSession{ .queued_counts = .{ .steering = 1, .follow_up = 2 } };
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 1 } };
     app.session = mock.session();
 
     try app.steer(" steer me ");
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
-    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
-    try std.testing.expectEqual(tui_state.QueuedPreviewKind.steering, app.state.queued_previews.items[0].kind);
-    try std.testing.expectEqualStrings("steer me", app.state.queued_previews.items[0].text);
-
-    mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
-    try app.queueFollowUp(" follow later ");
-    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
-    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
-    try std.testing.expectEqual(@as(usize, 2), app.state.queued_previews.items.len);
-    try std.testing.expectEqual(tui_state.QueuedPreviewKind.follow_up, app.state.queued_previews.items[1].kind);
-    try std.testing.expectEqualStrings("follow later", app.state.queued_previews.items[1].text);
 }
 
 test "TuiModel exits quit command while streaming" {
@@ -2732,17 +2270,6 @@ test "TuiModel Shift Tab cycles thinking level" {
     const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
-}
-
-test "TuiModel Ctrl D enters delete confirmation in session picker" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    try model.app.?.state.addSession("s1", "Session One");
-    model.app.?.state.mode = .session_picker;
-
-    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expect(model.app.?.state.session_delete_confirm);
 }
 
 test "App drain quarantines late events until the next turn starts" {
@@ -3021,8 +2548,6 @@ test "App drain auto-resumes remaining steering after completed turn" {
     var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
     defer mock.deinit();
     app.session = mock.session();
-    try app.state.addQueuedPreview(.steering, "run pwd");
-    try app.state.addQueuedPreview(.steering, "run uname -a");
     app.state.setQueuedCounts(mock.queued_counts);
     try mock.eventStream().push(.{ .message_end = .{
         .role = .user,
@@ -3034,77 +2559,6 @@ test "App drain auto-resumes remaining steering after completed turn" {
 
     try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
-}
-
-test "App drain prunes consumed steering preview after resume without user echo" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
-    defer mock.deinit();
-    app.session = mock.session();
-    try app.state.addQueuedPreview(.steering, "run pwd");
-    try app.state.addQueuedPreview(.steering, "run ps -ef");
-    app.state.setQueuedCounts(mock.queued_counts);
-
-    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
-    try app.drainEvents();
-
-    try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
-    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("run ps -ef", app.state.queued_previews.items[0].text);
-}
-
-test "App drain keeps steering preview until runtime user message arrives" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    var mock = MockAppSession{ .queued_counts = .{ .steering = 0 } };
-    defer mock.deinit();
-    app.session = mock.session();
-    try app.state.addQueuedPreview(.steering, "run uname -a");
-    app.state.setQueuedCounts(.{ .steering = 1 });
-    app.state.status.streaming = true;
-
-    try mock.eventStream().push(.{ .tool_execution_start = .{
-        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "tool-1")),
-        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
-        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{}")),
-    } });
-    try app.drainEvents();
-
-    try std.testing.expectEqual(@as(usize, 0), app.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
-
-    try mock.eventStream().push(.{ .message_end = .{
-        .role = .user,
-        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run uname -a")),
-    } });
-    try app.drainEvents();
-
-    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
-    try std.testing.expect(app.state.transcript.items.len >= 1);
-    const last = app.state.transcript.items[app.state.transcript.items.len - 1];
-    try std.testing.expectEqual(tui_state.TranscriptKind.user, last.kind);
-    try std.testing.expectEqualStrings("run uname -a", last.text.items);
-}
-
-test "App refresh prunes stale idle steering preview" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    var mock = MockAppSession{ .queued_counts = .{} };
-    defer mock.deinit();
-    app.session = mock.session();
-    try app.state.addQueuedPreview(.steering, "run ps -ef");
-    app.state.setQueuedCounts(.{ .steering = 1 });
-    app.state.status.streaming = false;
-
-    try app.drainEvents();
-
-    try std.testing.expectEqual(@as(usize, 0), app.state.queue.total());
-    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
 }
 
 test "App drain does not auto-resume queued steering after error turn" {
@@ -3119,30 +2573,6 @@ test "App drain does not auto-resume queued steering after error turn" {
 
     try std.testing.expectEqual(@as(usize, 0), mock.resume_count);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
-}
-
-test "TuiModel streaming Alt+Enter queues follow-up" {
-    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
-    errdefer std.testing.allocator.destroy(runtime);
-    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.runtime = runtime;
-    var mock = MockAppSession{};
-    defer mock.deinit();
-    model.app.?.session = mock.session();
-    model.app.?.state.status.streaming = true;
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "follow later");
-
-    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .alt = true } } }, undefined);
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
-    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
-    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.follow_up);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("follow later", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel local streaming Enter steers when steering available" {
@@ -3163,11 +2593,8 @@ test "TuiModel local streaming Enter steers when steering available" {
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.steering);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("steer now", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel stops Enter routing when drained event enters approval mode" {
@@ -3189,7 +2616,6 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
     try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
 }
 
@@ -3270,70 +2696,22 @@ test "session picker navigation pages through hidden rows" {
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
 }
 
-test "session picker typing filters without moving navigation" {
+test "session picker typing characters does not edit anything" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     model.app.?.state.mode = .session_picker;
-    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
-    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+    try model.app.?.state.addSession("s1", "Alpha");
+    try model.app.?.state.addSession("s2", "Beta");
+    model.app.?.state.session_index = 1;
 
     _ = model.update(.{ .key = .{ .key = .{ .char = 'g' } } }, undefined);
     _ = model.update(.{ .key = .{ .key = .{ .char = 'p' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 't' } } }, undefined);
-
-    try std.testing.expectEqualStrings("gpt", model.app.?.state.sessionFilterText());
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.filteredSessionCount());
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessionRawIndexAtFilteredIndex(0).?);
-
     _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    try std.testing.expectEqualStrings("gp", model.app.?.state.sessionFilterText());
-}
-
-test "session picker keeps selected session when still matched after filter" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    try app.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
-    try app.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
-    try app.state.addSessionWithDetails("s3", "Gamma", "gpt-4.1", "openai");
-    app.state.session_index = 2;
-
-    TuiModel.updateSessionFilter(&app, .char, 'g');
-    TuiModel.updateSessionFilter(&app, .char, 'p');
-    TuiModel.updateSessionFilter(&app, .char, 't');
-
-    try std.testing.expectEqual(@as(usize, 2), app.state.filteredSessionCount());
-    try std.testing.expectEqual(@as(usize, 1), app.state.session_index);
-    try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
-}
-
-test "session picker delete and nav keys fall back to filter input" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.state.mode = .session_picker;
-    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
-    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
-    try std.testing.expectEqualStrings("d", model.app.?.state.sessionFilterText());
-    try std.testing.expect(!model.app.?.state.session_delete_confirm);
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
-    try std.testing.expectEqualStrings("dj", model.app.?.state.sessionFilterText());
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
-    try std.testing.expectEqualStrings("djk", model.app.?.state.sessionFilterText());
-
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 's' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = '1' } } }, undefined);
-    try std.testing.expectEqualStrings("s1", model.app.?.state.sessionFilterText());
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.filteredSessionCount());
-
     _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    try std.testing.expect(model.app.?.state.session_delete_confirm);
+
+    try std.testing.expectEqual(@as(usize, 2), model.app.?.state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.session_index);
+    try std.testing.expectEqual(tui_state.AppMode.session_picker, model.app.?.state.mode);
 }
 
 fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
@@ -3348,113 +2726,10 @@ fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64)
         .session_id = try std.testing.allocator.dupe(u8, id),
         .model = try std.testing.allocator.dupe(u8, "model-a"),
         .provider = try std.testing.allocator.dupe(u8, "provider-a"),
-        .created_at = last_active,
         .last_active = last_active,
-        .turn_count = 1,
-        .working_dir = try std.testing.allocator.dupe(u8, ""),
     };
     defer meta.deinit(std.testing.allocator);
     try store.save(meta, .{ .turn_start = .{} });
-}
-
-test "session picker delete confirmation can be cancelled" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(base);
-
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
-    try saveTestSession(model.app.?.store.?, "s1", 1);
-    try model.app.?.loadSessions();
-    model.app.?.state.mode = .session_picker;
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    try std.testing.expect(model.app.?.state.session_delete_confirm);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'n' } } }, undefined);
-    try std.testing.expect(!model.app.?.state.session_delete_confirm);
-
-    var list = try model.app.?.store.?.list();
-    defer {
-        for (list.items) |*item| item.deinit(std.testing.allocator);
-        list.deinit(std.testing.allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 1), list.items.len);
-}
-
-test "session picker confirm deletes selected session and clamps selection" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(base);
-
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
-    try saveTestSession(model.app.?.store.?, "s1", 1);
-    try saveTestSession(model.app.?.store.?, "s2", 2);
-    try model.app.?.loadSessions();
-    model.app.?.state.mode = .session_picker;
-    model.app.?.state.session_index = 1;
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'y' } } }, undefined);
-
-    try std.testing.expect(!model.app.?.state.session_delete_confirm);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessions.items.len);
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
-    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
-}
-
-test "session picker delete respects active filter" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(base);
-
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
-    try saveTestSession(model.app.?.store.?, "s1", 1);
-    try saveTestSession(model.app.?.store.?, "s2", 2);
-    try saveTestSession(model.app.?.store.?, "s3", 3);
-    try model.app.?.loadSessions();
-    model.app.?.state.mode = .session_picker;
-    try model.app.?.state.session_filter.insertSlice(std.testing.allocator, "s1");
-    model.app.?.state.clampSessionSelectionToFilter();
-
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .enter } }, undefined);
-
-    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
-    var s2 = try model.app.?.store.?.load("s2");
-    s2.deinit(std.testing.allocator);
-    var s3 = try model.app.?.store.?.load("s3");
-    s3.deinit(std.testing.allocator);
-}
-
-test "deleting current session clears active session id" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(base);
-
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    app.store = try session_store.Store.init(std.testing.allocator, base);
-    try saveTestSession(app.store.?, "current", 1);
-    try app.loadSessions();
-    app.session_id = try std.testing.allocator.dupe(u8, "current");
-    try app.state.status.setSessionId(std.testing.allocator, "current");
-
-    try app.deleteSelectedSession();
-    try std.testing.expectEqual(@as(usize, 0), app.session_id.len);
-    try std.testing.expectEqual(@as(usize, 0), app.state.status.session_id.len);
-
-    try app.submit("next turn");
-    try std.testing.expect(app.session_id.len > 0);
-    try std.testing.expect(app.state.status.session_id.len > 0);
 }
 
 test "TuiModel PageUp and PageDown scroll the transcript" {
@@ -3525,10 +2800,7 @@ test "resume selected session clears delete reset flags on success" {
         .session_id = try std.testing.allocator.dupe(u8, "s1"),
         .model = try std.testing.allocator.dupe(u8, model.id),
         .provider = try std.testing.allocator.dupe(u8, model.provider),
-        .created_at = 1,
         .last_active = 1,
-        .turn_count = 1,
-        .working_dir = try std.testing.allocator.dupe(u8, ""),
     };
     defer meta.deinit(std.testing.allocator);
     try app.store.?.save(meta, .{ .turn_start = .{} });

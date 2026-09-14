@@ -91,16 +91,12 @@ pub const SessionMetadata = struct {
     session_id: []u8,
     model: []u8,
     provider: []u8,
-    created_at: i64,
     last_active: i64,
-    turn_count: usize,
-    working_dir: []u8,
 
     pub fn deinit(self: *SessionMetadata, allocator: std.mem.Allocator) void {
         allocator.free(self.session_id);
         allocator.free(self.model);
         allocator.free(self.provider);
-        allocator.free(self.working_dir);
         self.* = undefined;
     }
 };
@@ -178,15 +174,6 @@ pub const Store = struct {
         var ctx = LoadLineContext{ .allocator = self.allocator, .loaded = &loaded, .replay = &replay };
         try readJsonlRecords(self.allocator, path, load_max_bytes, &ctx, loadLine);
         return loaded;
-    }
-
-    pub fn delete(self: Store, session_id: []const u8) !void {
-        const path = try sessionPath(self.allocator, self.base_dir, session_id);
-        defer self.allocator.free(path);
-        compat.fs.getCwd().deleteFile(defaultIo(), path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
     }
 
     pub fn list(self: Store) !std.ArrayList(SessionMetadata) {
@@ -273,22 +260,7 @@ fn defaultMetadata(allocator: std.mem.Allocator, session_id: []const u8) !Sessio
         .session_id = try allocator.dupe(u8, session_id),
         .model = try allocator.dupe(u8, ""),
         .provider = try allocator.dupe(u8, ""),
-        .created_at = 0,
         .last_active = 0,
-        .turn_count = 0,
-        .working_dir = try allocator.dupe(u8, ""),
-    };
-}
-
-fn cloneMetadata(allocator: std.mem.Allocator, meta: SessionMetadata) !SessionMetadata {
-    return .{
-        .session_id = try allocator.dupe(u8, meta.session_id),
-        .model = try allocator.dupe(u8, meta.model),
-        .provider = try allocator.dupe(u8, meta.provider),
-        .created_at = meta.created_at,
-        .last_active = meta.last_active,
-        .turn_count = meta.turn_count,
-        .working_dir = try allocator.dupe(u8, meta.working_dir),
     };
 }
 
@@ -432,10 +404,7 @@ fn updateMetadata(allocator: std.mem.Allocator, meta: *SessionMetadata, obj: std
     if (stringField(obj, "session_id")) |v| try replaceString(allocator, &meta.session_id, v);
     if (stringField(obj, "model")) |v| try replaceString(allocator, &meta.model, v);
     if (stringField(obj, "provider")) |v| try replaceString(allocator, &meta.provider, v);
-    if (intField(obj, "created_at")) |v| meta.created_at = v;
     if (intField(obj, "last_active")) |v| meta.last_active = v;
-    if (uintField(obj, "turn_count")) |v| meta.turn_count = v;
-    if (stringField(obj, "working_dir")) |v| try replaceString(allocator, &meta.working_dir, v);
 }
 
 fn replaceString(allocator: std.mem.Allocator, target: *[]u8, value: []const u8) !void {
@@ -462,10 +431,7 @@ fn writeMetadata(w: *json_writer.JsonWriter, meta: SessionMetadata) !void {
     try w.writeStringField("session_id", meta.session_id);
     try w.writeStringField("model", meta.model);
     try w.writeStringField("provider", meta.provider);
-    try w.writeIntField("created_at", meta.created_at);
     try w.writeIntField("last_active", meta.last_active);
-    try w.writeIntField("turn_count", meta.turn_count);
-    try w.writeStringField("working_dir", meta.working_dir);
     try w.endObject();
 }
 
@@ -827,10 +793,7 @@ fn assistantTextMessage(allocator: std.mem.Allocator, text: []const u8, stop_rea
         .session_id = @constCast(""),
         .model = @constCast(""),
         .provider = @constCast(""),
-        .created_at = 0,
         .last_active = 0,
-        .turn_count = 0,
-        .working_dir = @constCast(""),
     };
     return assistantTextMessageWithMeta(allocator, meta, text, stop_reason);
 }
@@ -890,36 +853,6 @@ fn toolResultFromFields(allocator: std.mem.Allocator, tool_call_id: []const u8, 
     };
 }
 
-fn writeMessage(w: *json_writer.JsonWriter, message: ai_types.Message) !void {
-    try w.beginObject();
-    switch (message) {
-        .user => |m| {
-            try w.writeStringField("role", "user");
-            try w.writeStringField("text", switch (m.content) {
-                .text => |t| t,
-                .parts => "",
-            });
-            try w.writeIntField("timestamp", m.timestamp);
-        },
-        .assistant => |m| {
-            try w.writeStringField("role", "assistant");
-            try w.writeStringField("text", assistantText(m.content));
-            try w.writeStringField("stop_reason", @tagName(m.stop_reason));
-            try w.writeIntField("timestamp", m.timestamp);
-        },
-        .tool_result => |m| {
-            try w.writeStringField("role", "tool_result");
-            try w.writeStringField("tool_call_id", m.tool_call_id);
-            try w.writeStringField("tool_name", m.tool_name);
-            try w.writeStringField("text", userPartsText(m.content));
-            try w.writeStringField("details_json", m.details_json.slice());
-            try w.writeBoolField("is_error", m.is_error);
-            try w.writeIntField("timestamp", m.timestamp);
-        },
-    }
-    try w.endObject();
-}
-
 fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.Message {
     const obj = switch (value) {
         .object => |o| o,
@@ -942,22 +875,6 @@ fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.M
         } };
     }
     return error.InvalidMessage;
-}
-
-fn assistantText(content: []const ai_types.AssistantContent) []const u8 {
-    for (content) |block| switch (block) {
-        .text => |t| return t.text,
-        else => {},
-    };
-    return "";
-}
-
-fn userPartsText(parts: []const ai_types.UserContentPart) []const u8 {
-    for (parts) |part| switch (part) {
-        .text => |t| return t.text,
-        else => {},
-    };
-    return "";
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1060,12 +977,9 @@ test "save 10 events load replays in order" {
     defer meta.deinit(std.testing.allocator);
     try replaceString(std.testing.allocator, &meta.model, "model-a");
     try replaceString(std.testing.allocator, &meta.provider, "test");
-    try replaceString(std.testing.allocator, &meta.working_dir, base);
-    meta.created_at = 1;
     var i: usize = 0;
     while (i < 10) : (i += 1) {
         meta.last_active = @intCast(i + 1);
-        meta.turn_count = i + 1;
         const delta = try std.fmt.allocPrint(std.testing.allocator, "d{d}", .{i});
         defer std.testing.allocator.free(delta);
         var event = tui_session.TuiEvent{ .text_delta = .{ .content_index = i, .delta = try owned(std.testing.allocator, delta) } };
@@ -1117,12 +1031,9 @@ test "session metadata updates from last valid line" {
     defer meta.deinit(std.testing.allocator);
     try replaceString(std.testing.allocator, &meta.model, "m1");
     try replaceString(std.testing.allocator, &meta.provider, "p1");
-    meta.created_at = 10;
     meta.last_active = 20;
-    meta.turn_count = 1;
     try store.save(meta, .{ .turn_start = .{} });
     meta.last_active = 30;
-    meta.turn_count = 2;
     try store.save(meta, .{ .turn_start = .{} });
     var list = try store.list();
     defer {
@@ -1131,37 +1042,6 @@ test "session metadata updates from last valid line" {
     }
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
     try std.testing.expectEqual(@as(i64, 30), list.items[0].last_active);
-    try std.testing.expectEqual(@as(usize, 2), list.items[0].turn_count);
-}
-
-test "delete removes session from store list" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmpBase(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(base);
-    var store = try Store.init(std.testing.allocator, base);
-    defer store.deinit();
-    var meta = try defaultMetadata(std.testing.allocator, "delete-me");
-    defer meta.deinit(std.testing.allocator);
-    try store.save(meta, .{ .turn_start = .{} });
-
-    var before = try store.list();
-    defer {
-        for (before.items) |*item| item.deinit(std.testing.allocator);
-        before.deinit(std.testing.allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 1), before.items.len);
-
-    try store.delete("delete-me");
-    try store.delete("delete-me");
-    try std.testing.expectError(error.FileNotFound, store.load("delete-me"));
-
-    var after = try store.list();
-    defer {
-        for (after.items) |*item| item.deinit(std.testing.allocator);
-        after.deinit(std.testing.allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 0), after.items.len);
 }
 
 test "metadata loads from tail of large session file" {
@@ -1176,7 +1056,6 @@ test "metadata loads from tail of large session file" {
     try replaceString(std.testing.allocator, &meta.model, "tail-model");
     try replaceString(std.testing.allocator, &meta.provider, "tail-provider");
     meta.last_active = 99;
-    meta.turn_count = 7;
 
     const path = try sessionPath(std.testing.allocator, base, "large-metadata");
     defer std.testing.allocator.free(path);
