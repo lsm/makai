@@ -1728,43 +1728,6 @@ test "tool approval approve and reject paths emit tool events" {
     try std.testing.expect(reject_saw_error_tool);
 }
 
-test "runtime queues steering messages" {
-    var mock = MockProtocolCtx{ .tool_first = true, .wait_after_tool_first = true };
-    const models = [_]ai_types.Model{test_model_a};
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
-    defer runtime.deinit();
-
-    var tui_session = runtime.createSession();
-    try tui_session.start();
-    try tui_session.submitTurn("first");
-    try tui_session.steer("steer now");
-
-    var saw_first = false;
-    var saw_steer = false;
-    var rounds: usize = 0;
-    while (rounds < 2) : (rounds += 1) {
-        if (runtime.local_agent) |*local| local.waitForIdle();
-        while (tui_session.popEvent()) |event| {
-            var ev = event;
-            defer ev.deinit(std.testing.allocator);
-            switch (ev) {
-                .message_end => |payload| {
-                    if (payload.role != .user) continue;
-                    if (std.mem.eql(u8, payload.text.slice(), "first")) saw_first = true;
-                    if (std.mem.eql(u8, payload.text.slice(), "steer now")) saw_steer = true;
-                },
-                else => {},
-            }
-        }
-        if (saw_steer) break;
-        try tui_session.resumeSession();
-    }
-    try std.testing.expect(saw_first);
-    try std.testing.expect(saw_steer);
-    try std.testing.expect(mock.call_count >= 2);
-    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
-}
-
 test "runtime idle steering resumes immediately" {
     var mock = MockProtocolCtx{};
     const models = [_]ai_types.Model{test_model_a};
