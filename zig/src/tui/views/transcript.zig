@@ -129,7 +129,7 @@ fn appendBalancedToolCluster(
 ) !usize {
     var tool_index = initial_tool_index;
     if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
-        for (state.transcript.items[start..end], start..) |*entry, idx| {
+        for (state.transcript.items[start..end]) |*entry| {
             if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry);
         }
         return tool_index;

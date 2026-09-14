@@ -825,7 +825,6 @@ pub const AppState = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return;
         const obj = parsed.value.object;
-        const path = jsonString(obj, "path") orelse "(unknown)";
         const operation = jsonString(obj, "operation") orelse "hashline_edit";
         const start_line = jsonUsize(obj, "start_line") orelse 0;
         const end_line = jsonUsize(obj, "end_line") orelse start_line;
