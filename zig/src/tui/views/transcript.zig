@@ -502,13 +502,10 @@ fn flushWrapRow(writer: *std.Io.Writer, buf: *std.ArrayList(u8), col: *usize, pe
     col.* = tui_text.visibleWidth(buf.items);
     if (tail_len > 0) {
         try writer.writeByte('\n');
-        if (pad_from.*) |pf| {
-            pad_from.* = if (pf > tail_start) pf - tail_start else null;
-        }
     } else {
         pending_newline.* = true;
-        pad_from.* = null;
     }
+    pad_from.* = null;
 }
 
 fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, max_width: usize) !void {
