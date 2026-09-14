@@ -163,6 +163,7 @@ class PtySession:
                 raise ScenarioError(f"failed to answer terminal probe {probe!r}: {err}")
 
     def wait_for(self, marker, timeout, what):
+        marker = plain_text(marker)
         if not marker:
             raise ScenarioError(f"empty marker for {what}")
         search_from = len(self.plain)
@@ -285,8 +286,9 @@ def run_scenario(args, repo_root):
         first_frame_ms = (session.last_read_at - session.spawned_at) * 1000.0
         session.quiesce(0.4)
 
+        prompt_echo_from = len(session.plain)
         keypress_ms = session.type_text(args.prompt, measure=True)
-        if args.prompt.encode() not in session.plain:
+        if plain_text(args.prompt.encode()) not in session.plain[prompt_echo_from:]:
             raise ScenarioError("typed prompt did not appear in the composer render")
 
         submit_sent_at = time.monotonic()
@@ -376,6 +378,8 @@ def main():
     args = parser.parse_args()
     if not args.fixture_text:
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
+    if any(ord(char) < 32 or ord(char) == 127 for char in args.prompt):
+        parser.error("--prompt must be printable single-line text: control characters would be sent to the TUI as terminal input")
 
     session = None
     metrics = None
