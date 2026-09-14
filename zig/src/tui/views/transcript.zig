@@ -1373,15 +1373,11 @@ test "transcript allows tildes in tilde-fence info strings" {
 }
 
 test "transcript drops malformed multibyte leads without passing controls" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "a\xC2\x1B[2Jb");
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try wrapPlainLine(std.testing.allocator, &out.writer, "a\xC2\x1B[2Jb", 40);
 
-    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ab") != null);
+    try std.testing.expectEqualStrings("ab", out.written());
 }
 
 test "transcript keeps expanded tabs within the wrap width" {
