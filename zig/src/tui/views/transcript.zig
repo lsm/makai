@@ -444,17 +444,40 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
 
 const FenceMarker = struct { char: u8, len: usize };
 
+const LineIndent = struct { width: usize, start: usize };
+
+fn lineIndent(line: []const u8) LineIndent {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == ' ') {
+            width += 1;
+        } else if (c == '\t') {
+            width = (width / 4 + 1) * 4;
+        } else if (c != '\r') {
+            break;
+        }
+    }
+    return .{ .width = width, .start = i };
+}
+
 fn fenceMarker(line: []const u8) ?FenceMarker {
-    const trimmed = std.mem.trimStart(u8, line, " \t\r");
-    if (trimmed.len < 3 or (trimmed[0] != '`' and trimmed[0] != '~')) return null;
+    const ind = lineIndent(line);
+    if (ind.width > 3) return null;
+    const rest = line[ind.start..];
+    if (rest.len < 3 or (rest[0] != '`' and rest[0] != '~')) return null;
     var n: usize = 0;
-    while (n < trimmed.len and trimmed[n] == trimmed[0]) n += 1;
+    while (n < rest.len and rest[n] == rest[0]) n += 1;
     if (n < 3) return null;
-    return .{ .char = trimmed[0], .len = n };
+    if (std.mem.indexOfScalar(u8, rest[n..], rest[0]) != null) return null;
+    return .{ .char = rest[0], .len = n };
 }
 
 fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
-    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const ind = lineIndent(line);
+    if (ind.width > 3) return false;
+    const trimmed = std.mem.trim(u8, line[ind.start..], " \t\r");
     if (trimmed.len < open_len or trimmed[0] != open_char) return false;
     var n: usize = 0;
     while (n < trimmed.len and trimmed[n] == open_char) n += 1;
@@ -1376,6 +1399,39 @@ test "transcript detects tilde code fences" {
     try std.testing.expect(std.mem.indexOf(u8, text, "inside") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "~~~") == null);
+}
+
+test "transcript does not open a fence from inline code spans" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```code``` then text\nplain");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "```code```") != null);
+}
+
+test "transcript caps fence opener indent at three spaces" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "    ```\nplain line");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") != null);
+}
+
+test "transcript does not close a fence from a four-space closer" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```\ninside\n    ```\nafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") != null);
 }
 
 test "transcript strips escape sequences from plain assistant text" {
