@@ -125,7 +125,7 @@ fn toolMetaText(allocator: std.mem.Allocator, tool: *const tui_state.ToolEntry) 
     if (tool.artifact_count > 0) {
         const raw = try formatBytes(allocator, tool.raw_total_bytes);
         defer allocator.free(raw);
-        try meta_writer.print(" · {s} artifact · open/view/filter", .{raw});
+        try meta_writer.print(" · {s} artifact", .{raw});
     } else if (tool.truncated) {
         try meta_writer.writeAll(" · preview capped");
     }

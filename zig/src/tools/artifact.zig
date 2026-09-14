@@ -16,17 +16,16 @@ const RetrieveMode = enum {
     preview,
     range,
     grep,
-    full_for_display,
     full_for_context,
 };
 
 pub const retrieve_tool = agent.AgentTool{
     .label = "Artifact Retrieve",
     .name = "artifact_retrieve",
-    .description = "Inspect output previously stored as a local artifact. Defaults to a capped preview so large outputs are not inserted into model context. Use explicit modes for line ranges, literal grep, display-only full output, or full context retrieval.",
+    .description = "Inspect output previously stored as a local artifact. Defaults to a capped preview so large outputs are not inserted into model context. Use explicit modes for line ranges, literal grep, or full context retrieval.",
     .short_description = "Preview, filter, or explicitly retrieve stored tool output.",
     .parameters_schema_json =
-    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"reference":{"type":"string","description":"Artifact reference from the tool result."},"mode":{"type":"string","enum":["preview","range","grep","full_for_display","full_for_context"],"description":"preview is capped and is the default. full_for_display makes the full artifact available to the TUI without inserting it into model context. full_for_context explicitly returns the complete artifact to the model."},"start_line":{"type":"integer","minimum":1,"description":"First 1-based line for range mode."},"line_count":{"type":"integer","minimum":1,"description":"Maximum number of lines for range mode."},"pattern":{"type":"string","description":"Literal substring to search for in grep mode."},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines for grep mode."},"max_bytes":{"type":"integer","minimum":1,"description":"Maximum bytes returned to model context for preview, range, or grep modes."}},"required":["description","reference"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"reference":{"type":"string","description":"Artifact reference from the tool result."},"mode":{"type":"string","enum":["preview","range","grep","full_for_context"],"description":"preview is capped and is the default. full_for_context explicitly returns the complete artifact to the model."},"start_line":{"type":"integer","minimum":1,"description":"First 1-based line for range mode."},"line_count":{"type":"integer","minimum":1,"description":"Maximum number of lines for range mode."},"pattern":{"type":"string","description":"Literal substring to search for in grep mode."},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines for grep mode."},"max_bytes":{"type":"integer","minimum":1,"description":"Maximum bytes returned to model context for preview, range, or grep modes."}},"required":["description","reference"],"additionalProperties":false}
     ,
     .execute = executeRetrieve,
 };
@@ -56,7 +55,7 @@ pub fn executeRetrieve(
     if (common.isCancelled(cancel_token)) return error.Cancelled;
 
     const max_bytes = optionalUsize(parsed.value.object, "max_bytes") orelse switch (mode) {
-        .preview, .full_for_display => default_preview_max_bytes,
+        .preview => default_preview_max_bytes,
         .range => default_range_max_bytes,
         .grep => default_grep_max_bytes,
         .full_for_context => data.len,
@@ -74,7 +73,6 @@ pub fn executeRetrieve(
             const context_lines = optionalUsize(parsed.value.object, "context_lines") orelse default_grep_context_lines;
             break :blk try grepContent(allocator, reference, data, pattern, context_lines, max_bytes);
         },
-        .full_for_display => try displayOnlyContent(allocator, reference, data, max_bytes),
         .full_for_context => try allocator.dupe(u8, data),
     };
     defer allocator.free(content);
@@ -83,8 +81,8 @@ pub fn executeRetrieve(
     const compressed = returned_bytes < data.len or mode != .full_for_context;
     const details = try std.fmt.allocPrint(
         allocator,
-        "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":{},\"artifact_path\":\"{s}\",\"mode\":\"{s}\",\"display_only\":{}}}",
-        .{ data.len, returned_bytes, data.len -| returned_bytes, compressed, reference, @tagName(mode), mode == .full_for_display },
+        "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":{},\"artifact_path\":\"{s}\",\"mode\":\"{s}\"}}",
+        .{ data.len, returned_bytes, data.len -| returned_bytes, compressed, reference, @tagName(mode) },
     );
     defer allocator.free(details);
     return common.makeTextResult(allocator, content, details);
@@ -194,16 +192,6 @@ fn grepContent(allocator: std.mem.Allocator, reference: []const u8, data: []cons
     try writer.print("\nmatches: {d}\n", .{matches});
     const raw = try out.toOwnedSlice();
     return truncateWithNotice(allocator, raw, max_bytes);
-}
-
-fn displayOnlyContent(allocator: std.mem.Allocator, reference: []const u8, data: []const u8, max_bytes: usize) ![]u8 {
-    const preview = try previewContent(allocator, reference, data, default_head_lines, default_tail_lines, max_bytes);
-    defer allocator.free(preview);
-    return std.fmt.allocPrint(
-        allocator,
-        "artifact full output requested for display only\nreference: {s}\nbytes: {d}\nlines: {d}\n\nThe full artifact was not inserted into model context. Open it in the TUI artifact viewer for scrolling/copying.\n\n{s}",
-        .{ reference, data.len, countLines(data), preview },
-    );
 }
 
 fn writeFirstLines(writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {

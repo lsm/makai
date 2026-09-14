@@ -70,7 +70,7 @@ fn artifactDisplayPreview(allocator: std.mem.Allocator, data: []const u8, raw_to
         try writer.writeAll("\n...\ntail:\n");
         try writeLastTextLines(allocator, writer, safe_data, artifact_preview_tail_lines);
     }
-    try writer.print("\nartifact: {s}\nCtrl+O or /artifact opens the full local output. Ask for grep/range to filter without loading full output into context.", .{reference});
+    try writer.print("\nartifact: {s}\nAsk for grep/range to filter without loading full output into context.", .{reference});
     return out.toOwnedSlice();
 }
 
@@ -574,17 +574,6 @@ pub const App = struct {
 
     const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
 
-    const view_modes = [_]tui_state.TranscriptVisibilityMode{ .everything, .verbose, .balanced, .chat };
-
-    const thinking_levels = [_]ai_types.ThinkingLevel{ .off, .low, .medium, .high, .xhigh };
-
-    const export_methods = [_]ExportMethod{ .clipboard, .file };
-
-    const ExportMethod = enum {
-        clipboard,
-        file,
-    };
-
     fn loginProviderEnum(idx: usize) tui_login.Provider {
         return switch (idx) {
             0 => .anthropic,
@@ -634,37 +623,6 @@ pub const App = struct {
         self.enterMenu(.permission_picker);
     }
 
-    fn openViewPicker(self: *App) void {
-        self.state.menu_scroll = 0;
-        self.state.menu_index = 0;
-        for (view_modes, 0..) |mode, i| {
-            if (mode == self.state.transcript_mode) {
-                self.state.menu_index = i;
-                break;
-            }
-        }
-        self.enterMenu(.view_picker);
-    }
-
-    fn openThinkingPicker(self: *App) void {
-        self.state.menu_scroll = 0;
-        self.state.menu_index = 0;
-        if (self.runtime) |runtime| self.state.thinking_level = runtime.thinkingLevel();
-        for (thinking_levels, 0..) |level, i| {
-            if (level == self.state.thinking_level) {
-                self.state.menu_index = i;
-                break;
-            }
-        }
-        self.enterMenu(.thinking_picker);
-    }
-
-    fn openExportPicker(self: *App) void {
-        self.state.menu_scroll = 0;
-        self.state.menu_index = 0;
-        self.enterMenu(.export_picker);
-    }
-
     fn enterMenu(self: *App, mode: tui_state.AppMode) void {
         self.state.mode = mode;
         self.ensureMenuSelectionVisible();
@@ -675,9 +633,6 @@ pub const App = struct {
             .model_picker => if (self.runtime) |runtime| runtime.availableModels().len else 0,
             .login_picker => login_providers.len,
             .permission_picker => permission_modes.len,
-            .view_picker => view_modes.len,
-            .thinking_picker => thinking_levels.len,
-            .export_picker => export_methods.len,
             else => 0,
         };
     }
@@ -750,37 +705,6 @@ pub const App = struct {
         const msg = try std.fmt.allocPrint(self.allocator, "permission mode set to {s}", .{@tagName(mode)});
         defer self.allocator.free(msg);
         try self.state.appendTranscript(.system, msg);
-    }
-
-    fn applySelectedView(self: *App) !void {
-        const idx = @min(self.state.menu_index, view_modes.len - 1);
-        const mode = view_modes[idx];
-        self.state.setTranscriptMode(mode);
-        self.state.mode = .normal;
-        const msg = try std.fmt.allocPrint(self.allocator, "view mode set to {s}", .{@tagName(mode)});
-        defer self.allocator.free(msg);
-        try self.state.appendTranscript(.system, msg);
-    }
-
-    fn applySelectedThinking(self: *App) !void {
-        const idx = @min(self.state.menu_index, thinking_levels.len - 1);
-        const level = thinking_levels[idx];
-        if (self.runtime) |runtime| runtime.setThinkingLevel(level);
-        self.state.thinking_level = level;
-        self.state.mode = .normal;
-        const msg = try std.fmt.allocPrint(self.allocator, "thinking level set to {s}", .{@tagName(level)});
-        defer self.allocator.free(msg);
-        try self.state.appendTranscript(.system, msg);
-    }
-
-    fn applySelectedExport(self: *App) !void {
-        const idx = @min(self.state.menu_index, export_methods.len - 1);
-        const method = export_methods[idx];
-        self.state.mode = .normal;
-        switch (method) {
-            .clipboard => self.exportTranscriptToClipboard(),
-            .file => try self.exportTranscriptToFile(null),
-        }
     }
 
     fn pollLogin(self: *App) !void {
@@ -1298,7 +1222,7 @@ pub const App = struct {
             .command => |command| command,
         };
 
-        if (command.kind == .sessions or command.kind == .@"resume") self.loadSessions() catch |err| {
+        if (command.kind == .@"resume") self.loadSessions() catch |err| {
             try self.state.status.setError(self.allocator, @errorName(err));
             try self.state.appendTranscript(.@"error", @errorName(err));
             return;
@@ -1342,15 +1266,7 @@ pub const App = struct {
                 self.state.mode = .login_picker;
             },
             .open_permission_picker => self.openPermissionPicker(),
-            .open_view_picker => self.openViewPicker(),
-            .open_thinking_picker => self.openThinkingPicker(),
-            .open_export_picker => self.openExportPicker(),
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
-            .copy_last => self.copyLastAssistant(),
-            .copy_all => self.copyTranscript(),
-            .copy_tool => self.copySelectedToolOutput(),
-            .open_artifact_viewer => try self.openLatestArtifact(),
-            .export_file => try self.exportTranscriptToFile(if (result.export_path.len > 0) result.export_path else null),
             .none => {},
         }
         if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
@@ -1419,20 +1335,6 @@ pub const App = struct {
         self.state.appendTranscript(.system, "copied last reply to clipboard") catch {};
     }
 
-    fn copyTranscript(self: *App) void {
-        const text = self.state.transcriptToText(self.allocator) catch {
-            self.recordError("copy failed") catch {};
-            return;
-        };
-        defer self.allocator.free(text);
-        if (text.len == 0) {
-            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
-            return;
-        }
-        self.stageClipboard(text);
-        self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
-    }
-
     fn copyPreview(self: *App) void {
         if (self.state.preview.content.len == 0) {
             self.state.appendTranscript(.system, "nothing to copy yet") catch {};
@@ -1440,38 +1342,6 @@ pub const App = struct {
         }
         self.stageClipboard(self.state.preview.content);
         self.state.appendTranscript(.system, "copied preview to clipboard") catch {};
-    }
-
-    fn copySelectedToolOutput(self: *App) void {
-        const text = self.state.selectedToolOutputText() orelse {
-            self.state.appendTranscript(.system, "selected tool has no output to copy") catch {};
-            return;
-        };
-        self.stageClipboard(text);
-        if (text.len > 256 * 1024) {
-            self.state.appendTranscript(.system, "copied tool output to clipboard (large output)") catch {};
-        } else {
-            self.state.appendTranscript(.system, "copied tool output to clipboard") catch {};
-        }
-    }
-
-    fn openLatestArtifact(self: *App) !void {
-        var i = self.state.tools.items.len;
-        while (i > 0) {
-            i -= 1;
-            const refs = self.state.tools.items[i].artifact_refs;
-            const reference = firstArtifactReference(refs) orelse continue;
-            const data = tools_common.retrieveArtifact(self.allocator, reference, 64 * 1024 * 1024) catch |err| {
-                try self.recordError(@errorName(err));
-                return;
-            };
-            defer self.allocator.free(data);
-            const safe_data = try sanitizeTerminalPreviewText(self.allocator, data);
-            defer self.allocator.free(safe_data);
-            try self.state.setPreview(.artifact, reference, safe_data);
-            return;
-        }
-        try self.state.appendTranscript(.system, "no local artifact to open");
     }
 
     fn hydrateToolDisplayPreview(self: *App, event: tui_runtime.TuiEvent) !void {
@@ -1495,56 +1365,6 @@ pub const App = struct {
         }
     }
 
-    fn exportTranscriptToClipboard(self: *App) void {
-        const text = self.state.transcriptToMarkdown(self.allocator) catch |err| {
-            self.recordExportError("clipboard", err) catch {};
-            return;
-        };
-        defer self.allocator.free(text);
-        if (text.len == 0) {
-            self.state.appendTranscript(.system, "nothing to export yet") catch {};
-            return;
-        }
-        self.stageClipboard(text);
-        self.state.appendTranscript(.system, "exported transcript to clipboard") catch {};
-    }
-
-    fn exportTranscriptToFile(self: *App, maybe_path: ?[]const u8) !void {
-        const text = self.state.transcriptToMarkdown(self.allocator) catch |err| {
-            try self.recordExportError("file", err);
-            return;
-        };
-        defer self.allocator.free(text);
-        if (text.len == 0) {
-            try self.state.appendTranscript(.system, "nothing to export yet");
-            return;
-        }
-
-        const owned_default = if (maybe_path == null) try defaultExportPath(self.allocator) else null;
-        defer if (owned_default) |path| self.allocator.free(path);
-        const path = maybe_path orelse owned_default.?;
-
-        var file = std.Io.Dir.createFile(.cwd(), defaultIo(), path, .{ .truncate = true }) catch |err| {
-            try self.recordExportError(path, err);
-            return;
-        };
-        defer file.close(defaultIo());
-        file.writeStreamingAll(defaultIo(), text) catch |err| {
-            try self.recordExportError(path, err);
-            return;
-        };
-
-        const msg = try std.fmt.allocPrint(self.allocator, "exported transcript to {s}", .{path});
-        defer self.allocator.free(msg);
-        try self.state.appendTranscript(.system, msg);
-    }
-
-    fn recordExportError(self: *App, target: []const u8, err: anyerror) !void {
-        const msg = try std.fmt.allocPrint(self.allocator, "export failed for {s}: {s}", .{ target, @errorName(err) });
-        defer self.allocator.free(msg);
-        try self.recordError(msg);
-    }
-
     fn cycleThinkingLevel(self: *App) void {
         const level = self.state.cycleThinkingLevel();
         if (self.runtime) |runtime| runtime.setThinkingLevel(level);
@@ -1556,9 +1376,9 @@ pub const App = struct {
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
             const tips = if (self.steeringAvailable())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • Ctrl+D timestamp • /help commands"
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • Ctrl+D timestamp • /help commands";
+                "Enter submit • Alt+Enter queues follow-up • /resume opens sessions • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1571,7 +1391,7 @@ pub const App = struct {
         }
         const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
         const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
-        const welcome = try std.fmt.allocPrint(self.allocator, "Makai TUI • {s}/{s} • /sessions resumes saved work", .{ provider, model });
+        const welcome = try std.fmt.allocPrint(self.allocator, "Makai TUI • {s}/{s} • /resume opens saved work", .{ provider, model });
         defer self.allocator.free(welcome);
         try self.state.appendTranscript(.system, welcome);
     }
@@ -1855,26 +1675,14 @@ pub const TuiModel = struct {
                             app.state.toggleLatestToolExpanded();
                             return .none;
                         },
-                        'o' => {
-                            app.openLatestArtifact() catch |err| app.recordError(@errorName(err)) catch {};
-                            return .none;
-                        },
                         'y' => {
                             if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
                             app.flushClipboard(ctx);
                             return .none;
                         },
-                        'x' => {
-                            app.copySelectedToolOutput();
-                            app.flushClipboard(ctx);
-                            return .none;
-                        },
                         'd' => {
                             if (app.state.mode == .session_picker) {
-                            } else {
-                                _ = app.state.cycleTimestampDisplay();
-                                return .none;
-                            }
+                            } else return .none;
                         },
                         'p' => {
                             if (app.state.mode == .normal and app.state.focus_pane == .composer) _ = app.state.composerHistoryPrev() catch false;
@@ -2009,12 +1817,6 @@ pub const TuiModel = struct {
                                 app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {};
                             } else if (app.state.mode == .permission_picker) {
                                 app.applySelectedPermission() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else if (app.state.mode == .view_picker) {
-                                app.applySelectedView() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else if (app.state.mode == .thinking_picker) {
-                                app.applySelectedThinking() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else if (app.state.mode == .export_picker) {
-                                app.applySelectedExport() catch |err| app.recordError(@errorName(err)) catch {};
                             }
                         },
                         .escape => app.state.mode = .normal,
@@ -2234,50 +2036,6 @@ pub const TuiModel = struct {
                     .offset = app.state.menu_scroll,
                 }) catch "";
             },
-            .view_picker => blk: {
-                var items: [App.view_modes.len]menu_picker_view.Item = undefined;
-                for (App.view_modes, 0..) |mode, i| {
-                    items[i] = .{ .label = @tagName(mode), .detail = viewModeDetail(mode) };
-                }
-                break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Transcript view",
-                    .items = &items,
-                    .selected = app.state.menu_index,
-                    .width = width,
-                    .height = sessionPickerHeight(app),
-                    .offset = app.state.menu_scroll,
-                }) catch "";
-            },
-            .thinking_picker => blk: {
-                var items: [App.thinking_levels.len]menu_picker_view.Item = undefined;
-                for (App.thinking_levels, 0..) |level, i| {
-                    items[i] = .{ .label = @tagName(level), .detail = thinkingLevelDetail(level) };
-                }
-                break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Thinking level",
-                    .items = &items,
-                    .selected = app.state.menu_index,
-                    .width = width,
-                    .height = sessionPickerHeight(app),
-                    .offset = app.state.menu_scroll,
-                }) catch "";
-            },
-            .export_picker => blk: {
-                var items: [App.export_methods.len]menu_picker_view.Item = undefined;
-                for (App.export_methods, 0..) |method, i| {
-                    items[i] = .{ .label = exportMethodLabel(method), .detail = exportMethodDetail(method) };
-                }
-                break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Export conversation",
-                    .subtitle = "Select export method",
-                    .footer = "Esc to cancel",
-                    .items = &items,
-                    .selected = app.state.menu_index,
-                    .width = width,
-                    .height = sessionPickerHeight(app),
-                    .offset = app.state.menu_scroll,
-                }) catch "";
-            },
             .login_input => "",
             .normal => if (app.state.focus_pane == .tools) blk: {
                 const min_transcript = 3;
@@ -2336,7 +2094,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (indices[0..len], 0..) |idx, i| {
             if (i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width, state.timestamp_display);
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2439,7 +2197,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
             if (rel_i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20), app.state.timestamp_display);
+            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
             defer ctx.allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2532,7 +2290,7 @@ pub const TuiModel = struct {
 
     fn isMenuMode(mode: tui_state.AppMode) bool {
         return switch (mode) {
-            .model_picker, .login_picker, .permission_picker, .view_picker, .thinking_picker, .export_picker => true,
+            .model_picker, .login_picker, .permission_picker => true,
             else => false,
         };
     }
@@ -2541,39 +2299,6 @@ pub const TuiModel = struct {
         return switch (mode) {
             .bypass => "run tools without prompts",
             .ask => "ask before tool execution",
-        };
-    }
-
-    fn viewModeDetail(mode: tui_state.TranscriptVisibilityMode) []const u8 {
-        return switch (mode) {
-            .everything => "full protocol log",
-            .verbose => "more internals",
-            .balanced => "balanced details",
-            .chat => "mostly messages",
-        };
-    }
-
-    fn thinkingLevelDetail(level: ai_types.ThinkingLevel) []const u8 {
-        return switch (level) {
-            .off => "disabled",
-            .minimal, .low => "light reasoning",
-            .medium => "balanced reasoning",
-            .high => "deeper reasoning",
-            .xhigh => "maximum reasoning",
-        };
-    }
-
-    fn exportMethodLabel(method: App.ExportMethod) []const u8 {
-        return switch (method) {
-            .clipboard => "Copy to clipboard",
-            .file => "Save to file",
-        };
-    }
-
-    fn exportMethodDetail(method: App.ExportMethod) []const u8 {
-        return switch (method) {
-            .clipboard => "Copy the conversation to your system clipboard",
-            .file => "Save the conversation to a file in the current directory",
         };
     }
 
@@ -2636,30 +2361,6 @@ fn currentPathOwned(allocator: std.mem.Allocator) ![]u8 {
 fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store.SessionMetadata) bool {
     if (a.last_active == b.last_active) return std.mem.lessThan(u8, a.session_id, b.session_id);
     return a.last_active > b.last_active;
-}
-
-fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
-    const millis = compat.time.nowMillis();
-    const secs: i64 = @divFloor(millis, 1000);
-    const ms: i64 = @mod(millis, 1000);
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(secs, 0))) };
-    const day = epoch.getEpochDay();
-    const year_day = day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_secs = epoch.getDaySeconds();
-    return std.fmt.allocPrint(
-        allocator,
-        "transcript-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}.md",
-        .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
-            day_secs.getHoursIntoDay(),
-            day_secs.getMinutesIntoHour(),
-            day_secs.getSecondsIntoMinute(),
-            ms,
-        },
-    );
 }
 
 fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
@@ -2934,53 +2635,6 @@ test "App submit routes help command to system transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
 }
 
-test "App copies selected tool output" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    const tool = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
-    try tool.output.appendSlice(std.testing.allocator, "tool stdout");
-
-    app.copySelectedToolOutput();
-
-    defer if (app.pending_clipboard) |text| {
-        std.testing.allocator.free(text);
-        app.pending_clipboard = null;
-    };
-    try std.testing.expect(app.pending_clipboard != null);
-    try std.testing.expectEqualStrings("tool stdout", app.pending_clipboard.?);
-    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
-    try std.testing.expectEqualStrings("copied tool output to clipboard", app.state.transcript.items[0].text.items);
-}
-
-test "App reports empty selected tool output" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    _ = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
-
-    app.copySelectedToolOutput();
-
-    try std.testing.expect(app.pending_clipboard == null);
-    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
-    try std.testing.expectEqualStrings("selected tool has no output to copy", app.state.transcript.items[0].text.items);
-}
-
-test "App warns when copying large selected tool output" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    const tool = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
-    try tool.output.resize(std.testing.allocator, 256 * 1024 + 1);
-    @memset(tool.output.items, 'x');
-
-    app.copySelectedToolOutput();
-
-    defer if (app.pending_clipboard) |text| {
-        std.testing.allocator.free(text);
-        app.pending_clipboard = null;
-    };
-    try std.testing.expect(app.pending_clipboard != null);
-    try std.testing.expectEqual(@as(usize, 256 * 1024 + 1), app.pending_clipboard.?.len);
-    try std.testing.expectEqualStrings("copied tool output to clipboard (large output)", app.state.transcript.items[0].text.items);
-}
 
 test "App submit starts direct OpenAI Codex login command" {
     var app = App.initWithoutRuntime(std.testing.allocator);
@@ -3071,9 +2725,9 @@ test "multi-line /help output renders all lines into transcript view" {
     defer std.testing.allocator.free(rendered);
 
     const expect = [_][]const u8{
-        "/help",  "/model",       "/provider", "/status",
-        "/tools", "/permissions", "/view",     "/compact",
-        "/clear", "/diff",        "/quit",
+        "/help",      "/model",  "/provider", "/status",
+        "/resume",    "/login",  "/permissions", "/abort",
+        "/clear",     "/quit",
     };
     for (expect) |needle| {
         if (std.mem.indexOf(u8, rendered, needle) == null) {
@@ -3184,7 +2838,7 @@ test "App welcome uses session count" {
     try app.state.addSession("s1", "saved");
     try app.appendWelcome();
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/resume") != null);
 }
 
 test "App welcome shows follow-up tips but hides steering tips for remote runtime" {
@@ -3419,16 +3073,6 @@ test "TuiModel Shift Tab cycles thinking level" {
     try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
 }
 
-test "TuiModel Ctrl D cycles timestamp display" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-
-    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
-    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
-    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(tui_state.TimestampDisplay.full, model.app.?.state.timestamp_display);
-}
-
 test "TuiModel Ctrl D enters delete confirmation in session picker" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
@@ -3438,7 +3082,6 @@ test "TuiModel Ctrl D enters delete confirmation in session picker" {
     const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expect(model.app.?.state.session_delete_confirm);
-    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
 }
 
 test "App drain quarantines late events until the next turn starts" {
@@ -3656,20 +3299,6 @@ test "setting pickers apply selected values" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     app.runtime = runtime_ptr;
-
-    app.openViewPicker();
-    try std.testing.expectEqual(tui_state.AppMode.view_picker, app.state.mode);
-    app.state.menu_index = 0;
-    try app.applySelectedView();
-    try std.testing.expectEqual(tui_state.TranscriptVisibilityMode.everything, app.state.transcript_mode);
-    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
-
-    app.openThinkingPicker();
-    try std.testing.expectEqual(tui_state.AppMode.thinking_picker, app.state.mode);
-    app.state.menu_index = 3;
-    try app.applySelectedThinking();
-    try std.testing.expectEqual(ai_types.ThinkingLevel.high, app.state.thinking_level);
-    try std.testing.expectEqual(ai_types.ThinkingLevel.high, runtime_ptr.thinkingLevel());
 
     app.openPermissionPicker();
     try std.testing.expectEqual(tui_state.AppMode.permission_picker, app.state.mode);
@@ -4294,7 +3923,7 @@ test "TuiModel PageUp and PageDown scroll transcript when focused" {
 test "TuiModel preview Escape returns focus to composer" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
-    try model.app.?.state.setPreview(.artifact, "artifact", "content");
+    try model.app.?.state.setPreview(.diff, "diff", "content");
     model.app.?.state.focus_pane = .tools;
 
     _ = model.update(.{ .key = .{ .key = .escape } }, undefined);
