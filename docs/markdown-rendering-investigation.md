@@ -1,0 +1,182 @@
+# Markdown rendering investigation for the Zig TUI (#256)
+
+Date: 2026-09-14. Investigation only — no production changes. Decision owner: Marc.
+Baseline: `main` @ `0d2091d` (post #254 plain render). PoC branch: `poc/256-md4c-zig` @ `e86142e` (not for merge).
+
+## The contract any renderer must inherit (#254)
+
+The plain renderer established a security and layout contract that a markdown renderer
+must preserve bit-for-bit in its rejection semantics. All citations are merged code:
+
+- `renderAssistantPlain` (`zig/src/tui/views/transcript.zig:402`) — the only structure
+  detection is code fences (`fenceMarker` :465, `isFenceClose` :477). Prose lines go to
+  `wrapPlainLine` :427; fence lines go through `stripControls` :430 → `expandTabs` :432 →
+  `truncateLineToWidth` :434 → 2-space dim indent :437-440.
+- Sanitizer rejection set (`wrapPlainLine` :511-591 and `stripControls` :602-639):
+  ESC/CSI/OSC/DCS/APC sequences skipped via `skipAnsiSequence` :669-712 (prose :524,
+  fence :609); C0 controls except tab and DEL dropped (:528, :618); malformed UTF-8
+  lead/continuation bytes skipped (:567-572, :622-630); C1 controls U+0080–U+009F
+  rejected (:573-576, :631-634). Model-emitted ANSI never survives into prose — the
+  wrapper strips it; the only ANSI in bubble content is theme-introduced.
+- Width model: `zz.measure.charWidth` per codepoint (:578), tabs expanded to 8-column
+  stops atomically across wrap boundaries (:532-559), greedy wrap with last-space breaks
+  and hard splits for overlong words (`flushWrapRow` :487).
+- Bubble/scroll integration: `renderBubble` (:739) computes per-line visible width via
+  `visibleWidth` (ANSI-aware, `zig/src/tui/text.zig:6`) and re-asserts the bubble's open
+  SGR after every `\x1b[0m` inside content (:742-744). `lineWindow` (:882) slices the
+  transcript by rendered line count — so a renderer's emitted row count *is* the scroll
+  height, and every row must already fit the content width (no downstream re-wrap).
+
+Consequence for output model: a renderer that emits pre-styled ANSI strings works only
+if every output row is self-contained (re-assert open span styles at row start, reset at
+row end) and every width computation is column-based, ANSI-aware. A renderer that
+separates plain text from styling (events/AST) lets the TUI keep wrapping plain runs and
+apply styles per run — closest to the existing pattern.
+
+## Candidate A — vendored zigzag Markdown component
+
+`zig/vendor/zigzag/src/components/markdown.zig`, 368 lines. Already vendored, so zero
+new vendoring cost — and that is its only passing criterion.
+
+- **Not a parser.** Line-pattern matching over the source: ATX headings only for `# `,
+  `## `, `### ` (:204-221; H4–H6 unsupported), ``` fences only (no `~~~`), `- ` / `* ` /
+  `N. ` single-line list items (:232-254; no continuation lines, no multi-paragraph
+  items), single-level `> ` quotes (:223), `---`/`***` thematic breaks (:188-202). No
+  indented code blocks, no setext headings, no reference links, no escapes, no nested
+  emphasis rules. This is the "hand-rolled" category issue #256 rules out.
+- **No wrapping.** Paragraph text is never wrapped; `width` is used only for the code
+  box (:333-335) and HR length (:190). Long prose overflows the bubble.
+- **No sanitization.** `renderInline` copies unmatched bytes verbatim (:326); heading,
+  quote, and code content are rendered as-is. Model-emitted ESC bytes pass straight
+  into the terminal. Integrating it would require wrapping it with the #254 sanitizer —
+  which then strips nothing it doesn't already handle, but the component would still
+  emit none of the guarantees itself.
+- **Byte-based truncation** in code blocks (`@min(line.len, inner_width)` :175) can
+  split UTF-8 sequences and miscount wide chars.
+- **Tests:** one test (fence length, :359-368). No conformance suite.
+
+Verdict: **reject.** Fails CommonMark coverage, wrapping, and security criteria.
+
+## Candidate B — md4c (C, MIT, SAX)
+
+`mity/md4c`, latest tag `release-0.5.3`, master active (pushed 2026-09-13). Fully
+CommonMark 0.31-conformant; SAX API (`md_parse` + one callback struct in `md4c.h`).
+Same parser behind Qt's QTextMarkdown and LibreOffice's Markdown support. Linear /
+near-linear parsing with a pathological-input test suite — relevant because the input
+is untrusted model output. Explicit GIGO note in the docs: any byte sequence is
+accepted and ill-formed UTF-8 is passed through to callbacks — so the #254 sanitizer
+must wrap every `MD_TEXT` event; that is a clean, single choke point.
+
+Vendoring cost is the lowest of the C options: the parser is two files
+(`md4c.c` 6,462 lines + `md4c.h` 407 lines, stdlib-only, no CMake, no config headers —
+"add md4c.[hc] directly to your code base" per upstream). The HTML renderer and entity
+tables (`md4c-html.[ch]`, `entity.[ch]`) are not needed for an ANSI renderer.
+`MD_FLAG_NOHTML` disables raw HTML blocks and spans. One gap: entities arrive as
+`MD_TEXT_ENTITY` with the raw entity text; an ANSI renderer needs a small decode table
+(upstream `entity.c/h` is MIT and adaptable, or a compact Zig table for the common set).
+
+### PoC results (branch `poc/256-md4c-zig` @ `e86142e`)
+
+`zig/src/poc/md4c_ansi.zig` (632 lines incl. tests) drives `md_parse` from Zig via
+`@cImport` — a SAX→ANSI renderer with:
+
+- sanitizer ported from `stripControls` semantics applied at every text event
+  (ESC/CSI skip, C0+DEL drop, C1 rejection, malformed-UTF-8 skip);
+- width-aware greedy wrap with span re-assertion across row breaks and
+  reset-before-separator ordering (rows are self-contained: style at row start, reset
+  at row end — directly compatible with `renderBubble`'s re-assert and `lineWindow`'s
+  line counting);
+- styled headings/emphasis/code spans/links (text styled + dim URL), fenced and
+  indented code blocks (2-space dim indent, tab expansion, width truncation), nested
+  UL/OL markers with `start` offsets, quote bars, thematic breaks;
+- 6/6 inline tests pass on x86_64-linux with Zig 0.16.0 (`zig test` with `md4c.c` +
+  `-Ivendor`, no build.zig changes needed to compile it standalone).
+
+Build-cost evidence:
+
+| Target | `md4c.c` via `zig cc` | full renderer via `build-lib` |
+| --- | --- | --- |
+| x86_64-linux | OK | host `zig test` |
+| aarch64-linux | OK | OK |
+| x86_64-windows | OK | OK |
+| aarch64-windows | OK (**not in CI matrix**) | OK |
+| aarch64-macos | OK | OK |
+| x86_64-macos | OK | — |
+
+CI's cross-compile matrix covers `aarch64-macos`, `x86_64-macos`, `aarch64-linux`,
+`x86_64-windows` (`.github/workflows/ci.yml:163-175`) — `aarch64-windows` is untested
+in CI today regardless of this decision; md4c compiles there trivially via `zig cc`.
+
+Lessons the PoC already paid for (the implementation slice inherits them as known
+pitfalls, not surprises): multi-byte prefixes (`│ `, `• `) must be width-accounted, not
+byte-accounted; separator spaces must be ordered against span open/close boundaries;
+the production renderer must use `zz.measure.charWidth`, not the PoC's rune-count
+simplification, or CJK/emoji width breaks the bubble math.
+
+Verdict: **recommended**, subject to the conditions below.
+
+## Candidate C — cmark (C, BSD-2, AST)
+
+`commonmark/cmark`, latest release 0.31.2 (2026-02-14) — the CommonMark reference
+implementation, full conformance by definition. Node-API AST walk (`cmark_node_*`) is a
+fine fit conceptually — walk nodes, wrap each paragraph's text runs, style per run.
+
+Costs relative to md4c: the vendored surface is much larger (the parser is split across
+`blocks.c`, `inlines.c`, `node.c`, `references.c`, `utf8.c`, `buffer.c`, `houdini*`,
+`cmark.c` plus generated scanners; CMake-centric build expecting a configured
+`config.h`, so vendoring means either hand-maintaining a config header or shimming
+CMake output into build.zig). It allocates an AST per message where md4c streams
+events. BSD-2 is license-compatible; nothing wrong with the library — it is strictly
+more machinery for the same terminal result.
+
+Verdict: viable fallback if md4c hits an unforeseen wall; not preferred.
+
+## Candidate D — pure-Zig ecosystem survey
+
+- **zigmark** (`sc2in/zigmark`, published March 2026): claims 100% CommonMark 0.31.2
+  conformance (652 spec tests) but is licensed **PolyForm Noncommercial** — fails the
+  license criterion for this repository, and it is a brand-new single-author project.
+- **zigdown** (`JacobCrabill/zigdown`, MIT, Zig 0.16): a Glow/mdcat-inspired terminal
+  markdown toolset — but its own README states it "is not a CommonMark-compliant
+  Markdown parser, nor will it ever be one". Valuable as prior art for terminal
+  markdown aesthetics (its console renderer, clickable links); not a conformance
+  candidate for vendoring.
+- Nothing else in the Zig ecosystem is at comparable CommonMark maturity today.
+
+Verdict: no pure-Zig candidate passes; revisit yearly.
+
+## Criteria matrix
+
+| Criterion | zz.Markdown | md4c | cmark | pure-Zig |
+| --- | --- | --- | --- | --- |
+| CommonMark conformance | none (line patterns) | 0.31, SAX | 0.31, reference | none (license/blocklist) |
+| Output model fit | pre-styled ANSI string (worst) | events → wrap plain runs, style per run (best) | AST → same | varies |
+| Width wrapping | none | caller-owned (PoC proves) | caller-owned | varies |
+| Sanitizer inheritance | absent | clean choke point at text events | at node text walk | varies |
+| Vendoring cost | zero (present) | 2 files, no CMake, 6.9k C lines | ~10k C lines + config/CMake shim | n/a |
+| Windows ARM64 | untested by anyone | proven via zig cc | presumed fine, unproven | n/a |
+| License | vendored zigzag | MIT | BSD-2 | PolyForm-NC (zigmark) |
+| Test story | 1 test | upstream spec suite + PoC 6/6 | upstream spec suite | n/a |
+| Prod LOC added vs plain render | +368 (fails criteria) | ~600-800 Zig + vendor | ~600-800 Zig + more vendor | n/a |
+
+## Recommendation
+
+**Vendor md4c (release-0.5.3) and build a SAX→ANSI renderer in the TUI**, in two
+slices per methodology (vendor blob gets its own PR; the renderer is a second):
+
+1. **Vendor slice**: `zig/vendor/md4c/{md4c.c,md4c.h}` + LICENSE, `build.zig` C source
+   wiring, no behavior change (parser unreferenced by prod).
+2. **Renderer slice**: replace the body path in `renderAssistantPlain` for assistant
+   entries with the md4c renderer: sanitizer at every text event (port of
+   `stripControls`), `MD_FLAG_NOHTML`, `zz.measure.charWidth` width model, self-contained
+   styled rows, entity decode table, exact-output regression tests in the #254 pattern
+   plus a sampled CommonMark fixture set; consider adding `aarch64-windows` to the CI
+   cross-compile matrix in the same slice.
+
+Keep plain rendering as the fallback for non-assistant transcript entries (tool cards,
+errors) — only assistant prose benefits from markdown structure.
+
+Open question for the decision owner: whether terminal markdown is wanted at all right
+now — the trim series deliberately bought simplicity (-2,295 lines in #254) and model
+output is mostly readable as plain text. This investigation establishes that *if* it
+returns, md4c is the path with known, bounded cost.
