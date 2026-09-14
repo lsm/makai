@@ -15,12 +15,17 @@ protocol client for the fixture provider in `zig/src/tui/fixture_provider.zig`:
 every submitted turn streams the env value back as the assistant reply. The
 driver rejects an empty `--fixture-text` for the same reason: an empty value
 disables fixture mode inside the TUI and would let a submit reach real
-providers. It also rejects fixture text that is not printable single-line
-text or does not fit one rendered row at the selected width — the transcript
-renderer wraps and pads rows, so a marker spanning a wrap boundary could
-never match — and rejects a `--prompt` that overlaps or contains the fixture
-text, since the submitted prompt is echoed to the transcript before the
-reply streams. The driver also points `HOME` at a throwaway directory so session
+providers. It also rejects degenerate marker values before launching:
+non-printable, whitespace-only, leading/trailing-whitespace, or fence-opening
+(````` ``` `````, `~~~`) fixture text — the renderer hides fence lines and
+trims/pads rows, so such markers can never match or match too early — and
+fixture or prompt text wider than one rendered transcript row (the
+transcript caps and wraps rows near 106 columns regardless of the terminal
+width). A `--prompt` that overlaps the fixture text is rejected because the
+submitted prompt is echoed to the transcript before the reply streams, and a
+slash-prefixed or whitespace-only prompt is rejected because the TUI would
+dispatch it as a command (or nothing) instead of submitting a provider turn.
+The driver also points `HOME` at a throwaway directory so session
 storage, config, and credential stores start empty, and drops inherited
 terminal-identification variables (`TERM_PROGRAM`, `TMUX`, `KITTY_WINDOW_ID`,
 `TERM_FEATURES`, …) so the TUI's capability probing matches the declared
@@ -91,10 +96,10 @@ row names the exact source revision and host class it was measured on.
 
 | Revision | Host | Startup→first frame | Keypress median / p95 | Binary | tui/ LOC |
 | --- | --- | --- | --- | --- | --- |
-| `a235706` (PR #262) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 51.3 ms | 13.2 / 13.4 ms | 21,262,152 B | 14,617 (22 files) |
+| `755325d` (PR #262, final harness semantics) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 51.1 ms | 13.2 / 13.5 ms | 21,262,152 B | 14,617 (22 files) |
 
-Same run, phase timings: submit→fixture-reply 29.8 ms, `/model` picker open
-13.0 ms, `/resume` picker open 13.5 ms, `/quit`→exit 13.2 ms. For comparison,
+Same run, phase timings: submit→fixture-reply 46.7 ms, `/model` picker open
+13.4 ms, `/resume` picker open 13.3 ms, `/quit`→exit 13.0 ms. For comparison,
 before the driver answered the TUI's startup capability probes, first-frame
 was 457 ms — roughly 370 ms of that was the mode-2027 and primary-device-
 attributes queries timing out against a non-responsive master, not

@@ -428,10 +428,19 @@ def main():
         parser.error("--prompt and --fixture-text must not contain each other: the submitted prompt is echoed to the transcript before the assistant reply streams, so overlapping values cannot distinguish the reply render")
     if any(ord(char) < 32 or ord(char) == 127 for char in args.fixture_text):
         parser.error("--fixture-text must be printable single-line text: wrapped or multiline replies render non-contiguously and the marker cannot match them")
-    if terminal_cell_width(args.fixture_text) + 8 > args.width:
-        parser.error(f"--fixture-text must fit one rendered row at --width {args.width}: row wrapping inserts layout between fragments the marker cannot match")
-    if terminal_cell_width(args.prompt) + 8 > args.width:
-        parser.error(f"--prompt must fit one rendered row at --width {args.width}: a wrapped composer line breaks the echo assertion")
+    if not args.fixture_text.strip():
+        parser.error("--fixture-text must contain non-whitespace text: layout padding makes whitespace-only markers match before any reply renders")
+    if args.fixture_text != args.fixture_text.strip():
+        parser.error("--fixture-text must not have leading or trailing whitespace: trimmed rendering breaks marker contiguity")
+    if args.fixture_text.startswith(("```", "~~~")):
+        parser.error("--fixture-text must not open a code fence: the transcript renderer hides fence lines, so the marker can never appear")
+    if not args.prompt.strip():
+        parser.error("--prompt must contain non-whitespace text: whitespace-only input submits nothing")
+    if args.prompt.lstrip().startswith("/"):
+        parser.error("--prompt must not start with '/': the TUI dispatches slash-prefixed input as a command, so no provider turn is submitted")
+    body_cell_cap = min(args.width, 106) - 8
+    if terminal_cell_width(args.fixture_text) > body_cell_cap or terminal_cell_width(args.prompt) > body_cell_cap:
+        parser.error(f"--fixture-text and --prompt must each fit one rendered transcript row (at most {body_cell_cap} terminal cells at --width {args.width}; the transcript caps and wraps rows near 106 columns regardless of terminal width): wrapping inserts layout between fragments the marker cannot match")
 
     session = None
     metrics = None
