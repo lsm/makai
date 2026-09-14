@@ -3,7 +3,6 @@ const zz = @import("zigzag");
 const tui_state = @import("tui_state");
 const tui_theme = @import("tui_theme");
 const tui_text = @import("tui_text");
-const tui_markdown = @import("tui_markdown");
 
 const AppState = tui_state.AppState;
 const TranscriptKind = tui_state.TranscriptKind;
@@ -297,7 +296,6 @@ const user_bg = zz.Color.color256(111);
 const user_fg = zz.Color.color256(235);
 const assistant_bg = zz.Color.fromRgb(42, 44, 52);
 const assistant_fg = zz.Color.fromRgb(238, 241, 247);
-const assistant_code_bg = zz.Color.fromRgb(28, 30, 36);
 
 const chat_max_column: usize = 108;
 
@@ -326,17 +324,9 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
         },
         .assistant => blk: {
             const budget = @max(body_layout.width -| 2, 8);
-            const prepared = try tui_markdown.preprocess(arena, entry.text);
-            var markdown = zz.Markdown.init();
-            markdown.width = @intCast(@min(budget, std.math.maxInt(u16)));
-            markdown.text_style = (zz.Style{}).fg(assistant_fg).inline_style(true);
-            markdown.code_style = (zz.Style{}).fg(zz.Color.fromRgb(255, 229, 120)).bg(assistant_code_bg).inline_style(true);
-            markdown.code_block_style = (zz.Style{}).fg(zz.Color.fromRgb(96, 245, 150)).bg(assistant_code_bg).inline_style(true);
-            markdown.code_block_border = (zz.Style{}).fg(zz.Color.fromRgb(124, 139, 160)).bg(assistant_code_bg).inline_style(true);
-            const md = try markdown.render(arena, prepared);
-            const wrapped = try tui_text.wrapTextPreservingPrefix(arena, md, budget);
+            const rendered = try renderAssistantPlain(arena, entry.text, budget);
             const open = try openSgr(arena, assistant_fg, assistant_bg);
-            break :blk try renderBubble(arena, wrapped, open, false, body_layout.width);
+            break :blk try renderBubble(arena, rendered, open, false, body_layout.width);
         },
         .tool => try renderToolRow(arena, entry.tool_name, entry.text, body_layout.width),
         else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, body_layout.width),
@@ -407,6 +397,42 @@ fn renderToolRow(allocator: std.mem.Allocator, tool_name: []const u8, text: []co
     const truncated = try tui_text.truncateLinesToWidth(allocator, text, content_width, std.math.maxInt(usize));
     const styled = try styleEachLine(allocator, tui_theme.toolBody(tool_name), truncated);
     return styled;
+}
+
+fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const code_width = width -| 2;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var in_fence = false;
+    var first_line = true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (isFenceLine(line)) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if (!first_line) try writer.writeByte('\n');
+        first_line = false;
+        if (!in_fence) {
+            const wrapped = try tui_text.wrapTextWithAnsi(allocator, line, width);
+            defer allocator.free(wrapped);
+            try writer.writeAll(wrapped);
+            continue;
+        }
+        const clipped = try tui_text.truncateLineToWidth(allocator, line, code_width);
+        defer allocator.free(clipped);
+        if (clipped.len == 0) continue;
+        try writer.writeAll("  ");
+        const styled = try tui_theme.dim().render(allocator, clipped);
+        defer allocator.free(styled);
+        try writer.writeAll(styled);
+    }
+    return out.toOwnedSlice();
+}
+
+fn isFenceLine(line: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trimLeft(u8, line, " \t"), "```");
 }
 
 fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
@@ -871,7 +897,7 @@ test "transcript colors tool cards by inferred operation" {
     try std.testing.expect(!std.mem.eql(u8, shell_open, read_open));
 }
 
-test "transcript renders markdown syntax" {
+test "transcript renders assistant markdown syntax literally" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "# Heading\n- item");
@@ -879,9 +905,8 @@ test "transcript renders markdown syntax" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "Heading") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "item") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- item") != null);
 }
 
 test "transcript keeps assistant code indentation" {
@@ -965,20 +990,7 @@ test "transcript keeps one-line viewport within height when scrolled" {
     try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
 }
 
-test "transcript renders heading bold without markdown marker" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "# Heading");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "Heading") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") != null);
-}
-
-test "transcript renders list with indented continuation" {
+test "transcript wraps assistant list text plainly" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "- first second third");
@@ -986,10 +998,9 @@ test "transcript renders list with indented continuation" {
     const text = try render(std.testing.allocator, &state, .{ .width = 15, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "•") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- first") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "- first") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "third") != null);
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -997,7 +1008,7 @@ test "transcript renders list with indented continuation" {
     }
 }
 
-test "transcript renders inline code without backticks" {
+test "transcript renders inline code markers literally" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "use `code` here");
@@ -1005,12 +1016,10 @@ test "transcript renders inline code without backticks" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "code") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "`code`") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`code`") != null);
 }
 
-test "transcript renders fenced code block with border" {
+test "transcript dims and indents fenced code block" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "```zig\n    const x = 1;\n```\n");
@@ -1018,15 +1027,15 @@ test "transcript renders fenced code block with border" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "const x") != null);
+    const code_line = renderedLineContaining(text, "const x = 1;").?;
     try std.testing.expect(std.mem.indexOf(u8, text, "```zig") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "┌") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "└") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "│") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code_line, "const x = 1;") != null);
 
-    const border_line = renderedLineContaining(text, "┌").?;
-    try std.testing.expect(tui_text.visibleWidth(border_line) > 45);
-    try std.testing.expect(tui_text.visibleWidth(border_line) <= 80);
+    const dim_probe = try tui_theme.dim().render(std.testing.allocator, "x");
+    defer std.testing.allocator.free(dim_probe);
+    const x_index = std.mem.indexOf(u8, dim_probe, "x").?;
+    try std.testing.expect(std.mem.indexOf(u8, code_line, dim_probe[0..x_index]) != null);
 }
 
 test "transcript wraps assistant text within viewport width" {
@@ -1044,7 +1053,7 @@ test "transcript wraps assistant text within viewport width" {
     }
 }
 
-test "transcript renders inline LaTeX math as Unicode" {
+test "transcript renders math markers literally" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "energy is $E = mc^2$ here");
@@ -1052,27 +1061,10 @@ test "transcript renders inline LaTeX math as Unicode" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "E = mc²") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "$E") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "^2$") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$E = mc^2$") != null);
 }
 
-test "transcript renders block LaTeX math inside assistant bubble" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "Integral:\n\n$$\\int_0^\\infty f(x)\\,dx$$\n\ndone");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "∫") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "∞") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "$$") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Integral") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "done") != null);
-}
-
-test "transcript labels Mermaid diagrams and quotes raw source" {
+test "transcript renders fenced block contents without the fence markers" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "Diagram:\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\nend");
@@ -1080,31 +1072,9 @@ test "transcript labels Mermaid diagrams and quotes raw source" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 14 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid diagram: flowchart") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Diagram:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "flowchart TD") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "A --> B") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "```mermaid") == null);
-}
-
-test "transcript leaves non-mermaid fenced code blocks untouched by math pass" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "Code:\n\n```zig\nconst x = 1;\n```\n\nend");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "const x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid") == null);
-}
-
-test "transcript math falls back to raw for unknown LaTeX commands" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "weird $\\zztop$ end");
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "\\zztop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "$\\") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
 }
