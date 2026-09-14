@@ -31,12 +31,17 @@ All timings are wall-clock (`time.monotonic`) measured at the PTY master:
 
 - `startup.first_output_ms` — process spawn to the first output byte batch.
 - `startup.first_frame_ms` — process spawn to the first frame whose rendered
-  plaintext contains the welcome banner (`Makai TUI`).
+  plaintext contains the welcome banner (`Makai TUI`). The driver answers the
+  TUI's startup capability probes (mode-2027 and primary device attributes)
+  so this measures application work rather than queries timing out against a
+  non-responsive terminal.
 - `keypress.samples_ms` / `median_ms` / `p95_ms` — one sample per typed
-  character: the moment the byte is written to the PTY until the next output
-  batch arrives. The TUI renders only when the view changes and drains events
-  on a 50 ms tick, so this measures perceived echo latency including tick
-  coalescing, not just paint time.
+  character: the moment the byte is written to the PTY until the first output
+  batch of that key's render arrives; the remainder of the frame is then
+  drained (20 ms quiet gap) before the next key is sent, so a frame split
+  across PTY reads cannot satisfy the next key's wait. The TUI renders only
+  when the view changes and drains events on a 50 ms tick, so this measures
+  perceived echo latency including tick coalescing, not just paint time.
 - `phases.submit_to_reply_ms` — Enter on the prompt to the fixture reply
   appearing in the rendered transcript.
 - `phases.model_picker_open_ms`, `phases.session_picker_open_ms` — Enter on the

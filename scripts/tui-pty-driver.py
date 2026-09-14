@@ -18,6 +18,13 @@
 # The script exits non-zero when any scenario assertion fails, so CI can gate
 # on it. Timings are wall-clock (time.monotonic) and host-dependent: record
 # them against a stable host class, like the bench harness baseline.
+#
+# The driver answers the terminal capability probes the TUI sends at startup
+# (mode-2027 DECRQM and the primary device attributes query) so the startup
+# metric measures application work, not the probes timing out against a
+# non-responsive master. After each timed keypress it drains the remainder of
+# that render (until a 20 ms quiet gap) so a frame split across PTY reads can
+# never satisfy the next keypress's wait.
 
 import argparse
 import fcntl
@@ -41,6 +48,11 @@ WELCOME_MARKER = b"Makai TUI"
 MODEL_PICKER_MARKER = b"Select model"
 SESSION_PICKER_MARKER = b"Sessions"
 READ_CHUNK = 65536
+PROBE_CARRY = 16
+TERMINAL_PROBE_REPLIES = (
+    (b"\x1b[?2027$p", b"\x1b[?2027;2$y"),
+    (b"\x1b[c", b"\x1b[?62;9c"),
+)
 
 ANSI_RE = re.compile(
     rb"\x1b\[[0-9;?<=>! \-/]*[@-~]"
@@ -78,6 +90,7 @@ class PtySession:
         self.plain = b""
         self.first_output_ms = None
         self.last_read_at = time.monotonic()
+        self.probe_carry = b""
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
         env = dict(os.environ)
@@ -120,7 +133,17 @@ class PtySession:
             self.first_output_ms = (now - self.spawned_at) * 1000.0
         self.chunks.append((now, chunk))
         self.plain += plain_text(chunk)
+        self.answerTerminalProbes(chunk)
         return now
+
+    def answerTerminalProbes(self, chunk):
+        self.probe_carry = (self.probe_carry + chunk)[-PROBE_CARRY:]
+        for probe, reply in TERMINAL_PROBE_REPLIES:
+            if probe in self.probe_carry:
+                try:
+                    os.write(self.master, reply)
+                except OSError as err:
+                    raise ScenarioError(f"failed to answer terminal probe {probe!r}: {err}")
 
     def wait_for(self, marker, timeout, what):
         search_from = len(self.plain)
@@ -166,9 +189,16 @@ class PtySession:
         for char in text:
             self.send(char.encode(), f"key {char!r}")
             elapsed = self.wait_next_batch(2.0, f"key {char!r}")
+            self.drain_frame_tail()
             if measure:
                 latencies.append(elapsed)
         return latencies
+
+    def drain_frame_tail(self, quiet_seconds=0.02, max_drain_seconds=0.5):
+        deadline = time.monotonic() + max_drain_seconds
+        while time.monotonic() < deadline:
+            if self._read_once(quiet_seconds) is None:
+                return
 
     def wait_exit(self, timeout):
         deadline = time.monotonic() + timeout
