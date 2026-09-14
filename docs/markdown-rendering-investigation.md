@@ -1,7 +1,7 @@
 # Markdown rendering investigation for the Zig TUI (#256)
 
 Date: 2026-09-14. Investigation only — no production changes. Decision owner: Marc.
-Baseline: `main` @ `0d2091d` (post #254 plain render). PoC branch: `poc/256-md4c-zig` @ `47ef7a3` (not for merge).
+Baseline: `main` @ `0d2091d` (post #254 plain render). PoC branch: `poc/256-md4c-zig` @ `fe9f231` (not for merge).
 
 ## The contract any renderer must inherit (#254)
 
@@ -92,6 +92,10 @@ raw HTML blocks and spans. Two gaps the renderer slice must close deliberately:
   sanitizer over the attribute bytes before emission, or model output like
   `[x](https://e/\x1b]0;pwned\x07)` injects terminal control past the text-event choke
   point. The PoC originally had exactly this hole; it is fixed and tested there.
+  Attributes may themselves contain character references (`MD_ATTRIBUTE` exposes them
+  via `substr_types`/`substr_offsets`), so the decode-before-sanitize rule applies
+  here too: decode the attribute's substrings first, then sanitize the decoded bytes,
+  or a destination like `https://e/&#27;]0;pwned&#7;` injects OSC after sanitization.
 - **Structural events are not text payloads.** `MD_TEXT_BR` / `MD_TEXT_SOFTBR` are
   distinct event types carrying no bytes; they must dispatch straight to layout (row
   break), not pass through a byte sanitizer. Conversely `MD_TEXT_CODE` payloads *do*
@@ -114,7 +118,7 @@ raw HTML blocks and spans. Two gaps the renderer slice must close deliberately:
   documented as such if chosen. The PoC passes raw entity text through undecoded —
   safe, but not yet conformant rendering.
 
-### PoC results (branch `poc/256-md4c-zig` @ `47ef7a3`)
+### PoC results (branch `poc/256-md4c-zig` @ `fe9f231`)
 
 `zig/src/poc/md4c_ansi.zig` (657 lines incl. tests) drives `md_parse` from Zig via
 `@cImport` — a SAX→ANSI renderer with:
@@ -128,8 +132,9 @@ raw HTML blocks and spans. Two gaps the renderer slice must close deliberately:
   at row end — directly compatible with `renderBubble`'s re-assert and `lineWindow`'s
   line counting);
 - styled headings/emphasis/code spans/links (text styled + dim sanitized URL), fenced
-  and indented code blocks (2-space dim indent, tab expansion, width truncation),
-  nested UL/OL markers with `start` offsets, quote bars, thematic breaks;
+  and indented code blocks (2-space dim indent, width-aware wrap, per-byte stream
+  handling matched to md4c's granular `MD_TEXT_CODE` events), nested UL/OL markers
+  with `start` offsets, quote bars, thematic breaks;
 - 8/8 inline tests pass on x86_64-linux with Zig 0.16.0 (`zig test` with `md4c.c` +
   `-Ivendor`, no build.zig changes needed to compile it standalone).
 
