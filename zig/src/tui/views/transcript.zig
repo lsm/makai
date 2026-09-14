@@ -470,7 +470,7 @@ fn fenceMarker(line: []const u8) ?FenceMarker {
     var n: usize = 0;
     while (n < rest.len and rest[n] == rest[0]) n += 1;
     if (n < 3) return null;
-    if (std.mem.indexOfScalar(u8, rest[n..], rest[0]) != null) return null;
+    if (rest[0] == '`' and std.mem.indexOfScalar(u8, rest[n..], '`') != null) return null;
     return .{ .char = rest[0], .len = n };
 }
 
@@ -486,7 +486,7 @@ fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
 
 fn flushWrapRow(writer: *std.Io.Writer, buf: *std.ArrayList(u8), col: *usize, pending_newline: *bool) !void {
     var split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
-    if (split == 0 and buf.items.len > 1) split = lastCharStart(buf.items);
+    if (std.mem.trim(u8, buf.items[0..split], " ").len == 0) split = lastCharStart(buf.items);
     if (pending_newline.*) {
         try writer.writeByte('\n');
         pending_newline.* = false;
@@ -537,7 +537,10 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
         }
         const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         if (i + len > line.len) break;
-        const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
+        const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
         if (codepoint >= 0x80 and codepoint <= 0x9f) {
             i += len;
             continue;
@@ -1348,6 +1351,37 @@ test "transcript hard-splits leading-space words without a blank row" {
     const out = try renderAssistantPlain(std.testing.allocator, " abcdefghij", 9);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(" abcdefgh\nij", out);
+}
+
+test "transcript hard-splits indented words without whitespace rows" {
+    const out = try renderAssistantPlain(std.testing.allocator, "    abcdefghij", 9);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("    abcde\nfghij", out);
+}
+
+test "transcript allows tildes in tilde-fence info strings" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "~~~lang~variant\ninside\n~~~\nafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "inside") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "~~~") == null);
+}
+
+test "transcript drops malformed multibyte leads without passing controls" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "a\xC2\x1B[2Jb");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ab") != null);
 }
 
 test "transcript keeps expanded tabs within the wrap width" {
