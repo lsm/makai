@@ -160,10 +160,7 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, ma
         defer allocator.free(truncated);
         return tui_theme.muted().render(allocator, truncated);
     }
-    const base_hint = if (state.tools.items.len > 0)
-        "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit"
-    else
-        "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit";
+    const base_hint = "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit";
     const truncated = try tui_text.truncateToWidth(allocator, base_hint, max_width);
     defer allocator.free(truncated);
     return tui_theme.muted().render(allocator, truncated);
