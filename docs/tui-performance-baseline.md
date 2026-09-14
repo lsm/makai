@@ -13,8 +13,13 @@ The scenario must not depend on API keys or network access. When the
 entry point (`zig/src/tui/app.zig` `run()`) swaps the production provider
 protocol client for the fixture provider in `zig/src/tui/fixture_provider.zig`:
 every submitted turn streams the env value back as the assistant reply. The
-driver also points `HOME` at a throwaway directory so session storage, config,
-and credential stores start empty and the run leaves no state behind.
+driver rejects an empty `--fixture-text` for the same reason: an empty value
+disables fixture mode inside the TUI and would let a submit reach real
+providers. The driver also points `HOME` at a throwaway directory so session
+storage, config, and credential stores start empty, and drops inherited
+terminal-identification variables (`TERM_PROGRAM`, `TMUX`, `KITTY_WINDOW_ID`,
+`TERM_FEATURES`, …) so the TUI's capability probing matches the declared
+`TERM=xterm-256color` instead of the developer's outer terminal.
 
 ## Scenario
 

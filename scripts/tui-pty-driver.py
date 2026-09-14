@@ -53,6 +53,18 @@ TERMINAL_PROBE_REPLIES = (
     (b"\x1b[?2027$p", b"\x1b[?2027;2$y"),
     (b"\x1b[c", b"\x1b[?62;9c"),
 )
+TERMINAL_IDENTIFICATION_VARS = (
+    "COLORFGBG",
+    "COLORTERM",
+    "KITTY_WINDOW_ID",
+    "LC_TERMINAL",
+    "NO_COLOR",
+    "TERM_FEATURES",
+    "TERM_PROGRAM",
+    "TMUX",
+    "ZELLIJ",
+    "ZZ_UNICODE_WIDTH",
+)
 
 ANSI_RE = re.compile(
     rb"\x1b\[[0-9;?<=>! \-/]*[@-~]"
@@ -94,6 +106,8 @@ class PtySession:
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
         env = dict(os.environ)
+        for name in TERMINAL_IDENTIFICATION_VARS:
+            env.pop(name, None)
         env["HOME"] = self.home
         env["TERM"] = "xterm-256color"
         env[FIXTURE_ENV_VAR] = self.fixture_text
@@ -139,13 +153,18 @@ class PtySession:
     def answerTerminalProbes(self, chunk):
         self.probe_carry = (self.probe_carry + chunk)[-PROBE_CARRY:]
         for probe, reply in TERMINAL_PROBE_REPLIES:
-            if probe in self.probe_carry:
-                try:
-                    os.write(self.master, reply)
-                except OSError as err:
-                    raise ScenarioError(f"failed to answer terminal probe {probe!r}: {err}")
+            index = self.probe_carry.find(probe)
+            if index < 0:
+                continue
+            self.probe_carry = self.probe_carry[index + len(probe):]
+            try:
+                os.write(self.master, reply)
+            except OSError as err:
+                raise ScenarioError(f"failed to answer terminal probe {probe!r}: {err}")
 
     def wait_for(self, marker, timeout, what):
+        if not marker:
+            raise ScenarioError(f"empty marker for {what}")
         search_from = len(self.plain)
         deadline = time.monotonic() + timeout
         while True:
@@ -355,6 +374,8 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=15.0)
     parser.add_argument("--stream-timeout", type=float, default=15.0)
     args = parser.parse_args()
+    if not args.fixture_text:
+        parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
 
     session = None
     metrics = None
