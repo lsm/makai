@@ -405,22 +405,30 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
     errdefer out.deinit();
     const writer = &out.writer;
     var in_fence = false;
+    var fence_len: usize = 0;
     var first_line = true;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (isFenceLine(line)) {
-            in_fence = !in_fence;
+        if (!in_fence) {
+            const ticks = fenceMarkerLen(line);
+            if (ticks >= 3) {
+                in_fence = true;
+                fence_len = ticks;
+                continue;
+            }
+        } else if (isFenceClose(line, fence_len)) {
+            in_fence = false;
             continue;
         }
         if (!first_line) try writer.writeByte('\n');
         first_line = false;
         if (!in_fence) {
-            const wrapped = try tui_text.wrapTextWithAnsi(allocator, line, width);
-            defer allocator.free(wrapped);
-            try writer.writeAll(wrapped);
+            try wrapPlainLine(allocator, writer, line, width);
             continue;
         }
-        const clipped = try tui_text.truncateLineToWidth(allocator, line, code_width);
+        const cleaned = try stripControls(allocator, line);
+        defer allocator.free(cleaned);
+        const clipped = try tui_text.truncateLineToWidth(allocator, cleaned, code_width);
         defer allocator.free(clipped);
         if (clipped.len == 0) continue;
         try writer.writeAll("  ");
@@ -431,8 +439,135 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
     return out.toOwnedSlice();
 }
 
-fn isFenceLine(line: []const u8) bool {
-    return std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "```");
+fn fenceMarkerLen(line: []const u8) usize {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    var n: usize = 0;
+    while (n < trimmed.len and trimmed[n] == '`') n += 1;
+    return n;
+}
+
+fn isFenceClose(line: []const u8, open_len: usize) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    return trimmed.len >= open_len and fenceMarkerLen(trimmed) == trimmed.len;
+}
+
+fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, max_width: usize) !void {
+    if (max_width == 0 or line.len == 0) {
+        try writer.writeAll(line);
+        return;
+    }
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == 0x1b) {
+            skipAnsiSequence(line, &i);
+            continue;
+        }
+        if ((c < 0x20 and c != '\t') or c == 0x7f) {
+            i += 1;
+            continue;
+        }
+        if (c == ' ' or c == '\t') {
+            try buf.append(allocator, ' ');
+            col += 1;
+            i += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            if (i + len > line.len) break;
+            const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
+            try buf.appendSlice(allocator, line[i .. i + len]);
+            col += zz.measure.charWidth(@intCast(codepoint));
+            i += len;
+        }
+        if (col <= max_width) continue;
+        const split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
+        try writer.writeAll(buf.items[0..split]);
+        try writer.writeByte('\n');
+        const tail_start = if (buf.items[split] == ' ') split + 1 else split;
+        const tail_len = buf.items.len - tail_start;
+        std.mem.copyForwards(u8, buf.items[0..tail_len], buf.items[tail_start..]);
+        buf.shrinkRetainingCapacity(tail_len);
+        col = tui_text.visibleWidth(buf.items);
+    }
+    try writer.writeAll(buf.items);
+}
+
+fn lastCharStart(buf: []const u8) usize {
+    var i = buf.len;
+    while (i > 0) {
+        i -= 1;
+        if ((buf[i] & 0xc0) != 0x80) return i;
+    }
+    return 0;
+}
+
+fn stripControls(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == 0x1b) {
+            skipAnsiSequence(line, &i);
+            continue;
+        }
+        if ((c < 0x20 and c != '\t') or c == 0x7f) {
+            i += 1;
+            continue;
+        }
+        try writer.writeByte(c);
+        i += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+fn skipAnsiSequence(text: []const u8, index: *usize) void {
+    if (index.* >= text.len or text[index.*] != 0x1b) return;
+    index.* += 1;
+    if (index.* >= text.len) return;
+    const second = text[index.*];
+    index.* += 1;
+
+    if (second == '[') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c >= 0x40 and c <= 0x7e) return;
+        }
+        return;
+    }
+    if (second == ']') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
+    if (second >= '(' and second <= '+') {
+        if (index.* < text.len) index.* += 1;
+        return;
+    }
+    if (second == 'P') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
 }
 
 fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
@@ -1051,6 +1186,59 @@ test "transcript wraps assistant text within viewport width" {
     while (lines.next()) |line| {
         try std.testing.expect(tui_text.visibleWidth(line) <= 30);
     }
+}
+
+test "transcript hard-splits overlong assistant words" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "see https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaa/path");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 30, .height = 12 });
+    defer std.testing.allocator.free(text);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 30);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text, "aaaa") != null);
+}
+
+test "transcript preserves whitespace in plain assistant text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "  indented  double");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "  indented  double") != null);
+}
+
+test "transcript matches closing fence to opener length" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "````\nline ``` inside\nmore\n````\nafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 14 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "line ``` inside") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "````") == null);
+}
+
+test "transcript strips escape sequences from plain assistant text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "before\x1b[2Jafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
 }
 
 test "transcript renders math markers literally" {
