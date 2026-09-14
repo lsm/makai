@@ -123,9 +123,10 @@ class PtySession:
         return now
 
     def wait_for(self, marker, timeout, what):
+        search_from = len(self.plain)
         deadline = time.monotonic() + timeout
         while True:
-            if marker in self.plain:
+            if marker in self.plain[search_from:]:
                 return self.last_read_at
             remaining = deadline - time.monotonic()
             if remaining <= 0:

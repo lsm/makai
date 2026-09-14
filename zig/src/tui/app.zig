@@ -71,6 +71,13 @@ fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     return loadRuntimeModelsWithCatalog(allocator, model_catalog.loadProductionModels, true);
 }
 
+fn fixtureModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    const models = try allocator.alloc(ai_types.Model, 1);
+    errdefer allocator.free(models);
+    models[0] = defaultModel();
+    return models;
+}
+
 fn loadRuntimeModelsFresh(allocator: std.mem.Allocator) ![]ai_types.Model {
     return loadRuntimeModelsWithCatalog(allocator, model_catalog.refreshProductionModels, false);
 }
@@ -106,7 +113,11 @@ pub const ProductionRuntime = struct {
     models: []ai_types.Model,
     initial_model: ?SavedModelRef = null,
 
-    pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
+    pub const InitOptions = struct {
+        fixture: bool = false,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, init_options: InitOptions) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
         errdefer registry.deinit();
         try register_builtins.registerBuiltInApiProviders(&registry);
@@ -118,7 +129,10 @@ pub const ProductionRuntime = struct {
             @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
-        const models = try loadRuntimeModels(allocator);
+        const models = if (init_options.fixture)
+            try fixtureModels(allocator)
+        else
+            try loadRuntimeModels(allocator);
         errdefer model_catalog.deinitModels(allocator, models);
 
         var saved_config: ?tui_config.Config = null;
@@ -212,9 +226,13 @@ pub const FixtureRuntime = struct {
     provider: fixture_provider.MockProvider,
 
     pub fn fromEnv(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?*FixtureRuntime {
-        const value = env.get(fixture_env_var) orelse return null;
-        if (value.len == 0) return null;
-        const text = try allocator.dupe(u8, value);
+        return fromValue(allocator, env.get(fixture_env_var));
+    }
+
+    fn fromValue(allocator: std.mem.Allocator, value: ?[]const u8) !?*FixtureRuntime {
+        const supplied = value orelse return null;
+        if (supplied.len == 0) return null;
+        const text = try allocator.dupe(u8, supplied);
         errdefer allocator.free(text);
         const self = try allocator.create(FixtureRuntime);
         errdefer allocator.destroy(self);
@@ -224,7 +242,7 @@ pub const FixtureRuntime = struct {
             .steps = .{.{ .text = text }},
             .provider = undefined,
         };
-        self.provider = fixture_provider.MockProvider.init(.{ .steps = &self.steps });
+        self.provider = fixture_provider.MockProvider.init(.{ .steps = &self.steps, .repeat_last = true });
         return self;
     }
 
@@ -1758,13 +1776,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     var environ_map = try compat.createEnvMap(allocator);
     defer environ_map.deinit();
 
-    var production = try ProductionRuntime.init(allocator);
+    const fixture = try FixtureRuntime.fromEnv(allocator, &environ_map);
+    defer if (fixture) |runtime| runtime.deinit();
+
+    var production = try ProductionRuntime.init(allocator, .{ .fixture = fixture != null });
     defer production.deinit();
     production.initBridge();
 
     var options = production.options();
-    const fixture = try FixtureRuntime.fromEnv(allocator, &environ_map);
-    defer if (fixture) |runtime| runtime.deinit();
     if (fixture) |runtime| options.protocol = runtime.provider.protocolClient();
 
     var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, tuiProgramOptions());
@@ -1783,7 +1802,7 @@ pub fn tuiProgramOptionsForTest() zz.Options {
 }
 
 test "App init seeds registered tools from runtime" {
-    var production = try ProductionRuntime.init(std.testing.allocator);
+    var production = try ProductionRuntime.init(std.testing.allocator, .{});
     defer production.deinit();
     production.initBridge();
     var app = try App.init(std.testing.allocator, production.options());
@@ -1833,11 +1852,8 @@ test "TUI program preserves native text selection" {
 }
 
 test "fixture runtime stays inactive without a non-empty env value" {
-    var env = try compat.createEnvMap(std.testing.allocator);
-    defer env.deinit();
-    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromEnv(std.testing.allocator, &env));
-    try env.put(fixture_env_var, "");
-    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromEnv(std.testing.allocator, &env));
+    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromValue(std.testing.allocator, null));
+    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromValue(std.testing.allocator, ""));
 }
 
 test "fixture runtime streams the env-provided text" {
@@ -2857,7 +2873,7 @@ test "resume selected session clears delete reset flags on success" {
     const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(base);
 
-    var production = try ProductionRuntime.init(std.testing.allocator);
+    var production = try ProductionRuntime.init(std.testing.allocator, .{});
     defer production.deinit();
     production.initBridge();
 
@@ -2990,7 +3006,7 @@ fn drainStreamAndVerify(allocator: std.mem.Allocator, stream: *event_stream.Assi
 
 test "ProductionRuntime initBridge gives stable registry pointer" {
     const allocator = std.testing.allocator;
-    var production = try ProductionRuntime.init(allocator);
+    var production = try ProductionRuntime.init(allocator, .{});
     defer production.deinit();
 
     try registerMockProvider(&production.registry);
@@ -3008,7 +3024,7 @@ test "ProductionRuntime initBridge gives stable registry pointer" {
 
 test "ProductionRuntime multiple sequential streams reuse stable pointer" {
     const allocator = std.testing.allocator;
-    var production = try ProductionRuntime.init(allocator);
+    var production = try ProductionRuntime.init(allocator, .{});
     defer production.deinit();
 
     try registerMockProvider(&production.registry);
@@ -3028,7 +3044,7 @@ test "ProductionRuntime multiple sequential streams reuse stable pointer" {
 
 test "ProductionRuntime outlives stream threads from dropped TuiRuntime" {
     const allocator = std.testing.allocator;
-    var production = try ProductionRuntime.init(allocator);
+    var production = try ProductionRuntime.init(allocator, .{});
     defer production.deinit();
 
     try registerMockProvider(&production.registry);
