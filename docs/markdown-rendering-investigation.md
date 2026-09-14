@@ -25,8 +25,11 @@ must preserve bit-for-bit in its rejection semantics. All citations are merged c
   Model-emitted ANSI never survives into prose; the only ANSI in bubble content is
   theme-introduced.
 - Width model: `zz.measure.charWidth` per codepoint (:578), tabs expanded to 8-column
-  stops atomically across wrap boundaries (:532-559), greedy wrap with last-space breaks
-  and hard splits for overlong words (`flushWrapRow` :487).
+  stops with padding never dropped across wrap boundaries — a stop crossing the width
+  fills the current row, flushes it, and the remaining padding continues on the next
+  row (:532-559, i.e. padding may split across rows; it is never discarded as a word
+  separator) — greedy wrap with last-space breaks and hard splits for overlong words
+  (`flushWrapRow` :487).
 - Bubble/scroll integration: `renderBubble` (:739) computes per-line visible width via
   `visibleWidth` (ANSI-aware, `zig/src/tui/text.zig:6`) and re-asserts the bubble's open
   SGR after every `\x1b[0m` inside content (:742-744). `lineWindow` (:882) slices the
@@ -89,6 +92,18 @@ raw HTML blocks and spans. Two gaps the renderer slice must close deliberately:
   sanitizer over the attribute bytes before emission, or model output like
   `[x](https://e/\x1b]0;pwned\x07)` injects terminal control past the text-event choke
   point. The PoC originally had exactly this hole; it is fixed and tested there.
+- **Structural events are not text payloads.** `MD_TEXT_BR` / `MD_TEXT_SOFTBR` are
+  distinct event types carrying no bytes; they must dispatch straight to layout (row
+  break), not pass through a byte sanitizer. Conversely `MD_TEXT_CODE` payloads *do*
+  contain `\n` between code lines, so the code-path sanitizer must preserve newlines
+  (strip controls per line, not per payload) — a naive port of `stripControls` over
+  the whole payload would merge code lines.
+- **Line-ending semantics differ pre-parse.** `renderAssistantPlain` splits on LF only
+  and drops stray `\r` as a C0 control (:411, :528); CommonMark treats CR as a source
+  line ending *during parsing*, so a lone CR becomes structural breaks no
+  callback-level sanitizer can remove. The renderer must sanitize the raw input before
+  `md_parse` (drop CR bytes, preserving LF/tab semantics), then apply the event-,
+  attribute-, and post-decode sanitization above.
 - **Entities.** Entities arrive as `MD_TEXT_ENTITY` with the raw reference text
   (`&amp;`, `&#27;`, `&NewLine;`). The renderer must decode **first**, then run the
   sanitizer and width accounting over the decoded bytes — decoding after sanitizing
@@ -181,8 +196,8 @@ Verdict: no pure-Zig candidate passes; revisit yearly.
 | CommonMark conformance | none (line patterns) | 0.31, SAX | 0.31, reference | none (license/blocklist) |
 | Output model fit | pre-styled ANSI string (worst) | events → wrap plain runs, style per run (best) | AST → same | varies |
 | Width wrapping | none | caller-owned (PoC proves) | caller-owned | varies |
-| Sanitizer inheritance | absent | clean choke point at text events | at node text walk | varies |
-| Vendoring cost | zero (present) | 2 files, no CMake, 6.9k C lines | ~10k C lines + config/CMake shim | n/a |
+| Sanitizer inheritance | absent | at text events + every emitted span/block attribute | at node text walk + attributes | varies |
+| Vendoring cost | zero (present) | 4 files incl. entity table (parser 6.9k + entity 2.2k C lines), no CMake | ~10k C lines + config/CMake shim | n/a |
 | Windows ARM64 | untested | proven via zig cc; target already in CI smoke | presumed fine, unproven | n/a |
 | License | vendored zigzag | MIT | BSD-2 | PolyForm-NC (zigmark) |
 | Test story | 1 test | upstream spec suite + PoC 8/8 | upstream spec suite | n/a |
@@ -198,11 +213,12 @@ slices per methodology (vendor blob gets its own PR; the renderer is a second):
    renderer slice instead), `build.zig` C source wiring, no behavior change (parser
    unreferenced by prod).
 2. **Renderer slice**: replace the body path in `renderAssistantPlain` for assistant
-   entries with the md4c renderer: sanitizer at every text event (port of
-   `stripControls`) **and over every emitted span/block metadata attribute**, decode
-   entities before sanitizing, `MD_FLAG_NOHTML`, `zz.measure.charWidth` width model,
-   self-contained styled rows, exact-output regression tests in the #254 pattern plus
-   a sampled CommonMark fixture set.
+   entries with the md4c renderer: pre-parse CR removal, sanitizer on text payloads
+   (newline-preserving on the code path) **and over every emitted span/block metadata
+   attribute**, structural break events dispatched to layout, decode entities before
+   sanitizing, `MD_FLAG_NOHTML`, `zz.measure.charWidth` width model, self-contained
+   styled rows, exact-output regression tests in the #254 pattern plus a sampled
+   CommonMark fixture set.
 
 Keep plain rendering as the fallback for non-assistant transcript entries (tool cards,
 errors) — only assistant prose benefits from markdown structure.
