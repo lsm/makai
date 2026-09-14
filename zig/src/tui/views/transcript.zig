@@ -469,6 +469,7 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     var col: usize = 0;
+    var pending_newline = false;
     var i: usize = 0;
     while (i < line.len) {
         const c = line[i];
@@ -481,8 +482,9 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
             continue;
         }
         if (c == ' ' or c == '\t') {
-            try buf.append(allocator, ' ');
-            col += 1;
+            const pad: usize = if (c == '\t') tab_width - (col % tab_width) else 1;
+            try buf.appendNTimes(allocator, ' ', pad);
+            col += pad;
             i += 1;
         } else {
             const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
@@ -498,14 +500,20 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
         }
         if (col <= max_width) continue;
         const split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
+        if (pending_newline) try writer.writeByte('\n');
         try writer.writeAll(buf.items[0..split]);
-        try writer.writeByte('\n');
         const tail_start = if (buf.items[split] == ' ') split + 1 else split;
         const tail_len = buf.items.len - tail_start;
         std.mem.copyForwards(u8, buf.items[0..tail_len], buf.items[tail_start..]);
         buf.shrinkRetainingCapacity(tail_len);
         col = tui_text.visibleWidth(buf.items);
+        if (tail_len > 0) {
+            try writer.writeByte('\n');
+        } else {
+            pending_newline = true;
+        }
     }
+    if (pending_newline and std.mem.trim(u8, buf.items, " ").len > 0) try writer.writeByte('\n');
     try writer.writeAll(buf.items);
 }
 
@@ -1272,6 +1280,23 @@ test "transcript preserves whitespace in plain assistant text" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "  indented  double") != null);
+}
+
+test "transcript expands tabs to column stops in plain assistant text" {
+    const out = try renderAssistantPlain(std.testing.allocator, "a:\tvalue", 40);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a:      value") != null);
+}
+
+test "transcript drops the empty wrap row after trailing hard-break spaces" {
+    const out = try renderAssistantPlain(std.testing.allocator, "exactfill  ", 9);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(out));
+    try std.testing.expect(std.mem.startsWith(u8, out, "exactfill"));
+
+    const wrapped = try renderAssistantPlain(std.testing.allocator, "exactfill abc", 9);
+    defer std.testing.allocator.free(wrapped);
+    try std.testing.expectEqualStrings("exactfill\nabc", wrapped);
 }
 
 test "transcript matches closing fence to opener length" {
