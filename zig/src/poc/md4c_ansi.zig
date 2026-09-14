@@ -52,6 +52,7 @@ const AnsiRenderer = struct {
     pending_sep: bool,
     style_dirty: bool,
     row_styled: bool,
+    code_newlines: usize,
 
     fn init(allocator: std.mem.Allocator, width: usize) AnsiRenderer {
         return .{
@@ -78,6 +79,7 @@ const AnsiRenderer = struct {
             .pending_sep = false,
             .style_dirty = false,
             .row_styled = false,
+            .code_newlines = 0,
         };
     }
 
@@ -216,17 +218,73 @@ const AnsiRenderer = struct {
         }
     }
 
-    fn appendCodeLine(self: *AnsiRenderer, line: []const u8) !void {
+    fn ensureCodeRow(self: *AnsiRenderer) !void {
+        while (self.code_newlines > 0) {
+            try self.row.appendSlice(self.allocator, "\n  \x1b[2m");
+            self.row_w = 2;
+            self.code_newlines -= 1;
+        }
+    }
+
+    fn appendCodeText(self: *AnsiRenderer, raw: []const u8) !void {
         const max_w = self.width -| 2;
-        var budget = max_w -| self.row_w;
         var i: usize = 0;
-        while (i < line.len and budget > 0) {
-            const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-            const take = @min(len, line.len - i);
-            try self.row.appendSlice(self.allocator, line[i .. i + take]);
-            budget -= 1;
-            self.row_w += 1;
-            i += take;
+        while (i < raw.len) {
+            const ch = raw[i];
+            if (ch == '\n') {
+                self.code_newlines += 1;
+                i += 1;
+                continue;
+            }
+            if (ch == 0x1b) {
+                skipAnsi(raw, &i);
+                continue;
+            }
+            if (ch == '\t') {
+                try self.ensureCodeRow();
+                const pad = tab_width - (self.row_w % tab_width);
+                var remaining = pad;
+                while (remaining > 0) {
+                    var budget = max_w -| self.row_w;
+                    if (budget == 0) {
+                        self.code_newlines += 1;
+                        try self.ensureCodeRow();
+                        budget = max_w -| self.row_w;
+                    }
+                    const take = @min(budget, remaining);
+                    for (0..take) |_| try self.row.append(self.allocator, ' ');
+                    self.row_w += take;
+                    remaining -= take;
+                }
+                i += 1;
+                continue;
+            }
+            if (ch < 0x20 or ch == 0x7f) {
+                i += 1;
+                continue;
+            }
+            const len = std.unicode.utf8ByteSequenceLength(ch) catch {
+                i += 1;
+                continue;
+            };
+            if (i + len > raw.len) break;
+            const codepoint = std.unicode.utf8Decode(raw[i .. i + len]) catch {
+                i += 1;
+                continue;
+            };
+            if (codepoint >= 0x80 and codepoint <= 0x9f) {
+                i += len;
+                continue;
+            }
+            if (self.row_w >= max_w) {
+                self.code_newlines += 1;
+            }
+            try self.ensureCodeRow();
+            if (self.row_w < max_w) {
+                try self.row.appendSlice(self.allocator, raw[i .. i + len]);
+                self.row_w += 1;
+            }
+            i += len;
         }
     }
 
@@ -435,6 +493,7 @@ fn leaveBlockCb(blocktype: c.MD_BLOCKTYPE, detail: ?*anyopaque, userdata: ?*anyo
             },
             c.MD_BLOCK_CODE => {
                 self.in_code = false;
+                self.code_newlines = 0;
                 self.flushRow() catch break :blk;
                 self.need_blank = true;
             },
@@ -508,22 +567,11 @@ fn textCb(texttype: c.MD_TEXTTYPE, text: [*c]const c.MD_CHAR, size: c.MD_SIZE, u
                 self.flushRow() catch break :blk;
             },
             c.MD_TEXT_CODE, c.MD_TEXT_HTML, c.MD_TEXT_LATEXMATH => {
-                const clean = sanitize(self.allocator, raw) catch break :blk;
-                defer self.allocator.free(clean);
                 if (self.in_code) {
-                    var lines = std.mem.splitScalar(u8, clean, '\n');
-                    var first = true;
-                    while (lines.next()) |line| {
-                        if (!first) {
-                            self.row.appendSlice(self.allocator, "\n  \x1b[2m") catch break :blk;
-                            self.row_w = 2;
-                        }
-                        first = false;
-                        const expanded = expandTabs(self.allocator, line) catch break :blk;
-                        defer self.allocator.free(expanded);
-                        self.appendCodeLine(expanded) catch break :blk;
-                    }
+                    self.appendCodeText(raw) catch break :blk;
                 } else {
+                    const clean = sanitize(self.allocator, raw) catch break :blk;
+                    defer self.allocator.free(clean);
                     self.appendProse(clean) catch break :blk;
                 }
             },
@@ -603,11 +651,13 @@ test "model output control bytes are stripped" {
     try std.testing.expect(std.mem.indexOf(u8, out, "safe") != null);
 }
 
-test "code block indents dim truncates and expands tabs" {
-    const src = "```zig\nconst x = 1;\n\ttabbed_line_here\n```\n";
+test "code block indents dim truncates expands tabs and keeps lines separate" {
+    const src = "```zig\nconst x = 1;\n\ttabbed_line_here\nconst y = 2;\n```\n";
     const out = try renderMarkdownAnsi(std.testing.allocator, src, 24);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "  \x1b[2mconst x = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "const x = 1;\n  \x1b[2m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "const y = 2;\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\t") == null);
     var longest: usize = 0;
     var lines = std.mem.splitScalar(u8, out, '\n');
