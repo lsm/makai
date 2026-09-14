@@ -594,46 +594,41 @@ pub const App = struct {
         return null;
     }
 
-    fn openModelPicker(self: *App) void {
-        self.state.menu_scroll = 0;
+    fn openPicker(self: *App, kind: tui_state.PickerKind) void {
+        self.state.picker_kind = kind;
         self.state.menu_index = 0;
-        const runtime = self.runtime orelse return self.enterMenu(.model_picker);
-        const current = runtime.currentModel();
-        if (current) |active| {
-            for (runtime.availableModels(), 0..) |model, i| {
-                if (std.mem.eql(u8, model.id, active.id)) {
-                    self.state.menu_index = i;
-                    break;
+        self.state.menu_scroll = 0;
+        switch (kind) {
+            .model => if (self.runtime) |runtime| {
+                if (runtime.currentModel()) |active| {
+                    for (runtime.availableModels(), 0..) |model, i| {
+                        if (std.mem.eql(u8, model.id, active.id)) {
+                            self.state.menu_index = i;
+                            break;
+                        }
+                    }
                 }
-            }
+            },
+            .permission => {
+                if (self.runtime) |runtime| self.state.permission_mode = runtime.permissionMode();
+                for (permission_modes, 0..) |mode, i| {
+                    if (mode == self.state.permission_mode) {
+                        self.state.menu_index = i;
+                        break;
+                    }
+                }
+            },
+            .login => {},
         }
-        self.enterMenu(.model_picker);
-    }
-
-    fn openPermissionPicker(self: *App) void {
-        self.state.menu_scroll = 0;
-        self.state.menu_index = 0;
-        if (self.runtime) |runtime| self.state.permission_mode = runtime.permissionMode();
-        for (permission_modes, 0..) |mode, i| {
-            if (mode == self.state.permission_mode) {
-                self.state.menu_index = i;
-                break;
-            }
-        }
-        self.enterMenu(.permission_picker);
-    }
-
-    fn enterMenu(self: *App, mode: tui_state.AppMode) void {
-        self.state.mode = mode;
+        self.state.mode = .picker;
         self.ensureMenuSelectionVisible();
     }
 
     fn menuItemCount(self: *const App) usize {
-        return switch (self.state.mode) {
-            .model_picker => if (self.runtime) |runtime| runtime.availableModels().len else 0,
-            .login_picker => login_providers.len,
-            .permission_picker => permission_modes.len,
-            else => 0,
+        return switch (self.state.picker_kind) {
+            .model => if (self.runtime) |runtime| runtime.availableModels().len else 0,
+            .login => login_providers.len,
+            .permission => permission_modes.len,
         };
     }
 
@@ -1259,13 +1254,9 @@ pub const App = struct {
                 self.state.session_delete_confirm = false;
                 self.state.mode = .session_picker;
             },
-            .open_model_picker => self.openModelPicker(),
-            .open_login_picker => {
-                self.state.menu_index = 0;
-                self.state.menu_scroll = 0;
-                self.state.mode = .login_picker;
-            },
-            .open_permission_picker => self.openPermissionPicker(),
+            .open_model_picker => self.openPicker(.model),
+            .open_login_picker => self.openPicker(.login),
+            .open_permission_picker => self.openPicker(.permission),
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .none => {},
         }
@@ -1801,7 +1792,7 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
-                if (isMenuMode(app.state.mode)) {
+                if (app.state.mode == .picker) {
                     switch (key.key) {
                         .up => app.moveMenuSelection(-1),
                         .down => app.moveMenuSelection(1),
@@ -1810,14 +1801,10 @@ pub const TuiModel = struct {
                             'j' => app.moveMenuSelection(1),
                             else => {},
                         },
-                        .enter => {
-                            if (app.state.mode == .model_picker) {
-                                app.applySelectedModel() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else if (app.state.mode == .login_picker) {
-                                app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else if (app.state.mode == .permission_picker) {
-                                app.applySelectedPermission() catch |err| app.recordError(@errorName(err)) catch {};
-                            }
+                        .enter => switch (app.state.picker_kind) {
+                            .model => app.applySelectedModel() catch |err| app.recordError(@errorName(err)) catch {},
+                            .login => app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {},
+                            .permission => app.applySelectedPermission() catch |err| app.recordError(@errorName(err)) catch {},
                         },
                         .escape => app.state.mode = .normal,
                         else => {},
@@ -1996,44 +1983,41 @@ pub const TuiModel = struct {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
-            .model_picker => blk: {
-                const models = if (app.runtime) |runtime| runtime.availableModels() else &[_]ai_types.Model{};
-                const items = ctx.allocator.alloc(menu_picker_view.Item, models.len) catch break :blk "";
-                for (models, 0..) |model, i| items[i] = .{ .label = model.id, .detail = model.provider };
+            .picker => blk: {
+                var login_items: [App.login_providers.len]menu_picker_view.Item = undefined;
+                var permission_items: [App.permission_modes.len]menu_picker_view.Item = undefined;
+                var title: []const u8 = "";
+                var empty_message: []const u8 = "  (nothing to select)";
+                const items: []const menu_picker_view.Item = switch (app.state.picker_kind) {
+                    .model => model_items: {
+                        const models = if (app.runtime) |runtime| runtime.availableModels() else &[_]ai_types.Model{};
+                        const list = ctx.allocator.alloc(menu_picker_view.Item, models.len) catch break :blk "";
+                        for (models, 0..) |model, i| list[i] = .{ .label = model.id, .detail = model.provider };
+                        title = "Select model";
+                        empty_message = "  no models available";
+                        break :model_items list;
+                    },
+                    .login => login_items_blk: {
+                        for (App.login_providers, 0..) |provider, i| login_items[i] = .{ .label = provider };
+                        title = "Login provider";
+                        break :login_items_blk &login_items;
+                    },
+                    .permission => permission_items_blk: {
+                        for (App.permission_modes, 0..) |mode, i| {
+                            permission_items[i] = .{ .label = @tagName(mode), .detail = permissionModeDetail(mode) };
+                        }
+                        title = "Tool permissions";
+                        break :permission_items_blk &permission_items;
+                    },
+                };
                 break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Select model",
+                    .title = title,
                     .items = items,
                     .selected = app.state.menu_index,
                     .width = width,
                     .height = sessionPickerHeight(app),
                     .offset = app.state.menu_scroll,
-                    .empty_message = "  no models available",
-                }) catch "";
-            },
-            .login_picker => blk: {
-                var items: [App.login_providers.len]menu_picker_view.Item = undefined;
-                for (App.login_providers, 0..) |provider, i| items[i] = .{ .label = provider };
-                break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Login provider",
-                    .items = &items,
-                    .selected = app.state.menu_index,
-                    .width = width,
-                    .height = sessionPickerHeight(app),
-                    .offset = app.state.menu_scroll,
-                }) catch "";
-            },
-            .permission_picker => blk: {
-                var items: [App.permission_modes.len]menu_picker_view.Item = undefined;
-                for (App.permission_modes, 0..) |mode, i| {
-                    items[i] = .{ .label = @tagName(mode), .detail = permissionModeDetail(mode) };
-                }
-                break :blk menu_picker_view.render(ctx.allocator, .{
-                    .title = "Tool permissions",
-                    .items = &items,
-                    .selected = app.state.menu_index,
-                    .width = width,
-                    .height = sessionPickerHeight(app),
-                    .offset = app.state.menu_scroll,
+                    .empty_message = empty_message,
                 }) catch "";
             },
             .login_input => "",
@@ -2286,13 +2270,6 @@ pub const TuiModel = struct {
             },
             else => {},
         }
-    }
-
-    fn isMenuMode(mode: tui_state.AppMode) bool {
-        return switch (mode) {
-            .model_picker, .login_picker, .permission_picker => true,
-            else => false,
-        };
     }
 
     fn permissionModeDetail(mode: tui_runtime.PermissionMode) []const u8 {
@@ -3300,8 +3277,9 @@ test "setting pickers apply selected values" {
     defer app.deinit();
     app.runtime = runtime_ptr;
 
-    app.openPermissionPicker();
-    try std.testing.expectEqual(tui_state.AppMode.permission_picker, app.state.mode);
+    app.openPicker(.permission);
+    try std.testing.expectEqual(tui_state.AppMode.picker, app.state.mode);
+    try std.testing.expectEqual(tui_state.PickerKind.permission, app.state.picker_kind);
     app.state.menu_index = 1;
     try app.applySelectedPermission();
     try std.testing.expectEqual(tui_runtime.PermissionMode.ask, app.state.permission_mode);

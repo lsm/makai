@@ -295,7 +295,8 @@ test "e2e: /model opens the picker and selecting switches the active model" {
     d.pressEnter();
     _ = d.frame();
 
-    try std.testing.expectEqual(tui_state.AppMode.model_picker, d.app().state.mode);
+    try std.testing.expectEqual(tui_state.AppMode.picker, d.app().state.mode);
+    try std.testing.expectEqual(tui_state.PickerKind.model, d.app().state.picker_kind);
     try std.testing.expect(d.frameContains("Select model"));
     try std.testing.expect(d.frameContains("second-model"));
 
@@ -378,7 +379,8 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     d.pressEnter();
     _ = d.frame();
 
-    try std.testing.expectEqual(tui_state.AppMode.login_picker, d.app().state.mode);
+    try std.testing.expectEqual(tui_state.AppMode.picker, d.app().state.mode);
+    try std.testing.expectEqual(tui_state.PickerKind.login, d.app().state.picker_kind);
     try std.testing.expect(d.frameContains("Login provider"));
     try std.testing.expect(d.frameContains("anthropic"));
 

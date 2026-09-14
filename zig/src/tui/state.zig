@@ -9,10 +9,14 @@ pub const AppMode = enum {
     approval,
     preview,
     session_picker,
-    model_picker,
-    login_picker,
-    permission_picker,
+    picker,
     login_input,
+};
+
+pub const PickerKind = enum {
+    model,
+    login,
+    permission,
 };
 
 pub const FocusPane = enum {
@@ -459,6 +463,7 @@ pub const AppState = struct {
     session_delete_confirm: bool = false,
     menu_index: usize = 0,
     menu_scroll: usize = 0,
+    picker_kind: PickerKind = .model,
     active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
