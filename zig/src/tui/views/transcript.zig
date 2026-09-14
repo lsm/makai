@@ -440,14 +440,14 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
 }
 
 fn fenceMarkerLen(line: []const u8) usize {
-    const trimmed = std.mem.trimStart(u8, line, " \t");
+    const trimmed = std.mem.trimStart(u8, line, " \t\r");
     var n: usize = 0;
     while (n < trimmed.len and trimmed[n] == '`') n += 1;
     return n;
 }
 
 fn isFenceClose(line: []const u8, open_len: usize) bool {
-    const trimmed = std.mem.trim(u8, line, " \t");
+    const trimmed = std.mem.trim(u8, line, " \t\r");
     return trimmed.len >= open_len and fenceMarkerLen(trimmed) == trimmed.len;
 }
 
@@ -1226,6 +1226,19 @@ test "transcript matches closing fence to opener length" {
     try std.testing.expect(std.mem.indexOf(u8, text, "more") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "````") == null);
+}
+
+test "transcript closes code fence on CRLF endings" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```zig\r\nconst x = 1;\r\n```\r\nafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "const x = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
 }
 
 test "transcript strips escape sequences from plain assistant text" {
