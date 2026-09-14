@@ -219,10 +219,10 @@ pub const SessionEntry = struct {
     label: []u8,
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8) !SessionEntry {
-        return .{
-            .id = try allocator.dupe(u8, id),
-            .label = try allocator.dupe(u8, label),
-        };
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
+        const owned_label = try allocator.dupe(u8, label);
+        return .{ .id = owned_id, .label = owned_label };
     }
 
     pub fn deinit(self: *SessionEntry, allocator: std.mem.Allocator) void {
