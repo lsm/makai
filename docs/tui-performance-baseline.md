@@ -79,7 +79,10 @@ and records `metrics.json` in the job summary and run artifacts.
 Timings are host-class dependent. Record baselines against a stable host class
 (`github-ubuntu-latest` for the CI numbers) and re-measure before drawing
 conclusions from a delta; single-run outliers on shared runners are common.
-The binary size and `tui_loc` figures are exact and host-independent.
+`tui_loc` is exact and host-independent. The binary size is exact for a given
+target and build configuration (the table row names the CI's
+`x86_64-linux` ReleaseFast build); comparing sizes across OSes or
+architectures measures the target difference, not a TUI change.
 
 ## Baseline
 

@@ -42,6 +42,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 
 FIXTURE_ENV_VAR = "MAKAI_TUI_FIXTURE"
 WELCOME_MARKER = b"Makai TUI"
@@ -100,6 +101,15 @@ def median(sorted_samples):
     return (sorted_samples[middle - 1] + sorted_samples[middle]) / 2.0
 
 
+def terminal_cell_width(text):
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
 class PtySession:
     def __init__(self, args):
         self.binary = args.binary
@@ -112,7 +122,6 @@ class PtySession:
         self.first_output_ms = None
         self.last_read_at = time.monotonic()
         self.probe_carry = b""
-        self.home = tempfile.mkdtemp(prefix="makai-pty-home-")
         self.master = None
         self.proc = None
         try:
@@ -419,8 +428,10 @@ def main():
         parser.error("--prompt and --fixture-text must not contain each other: the submitted prompt is echoed to the transcript before the assistant reply streams, so overlapping values cannot distinguish the reply render")
     if any(ord(char) < 32 or ord(char) == 127 for char in args.fixture_text):
         parser.error("--fixture-text must be printable single-line text: wrapped or multiline replies render non-contiguously and the marker cannot match them")
-    if len(args.fixture_text) + 8 > args.width:
+    if terminal_cell_width(args.fixture_text) + 8 > args.width:
         parser.error(f"--fixture-text must fit one rendered row at --width {args.width}: row wrapping inserts layout between fragments the marker cannot match")
+    if terminal_cell_width(args.prompt) + 8 > args.width:
+        parser.error(f"--prompt must fit one rendered row at --width {args.width}: a wrapped composer line breaks the echo assertion")
 
     session = None
     metrics = None
