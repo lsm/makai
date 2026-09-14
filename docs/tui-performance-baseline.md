@@ -15,7 +15,12 @@ protocol client for the fixture provider in `zig/src/tui/fixture_provider.zig`:
 every submitted turn streams the env value back as the assistant reply. The
 driver rejects an empty `--fixture-text` for the same reason: an empty value
 disables fixture mode inside the TUI and would let a submit reach real
-providers. The driver also points `HOME` at a throwaway directory so session
+providers. It also rejects fixture text that is not printable single-line
+text or does not fit one rendered row at the selected width — the transcript
+renderer wraps and pads rows, so a marker spanning a wrap boundary could
+never match — and rejects a `--prompt` that overlaps or contains the fixture
+text, since the submitted prompt is echoed to the transcript before the
+reply streams. The driver also points `HOME` at a throwaway directory so session
 storage, config, and credential stores start empty, and drops inherited
 terminal-identification variables (`TERM_PROGRAM`, `TMUX`, `KITTY_WINDOW_ID`,
 `TERM_FEATURES`, …) so the TUI's capability probing matches the declared

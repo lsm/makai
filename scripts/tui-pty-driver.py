@@ -91,6 +91,15 @@ def percentile(sorted_samples, fraction):
     return sorted_samples[index]
 
 
+def median(sorted_samples):
+    if not sorted_samples:
+        return None
+    middle = len(sorted_samples) // 2
+    if len(sorted_samples) % 2 == 1:
+        return sorted_samples[middle]
+    return (sorted_samples[middle - 1] + sorted_samples[middle]) / 2.0
+
+
 class PtySession:
     def __init__(self, args):
         self.binary = args.binary
@@ -274,15 +283,25 @@ def count_tui_loc(repo_root):
 
 def git_revision(repo_root):
     try:
-        result = subprocess.run(
+        head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             capture_output=True,
             text=True,
             timeout=10,
         )
-        if result.returncode == 0:
-            return result.stdout.strip()
+        if head.returncode != 0:
+            return None
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            return head.stdout.strip() + "-dirty"
+        return head.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
     return None
@@ -361,7 +380,7 @@ def run_scenario(args, repo_root):
             "keypress": {
                 "samples": len(sorted_latencies),
                 "samples_ms": [round(v, 3) for v in keypress_ms],
-                "median_ms": round(percentile(sorted_latencies, 0.5), 3) if sorted_latencies else None,
+                "median_ms": round(median(sorted_latencies), 3) if sorted_latencies else None,
                 "p95_ms": round(percentile(sorted_latencies, 0.95), 3) if sorted_latencies else None,
                 "max_ms": round(sorted_latencies[-1], 3) if sorted_latencies else None,
             },
@@ -396,6 +415,12 @@ def main():
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
     if any(ord(char) < 32 or ord(char) == 127 for char in args.prompt):
         parser.error("--prompt must be printable single-line text: control characters would be sent to the TUI as terminal input")
+    if args.fixture_text in args.prompt or args.prompt in args.fixture_text:
+        parser.error("--prompt and --fixture-text must not contain each other: the submitted prompt is echoed to the transcript before the assistant reply streams, so overlapping values cannot distinguish the reply render")
+    if any(ord(char) < 32 or ord(char) == 127 for char in args.fixture_text):
+        parser.error("--fixture-text must be printable single-line text: wrapped or multiline replies render non-contiguously and the marker cannot match them")
+    if len(args.fixture_text) + 8 > args.width:
+        parser.error(f"--fixture-text must fit one rendered row at --width {args.width}: row wrapping inserts layout between fragments the marker cannot match")
 
     session = None
     metrics = None
