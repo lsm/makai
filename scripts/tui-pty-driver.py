@@ -422,12 +422,12 @@ def main():
     args = parser.parse_args()
     if not args.fixture_text:
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
-    if any(ord(char) < 32 or ord(char) == 127 for char in args.prompt):
+    if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in args.prompt):
         parser.error("--prompt must be printable single-line text: control characters would be sent to the TUI as terminal input")
     if args.fixture_text in args.prompt or args.prompt in args.fixture_text:
         parser.error("--prompt and --fixture-text must not contain each other: the submitted prompt is echoed to the transcript before the assistant reply streams, so overlapping values cannot distinguish the reply render")
-    if any(ord(char) < 32 or ord(char) == 127 for char in args.fixture_text):
-        parser.error("--fixture-text must be printable single-line text: wrapped or multiline replies render non-contiguously and the marker cannot match them")
+    if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in args.fixture_text):
+        parser.error("--fixture-text must be printable single-line text: the transcript renderer strips C0/C1 controls and wraps multiline replies, so markers containing them can never match")
     if not args.fixture_text.strip():
         parser.error("--fixture-text must contain non-whitespace text: layout padding makes whitespace-only markers match before any reply renders")
     if args.fixture_text != args.fixture_text.strip():
