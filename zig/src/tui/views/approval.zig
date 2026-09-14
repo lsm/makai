@@ -98,7 +98,7 @@ test "approval renders hashline preview" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.approval.setPending(std.testing.allocator, "call-2", "hashline_edit", "hashline_edit", "{\"path\":\"src/main.zig\"}");
-    try state.preview.set(std.testing.allocator, .diff, "src/main.zig", "hashline edit preview\nrange: 2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n+ 2|new");
+    try state.preview.set(std.testing.allocator, "hashline edit preview\nrange: 2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n+ 2|new");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120 });
     defer std.testing.allocator.free(text);
@@ -111,7 +111,7 @@ test "approval renders hashline preview" {
 test "approval hides stale preview for non hashline request" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.preview.set(std.testing.allocator, .diff, "src/main.zig", "hashline edit preview\n+ 2|stale");
+    try state.preview.set(std.testing.allocator, "hashline edit preview\n+ 2|stale");
     try state.approval.setPending(std.testing.allocator, "call-3", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120 });

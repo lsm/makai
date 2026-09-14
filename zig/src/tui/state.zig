@@ -7,7 +7,6 @@ const compat = @import("compat");
 pub const AppMode = enum {
     normal,
     approval,
-    preview,
     session_picker,
     picker,
     login_input,
@@ -17,12 +16,6 @@ pub const PickerKind = enum {
     model,
     login,
     permission,
-};
-
-pub const FocusPane = enum {
-    composer,
-    transcript,
-    tools,
 };
 
 pub const TranscriptKind = enum {
@@ -46,11 +39,6 @@ pub const ApprovalStatus = enum {
     pending,
     approved,
     rejected,
-};
-
-pub const PreviewKind = enum {
-    diff,
-    file,
 };
 
 pub const TranscriptEntry = struct {
@@ -104,14 +92,12 @@ pub const ToolEntry = struct {
     args_json: []u8,
     output: std.ArrayList(u8) = .empty,
     status: ToolStatus = .pending,
-    expanded: bool = false,
     raw_total_bytes: u64 = 0,
     returned_total_bytes: u64 = 0,
     estimated_returned_tokens: u64 = 0,
     artifact_count: u32 = 0,
     artifact_refs: []u8 = &.{},
     truncated: bool = false,
-    display_preview: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
@@ -130,7 +116,6 @@ pub const ToolEntry = struct {
         allocator.free(self.args_json);
         self.output.deinit(allocator);
         if (self.artifact_refs.len > 0) allocator.free(self.artifact_refs);
-        if (self.display_preview.len > 0) allocator.free(self.display_preview);
         self.* = undefined;
     }
 };
@@ -262,25 +247,17 @@ pub const StatusState = struct {
 };
 
 pub const PreviewState = struct {
-    kind: PreviewKind = .file,
-    title: []u8 = &.{},
     content: []u8 = &.{},
-    scroll: usize = 0,
 
     pub fn deinit(self: *PreviewState, allocator: std.mem.Allocator) void {
-        if (self.title.len > 0) allocator.free(self.title);
         if (self.content.len > 0) allocator.free(self.content);
         self.* = .{};
     }
 
-    pub fn set(self: *PreviewState, allocator: std.mem.Allocator, kind: PreviewKind, title: []const u8, content: []const u8) !void {
+    pub fn set(self: *PreviewState, allocator: std.mem.Allocator, content: []const u8) !void {
+        const owned = try allocator.dupe(u8, content);
         self.deinit(allocator);
-        self.* = .{
-            .kind = kind,
-            .title = try allocator.dupe(u8, title),
-            .content = try allocator.dupe(u8, content),
-            .scroll = 0,
-        };
+        self.* = .{ .content = owned };
     }
 };
 
@@ -456,7 +433,6 @@ pub const AppState = struct {
     login_input_secret: bool = false,
     anim_tick: u64 = 0,
     transcript_scroll: usize = 0,
-    tool_scroll: usize = 0,
     session_index: usize = 0,
     session_scroll: usize = 0,
     session_filter: ComposerState = .{},
@@ -467,11 +443,6 @@ pub const AppState = struct {
     active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
-    focus_pane: FocusPane = .composer,
-    selected_message_index: ?usize = null,
-    selected_tool_index: ?usize = null,
-    follow_selection: bool = false,
-    manual_transcript_paging: bool = false,
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
     backpressure_active: bool = false,
@@ -501,7 +472,6 @@ pub const AppState = struct {
 
     pub fn appendTranscript(self: *AppState, kind: TranscriptKind, text: []const u8) !void {
         try self.transcript.append(self.allocator, try TranscriptEntry.init(self.allocator, kind, text));
-        self.requestSelectionFollowAfterTranscriptMutation();
     }
 
     pub fn setRegisteredTools(self: *AppState, tools: []const agent.AgentTool) !void {
@@ -522,9 +492,6 @@ pub const AppState = struct {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
-        self.selected_message_index = null;
-        self.follow_selection = false;
-        self.manual_transcript_paging = false;
         self.clearActiveTranscriptEntries();
     }
 
@@ -542,8 +509,6 @@ pub const AppState = struct {
     pub fn clearTools(self: *AppState) void {
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.clearRetainingCapacity();
-        self.tool_scroll = 0;
-        self.selected_tool_index = null;
     }
 
     pub fn resetReplayState(self: *AppState) void {
@@ -629,153 +594,6 @@ pub const AppState = struct {
 
     pub fn toggleThinking(self: *AppState) void {
         self.show_thinking = !self.show_thinking;
-    }
-
-    pub fn focusComposer(self: *AppState) void {
-        self.focus_pane = .composer;
-    }
-
-    pub fn focusNextPane(self: *AppState) void {
-        self.focus_pane = switch (self.focus_pane) {
-            .composer => .transcript,
-            .transcript => .tools,
-            .tools => .composer,
-        };
-        self.ensurePaneSelectionSet();
-    }
-
-    pub fn focusPrevPane(self: *AppState) void {
-        self.focus_pane = switch (self.focus_pane) {
-            .composer => .tools,
-            .tools => .transcript,
-            .transcript => .composer,
-        };
-        self.ensurePaneSelectionSet();
-    }
-
-    fn ensurePaneSelectionSet(self: *AppState) void {
-        switch (self.focus_pane) {
-            .transcript => {
-                self.manual_transcript_paging = false;
-                const current = self.selected_message_index;
-                if (current == null or current.? >= self.transcript.items.len or self.visibleTranscriptIndex(current.?) == null) {
-                    self.selected_message_index = self.nearestSelectableTranscriptIndex(current orelse self.transcript.items.len -| 1);
-                }
-                if (self.selected_message_index != null) self.follow_selection = true;
-            },
-            .tools => {
-                if (self.selected_tool_index == null) {
-                    if (self.tools.items.len > 0) {
-                        self.selected_tool_index = self.tools.items.len - 1;
-                    }
-                }
-            },
-            .composer => {},
-        }
-    }
-
-    pub fn moveSelection(self: *AppState, delta: isize) void {
-        switch (self.focus_pane) {
-            .composer => {},
-            .transcript => {
-                self.manual_transcript_paging = false;
-                const count = self.visibleTranscriptCount();
-                if (count == 0) {
-                    self.selected_message_index = null;
-                    return;
-                }
-                if (self.selected_message_index == null) {
-                    const visible_index = if (delta < 0) count - 1 else 0;
-                    self.selected_message_index = self.transcriptIndexForVisible(visible_index);
-                    self.follow_selection = true;
-                    return;
-                }
-                const current_visible = self.visibleTranscriptIndex(self.selected_message_index.?) orelse if (delta < 0) count - 1 else 0;
-                const abs = @as(usize, @intCast(if (delta < 0) -delta else delta));
-                const new_visible = if (delta < 0)
-                    current_visible -| abs
-                else
-                    @min(count - 1, current_visible + abs);
-                self.selected_message_index = self.transcriptIndexForVisible(new_visible);
-                self.follow_selection = true;
-            },
-            .tools => {
-                const count = self.tools.items.len;
-                if (count == 0) {
-                    self.selected_tool_index = null;
-                    return;
-                }
-                if (self.selected_tool_index == null) {
-                    self.selected_tool_index = if (delta < 0) count - 1 else 0;
-                    return;
-                }
-                const current = self.selected_tool_index.?;
-                const abs = @as(usize, @intCast(if (delta < 0) -delta else delta));
-                if (delta < 0) {
-                    self.selected_tool_index = current -| abs;
-                } else {
-                    self.selected_tool_index = @min(count - 1, current + abs);
-                }
-            },
-        }
-    }
-
-    fn requestSelectionFollowAfterTranscriptMutation(self: *AppState) void {
-        if (self.focus_pane != .transcript) return;
-        if (self.manual_transcript_paging) return;
-        const selected = self.selected_message_index orelse return;
-        if (selected >= self.transcript.items.len) return;
-        if (self.visibleTranscriptIndex(selected) == null) return;
-        self.follow_selection = true;
-    }
-
-    fn nearestSelectableTranscriptIndex(self: *const AppState, preferred_index: usize) ?usize {
-        if (self.transcript.items.len == 0) return null;
-        var i = @min(preferred_index, self.transcript.items.len - 1);
-        while (i < self.transcript.items.len) : (i += 1) {
-            if (self.isSelectableTranscriptEntry(&self.transcript.items[i])) return i;
-        }
-        i = @min(preferred_index, self.transcript.items.len - 1);
-        while (i > 0) {
-            i -= 1;
-            if (self.isSelectableTranscriptEntry(&self.transcript.items[i])) return i;
-        }
-        return null;
-    }
-
-    fn isSelectableTranscriptEntry(self: *const AppState, entry: *const TranscriptEntry) bool {
-        if (entry.kind == .thinking and !self.show_thinking) return false;
-        return !isLowValueSystem(entry) and (entry.kind != .tool or (self.tools.items.len == 0 and !isRawToolArgs(entry.text.items)));
-    }
-
-    fn visibleTranscriptCount(self: *const AppState) usize {
-        var count: usize = 0;
-        for (self.transcript.items) |entry| {
-            if (self.isSelectableTranscriptEntry(&entry)) count += 1;
-        }
-        return count;
-    }
-
-    fn visibleTranscriptIndex(self: *const AppState, transcript_index: usize) ?usize {
-        var visible: usize = 0;
-        for (self.transcript.items, 0..) |entry, i| {
-            if (self.isSelectableTranscriptEntry(&entry)) {
-                if (i == transcript_index) return visible;
-                visible += 1;
-            }
-        }
-        return null;
-    }
-
-    fn transcriptIndexForVisible(self: *const AppState, visible_index: usize) usize {
-        var visible: usize = 0;
-        for (self.transcript.items, 0..) |entry, i| {
-            if (self.isSelectableTranscriptEntry(&entry)) {
-                if (visible == visible_index) return i;
-                visible += 1;
-            }
-        }
-        return self.transcript.items.len -| 1;
     }
 
     pub fn cycleThinkingLevel(self: *AppState) ai_types.ThinkingLevel {
@@ -940,23 +758,8 @@ pub const AppState = struct {
         self.approval.status = if (approved) .approved else .rejected;
         self.approval.always = always;
         self.mode = .normal;
-        self.focus_pane = .composer;
     }
 
-    pub fn toggleToolExpanded(self: *AppState, index: usize) void {
-        if (index >= self.tools.items.len) return;
-        self.tools.items[index].expanded = !self.tools.items[index].expanded;
-    }
-
-    pub fn toggleLatestToolExpanded(self: *AppState) void {
-        if (self.tools.items.len == 0) return;
-        self.toggleToolExpanded(self.tools.items.len - 1);
-    }
-
-    pub fn setPreview(self: *AppState, kind: PreviewKind, title: []const u8, content: []const u8) !void {
-        try self.preview.set(self.allocator, kind, title, content);
-        self.mode = .preview;
-    }
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
         try self.addSessionWithDetails(id, label, "", "");
@@ -1022,7 +825,6 @@ pub const AppState = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return;
         const obj = parsed.value.object;
-        const path = jsonString(obj, "path") orelse "(unknown)";
         const operation = jsonString(obj, "operation") orelse "hashline_edit";
         const start_line = jsonUsize(obj, "start_line") orelse 0;
         const end_line = jsonUsize(obj, "end_line") orelse start_line;
@@ -1054,7 +856,7 @@ pub const AppState = struct {
                 }
             }
         }
-        try self.preview.set(self.allocator, .diff, path, out.items);
+        try self.preview.set(self.allocator, out.items);
     }
 
     fn ensureTrailingEntry(self: *AppState, kind: TranscriptKind) !usize {
@@ -1076,7 +878,6 @@ pub const AppState = struct {
             else => try self.ensureTrailingEntry(kind),
         };
         try self.transcript.items[index].text.appendSlice(self.allocator, delta);
-        self.requestSelectionFollowAfterTranscriptMutation();
     }
 
     fn activeOrTrailingEntry(self: *AppState, kind: TranscriptKind, active_entry: *?usize) !usize {
@@ -1148,14 +949,6 @@ pub const AppState = struct {
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
-        self.adjustSelectedMessageIndexAfterRemove(index);
-        self.requestSelectionFollowAfterTranscriptMutation();
-    }
-
-    fn adjustSelectedMessageIndexAfterRemove(self: *AppState, removed_index: usize) void {
-        if (self.selected_message_index) |index| {
-            self.selected_message_index = if (index == removed_index) null else if (index > removed_index) index - 1 else index;
-        }
     }
 
     fn adjustActiveTranscriptEntryAfterRemove(self: *AppState, active_entry: *?usize, removed_index: usize) void {
@@ -1170,7 +963,6 @@ pub const AppState = struct {
         if (std.mem.eql(u8, entry.text.items, text)) return;
         entry.text.clearRetainingCapacity();
         try entry.text.appendSlice(self.allocator, text);
-        self.requestSelectionFollowAfterTranscriptMutation();
     }
 
     fn applyContextUsage(self: *AppState, payload: anytype) void {
@@ -1209,7 +1001,7 @@ pub const AppState = struct {
             defer out.deinit();
             const writer = &out.writer;
             try writer.print("{s} [preview {d}->{d} bytes", .{ tool.label, raw_total_bytes, returned_total_bytes });
-            if (artifact_refs.len > 0) try writer.writeAll("; artifact available in TUI viewer");
+            if (artifact_refs.len > 0) try writer.writeAll("; artifact on disk");
             try writer.writeAll("]");
             const indicator = try out.toOwnedSlice();
             defer self.allocator.free(indicator);
@@ -1246,11 +1038,6 @@ pub const AppState = struct {
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
-
-fn isRawToolArgs(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    return std.mem.startsWith(u8, trimmed, "{") or std.mem.startsWith(u8, trimmed, "[");
-}
 
 pub fn isLowValueSystem(entry: *const TranscriptEntry) bool {
     return entry.kind == .system and std.mem.eql(u8, entry.text.items, "agent started");
@@ -2163,235 +1950,11 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
     var found_marker = false;
     for (state.transcript.items) |entry| {
-        if (std.mem.indexOf(u8, entry.text.items, "artifact available") != null) found_marker = true;
+        if (std.mem.indexOf(u8, entry.text.items, "artifact on disk") != null) found_marker = true;
     }
     try std.testing.expect(found_marker);
 }
 
-test "AppState focus cycles through panes" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try std.testing.expectEqual(FocusPane.composer, state.focus_pane);
-    state.focusNextPane();
-    try std.testing.expectEqual(FocusPane.transcript, state.focus_pane);
-    state.focusNextPane();
-    try std.testing.expectEqual(FocusPane.tools, state.focus_pane);
-    state.focusNextPane();
-    try std.testing.expectEqual(FocusPane.composer, state.focus_pane);
-    state.focusPrevPane();
-    try std.testing.expectEqual(FocusPane.tools, state.focus_pane);
-    state.focusPrevPane();
-    try std.testing.expectEqual(FocusPane.transcript, state.focus_pane);
-    state.focusComposer();
-    try std.testing.expectEqual(FocusPane.composer, state.focus_pane);
-}
-
-test "AppState focus pane initializes selection" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "one");
-    try state.appendTranscript(.assistant, "two");
-
-    state.focusNextPane();
-    try std.testing.expectEqual(FocusPane.transcript, state.focus_pane);
-    try std.testing.expectEqual(@as(?usize, 1), state.selected_message_index);
-
-    state.focusNextPane();
-    try std.testing.expectEqual(FocusPane.tools, state.focus_pane);
-    try std.testing.expectEqual(@as(?usize, null), state.selected_tool_index);
-
-    try state.tools.append(std.testing.allocator, try ToolEntry.init(std.testing.allocator, "a", "tool", "tool", "{}", .done));
-    state.focusPrevPane();
-    try std.testing.expectEqual(FocusPane.transcript, state.focus_pane);
-    state.focusNextPane();
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_tool_index);
-}
-
-test "AppState transcript selection moves and clamps" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "a");
-    try state.appendTranscript(.assistant, "b");
-    try state.appendTranscript(.system, "c");
-
-    state.focus_pane = .transcript;
-    state.selected_message_index = 2;
-
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 1), state.selected_message_index);
-    state.moveSelection(1);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
-    state.moveSelection(100);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
-    state.moveSelection(-100);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
-}
-
-test "AppState tool selection moves and clamps" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.tools.append(std.testing.allocator, try ToolEntry.init(std.testing.allocator, "call-1", "shell", "shell", "{}", .done));
-    try state.tools.append(std.testing.allocator, try ToolEntry.init(std.testing.allocator, "call-2", "edit", "edit", "{}", .running));
-
-    state.focus_pane = .tools;
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 1), state.selected_tool_index);
-    state.moveSelection(1);
-    try std.testing.expectEqual(@as(?usize, 1), state.selected_tool_index);
-    state.moveSelection(-10);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_tool_index);
-    state.moveSelection(10);
-    try std.testing.expectEqual(@as(?usize, 1), state.selected_tool_index);
-}
-
-test "AppState selection ignores composer pane" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "x");
-    state.focus_pane = .composer;
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, null), state.selected_message_index);
-    try std.testing.expectEqual(@as(?usize, null), state.selected_tool_index);
-}
-
-test "AppState selection skips low-value system entries in balanced mode" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "q");
-    try state.appendTranscript(.system, "agent started");
-    try state.appendTranscript(.assistant, "a");
-
-    state.focus_pane = .transcript;
-    state.selected_message_index = 2;
-
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
-    state.moveSelection(1);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
-}
-
-test "AppState selection skips collapsed tool entries in balanced mode" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "q");
-    try state.appendTranscript(.tool, "◈ Shell Command ok \"ls\"");
-    try state.appendTranscript(.tool, "{\"cmd\":\"ls\"}");
-    try state.appendTranscript(.assistant, "a");
-    try state.tools.append(std.testing.allocator, try ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{}", .done));
-
-    state.focus_pane = .transcript;
-    state.selected_message_index = 3;
-
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
-    state.moveSelection(1);
-    try std.testing.expectEqual(@as(?usize, 3), state.selected_message_index);
-}
-
-test "AppState selection skips hidden thinking and low-value system entries" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "q");
-    try state.appendTranscript(.thinking, "hidden");
-    try state.appendTranscript(.system, "agent started");
-    try state.appendTranscript(.assistant, "a");
-    state.show_thinking = false;
-
-    state.focus_pane = .transcript;
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 3), state.selected_message_index);
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
-}
-
-test "AppState refocus revalidates hidden transcript selection" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "q");
-    try state.appendTranscript(.thinking, "hidden");
-    try state.appendTranscript(.assistant, "a");
-    state.selected_message_index = 1;
-    state.focus_pane = .composer;
-    state.show_thinking = false;
-
-    state.focusNextPane();
-
-    try std.testing.expectEqual(FocusPane.transcript, state.focus_pane);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
-    try std.testing.expect(state.follow_selection);
-}
-
-test "AppState transcript mutation follows selection unless manually paged" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "selected");
-    state.focus_pane = .transcript;
-    state.selected_message_index = 0;
-    state.follow_selection = false;
-
-    try state.appendTranscript(.assistant, "new row");
-    try std.testing.expect(state.follow_selection);
-
-    state.follow_selection = false;
-    state.manual_transcript_paging = true;
-    try state.appendTranscript(.assistant, "manual row");
-    try std.testing.expect(!state.follow_selection);
-}
-
-test "AppState selection clamps around hidden thinking entries" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.user, "q");
-    try state.appendTranscript(.thinking, "hidden");
-    try state.appendTranscript(.assistant, "a");
-    state.show_thinking = false;
-
-    state.focus_pane = .transcript;
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected_message_index);
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected_message_index);
-}
-
-test "AppState clearTranscript resets selection" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "x");
-    state.focus_pane = .transcript;
-    state.selected_message_index = 0;
-    state.clearTranscript();
-    try std.testing.expectEqual(@as(?usize, null), state.selected_message_index);
-    try std.testing.expectEqual(@as(usize, 0), state.transcript_scroll);
-}
-
-test "AppState clearTools resets selection" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.tools.append(std.testing.allocator, try ToolEntry.init(std.testing.allocator, "a", "t", "t", "{}", .done));
-    state.focus_pane = .tools;
-    state.selected_tool_index = 0;
-    state.clearTools();
-    try std.testing.expectEqual(@as(?usize, null), state.selected_tool_index);
-    try std.testing.expectEqual(@as(usize, 0), state.tool_scroll);
-}
-
-test "AppState removes stale transcript selection when empty entry removed" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.assistant, "first");
-    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
-    state.selected_message_index = 1;
-
-    var end_event = tui_runtime.TuiEvent{ .message_end = .{
-        .role = .assistant,
-        .text = try ownedText(""),
-    } };
-    defer end_event.deinit(std.testing.allocator);
-    try state.applyEvent(end_event);
-
-    try std.testing.expectEqual(@as(?usize, null), state.selected_message_index);
-}
 
 test "AppState appends visible transcript row for tool execution errors" {
     var state = AppState.init(std.testing.allocator);

@@ -29,7 +29,6 @@ const borrowed_empty_theme: []u8 = &.{};
 
 pub const UiSettings = struct {
     theme: []u8 = borrowed_empty_theme,
-    show_tool_panel: bool = true,
 
     pub fn deinit(self: *UiSettings, allocator: std.mem.Allocator) void {
         if (self.theme.ptr != borrowed_empty_theme.ptr) allocator.free(self.theme);
@@ -183,7 +182,6 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
                 if (cfg.ui.theme.len > 0) allocator.free(cfg.ui.theme);
                 cfg.ui.theme = try allocator.dupe(u8, theme);
             }
-            cfg.ui.show_tool_panel = boolField(ui_obj, "show_tool_panel", cfg.ui.show_tool_panel);
         },
         else => {},
     };
@@ -216,7 +214,6 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.writeKey("ui");
     try w.beginObject();
     try w.writeStringField("theme", cfg.ui.theme);
-    try w.writeBoolField("show_tool_panel", cfg.ui.show_tool_panel);
     try w.endObject();
     try w.endObject();
     try buf.append(allocator, '\n');
