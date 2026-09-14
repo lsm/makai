@@ -432,7 +432,7 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
 }
 
 fn isFenceLine(line: []const u8) bool {
-    return std.mem.startsWith(u8, std.mem.trimLeft(u8, line, " \t"), "```");
+    return std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "```");
 }
 
 fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
