@@ -577,8 +577,9 @@ fn expandTabs(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
         }
         const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         const take = @min(len, line.len - i);
+        const codepoint = std.unicode.utf8Decode(line[i .. i + take]) catch c;
         try writer.writeAll(line[i .. i + take]);
-        col += 1;
+        col += zz.measure.charWidth(@intCast(codepoint));
         i += take;
     }
     return out.toOwnedSlice();
@@ -1356,6 +1357,13 @@ test "expandTabs pads to the next eight-column stop" {
     const out = try expandTabs(std.testing.allocator, "a:\tvalue\tend");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("a:      value   end", out);
+}
+
+test "expandTabs measures wide codepoints by display width" {
+    const out = try expandTabs(std.testing.allocator, "中文\tx");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("中文    x", out);
+    try std.testing.expectEqual(@as(usize, 8), tui_text.visibleWidth(out[0 .. out.len - 1]));
 }
 
 test "stripControls drops C1 control codepoints" {
