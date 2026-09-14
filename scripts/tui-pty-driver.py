@@ -103,32 +103,45 @@ class PtySession:
         self.first_output_ms = None
         self.last_read_at = time.monotonic()
         self.probe_carry = b""
-        self.master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
-        env = dict(os.environ)
-        for name in TERMINAL_IDENTIFICATION_VARS:
-            env.pop(name, None)
-        env["HOME"] = self.home
-        env["TERM"] = "xterm-256color"
-        env[FIXTURE_ENV_VAR] = self.fixture_text
-        self.spawned_at = time.monotonic()
-        self.proc = subprocess.Popen(
-            [self.binary, "--tui"],
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            start_new_session=True,
-            env=env,
-        )
-        os.close(slave)
+        self.home = tempfile.mkdtemp(prefix="makai-pty-home-")
+        self.master = None
+        self.proc = None
+        try:
+            self.master, slave = pty.openpty()
+            try:
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
+                env = dict(os.environ)
+                for name in TERMINAL_IDENTIFICATION_VARS:
+                    env.pop(name, None)
+                env["HOME"] = self.home
+                env["TERM"] = "xterm-256color"
+                env[FIXTURE_ENV_VAR] = self.fixture_text
+                self.spawned_at = time.monotonic()
+                self.proc = subprocess.Popen(
+                    [self.binary, "--tui"],
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    start_new_session=True,
+                    env=env,
+                )
+            finally:
+                os.close(slave)
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
-        try:
-            os.close(self.master)
-        except OSError:
-            pass
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait()
+        if self.master is not None:
+            try:
+                os.close(self.master)
+            except OSError:
+                pass
+            self.master = None
         shutil.rmtree(self.home, ignore_errors=True)
 
     def _read_once(self, timeout):
@@ -279,7 +292,10 @@ def run_scenario(args, repo_root):
     if not os.path.isfile(args.binary):
         raise ScenarioError(f"binary not found: {args.binary} (build with: zig build install -Doptimize=ReleaseFast)")
 
-    session = PtySession(args)
+    try:
+        session = PtySession(args)
+    except OSError as err:
+        raise ScenarioError(f"failed to start {args.binary} in a pseudo-terminal: {err}")
     error = None
     try:
         session.wait_for(WELCOME_MARKER, args.startup_timeout, "first frame (welcome banner)")
