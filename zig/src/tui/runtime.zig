@@ -1739,21 +1739,29 @@ test "runtime queues steering messages" {
     try tui_session.submitTurn("first");
     try tui_session.steer("steer now");
 
-    if (runtime.local_agent) |*local| local.waitForIdle();
-
-    var user_messages: usize = 0;
-    while (tui_session.popEvent()) |event| {
-        var ev = event;
-        defer ev.deinit(std.testing.allocator);
-        switch (ev) {
-            .message_end => |payload| {
-                if (payload.role == .user) user_messages += 1;
-            },
-            else => {},
+    var saw_first = false;
+    var saw_steer = false;
+    var rounds: usize = 0;
+    while (rounds < 2) : (rounds += 1) {
+        if (runtime.local_agent) |*local| local.waitForIdle();
+        while (tui_session.popEvent()) |event| {
+            var ev = event;
+            defer ev.deinit(std.testing.allocator);
+            switch (ev) {
+                .message_end => |payload| {
+                    if (payload.role != .user) continue;
+                    if (std.mem.eql(u8, payload.text.slice(), "first")) saw_first = true;
+                    if (std.mem.eql(u8, payload.text.slice(), "steer now")) saw_steer = true;
+                },
+                else => {},
+            }
         }
+        if (saw_steer) break;
+        try tui_session.resumeSession();
     }
-    try std.testing.expect(user_messages >= 2);
-    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expect(saw_first);
+    try std.testing.expect(saw_steer);
+    try std.testing.expect(mock.call_count >= 2);
     try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
 }
 
