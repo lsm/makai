@@ -1,7 +1,7 @@
 # Markdown rendering investigation for the Zig TUI (#256)
 
 Date: 2026-09-14. Investigation only — no production changes. Decision owner: Marc.
-Baseline: `main` @ `0d2091d` (post #254 plain render). PoC branch: `poc/256-md4c-zig` @ `e86142e` (not for merge).
+Baseline: `main` @ `0d2091d` (post #254 plain render). PoC branch: `poc/256-md4c-zig` @ `47ef7a3` (not for merge).
 
 ## The contract any renderer must inherit (#254)
 
@@ -13,11 +13,17 @@ must preserve bit-for-bit in its rejection semantics. All citations are merged c
   `wrapPlainLine` :427; fence lines go through `stripControls` :430 → `expandTabs` :432 →
   `truncateLineToWidth` :434 → 2-space dim indent :437-440.
 - Sanitizer rejection set (`wrapPlainLine` :511-591 and `stripControls` :602-639):
-  ESC/CSI/OSC/DCS/APC sequences skipped via `skipAnsiSequence` :669-712 (prose :524,
-  fence :609); C0 controls except tab and DEL dropped (:528, :618); malformed UTF-8
-  lead/continuation bytes skipped (:567-572, :622-630); C1 controls U+0080–U+009F
-  rejected (:573-576, :631-634). Model-emitted ANSI never survives into prose — the
-  wrapper strips it; the only ANSI in bubble content is theme-introduced.
+  `skipAnsiSequence` :669-712 consumes CSI (`[`), OSC (`]`), DCS (`P`), and charset
+  selector (`(`–`+`) sequences whole (prose :524, fence :609); C0 controls except tab
+  and DEL dropped (:528, :618); malformed UTF-8 lead/continuation bytes skipped
+  (:567-572, :622-630); C1 controls U+0080–U+009F rejected (:573-576, :631-634). The
+  invariant that actually holds: **no ESC byte ever survives** — for introducers with
+  no branch (APC `ESC _`, PM `ESC ^`, SOS `ESC X`) the ESC and its successor byte are
+  still consumed, destroying the sequence, but the payload up to ST then flows through
+  the ordinary C0/C1/UTF-8 filters and renders as inert text. A renderer port should
+  close that cosmetic gap by consuming APC/PM/SOS payloads to ST, as the PoC does.
+  Model-emitted ANSI never survives into prose; the only ANSI in bubble content is
+  theme-introduced.
 - Width model: `zz.measure.charWidth` per codepoint (:578), tabs expanded to 8-column
   stops atomically across wrap boundaries (:532-559), greedy wrap with last-space breaks
   and hard splits for overlong words (`flushWrapRow` :487).
@@ -45,7 +51,7 @@ new vendoring cost — and that is its only passing criterion.
   indented code blocks, no setext headings, no reference links, no escapes, no nested
   emphasis rules. This is the "hand-rolled" category issue #256 rules out.
 - **No wrapping.** Paragraph text is never wrapped; `width` is used only for the code
-  box (:333-335) and HR length (:190). Long prose overflows the bubble.
+  box (:333-335) and HR lengths (:190, :198). Long prose overflows the bubble.
 - **No sanitization.** `renderInline` copies unmatched bytes verbatim (:326); heading,
   quote, and code content are rendered as-is. Model-emitted ESC bytes pass straight
   into the terminal. Integrating it would require wrapping it with the #254 sanitizer —
@@ -71,25 +77,43 @@ Vendoring cost is the lowest of the C options: the parser is two files
 (`md4c.c` 6,462 lines + `md4c.h` 407 lines, stdlib-only, no CMake, no config headers —
 "add md4c.[hc] directly to your code base" per upstream). The HTML renderer and entity
 tables (`md4c-html.[ch]`, `entity.[ch]`) are not needed for an ANSI renderer.
-`MD_FLAG_NOHTML` disables raw HTML blocks and spans. One gap: entities arrive as
-`MD_TEXT_ENTITY` with the raw entity text; an ANSI renderer needs a small decode table
-(upstream `entity.c/h` is MIT and adaptable, or a compact Zig table for the common set).
+`MD_FLAG_NOHTML` disables raw HTML blocks and spans. Two gaps the renderer slice must
+close deliberately:
 
-### PoC results (branch `poc/256-md4c-zig` @ `e86142e`)
+- **Span metadata bypasses text events.** Link destinations, titles, and image sources
+  arrive as `MD_ATTRIBUTE` fields on span-detail structs (`MD_SPAN_A_DETAIL.href`,
+  `MD_SPAN_IMG_DETAIL.src`, wikilink targets) — never through `MD_TEXT` callbacks. A
+  renderer that prints any of them (e.g. a dim URL after a link) must run the same
+  sanitizer over the attribute bytes before emission, or model output like
+  `[x](https://e/\x1b]0;pwned\x07)` injects terminal control past the text-event choke
+  point. The PoC originally had exactly this hole; it is fixed and tested there.
+- **Entities.** Entities arrive as `MD_TEXT_ENTITY` with the raw reference text
+  (`&amp;`, `&#27;`, `&NewLine;`). The renderer must decode **first**, then run the
+  sanitizer and width accounting over the decoded bytes — decoding after sanitizing
+  re-introduces ESC/newline/tab bytes (`&#27;`, `&NewLine;`, `&Tab;`) that the
+  sanitizer already passed. Decoding needs the complete CommonMark named-entity set
+  plus numeric references for full conformance (upstream `entity.c/h` is MIT and
+  adaptable); a common-subset table would be reduced entity compatibility and must be
+  documented as such if chosen. The PoC passes raw entity text through undecoded —
+  safe, but not yet conformant rendering.
 
-`zig/src/poc/md4c_ansi.zig` (632 lines incl. tests) drives `md_parse` from Zig via
+### PoC results (branch `poc/256-md4c-zig` @ `47ef7a3`)
+
+`zig/src/poc/md4c_ansi.zig` (657 lines incl. tests) drives `md_parse` from Zig via
 `@cImport` — a SAX→ANSI renderer with:
 
 - sanitizer ported from `stripControls` semantics applied at every text event
-  (ESC/CSI skip, C0+DEL drop, C1 rejection, malformed-UTF-8 skip);
+  (ESC/CSI skip, C0+DEL drop, C1 rejection, malformed-UTF-8 skip), plus the two
+  hardening deltas above: sanitized link destinations and APC/PM/SOS payloads
+  consumed to ST;
 - width-aware greedy wrap with span re-assertion across row breaks and
   reset-before-separator ordering (rows are self-contained: style at row start, reset
   at row end — directly compatible with `renderBubble`'s re-assert and `lineWindow`'s
   line counting);
-- styled headings/emphasis/code spans/links (text styled + dim URL), fenced and
-  indented code blocks (2-space dim indent, tab expansion, width truncation), nested
-  UL/OL markers with `start` offsets, quote bars, thematic breaks;
-- 6/6 inline tests pass on x86_64-linux with Zig 0.16.0 (`zig test` with `md4c.c` +
+- styled headings/emphasis/code spans/links (text styled + dim sanitized URL), fenced
+  and indented code blocks (2-space dim indent, tab expansion, width truncation),
+  nested UL/OL markers with `start` offsets, quote bars, thematic breaks;
+- 8/8 inline tests pass on x86_64-linux with Zig 0.16.0 (`zig test` with `md4c.c` +
   `-Ivendor`, no build.zig changes needed to compile it standalone).
 
 Build-cost evidence:
@@ -99,13 +123,14 @@ Build-cost evidence:
 | x86_64-linux | OK | host `zig test` |
 | aarch64-linux | OK | OK |
 | x86_64-windows | OK | OK |
-| aarch64-windows | OK (**not in CI matrix**) | OK |
+| aarch64-windows | OK | OK |
 | aarch64-macos | OK | OK |
 | x86_64-macos | OK | — |
 
-CI's cross-compile matrix covers `aarch64-macos`, `x86_64-macos`, `aarch64-linux`,
-`x86_64-windows` (`.github/workflows/ci.yml:163-175`) — `aarch64-windows` is untested
-in CI today regardless of this decision; md4c compiles there trivially via `zig cc`.
+CI's cross-compile smoke matrix (`cross-compile-smoke`, `.github/workflows/ci.yml:164-179`)
+already builds all five of these release targets on every PR — `aarch64-windows`
+included, on `windows-latest` — so md4c's portability claims are exercised by the
+existing pipeline, not just by this PoC.
 
 Lessons the PoC already paid for (the implementation slice inherits them as known
 pitfalls, not surprises): multi-byte prefixes (`│ `, `• `) must be width-accounted, not
@@ -154,7 +179,7 @@ Verdict: no pure-Zig candidate passes; revisit yearly.
 | Width wrapping | none | caller-owned (PoC proves) | caller-owned | varies |
 | Sanitizer inheritance | absent | clean choke point at text events | at node text walk | varies |
 | Vendoring cost | zero (present) | 2 files, no CMake, 6.9k C lines | ~10k C lines + config/CMake shim | n/a |
-| Windows ARM64 | untested by anyone | proven via zig cc | presumed fine, unproven | n/a |
+| Windows ARM64 | untested | proven via zig cc; target already in CI smoke | presumed fine, unproven | n/a |
 | License | vendored zigzag | MIT | BSD-2 | PolyForm-NC (zigmark) |
 | Test story | 1 test | upstream spec suite + PoC 6/6 | upstream spec suite | n/a |
 | Prod LOC added vs plain render | +368 (fails criteria) | ~600-800 Zig + vendor | ~600-800 Zig + more vendor | n/a |
@@ -168,10 +193,10 @@ slices per methodology (vendor blob gets its own PR; the renderer is a second):
    wiring, no behavior change (parser unreferenced by prod).
 2. **Renderer slice**: replace the body path in `renderAssistantPlain` for assistant
    entries with the md4c renderer: sanitizer at every text event (port of
-   `stripControls`), `MD_FLAG_NOHTML`, `zz.measure.charWidth` width model, self-contained
-   styled rows, entity decode table, exact-output regression tests in the #254 pattern
-   plus a sampled CommonMark fixture set; consider adding `aarch64-windows` to the CI
-   cross-compile matrix in the same slice.
+   `stripControls`) **and over every emitted span/block metadata attribute**, decode
+   entities before sanitizing, `MD_FLAG_NOHTML`, `zz.measure.charWidth` width model,
+   self-contained styled rows, exact-output regression tests in the #254 pattern plus
+   a sampled CommonMark fixture set.
 
 Keep plain rendering as the fallback for non-assistant transcript entries (tool cards,
 errors) — only assistant prose benefits from markdown structure.
