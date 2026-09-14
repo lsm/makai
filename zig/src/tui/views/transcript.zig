@@ -461,6 +461,22 @@ fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
     return n == trimmed.len;
 }
 
+fn flushWrapRow(writer: *std.Io.Writer, buf: *std.ArrayList(u8), col: *usize, pending_newline: *bool) !void {
+    const split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
+    if (pending_newline.*) try writer.writeByte('\n');
+    try writer.writeAll(buf.items[0..split]);
+    const tail_start = if (buf.items[split] == ' ') split + 1 else split;
+    const tail_len = buf.items.len - tail_start;
+    std.mem.copyForwards(u8, buf.items[0..tail_len], buf.items[tail_start..]);
+    buf.shrinkRetainingCapacity(tail_len);
+    col.* = tui_text.visibleWidth(buf.items);
+    if (tail_len > 0) {
+        try writer.writeByte('\n');
+    } else {
+        pending_newline.* = true;
+    }
+}
+
 fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, max_width: usize) !void {
     if (max_width == 0 or line.len == 0) {
         try writer.writeAll(line);
@@ -483,38 +499,35 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
         }
         if (c == ' ' or c == '\t') {
             const pad: usize = if (c == '\t') tab_width - (col % tab_width) else 1;
-            try buf.appendNTimes(allocator, ' ', pad);
-            col += pad;
             i += 1;
-        } else {
-            const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
-            if (i + len > line.len) break;
-            const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
-            if (codepoint >= 0x80 and codepoint <= 0x9f) {
-                i += len;
-                continue;
+            var n: usize = 0;
+            while (n < pad) : (n += 1) {
+                try buf.append(allocator, ' ');
+                col += 1;
+                if (col > max_width) try flushWrapRow(writer, &buf, &col, &pending_newline);
             }
-            try buf.appendSlice(allocator, line[i .. i + len]);
-            col += zz.measure.charWidth(@intCast(codepoint));
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (i + len > line.len) break;
+        const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
+        if (codepoint >= 0x80 and codepoint <= 0x9f) {
             i += len;
+            continue;
         }
-        if (col <= max_width) continue;
-        const split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
-        if (pending_newline) try writer.writeByte('\n');
-        try writer.writeAll(buf.items[0..split]);
-        const tail_start = if (buf.items[split] == ' ') split + 1 else split;
-        const tail_len = buf.items.len - tail_start;
-        std.mem.copyForwards(u8, buf.items[0..tail_len], buf.items[tail_start..]);
-        buf.shrinkRetainingCapacity(tail_len);
-        col = tui_text.visibleWidth(buf.items);
-        if (tail_len > 0) {
-            try writer.writeByte('\n');
-        } else {
-            pending_newline = true;
-        }
+        try buf.appendSlice(allocator, line[i .. i + len]);
+        col += zz.measure.charWidth(@intCast(codepoint));
+        i += len;
+        if (col > max_width) try flushWrapRow(writer, &buf, &col, &pending_newline);
     }
-    if (pending_newline and std.mem.trim(u8, buf.items, " ").len > 0) try writer.writeByte('\n');
-    try writer.writeAll(buf.items);
+    if (pending_newline) {
+        if (std.mem.trim(u8, buf.items, " ").len > 0) {
+            try writer.writeByte('\n');
+            try writer.writeAll(buf.items);
+        }
+    } else {
+        try writer.writeAll(buf.items);
+    }
 }
 
 fn lastCharStart(buf: []const u8) usize {
@@ -1291,12 +1304,22 @@ test "transcript expands tabs to column stops in plain assistant text" {
 test "transcript drops the empty wrap row after trailing hard-break spaces" {
     const out = try renderAssistantPlain(std.testing.allocator, "exactfill  ", 9);
     defer std.testing.allocator.free(out);
-    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(out));
-    try std.testing.expect(std.mem.startsWith(u8, out, "exactfill"));
+    try std.testing.expectEqualStrings("exactfill", out);
 
     const wrapped = try renderAssistantPlain(std.testing.allocator, "exactfill abc", 9);
     defer std.testing.allocator.free(wrapped);
     try std.testing.expectEqualStrings("exactfill\nabc", wrapped);
+}
+
+test "transcript keeps expanded tabs within the wrap width" {
+    const out = try renderAssistantPlain(std.testing.allocator, "12345678\tX", 8);
+    defer std.testing.allocator.free(out);
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 8);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "12345678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "X") != null);
 }
 
 test "transcript matches closing fence to opener length" {
