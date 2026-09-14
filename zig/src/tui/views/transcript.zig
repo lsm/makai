@@ -462,7 +462,8 @@ fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
 }
 
 fn flushWrapRow(writer: *std.Io.Writer, buf: *std.ArrayList(u8), col: *usize, pending_newline: *bool) !void {
-    const split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
+    var split = std.mem.lastIndexOfScalar(u8, buf.items, ' ') orelse lastCharStart(buf.items);
+    if (split == 0 and buf.items.len > 1) split = lastCharStart(buf.items);
     if (pending_newline.*) {
         try writer.writeByte('\n');
         pending_newline.* = false;
@@ -1318,6 +1319,12 @@ test "transcript clears the deferred newline after emitting it" {
     const out = try renderAssistantPlain(std.testing.allocator, "exactfill abcdefghij", 9);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("exactfill\nabcdefghi\nj", out);
+}
+
+test "transcript hard-splits leading-space words without a blank row" {
+    const out = try renderAssistantPlain(std.testing.allocator, " abcdefghij", 9);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(" abcdefgh\nij", out);
 }
 
 test "transcript keeps expanded tabs within the wrap width" {
