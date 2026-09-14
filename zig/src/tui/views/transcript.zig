@@ -405,18 +405,19 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
     errdefer out.deinit();
     const writer = &out.writer;
     var in_fence = false;
+    var fence_char: u8 = 0;
     var fence_len: usize = 0;
     var first_line = true;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!in_fence) {
-            const ticks = fenceMarkerLen(line);
-            if (ticks >= 3) {
+            if (fenceMarker(line)) |marker| {
                 in_fence = true;
-                fence_len = ticks;
+                fence_char = marker.char;
+                fence_len = marker.len;
                 continue;
             }
-        } else if (isFenceClose(line, fence_len)) {
+        } else if (isFenceClose(line, fence_char, fence_len)) {
             in_fence = false;
             continue;
         }
@@ -439,16 +440,23 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
     return out.toOwnedSlice();
 }
 
-fn fenceMarkerLen(line: []const u8) usize {
+const FenceMarker = struct { char: u8, len: usize };
+
+fn fenceMarker(line: []const u8) ?FenceMarker {
     const trimmed = std.mem.trimStart(u8, line, " \t\r");
+    if (trimmed.len < 3 or (trimmed[0] != '`' and trimmed[0] != '~')) return null;
     var n: usize = 0;
-    while (n < trimmed.len and trimmed[n] == '`') n += 1;
-    return n;
+    while (n < trimmed.len and trimmed[n] == trimmed[0]) n += 1;
+    if (n < 3) return null;
+    return .{ .char = trimmed[0], .len = n };
 }
 
-fn isFenceClose(line: []const u8, open_len: usize) bool {
+fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r");
-    return trimmed.len >= open_len and fenceMarkerLen(trimmed) == trimmed.len;
+    if (trimmed.len < open_len or trimmed[0] != open_char) return false;
+    var n: usize = 0;
+    while (n < trimmed.len and trimmed[n] == open_char) n += 1;
+    return n == trimmed.len;
 }
 
 fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, max_width: usize) !void {
@@ -1239,6 +1247,19 @@ test "transcript closes code fence on CRLF endings" {
     try std.testing.expect(std.mem.indexOf(u8, text, "const x = 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
+}
+
+test "transcript detects tilde code fences" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "~~~text\ninside\n~~~\nafter");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "inside") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "~~~") == null);
 }
 
 test "transcript strips escape sequences from plain assistant text" {
