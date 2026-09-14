@@ -493,7 +493,7 @@ test "abort when streaming cancels session" {
 }
 
 test "abort cancels active turn before streaming status is set" {
-    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{ .backend = .local });
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     defer runtime.deinit();
     runtime.stream_active = true;
 
