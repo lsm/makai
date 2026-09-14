@@ -998,6 +998,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tui_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/fixture_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent", .module = agent_mod },
+        },
+    });
+
     const tui_app_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/tui/app.zig"),
         .target = target,
@@ -1031,18 +1043,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "permission", .module = permission_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tui_tests_mock_provider_mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/tui/tests/mock_provider.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "event_stream", .module = event_stream_mod },
-            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "tui_fixture", .module = tui_fixture_mod },
         },
     });
 
@@ -1063,7 +1064,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
-            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+            .{ .name = "tui_fixture", .module = tui_fixture_mod },
         },
     });
 
@@ -1078,7 +1079,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tui_session_store", .module = tui_session_store_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
-            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+            .{ .name = "tui_fixture", .module = tui_fixture_mod },
             .{ .name = "tui_tests_mock_transport", .module = tui_tests_mock_transport_mod },
             .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
         },
@@ -1100,7 +1101,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_session_store", .module = tui_session_store_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
-            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+            .{ .name = "tui_fixture", .module = tui_fixture_mod },
             .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
         },
     });

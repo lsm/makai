@@ -22,6 +22,7 @@ const session_picker_view = @import("tui_view_session_picker");
 const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
+const fixture_provider = @import("tui_fixture");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -199,6 +200,37 @@ const SavedModelRef = struct {
         allocator.free(self.provider);
         allocator.free(self.api);
         self.* = undefined;
+    }
+};
+
+pub const fixture_env_var = "MAKAI_TUI_FIXTURE";
+
+pub const FixtureRuntime = struct {
+    allocator: std.mem.Allocator,
+    text: []u8,
+    steps: [1]fixture_provider.ResponseStep,
+    provider: fixture_provider.MockProvider,
+
+    pub fn fromEnv(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?*FixtureRuntime {
+        const value = env.get(fixture_env_var) orelse return null;
+        if (value.len == 0) return null;
+        const text = try allocator.dupe(u8, value);
+        errdefer allocator.free(text);
+        const self = try allocator.create(FixtureRuntime);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .text = text,
+            .steps = .{.{ .text = text }},
+            .provider = undefined,
+        };
+        self.provider = fixture_provider.MockProvider.init(.{ .steps = &self.steps });
+        return self;
+    }
+
+    pub fn deinit(self: *FixtureRuntime) void {
+        self.allocator.free(self.text);
+        self.allocator.destroy(self);
     }
 };
 
@@ -1730,8 +1762,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     defer production.deinit();
     production.initBridge();
 
+    var options = production.options();
+    const fixture = try FixtureRuntime.fromEnv(allocator, &environ_map);
+    defer if (fixture) |runtime| runtime.deinit();
+    if (fixture) |runtime| options.protocol = runtime.provider.protocolClient();
+
     var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, tuiProgramOptions());
-    program.model = .{ .options = production.options() };
+    program.model = .{ .options = options };
     defer program.deinit();
     try program.run();
 }
@@ -1793,6 +1830,42 @@ test "TUI program preserves native text selection" {
     try std.testing.expect(!tuiProgramOptions().alternate_scroll);
     try std.testing.expect(!tuiProgramOptions().alt_screen);
     try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
+}
+
+test "fixture runtime stays inactive without a non-empty env value" {
+    var env = try compat.createEnvMap(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromEnv(std.testing.allocator, &env));
+    try env.put(fixture_env_var, "");
+    try std.testing.expectEqual(@as(?*FixtureRuntime, null), try FixtureRuntime.fromEnv(std.testing.allocator, &env));
+}
+
+test "fixture runtime streams the env-provided text" {
+    var env = try compat.createEnvMap(std.testing.allocator);
+    defer env.deinit();
+    try env.put(fixture_env_var, "pty fixture reply");
+    const fixture = (try FixtureRuntime.fromEnv(std.testing.allocator, &env)).?;
+    defer fixture.deinit();
+
+    const client = fixture.provider.protocolClient();
+    const stream_ptr = try client.stream(fixture_provider.test_model, .{ .messages = &.{}, .is_owned = false }, .{}, std.testing.allocator);
+    defer {
+        stream_ptr.deinit();
+        std.testing.allocator.destroy(stream_ptr);
+    }
+
+    var saw_delta = false;
+    while (stream_ptr.wait()) |event| {
+        var ev = event;
+        defer switch (ev) {
+            .done => |*payload| payload.message.deinit(std.testing.allocator),
+            .@"error" => |*payload| payload.err.deinit(std.testing.allocator),
+            else => {},
+        };
+        if (ev == .text_delta) saw_delta = std.mem.eql(u8, ev.text_delta.delta, "pty fixture reply");
+    }
+    try std.testing.expect(saw_delta);
+    try std.testing.expectEqual(@as(usize, 1), fixture.provider.call_count);
 }
 
 test "App saveEvent keeps debug-visible event types" {

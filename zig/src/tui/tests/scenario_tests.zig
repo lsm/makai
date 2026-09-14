@@ -3,7 +3,7 @@ const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_session = @import("tui_session");
 const session_store = @import("tui_session_store");
-const mock_provider = @import("tui_tests_mock_provider");
+const mock_provider = @import("tui_fixture");
 const fixtures = @import("tui_tests_fixtures");
 const ai_types = @import("ai_types");
 

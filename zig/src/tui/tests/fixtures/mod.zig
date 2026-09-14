@@ -2,7 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
-const mock_provider = @import("tui_tests_mock_provider");
+const mock_provider = @import("tui_fixture");
 
 pub const expected_text = "fixture response";
 pub const final_text = "tools complete";

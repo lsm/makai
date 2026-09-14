@@ -9,7 +9,7 @@ const tui_state = @import("tui_state");
 const tui_session = @import("tui_session");
 const session_store = @import("tui_session_store");
 const tui_config = @import("tui_config");
-const mock_provider = @import("tui_tests_mock_provider");
+const mock_provider = @import("tui_fixture");
 const fixtures = @import("tui_tests_fixtures");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
