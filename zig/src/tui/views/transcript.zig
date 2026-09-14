@@ -33,9 +33,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
     try buildVisibleEntries(allocator, arena, state, &visible_entries);
 
     if (visible_entries.items.len == 0) {
-        var ready_text: []const u8 = "Makai ready. Type message, /quit exits.";
-        if (state.transcript.items.len > 0 and !state.show_thinking) ready_text = "Thinking hidden.";
-        const ready_line = try tui_theme.muted().render(allocator, ready_text);
+        const ready_line = try tui_theme.muted().render(allocator, "Makai ready. Type message, /quit exits.");
         defer allocator.free(ready_line);
         return padTopToHeight(allocator, ready_line, options.height);
     }
@@ -98,10 +96,6 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
     var i: usize = 0;
     while (i < state.transcript.items.len) {
         const entry = &state.transcript.items[i];
-        if (entry.kind == .thinking and !state.show_thinking) {
-            i += 1;
-            continue;
-        }
         if (isLowValueSystem(entry)) {
             i += 1;
             continue;
@@ -1011,33 +1005,6 @@ test "transcript preserves multiline entries" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "beta") != null);
-}
-
-test "transcript hides thinking when toggled off" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.thinking, "secret plan");
-    try state.appendTranscript(.assistant, "visible answer");
-    state.show_thinking = false;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "secret plan") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "visible answer") != null);
-}
-
-test "transcript empty visible state does not advertise removed Ctrl R shortcut" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.appendTranscript(.thinking, "secret plan");
-    state.show_thinking = false;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "Thinking hidden.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+R") == null);
 }
 
 test "transcript renders backpressure warning" {

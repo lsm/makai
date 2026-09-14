@@ -135,9 +135,9 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, ma
     if (state.status.streaming) {
         const queued = state.queue.total();
         const hint = if (queued > 0)
-            try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
+            try std.fmt.allocPrint(allocator, "Enter steer • queued {d}", .{queued})
         else
-            try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
+            try allocator.dupe(u8, "Enter steer");
         defer allocator.free(hint);
         const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
         defer allocator.free(truncated);
@@ -240,16 +240,17 @@ test "composer masks secret login input" {
     try std.testing.expect(std.mem.indexOf(u8, text, "***************") != null);
 }
 
-test "composer renders queued hint while streaming shortcuts are supported" {
+test "composer renders queued hint while streaming" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     state.status.streaming = true;
-    state.queue.follow_up = 2;
+    state.queue.steering = 2;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80 });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter steer") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") == null);
 }
 
 test "composer renders shell and file hints" {

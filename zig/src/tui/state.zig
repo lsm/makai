@@ -150,59 +150,12 @@ pub const ApprovalState = struct {
     }
 };
 
-pub const PromptSegmentState = struct {
-    bytes: u64 = 0,
-    estimated_tokens: u64 = 0,
-    item_count: u32 = 0,
-    cache_role: tui_runtime.TuiEvent.PromptSegmentCacheRole = .dynamic,
-    seen: bool = false,
-};
-
 pub const TelemetryState = struct {
-    system_prompt_bytes: u64 = 0,
-    message_bytes: u64 = 0,
-    tool_definition_bytes: u64 = 0,
-    total_bytes: u64 = 0,
     estimated_tokens: u64 = 0,
     context_window: u64 = 0,
-    message_count: u32 = 0,
-    tool_count: u32 = 0,
-    system_prompt: PromptSegmentState = .{},
-    messages: PromptSegmentState = .{},
-    tool_definitions: PromptSegmentState = .{},
-
-    pub fn segment(self: *TelemetryState, kind: tui_runtime.TuiEvent.PromptSegmentKind) *PromptSegmentState {
-        return switch (kind) {
-            .system_prompt => &self.system_prompt,
-            .message_history => &self.messages,
-            .tool_definitions => &self.tool_definitions,
-        };
-    }
 };
 
 pub const QueueState = tui_runtime.QueuedCounts;
-
-pub const QueuedPreviewKind = enum {
-    steering,
-    follow_up,
-};
-
-pub const QueuedPreview = struct {
-    kind: QueuedPreviewKind,
-    text: []u8,
-
-    pub fn init(allocator: std.mem.Allocator, kind: QueuedPreviewKind, text: []const u8) !QueuedPreview {
-        return .{
-            .kind = kind,
-            .text = try allocator.dupe(u8, text),
-        };
-    }
-
-    pub fn deinit(self: *QueuedPreview, allocator: std.mem.Allocator) void {
-        allocator.free(self.text);
-        self.* = undefined;
-    }
-};
 
 pub const StatusState = struct {
     model: []u8 = &.{},
@@ -264,51 +217,20 @@ pub const PreviewState = struct {
 pub const SessionEntry = struct {
     id: []u8,
     label: []u8,
-    model: []u8 = &.{},
-    provider: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8) !SessionEntry {
-        return initWithDetails(allocator, id, label, "", "");
-    }
-
-    pub fn initWithDetails(allocator: std.mem.Allocator, id: []const u8, label: []const u8, model: []const u8, provider: []const u8) !SessionEntry {
-        const owned_id = try allocator.dupe(u8, id);
-        errdefer allocator.free(owned_id);
-        const owned_label = try allocator.dupe(u8, label);
-        errdefer allocator.free(owned_label);
-        const owned_model = try dupOrEmpty(allocator, model);
-        errdefer if (owned_model.len > 0) allocator.free(owned_model);
-        const owned_provider = try dupOrEmpty(allocator, provider);
-        errdefer if (owned_provider.len > 0) allocator.free(owned_provider);
         return .{
-            .id = owned_id,
-            .label = owned_label,
-            .model = owned_model,
-            .provider = owned_provider,
+            .id = try allocator.dupe(u8, id),
+            .label = try allocator.dupe(u8, label),
         };
-    }
-
-    pub fn matchesQuery(self: SessionEntry, query: []const u8) bool {
-        if (query.len == 0) return true;
-        return std.ascii.indexOfIgnoreCase(self.label, query) != null or
-            std.ascii.indexOfIgnoreCase(self.id, query) != null or
-            std.ascii.indexOfIgnoreCase(self.model, query) != null or
-            std.ascii.indexOfIgnoreCase(self.provider, query) != null;
     }
 
     pub fn deinit(self: *SessionEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.label);
-        if (self.model.len > 0) allocator.free(self.model);
-        if (self.provider.len > 0) allocator.free(self.provider);
         self.* = undefined;
     }
 };
-
-fn dupOrEmpty(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    if (value.len == 0) return &.{};
-    return allocator.dupe(u8, value);
-}
 
 pub const ComposerState = struct {
     buffer: std.ArrayList(u8) = .empty,
@@ -354,16 +276,6 @@ pub const ComposerState = struct {
         std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[self.cursor..]);
         self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
         self.cursor = start;
-        return true;
-    }
-
-    pub fn deleteAfterCursor(self: *ComposerState) bool {
-        self.normalizeCursor();
-        if (self.cursor >= self.buffer.items.len) return false;
-        const end = nextCodepointEnd(self.buffer.items, self.cursor);
-        const removed = end - self.cursor;
-        std.mem.copyForwards(u8, self.buffer.items[self.cursor..], self.buffer.items[end..]);
-        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
         return true;
     }
 
@@ -425,18 +337,14 @@ pub const AppState = struct {
     permission_mode: tui_runtime.PermissionMode = .bypass,
     status: StatusState = .{},
     queue: QueueState = .{},
-    queued_previews: std.ArrayList(QueuedPreview) = .empty,
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
-    show_thinking: bool = true,
     thinking_level: ai_types.ThinkingLevel = .low,
     login_input_secret: bool = false,
     anim_tick: u64 = 0,
     transcript_scroll: usize = 0,
     session_index: usize = 0,
     session_scroll: usize = 0,
-    session_filter: ComposerState = .{},
-    session_delete_confirm: bool = false,
     menu_index: usize = 0,
     menu_scroll: usize = 0,
     picker_kind: PickerKind = .model,
@@ -460,11 +368,8 @@ pub const AppState = struct {
         self.tools.deinit(self.allocator);
         for (self.sessions.items) |*session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
-        self.session_filter.deinit(self.allocator);
         self.composer.deinit(self.allocator);
         self.approval.deinit(self.allocator);
-        self.clearQueuedPreviews();
-        self.queued_previews.deinit(self.allocator);
         self.status.deinit(self.allocator);
         self.preview.deinit(self.allocator);
         self.* = undefined;
@@ -515,7 +420,6 @@ pub const AppState = struct {
         self.clearTranscript();
         self.clearTools();
         self.telemetry = .{};
-        self.clearQueuedPreviews();
         self.queue = .{};
         self.status.context_used = 0;
         self.status.turn_count = 0;
@@ -592,10 +496,6 @@ pub const AppState = struct {
         return true;
     }
 
-    pub fn toggleThinking(self: *AppState) void {
-        self.show_thinking = !self.show_thinking;
-    }
-
     pub fn cycleThinkingLevel(self: *AppState) ai_types.ThinkingLevel {
         self.thinking_level = switch (self.thinking_level) {
             .off, .minimal => .low,
@@ -609,50 +509,6 @@ pub const AppState = struct {
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
         self.queue = counts;
-    }
-
-    pub fn pruneQueuedPreviewsToCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
-        self.pruneQueuedPreviewKind(.steering, counts.steering);
-        self.pruneQueuedPreviewKind(.follow_up, counts.follow_up);
-    }
-
-    fn pruneQueuedPreviewKind(self: *AppState, kind: QueuedPreviewKind, keep_count: usize) void {
-        var existing: usize = 0;
-        for (self.queued_previews.items) |preview| {
-            if (preview.kind == kind) existing += 1;
-        }
-        var remove_count = existing -| keep_count;
-        var idx: usize = 0;
-        while (idx < self.queued_previews.items.len and remove_count > 0) {
-            if (self.queued_previews.items[idx].kind != kind) {
-                idx += 1;
-                continue;
-            }
-            var removed = self.queued_previews.orderedRemove(idx);
-            removed.deinit(self.allocator);
-            remove_count -= 1;
-        }
-    }
-
-    pub fn addQueuedPreview(self: *AppState, kind: QueuedPreviewKind, text: []const u8) !void {
-        try self.queued_previews.append(self.allocator, try QueuedPreview.init(self.allocator, kind, text));
-    }
-
-    pub fn clearQueuedPreviews(self: *AppState) void {
-        for (self.queued_previews.items) |*preview| preview.deinit(self.allocator);
-        self.queued_previews.clearRetainingCapacity();
-    }
-
-    pub fn consumeQueuedPreviewText(self: *AppState, text: []const u8) bool {
-        const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        var idx: usize = 0;
-        while (idx < self.queued_previews.items.len) : (idx += 1) {
-            if (!std.mem.eql(u8, self.queued_previews.items[idx].text, trimmed)) continue;
-            var removed = self.queued_previews.orderedRemove(idx);
-            removed.deinit(self.allocator);
-            return true;
-        }
-        return false;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
@@ -719,7 +575,7 @@ pub const AppState = struct {
                 }
             },
             .context_usage => |payload| self.applyContextUsage(payload),
-            .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
+            .prompt_segment_usage => {},
             .system_warning => |payload| try self.appendTranscript(.@"error", payload.message.slice()),
             .backpressure_status => |payload| {
                 self.backpressure_active = payload.active;
@@ -762,62 +618,7 @@ pub const AppState = struct {
 
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
-        try self.addSessionWithDetails(id, label, "", "");
-    }
-
-    pub fn addSessionWithDetails(self: *AppState, id: []const u8, label: []const u8, model: []const u8, provider: []const u8) !void {
-        try self.sessions.append(self.allocator, try SessionEntry.initWithDetails(self.allocator, id, label, model, provider));
-    }
-
-    pub fn sessionFilterText(self: *const AppState) []const u8 {
-        return self.session_filter.text();
-    }
-
-    pub fn filteredSessionCount(self: *const AppState) usize {
-        const query = self.sessionFilterText();
-        var count: usize = 0;
-        for (self.sessions.items) |session| {
-            if (session.matchesQuery(query)) count += 1;
-        }
-        return count;
-    }
-
-    pub fn sessionRawIndexAtFilteredIndex(self: *const AppState, filtered_index: usize) ?usize {
-        const query = self.sessionFilterText();
-        var matched: usize = 0;
-        for (self.sessions.items, 0..) |session, raw_index| {
-            if (!session.matchesQuery(query)) continue;
-            if (matched == filtered_index) return raw_index;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn sessionFilteredIndexForRawIndex(self: *const AppState, target_raw_index: usize) ?usize {
-        const query = self.sessionFilterText();
-        var matched: usize = 0;
-        for (self.sessions.items, 0..) |session, raw_index| {
-            if (!session.matchesQuery(query)) continue;
-            if (raw_index == target_raw_index) return matched;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn sessionAtFilteredIndex(self: *const AppState, filtered_index: usize) ?*const SessionEntry {
-        const raw_index = self.sessionRawIndexAtFilteredIndex(filtered_index) orelse return null;
-        return &self.sessions.items[raw_index];
-    }
-
-    pub fn clampSessionSelectionToFilter(self: *AppState) void {
-        const count = self.filteredSessionCount();
-        if (count == 0) {
-            self.session_index = 0;
-            self.session_scroll = 0;
-            return;
-        }
-        if (self.session_index >= count) self.session_index = count - 1;
-        if (self.session_scroll > self.session_index) self.session_scroll = self.session_index;
+        try self.sessions.append(self.allocator, try SessionEntry.init(self.allocator, id, label));
     }
 
     fn setHashlinePreview(self: *AppState, args_json: []const u8) !void {
@@ -966,26 +767,9 @@ pub const AppState = struct {
     }
 
     fn applyContextUsage(self: *AppState, payload: anytype) void {
-        self.telemetry.system_prompt_bytes = payload.system_prompt_bytes;
-        self.telemetry.message_bytes = payload.message_bytes;
-        self.telemetry.tool_definition_bytes = payload.tool_definition_bytes;
-        self.telemetry.total_bytes = payload.total_bytes;
         self.telemetry.estimated_tokens = payload.estimated_tokens;
-        self.telemetry.message_count = payload.message_count;
-        self.telemetry.tool_count = payload.tool_count;
         self.telemetry.context_window = self.status.context_limit;
         self.status.context_used = @intCast(payload.estimated_tokens);
-    }
-
-    fn applyPromptSegmentUsage(self: *AppState, payload: anytype) void {
-        const segment = self.telemetry.segment(payload.segment);
-        segment.* = .{
-            .bytes = payload.bytes,
-            .estimated_tokens = payload.estimated_tokens,
-            .item_count = payload.item_count,
-            .cache_role = payload.cache_role,
-            .seen = true,
-        };
     }
 
     fn applyToolTelemetry(self: *AppState, tool: *ToolEntry, raw_total_bytes: u64, returned_total_bytes: u64, estimated_returned_tokens: u64, artifact_count: u32, artifact_refs: []const u8) !void {
@@ -1734,14 +1518,6 @@ test "Composer cursor edits within the draft" {
     try std.testing.expectEqual(@as(usize, "λ".len), state.composer.cursor);
 }
 
-test "AppState toggles thinking visibility" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try std.testing.expect(state.show_thinking);
-    state.toggleThinking();
-    try std.testing.expect(!state.show_thinking);
-}
-
 test "AppState cycles thinking levels for TUI shortcut" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -1757,51 +1533,10 @@ test "AppState reset replay clears stale queue counts" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     state.queue = .{ .steering = 1, .follow_up = 2 };
-    try state.addQueuedPreview(.steering, "now");
-    try state.addQueuedPreview(.follow_up, "later");
 
     state.resetReplayState();
 
     try std.testing.expectEqual(@as(usize, 0), state.queue.total());
-    try std.testing.expectEqual(@as(usize, 0), state.queued_previews.items.len);
-}
-
-test "AppState keeps queued previews until matching user message is consumed" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.addQueuedPreview(.steering, "steer now");
-    try state.addQueuedPreview(.follow_up, "follow later");
-    try state.addQueuedPreview(.follow_up, "follow after");
-
-    state.setQueuedCounts(.{ .steering = 1, .follow_up = 2 });
-    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
-
-    state.setQueuedCounts(.{ .steering = 0, .follow_up = 1 });
-    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
-    try std.testing.expect(state.consumeQueuedPreviewText("steer now"));
-    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
-    try std.testing.expect(state.consumeQueuedPreviewText("follow later"));
-    try std.testing.expectEqual(@as(usize, 1), state.queued_previews.items.len);
-    try std.testing.expectEqualStrings("follow after", state.queued_previews.items[0].text);
-}
-
-test "AppState prunes stale queued previews to authoritative counts" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.addQueuedPreview(.steering, "old steering");
-    try state.addQueuedPreview(.follow_up, "old follow");
-    try state.addQueuedPreview(.steering, "remaining steering");
-    try state.addQueuedPreview(.follow_up, "remaining follow");
-
-    state.pruneQueuedPreviewsToCounts(.{ .steering = 1, .follow_up = 1 });
-
-    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
-    try std.testing.expectEqual(QueuedPreviewKind.steering, state.queued_previews.items[0].kind);
-    try std.testing.expectEqualStrings("remaining steering", state.queued_previews.items[0].text);
-    try std.testing.expectEqual(QueuedPreviewKind.follow_up, state.queued_previews.items[1].kind);
-    try std.testing.expectEqualStrings("remaining follow", state.queued_previews.items[1].text);
 }
 
 test "AppState reset replay clears backpressure state" {
@@ -1894,36 +1629,7 @@ test "AppState token counters update from context usage events" {
 
     try std.testing.expectEqual(@as(usize, 150), state.status.context_used);
     try std.testing.expectEqual(@as(u64, 150), state.telemetry.estimated_tokens);
-    try std.testing.expectEqual(@as(u64, 600), state.telemetry.total_bytes);
     try std.testing.expectEqual(@as(u64, 2000), state.telemetry.context_window);
-    try std.testing.expectEqual(@as(u32, 4), state.telemetry.message_count);
-}
-
-test "AppState parses prompt segment usage events" {
-    var state = AppState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.applyEvent(.{ .prompt_segment_usage = .{
-        .segment = .system_prompt,
-        .cache_role = .stable,
-        .bytes = 80,
-        .estimated_tokens = 20,
-        .item_count = 1,
-    } });
-    try state.applyEvent(.{ .prompt_segment_usage = .{
-        .segment = .message_history,
-        .cache_role = .dynamic,
-        .bytes = 240,
-        .estimated_tokens = 60,
-        .item_count = 3,
-    } });
-
-    try std.testing.expect(state.telemetry.system_prompt.seen);
-    try std.testing.expectEqual(@as(u64, 80), state.telemetry.system_prompt.bytes);
-    try std.testing.expectEqual(tui_runtime.TuiEvent.PromptSegmentCacheRole.stable, state.telemetry.system_prompt.cache_role);
-    try std.testing.expect(state.telemetry.messages.seen);
-    try std.testing.expectEqual(@as(u64, 60), state.telemetry.messages.estimated_tokens);
-    try std.testing.expectEqual(tui_runtime.TuiEvent.PromptSegmentCacheRole.dynamic, state.telemetry.messages.cache_role);
 }
 
 test "AppState detects truncated tool execution end events" {

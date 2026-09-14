@@ -986,8 +986,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tui_model_catalog_mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/tui/model_catalog.zig"),
+    const model_catalog_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/model_catalog.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1015,7 +1015,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
             .{ .name = "tui_login", .module = tui_login_mod },
-            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
+            .{ .name = "model_catalog", .module = model_catalog_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
             .{ .name = "tui_theme", .module = tui_theme_mod },
             .{ .name = "tui_text", .module = tui_text_mod },
@@ -1464,7 +1464,7 @@ pub fn build(b: *std.Build) void {
     const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
     const tui_commands_test = b.addTest(.{ .root_module = tui_commands_mod });
     const tui_login_test = b.addTest(.{ .root_module = tui_login_mod });
-    const tui_model_catalog_test = b.addTest(.{ .root_module = tui_model_catalog_mod });
+    const model_catalog_test = b.addTest(.{ .root_module = model_catalog_mod });
     const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
     const tui_theme_test = b.addTest(.{ .root_module = tui_theme_mod });
     const tui_text_test = b.addTest(.{ .root_module = tui_text_mod });
@@ -1573,7 +1573,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
             .{ .name = "tui_app", .module = tui_app_mod },
-            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
+            .{ .name = "model_catalog", .module = model_catalog_mod },
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "provider_base_url", .module = provider_base_url_mod },
         },
@@ -1716,7 +1716,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_login_test).step);
-    test_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
+    test_step.dependOn(&b.addRunArtifact(model_catalog_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_text_test).step);
@@ -1888,7 +1888,7 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_login_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(model_catalog_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_text_test).step);

@@ -90,10 +90,6 @@ pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     return models;
 }
 
-pub fn loadKimiModelsPublic(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadKimiModels(allocator);
-}
-
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     var region: []const u8 = "china";
     if (builtin.is_test) {
@@ -448,10 +444,6 @@ fn parseProviderDataAccountId(allocator: std.mem.Allocator, provider_data: []con
     return try allocator.dupe(u8, account_id.string);
 }
 
-pub fn parseCodexModelsCache(allocator: std.mem.Allocator, data: []const u8) ![]ai_types.Model {
-    return parseCodexModelsCacheWithOptions(allocator, data, .{});
-}
-
 fn parseCodexModelsCacheWithOptions(
     allocator: std.mem.Allocator,
     data: []const u8,
@@ -695,7 +687,7 @@ test "parseCodexModelsCache maps visible supported Codex models" {
         \\}
     ;
 
-    const models = try parseCodexModelsCache(std.testing.allocator, data);
+    const models = try parseCodexModelsCacheWithOptions(std.testing.allocator, data, .{});
     defer deinitModels(std.testing.allocator, models);
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
@@ -768,7 +760,7 @@ test "parseCodexModelsCache accepts models response body" {
         \\{"models":[{"slug":"gpt-api","visibility":"list","supported_in_api":true,"max_context_window":128000}]}
     ;
 
-    const models = try parseCodexModelsCache(std.testing.allocator, data);
+    const models = try parseCodexModelsCacheWithOptions(std.testing.allocator, data, .{});
     defer deinitModels(std.testing.allocator, models);
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
@@ -783,7 +775,7 @@ test "parseCodexModelsCache rejects oversized floating catalog sizes" {
         \\{"models":[{"slug":"bad-context","visibility":"list","supported_in_api":true,"context_window":1e40}]}
     ;
 
-    const no_models = try parseCodexModelsCache(std.testing.allocator, oversized_context);
+    const no_models = try parseCodexModelsCacheWithOptions(std.testing.allocator, oversized_context, .{});
     defer deinitModels(std.testing.allocator, no_models);
     try std.testing.expectEqual(@as(usize, 0), no_models.len);
 
@@ -791,7 +783,7 @@ test "parseCodexModelsCache rejects oversized floating catalog sizes" {
         \\{"models":[{"slug":"valid-context","visibility":"list","supported_in_api":true,"context_window":128000,"max_tokens":1e40}]}
     ;
 
-    const models = try parseCodexModelsCache(std.testing.allocator, oversized_max_tokens);
+    const models = try parseCodexModelsCacheWithOptions(std.testing.allocator, oversized_max_tokens, .{});
     defer deinitModels(std.testing.allocator, models);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqual(@as(u32, default_max_output_tokens), models[0].max_tokens);

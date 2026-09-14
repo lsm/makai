@@ -25,17 +25,6 @@ pub const ModeSettings = struct {
     compact_output: bool = true,
 };
 
-const borrowed_empty_theme: []u8 = &.{};
-
-pub const UiSettings = struct {
-    theme: []u8 = borrowed_empty_theme,
-
-    pub fn deinit(self: *UiSettings, allocator: std.mem.Allocator) void {
-        if (self.theme.ptr != borrowed_empty_theme.ptr) allocator.free(self.theme);
-        self.* = .{};
-    }
-};
-
 pub const Config = struct {
     model: []u8,
     provider: []u8,
@@ -43,7 +32,6 @@ pub const Config = struct {
     workspace: []u8,
     permissions: std.ArrayList(ToolPermission) = .empty,
     mode: ModeSettings = .{},
-    ui: UiSettings = .{},
 
     pub fn defaults(allocator: std.mem.Allocator) !Config {
         return .{
@@ -51,7 +39,6 @@ pub const Config = struct {
             .provider = try allocator.dupe(u8, "anthropic"),
             .api = try allocator.dupe(u8, "anthropic-messages"),
             .workspace = try allocator.dupe(u8, "."),
-            .ui = .{ .theme = try allocator.dupe(u8, "default") },
         };
     }
 
@@ -62,7 +49,6 @@ pub const Config = struct {
         allocator.free(self.workspace);
         for (self.permissions.items) |*permission| permission.deinit(allocator);
         self.permissions.deinit(allocator);
-        self.ui.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -144,7 +130,6 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
         .provider = try dupStringField(allocator, obj, "provider", "anthropic"),
         .api = try dupStringField(allocator, obj, "api", ""),
         .workspace = try dupStringField(allocator, obj, "workspace", ""),
-        .ui = .{ .theme = try allocator.dupe(u8, "default") },
     };
     errdefer cfg.deinit(allocator);
 
@@ -176,16 +161,6 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
         else => {},
     };
 
-    if (obj.get("ui")) |value| switch (value) {
-        .object => |ui_obj| {
-            if (stringField(ui_obj, "theme")) |theme| {
-                if (cfg.ui.theme.len > 0) allocator.free(cfg.ui.theme);
-                cfg.ui.theme = try allocator.dupe(u8, theme);
-            }
-        },
-        else => {},
-    };
-
     return cfg;
 }
 
@@ -210,10 +185,6 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.writeKey("mode");
     try w.beginObject();
     try w.writeBoolField("compact_output", cfg.mode.compact_output);
-    try w.endObject();
-    try w.writeKey("ui");
-    try w.beginObject();
-    try w.writeStringField("theme", cfg.ui.theme);
     try w.endObject();
     try w.endObject();
     try buf.append(allocator, '\n');
