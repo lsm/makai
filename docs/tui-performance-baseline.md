@@ -76,4 +76,12 @@ row names the exact source revision and host class it was measured on.
 
 | Revision | Host | Startup→first frame | Keypress median / p95 | Binary | tui/ LOC |
 | --- | --- | --- | --- | --- | --- |
-| _(recorded from the PR introducing this file; see its CI `TUI PTY Harness` job and PR body)_ | | | | | |
+| `a235706` (PR #262) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 51.3 ms | 13.2 / 13.4 ms | 21,262,152 B | 14,617 (22 files) |
+
+Same run, phase timings: submit→fixture-reply 29.8 ms, `/model` picker open
+13.0 ms, `/resume` picker open 13.5 ms, `/quit`→exit 13.2 ms. For comparison,
+before the driver answered the TUI's startup capability probes, first-frame
+was 457 ms — roughly 370 ms of that was the mode-2027 and primary-device-
+attributes queries timing out against a non-responsive master, not
+application work. Raw numbers for every run are in the `TUI PTY Harness` job
+summary and artifacts (`tui-pty-harness`).
