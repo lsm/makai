@@ -618,7 +618,9 @@ pub const AppState = struct {
 
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
-        try self.sessions.append(self.allocator, try SessionEntry.init(self.allocator, id, label));
+        var entry = try SessionEntry.init(self.allocator, id, label);
+        errdefer entry.deinit(self.allocator);
+        try self.sessions.append(self.allocator, entry);
     }
 
     fn setHashlinePreview(self: *AppState, args_json: []const u8) !void {
