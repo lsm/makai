@@ -36,8 +36,10 @@ All timings are wall-clock (`time.monotonic`) measured at the PTY master:
   so this measures application work rather than queries timing out against a
   non-responsive terminal.
 - `keypress.samples_ms` / `median_ms` / `p95_ms` — one sample per typed
-  character: the moment the byte is written to the PTY until the first output
-  batch of that key's render arrives; the remainder of the frame is then
+  character: the sample clock starts immediately before the byte is written
+  to the PTY and stops at the read of the first output batch of that key's
+  render, so a render that completes between the write and the wait loop can
+  never be excluded from the sample; the remainder of the frame is then
   drained (20 ms quiet gap) before the next key is sent, so a frame split
   across PTY reads cannot satisfy the next key's wait. The TUI renders only
   when the view changes and drains events on a 50 ms tick, so this measures

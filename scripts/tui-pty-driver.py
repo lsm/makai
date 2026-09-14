@@ -160,15 +160,14 @@ class PtySession:
                 )
             self._read_once(min(0.05, remaining))
 
-    def wait_next_batch(self, timeout, what):
-        deadline = time.monotonic() + timeout
-        start = time.monotonic()
+    def wait_next_batch(self, timeout, what, since):
+        deadline = since + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ScenarioError(f"timed out after {timeout}s waiting for render after {what}")
             if self._read_once(min(0.05, remaining)) is not None:
-                return (time.monotonic() - start) * 1000.0
+                return (self.last_read_at - since) * 1000.0
 
     def quiesce(self, quiet_seconds, hard_timeout=20.0):
         deadline = time.monotonic() + hard_timeout
@@ -187,8 +186,9 @@ class PtySession:
     def type_text(self, text, measure=False):
         latencies = []
         for char in text:
+            sent_at = time.monotonic()
             self.send(char.encode(), f"key {char!r}")
-            elapsed = self.wait_next_batch(2.0, f"key {char!r}")
+            elapsed = self.wait_next_batch(2.0, f"key {char!r}", since=sent_at)
             self.drain_frame_tail()
             if measure:
                 latencies.append(elapsed)
@@ -270,31 +270,31 @@ def run_scenario(args, repo_root):
         if args.prompt.encode() not in session.plain:
             raise ScenarioError("typed prompt did not appear in the composer render")
 
-        session.send(b"\r", "Enter (submit)")
         submit_sent_at = time.monotonic()
+        session.send(b"\r", "Enter (submit)")
         session.wait_for(args.fixture_text.encode(), args.stream_timeout, "fixture reply after submit")
         submit_to_reply_ms = (session.last_read_at - submit_sent_at) * 1000.0
         session.quiesce(1.0)
 
         session.type_text("/model")
-        session.send(b"\r", "Enter (/model)")
         model_sent_at = time.monotonic()
+        session.send(b"\r", "Enter (/model)")
         session.wait_for(MODEL_PICKER_MARKER, 5.0, "model picker")
         model_picker_ms = (session.last_read_at - model_sent_at) * 1000.0
         session.send(b"\x1b", "Escape (close model picker)")
         session.quiesce(0.4)
 
         session.type_text("/resume")
-        session.send(b"\r", "Enter (/resume)")
         resume_sent_at = time.monotonic()
+        session.send(b"\r", "Enter (/resume)")
         session.wait_for(SESSION_PICKER_MARKER, 5.0, "session picker")
         session_picker_ms = (session.last_read_at - resume_sent_at) * 1000.0
         session.send(b"\x1b", "Escape (close session picker)")
         session.quiesce(0.4)
 
         session.type_text("/quit")
-        session.send(b"\r", "Enter (/quit)")
         quit_started = time.monotonic()
+        session.send(b"\r", "Enter (/quit)")
         exit_code = session.wait_exit(5.0)
         quit_ms = (time.monotonic() - quit_started) * 1000.0
         if exit_code != 0:
