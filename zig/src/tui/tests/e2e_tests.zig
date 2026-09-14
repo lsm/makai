@@ -427,10 +427,7 @@ test "e2e: /resume opens the picker and resuming replays the saved transcript" {
             .session_id = try std.testing.allocator.dupe(u8, "seeded-session"),
             .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
             .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
-            .created_at = 1,
             .last_active = 1,
-            .turn_count = 1,
-            .working_dir = try std.testing.allocator.dupe(u8, "."),
         };
         defer meta.deinit(std.testing.allocator);
 

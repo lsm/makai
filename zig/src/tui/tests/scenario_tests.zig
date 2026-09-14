@@ -338,10 +338,7 @@ test "runtime persistence full save and resume cycle" {
         .session_id = try std.testing.allocator.dupe(u8, "resume-cycle"),
         .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
         .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
-        .created_at = 1,
         .last_active = 1,
-        .turn_count = 1,
-        .working_dir = try std.testing.allocator.dupe(u8, "."),
     };
     defer meta.deinit(std.testing.allocator);
 
@@ -398,10 +395,7 @@ test "session persistence reconstructs tool call before tool result" {
         .session_id = try std.testing.allocator.dupe(u8, "tool-cycle"),
         .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
         .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
-        .created_at = 1,
         .last_active = 1,
-        .turn_count = 1,
-        .working_dir = try std.testing.allocator.dupe(u8, "."),
     };
     defer meta.deinit(std.testing.allocator);
 

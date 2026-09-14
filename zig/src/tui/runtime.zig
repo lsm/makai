@@ -1742,14 +1742,13 @@ test "runtime queues steering messages" {
     if (runtime.local_agent) |*local| local.waitForIdle();
 
     var user_messages: usize = 0;
-    while (tui_session.waitEvent()) |event| {
+    while (tui_session.popEvent()) |event| {
         var ev = event;
         defer ev.deinit(std.testing.allocator);
         switch (ev) {
             .message_end => |payload| {
                 if (payload.role == .user) user_messages += 1;
             },
-            .agent_end => break,
             else => {},
         }
     }
