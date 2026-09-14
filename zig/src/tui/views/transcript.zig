@@ -429,7 +429,9 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
         }
         const cleaned = try stripControls(allocator, line);
         defer allocator.free(cleaned);
-        const clipped = try tui_text.truncateLineToWidth(allocator, cleaned, code_width);
+        const expanded = try expandTabs(allocator, cleaned);
+        defer allocator.free(expanded);
+        const clipped = try tui_text.truncateLineToWidth(allocator, expanded, code_width);
         defer allocator.free(clipped);
         if (clipped.len == 0) continue;
         try writer.writeAll("  ");
@@ -486,6 +488,10 @@ fn wrapPlainLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []c
             const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
             if (i + len > line.len) break;
             const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
+            if (codepoint >= 0x80 and codepoint <= 0x9f) {
+                i += len;
+                continue;
+            }
             try buf.appendSlice(allocator, line[i .. i + len]);
             col += zz.measure.charWidth(@intCast(codepoint));
             i += len;
@@ -523,12 +529,57 @@ fn stripControls(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
             skipAnsiSequence(line, &i);
             continue;
         }
-        if ((c < 0x20 and c != '\t') or c == 0x7f) {
+        if (c == '\t') {
+            try writer.writeByte(c);
             i += 1;
             continue;
         }
-        try writer.writeByte(c);
-        i += 1;
+        if (c < 0x20 or c == 0x7f) {
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > line.len) break;
+        const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (codepoint >= 0x80 and codepoint <= 0x9f) {
+            i += len;
+            continue;
+        }
+        try writer.writeAll(line[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice();
+}
+
+const tab_width: usize = 8;
+
+fn expandTabs(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, line, '\t') == null) return allocator.dupe(u8, line);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == '\t') {
+            const pad = tab_width - (col % tab_width);
+            try writeSpaces(writer, pad);
+            col += pad;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        const take = @min(len, line.len - i);
+        try writer.writeAll(line[i .. i + take]);
+        col += 1;
+        i += take;
     }
     return out.toOwnedSlice();
 }
@@ -1299,4 +1350,68 @@ test "transcript renders fenced block contents without the fence markers" {
     try std.testing.expect(std.mem.indexOf(u8, text, "A --> B") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "end") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
+}
+
+test "expandTabs pads to the next eight-column stop" {
+    const out = try expandTabs(std.testing.allocator, "a:\tvalue\tend");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("a:      value   end", out);
+}
+
+test "stripControls drops C1 control codepoints" {
+    const out = try stripControls(std.testing.allocator, "a\u{009b}b\u{0085}c");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("abc", out);
+}
+
+test "stripControls drops raw C1 bytes" {
+    const out = try stripControls(std.testing.allocator, "a\x9bb\x85c");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("abc", out);
+}
+
+test "stripControls keeps multibyte text outside C1" {
+    const out = try stripControls(std.testing.allocator, "héllo→世界");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("héllo→世界", out);
+}
+
+test "transcript strips C1 controls from plain assistant text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "before\u{009b}after");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{009b}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "beforeafter") != null);
+}
+
+test "transcript expands fenced tabs before rendering" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```\na:\tvalue\n```");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    const code_line = renderedLineContaining(text, "value").?;
+    try std.testing.expect(std.mem.indexOfScalar(u8, code_line, '\t') == null);
+    try std.testing.expect(std.mem.indexOf(u8, code_line, "a:      value") != null);
+}
+
+test "transcript expands fenced tabs and clips to bubble width" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```\n\t" ++ ("x" ** 60) ++ "\n```");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '\t') == null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 40);
+    }
 }
