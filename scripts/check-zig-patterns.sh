@@ -31,24 +31,64 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
+ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.DefaultPrng'
+
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
   "zig/src/utils/oauth/pkce.zig"
-  "zig/src/oauth/openai_codex.zig"
-  "zig/src/oauth/google_gemini_cli.zig"
-  "zig/src/oauth/google_antigravity.zig"
+  "zig/src/utils/oauth/openai_codex.zig"
   "zig/src/transports/websocket.zig"
   "zig/src/protocol/provider/types.zig"
+  "zig/src/tui/app.zig"
 )
 
+ordinary_entropy_files=(
+  "zig/src/compat/random.zig"
+  "zig/src/model_catalog.zig"
+  "zig/src/utils/oauth/storage.zig"
+  "zig/src/utils/tool_utils.zig"
+  "zig/src/providers/sse_parser.zig"
+  "zig/src/transports/transport_retry.zig"
+  "zig/src/utils/retry.zig"
+)
+
+echo "[patterns] checking security-sensitive entropy call sites..."
 for file in "${secure_random_files[@]}"; do
-  if grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >/dev/null; then
+  if [[ ! -f "$file" ]]; then
+    echo "[patterns] secure_random_files lists a path that does not exist: $file" >&2
+    echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+    exit 1
+  fi
+  if grep -nE "$ordinary_entropy_pattern" "$file" >/dev/null; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
-    grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >&2
+    grep -nE "$ordinary_entropy_pattern" "$file" >&2
     echo "[patterns] use compat.random secure helpers / io.randomSecure for OAuth, WebSocket, and protocol IDs" >&2
     exit 1
   fi
 done
+
+echo "[patterns] checking ordinary entropy call sites are declared..."
+for file in "${ordinary_entropy_files[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    echo "[patterns] ordinary_entropy_files lists a path that does not exist: $file" >&2
+    echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+    exit 1
+  fi
+done
+
+all_ordinary_entropy="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src || true)"
+if [[ -n "$all_ordinary_entropy" ]]; then
+  undeclared_ordinary_entropy="$all_ordinary_entropy"
+  for file in "${ordinary_entropy_files[@]}"; do
+    undeclared_ordinary_entropy="$(printf "%s\n" "$undeclared_ordinary_entropy" | grep -v "^$file:" || true)"
+  done
+  if [[ -n "$undeclared_ordinary_entropy" ]]; then
+    echo "[patterns] ordinary entropy used outside the declared non-security call sites:" >&2
+    echo "$undeclared_ordinary_entropy" >&2
+    echo "[patterns] use compat.random secure helpers, or add the file to ordinary_entropy_files with rationale in the commit message" >&2
+    exit 1
+  fi
+fi
 
 echo "[patterns] checking deinit poisoning in critical types..."
 required_files=(
