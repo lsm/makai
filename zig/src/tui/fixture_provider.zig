@@ -32,6 +32,7 @@ pub const ResponseStep = union(enum) {
 
 pub const Scenario = struct {
     steps: []const ResponseStep,
+    repeat_last: bool = false,
 };
 
 pub const MockProvider = struct {
@@ -66,6 +67,8 @@ pub const MockProvider = struct {
 
         const step = if (self.call_count < self.scenario.steps.len)
             self.scenario.steps[self.call_count]
+        else if (self.scenario.repeat_last and self.scenario.steps.len > 0)
+            self.scenario.steps[self.scenario.steps.len - 1]
         else
             ResponseStep{ .text = "done" };
         self.call_count += 1;
@@ -257,4 +260,30 @@ test "mock provider streams canned text" {
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqualStrings(test_model.id, provider.last_model_id);
     try std.testing.expectEqual(@as(usize, 0), provider.last_message_count);
+}
+
+test "repeat_last scenario keeps replaying the final step" {
+    const steps = [_]ResponseStep{.{ .text = "again" }};
+    var provider = MockProvider.init(.{ .steps = &steps, .repeat_last = true });
+
+    for (0..3) |_| {
+        const client = provider.protocolClient();
+        const stream_ptr = try client.stream(test_model, .{ .messages = &.{}, .is_owned = false }, .{}, std.testing.allocator);
+        defer {
+            stream_ptr.deinit();
+            std.testing.allocator.destroy(stream_ptr);
+        }
+        var saw_delta = false;
+        while (stream_ptr.wait()) |event| {
+            var ev = event;
+            defer switch (ev) {
+                .done => |*payload| payload.message.deinit(std.testing.allocator),
+                .@"error" => |*payload| payload.err.deinit(std.testing.allocator),
+                else => {},
+            };
+            if (ev == .text_delta) saw_delta = std.mem.eql(u8, ev.text_delta.delta, "again");
+        }
+        try std.testing.expect(saw_delta);
+    }
+    try std.testing.expectEqual(@as(usize, 3), provider.call_count);
 }

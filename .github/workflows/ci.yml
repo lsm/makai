@@ -138,6 +138,61 @@ jobs:
         run: npm run check:declarations
 
   # =============================================================================
+  # TUI PTY Harness (deterministic, fixture provider — no API keys)
+  #
+  # Drives `makai --tui` through a pseudo-terminal with the canned-reply
+  # fixture (MAKAI_TUI_FIXTURE), asserting the core loop scenario and
+  # recording the TUI performance baseline (startup-to-first-frame,
+  # keypress-to-render latency, binary size, tui/ LOC). Metrics land in the
+  # job summary and the run artifacts; see scripts/tui-pty-driver.py and
+  # docs/tui-performance-baseline.md.
+  # =============================================================================
+  tui-pty-harness:
+    name: TUI PTY Harness
+    needs: [unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Run TUI PTY driver
+        run: |
+          zig build install -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/makai-pty"
+          python3 scripts/tui-pty-driver.py --binary "$RUNNER_TEMP/makai-pty/bin/makai" --output-dir tui-pty-out
+
+      - name: Record metrics in job summary
+        if: success()
+        run: |
+          {
+            echo '### TUI PTY baseline'
+            echo '```json'
+            cat tui-pty-out/metrics.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload TUI PTY artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-pty-harness
+          path: tui-pty-out/
+          if-no-files-found: warn
+
+  # =============================================================================
   # Cross-compile Smoke (release-target coverage)
   #
   # Unit CI only compiles for the host (linux), so macOS/Windows release
