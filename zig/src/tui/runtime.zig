@@ -125,6 +125,7 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
     dropped_event_count: u64 = 0,
     dropped_since_warning: u64 = 0,
+    steering_tagged_count: u64 = 0,
     current_generation: u32 = 0,
     backpressure_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     backpressure_status_active_emitted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -309,6 +310,7 @@ pub const TuiRuntime = struct {
                 .steer = sessionSteer,
                 .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
+                .steers_consumed = sessionSteersConsumed,
                 .can_steer = sessionCanSteer,
                 .switch_model = sessionSwitchModel,
                 .switch_model_exact = sessionSwitchModelExact,
@@ -477,6 +479,11 @@ pub const TuiRuntime = struct {
     pub fn queuedCounts(self: *TuiRuntime) QueuedCounts {
         const local = &(self.local_agent orelse return .{});
         return local.queuedCounts();
+    }
+
+    pub fn steersConsumedCount(self: *TuiRuntime) u64 {
+        const local = &(self.local_agent orelse return 0);
+        return local.steeringConsumedCount();
     }
 
     pub fn replaceMessages(self: *TuiRuntime, messages: []const ai_types.Message) !void {
@@ -970,7 +977,16 @@ pub const TuiRuntime = struct {
                 try self.pushMessageUpdate(payload.event);
             },
             .message_end => |payload| {
-                self.push(.{ .message_end = try self.messageEndPayload(payload.message) });
+                var message_payload = try self.messageEndPayload(payload.message);
+                if (message_payload.role == .user) {
+                    if (self.local_agent) |*local| {
+                        if (local.steeringConsumedCount() > self.steering_tagged_count) {
+                            message_payload.steering = true;
+                            self.steering_tagged_count += 1;
+                        }
+                    }
+                }
+                self.push(.{ .message_end = message_payload });
             },
             .tool_execution_start => |payload| self.push(.{ .tool_execution_start = .{
                 .tool_call_id = try self.dupeOwned(payload.tool_call_id),
@@ -1171,6 +1187,11 @@ fn sessionQueuedCounts(ctx: ?*anyopaque) QueuedCounts {
     return self.queuedCounts();
 }
 
+fn sessionSteersConsumed(ctx: ?*anyopaque) u64 {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.steersConsumedCount();
+}
+
 fn sessionCanSteer(ctx: ?*anyopaque) bool {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     return self.canSteer();
@@ -1234,6 +1255,7 @@ const MockProtocolCtx = struct {
     saw_workspace_prompt: bool = false,
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
+    deliver_flood_second: usize = 0,
     tool_first: bool = false,
     wait_after_tool_first: bool = false,
     wait_before_text_first: bool = false,
@@ -1374,6 +1396,18 @@ fn mockStream(
         while (i < mock.flood_count) : (i += 1) {
             try stream.push(.{ .text_delta = .{ .content_index = 0, .delta = "x", .partial = partial } });
             if (stream.poll()) |_| {}
+        }
+        const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "done" } }};
+        try pushDoneAndComplete(stream, allocator, model, &content, .stop);
+        return stream;
+    }
+
+    if (mock.deliver_flood_second > 0 and mock.call_count == 2) {
+        const partial = emptyAssistantMessage(model, .stop);
+        try stream.push(.{ .start = .{ .partial = partial } });
+        var i: usize = 0;
+        while (i < mock.deliver_flood_second) : (i += 1) {
+            try stream.push(.{ .text_delta = .{ .content_index = 0, .delta = "x", .partial = partial } });
         }
         const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "done" } }};
         try pushDoneAndComplete(stream, allocator, model, &content, .stop);
@@ -1766,6 +1800,73 @@ test "runtime idle steering resumes immediately" {
     try std.testing.expect(saw_steering_user);
 }
 
+test "runtime tags auto-resumed steer prompt with steering provenance" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end) break;
+    }
+
+    try tui_session.steer("steer after idle");
+
+    var tagged_user_message_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and payload.steering) tagged_user_message_end = true;
+            },
+            .agent_end => break,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expect(tagged_user_message_end);
+}
+
+test "runtime tags async auto-resumed steer prompt with steering provenance" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end) break;
+    }
+
+    try tui_session.steer("steer after idle");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var tagged_user_message_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and payload.steering) tagged_user_message_end = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expect(tagged_user_message_end);
+}
+
 test "runtime active steering continues after plain assistant stop" {
     var mock = MockProtocolCtx{ .wait_before_text_first = true };
     const models = [_]ai_types.Model{test_model_a};
@@ -1796,6 +1897,69 @@ test "runtime active steering continues after plain assistant stop" {
         }
     }
     try std.testing.expect(saw_steering_user);
+}
+
+test "runtime tags consumed steer message_end with steering provenance" {
+    var mock = MockProtocolCtx{ .wait_before_text_first = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.steer("steer during response");
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expectEqual(@as(u64, 1), tui_session.steersConsumedCount());
+
+    var steer_message_end_tagged = false;
+    var prompt_message_end_untagged = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user) {
+                    if (std.mem.eql(u8, payload.text.slice(), "steer during response")) {
+                        steer_message_end_tagged = payload.steering;
+                    } else if (std.mem.eql(u8, payload.text.slice(), "first")) {
+                        prompt_message_end_untagged = !payload.steering;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(steer_message_end_tagged);
+    try std.testing.expect(prompt_message_end_untagged);
+}
+
+test "steer consumption count survives backpressure eviction of consumption events" {
+    var mock = MockProtocolCtx{ .wait_before_text_first = true, .deliver_flood_second = TuiEventStream.usable_capacity - 2 };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.steer("steer during response");
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expect(runtime.dropped_event_count > 0);
+
+    var saw_user_message_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .message_end and ev.message_end.role == .user) saw_user_message_end = true;
+    }
+    try std.testing.expect(!saw_user_message_end);
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
 }
 
 test "local runtime reports steering available" {

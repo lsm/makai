@@ -52,6 +52,7 @@ pub const TuiEvent = union(enum) {
         artifacts_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         stop_reason: ai_types.StopReason = .stop,
         is_error: bool = false,
+        steering: bool = false,
     },
     tool_approval_requested: struct {
         generation: u32 = 0,
@@ -278,6 +279,10 @@ pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 pub const QueuedCounts = agent.Agent.QueuedCounts;
 pub const CompactMessagesResult = ai_types.CompactMessagesResult;
 
+fn noSteersConsumed(_: ?*anyopaque) u64 {
+    return 0;
+}
+
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     resume_session: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
@@ -287,6 +292,7 @@ pub const TuiSessionOps = struct {
     steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
+    steers_consumed: *const fn (ctx: ?*anyopaque) u64 = noSteersConsumed,
     can_steer: *const fn (ctx: ?*anyopaque) bool = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     switch_model_exact: *const fn (ctx: ?*anyopaque, model: ai_types.Model) anyerror!void = undefined,
@@ -329,6 +335,10 @@ pub const TuiSession = struct {
 
     pub fn queuedCounts(self: *TuiSession) QueuedCounts {
         return self.ops.queued_counts(self.ctx);
+    }
+
+    pub fn steersConsumedCount(self: *TuiSession) u64 {
+        return self.ops.steers_consumed(self.ctx);
     }
 
     pub fn canSteer(self: *const TuiSession) bool {
