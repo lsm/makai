@@ -2321,9 +2321,19 @@ const PrintModeInvocation = union(enum) {
 const PrintModeArgError = union(enum) {
     missing_prompt,
     missing_option_value: []const u8,
+    misplaced_option: []const u8,
     unsupported_option: []const u8,
     unexpected_argument: []const u8,
 };
+
+fn takePrintModeOptionValue(args: []const []const u8, index: *usize) ?[]const u8 {
+    const value_index = index.* + 1;
+    if (value_index >= args.len) return null;
+    const value = args[value_index];
+    if (std.mem.startsWith(u8, value, "--")) return null;
+    index.* = value_index;
+    return value;
+}
 
 fn parsePrintModeArgs(
     args: []const []const u8,
@@ -2350,19 +2360,20 @@ fn parsePrintModeArgs(
         } else if (std.mem.eql(u8, arg, "--storage")) {
             use_storage_auth = true;
         } else if (std.mem.eql(u8, arg, "--tui-runtime")) {
-            index += 1;
-            if (index >= args.len) {
-                err_out.* = .{ .missing_option_value = arg };
+            if (prompt != null) {
+                err_out.* = .{ .misplaced_option = arg };
                 return error.InvalidArgument;
             }
-            return .{ .tui_runtime = args[index] };
+            const tui_prompt = takePrintModeOptionValue(args, &index) orelse {
+                err_out.* = .{ .missing_option_value = arg };
+                return error.InvalidArgument;
+            };
+            return .{ .tui_runtime = tui_prompt };
         } else if (std.mem.eql(u8, arg, "--model")) {
-            index += 1;
-            if (index >= args.len) {
+            model_id = takePrintModeOptionValue(args, &index) orelse {
                 err_out.* = .{ .missing_option_value = arg };
                 return error.InvalidArgument;
-            }
-            model_id = args[index];
+            };
         } else {
             err_out.* = .{ .unsupported_option = arg };
             return error.InvalidArgument;
@@ -2385,6 +2396,7 @@ fn reportPrintModeArgError(err: PrintModeArgError) void {
     switch (err) {
         .missing_prompt => perr("error: -p requires a prompt argument\n"),
         .missing_option_value => |flag| perrf("error: {s} requires a value\n", .{flag}),
+        .misplaced_option => |flag| perrf("error: {s} must appear before the prompt\n", .{flag}),
         .unsupported_option => |flag| perrf("error: unsupported -p option: {s}\n", .{flag}),
         .unexpected_argument => |arg| perrf("error: unexpected -p argument: {s}\n", .{arg}),
     }
@@ -6467,6 +6479,44 @@ test "print mode rejects options without a prompt" {
         parsePrintModeArgs(&[_][]const u8{}, &empty_error),
     );
     try std.testing.expect(std.meta.activeTag(empty_error) == .missing_prompt);
+}
+
+test "print mode rejects an option token as a --model value" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "write a haiku", "--model", "--storage" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .missing_option_value);
+    try std.testing.expectEqualStrings("--model", arg_error.missing_option_value);
+
+    var leading_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "--model", "--agent", "write a haiku" }, &leading_error),
+    );
+    try std.testing.expect(std.meta.activeTag(leading_error) == .missing_option_value);
+    try std.testing.expectEqualStrings("--model", leading_error.missing_option_value);
+}
+
+test "print mode rejects --tui-runtime once a prompt is set" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "first", "--tui-runtime", "second" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .misplaced_option);
+    try std.testing.expectEqualStrings("--tui-runtime", arg_error.misplaced_option);
+}
+
+test "print mode rejects an option token as a --tui-runtime prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "--tui-runtime", "--model", "some-model" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .missing_option_value);
+    try std.testing.expectEqualStrings("--tui-runtime", arg_error.missing_option_value);
 }
 
 test "print mode short-circuits on --tui-runtime with its prompt" {
