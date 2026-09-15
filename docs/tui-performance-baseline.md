@@ -52,9 +52,13 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   `/login` (picker, escape without triggering a real OAuth flow), `/permissions`
   (picker + `ask`/`bypass`/invalid-arg), `/resume` on an empty store, `/abort`
   while idle, an unknown command, `/clear`, `/quit`.
-- `keys` — the kept keys: Ctrl+Y copy, Shift+Enter (kitty `CSI 13;2u` encoding)
-  composer newline, Up/Down history recall, PgUp/PgDn, Ctrl+T, Shift+Tab
-  thinking cycle (status `think:` segment), Ctrl+C exit.
+- `keys` — the kept keys: Ctrl+Y copy (asserts the raw stream carries an
+  `OSC 52 ; c` clipboard sequence whose base64 payload decodes to the last
+  reply; a malformed payload is itself a failure), Shift+Enter (kitty
+  `CSI 13;2u` encoding) composer newline (asserted positively: the submitted
+  draft must echo as two separate transcript rows), Up/Down history recall,
+  PgUp/PgDn, Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
+  Ctrl+C exit.
 - `steer-abort` — a `hold` fixture step keeps the stream open so Enter mid-turn
   steers (queue indicator) and `/abort` cancels.
 - `approval-deny` — `ask` mode + a tool fixture step: the approval view
@@ -62,7 +66,9 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   runs.
 - `approval-allow` — `y` approves once and the tool runs.
 - `session-roundtrip` — two runs share one `HOME`: the first saves a session,
-  the second lists it via `/resume` and replays the saved transcript.
+  the second lists it via `/resume` and replays the saved transcript; each half
+  dumps its own artifacts under `session-roundtrip/save/` and
+  `session-roundtrip/resume/`.
 
 These scenarios use the fixture step encoding, which extends the plain
 canned-reply value: `|`-separated steps `text:<body>`, `tool:<name>` or
