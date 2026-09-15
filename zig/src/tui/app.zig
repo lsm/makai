@@ -1630,7 +1630,8 @@ pub const TuiModel = struct {
             try writer.writeAll(rendered);
             if (state.active_user_entry != null and idx == state.active_user_entry.?) {
                 var next = idx + 1;
-                while (next < state.transcript.items.len and state.transcript.items[next].kind == .user) : (next += 1) {
+                while (next < state.transcript.items.len) : (next += 1) {
+                    if (state.transcript.items[next].kind != .user) continue;
                     const extra = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[next], width);
                     defer allocator.free(extra);
                     try writer.writeAll("\n\n");
@@ -2882,6 +2883,7 @@ test "TuiModel inline render shows every steer echo while assistant streams" {
 
     try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
     try state.appendSteeredMessage("first steer");
+    try state.appendTranscript(.system, "status row between steers");
     try state.appendSteeredMessage("second steer");
     try std.testing.expectEqual(@as(usize, 0), state.active_assistant_entry.?);
     try std.testing.expectEqual(@as(usize, 1), state.active_user_entry.?);

@@ -469,7 +469,7 @@ pub const AppState = struct {
         return true;
     }
 
-    fn clearPendingSteers(self: *AppState) void {
+    pub fn clearPendingSteers(self: *AppState) void {
         for (self.pending_steers.items) |pending| self.allocator.free(pending);
         self.pending_steers.clearRetainingCapacity();
     }
