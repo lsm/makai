@@ -113,30 +113,21 @@ unreachable (no row links to them); clearing keeps the registry truthful and bou
 | 5 rejected-call readability (r3) | §1/§2: result row kept when the error detail is not readable |
 | `/clear` desync (issue comment) | §4 + §2: `/clear` clears tools; links make residual staleness unrenderable |
 
-## Addendum: model extensions from review rounds 2-5
+## Addendum: readability refinement, and the r3-r5 split
 
-Three rounds extended the posted model where its assumptions were too narrow. These are
-parts of the model now, recorded with their fixes:
+Review round 2 refined one predicate: "readable" error detail means the summary preview
+and error card actually carry a human-readable sentence — an unwrapped `err`, or a
+payload that is not a JSON object (plain text renders verbatim in both). Object
+envelopes without a readable `err` (`{"rejected":true}`) and absent details (parsed
+`null`) keep their result row.
 
-- **Readability of error details** (§1 refinement): "readable" means the summary preview
-  and error card actually carry a human-readable sentence — an unwrapped `err`, or a
-  payload that is not a JSON object (plain text renders verbatim in both). Object
-  envelopes without a readable `err` (`{"rejected":true}`) and absent details (parsed
-  `null`) keep their result row.
-- **Occurrence-scoped identity** (§2 refinement): provider `tool_call_id`s correlate
-  only concurrently in-flight calls (`docs/oap-alignment.md`); a reused id in a later
-  turn is a new call. `ToolEntry` identity is occurrence-qualified (`id`, `id␟2`, …):
-  live-intent events (start/update/approval) reuse only a live entry, end events resolve
-  live-else-latest, and every row link, linked-row removal, and replay args recovery
-  binds to the occurrence key (recovery matches the bare provider id).
-- **Backpressure is the live twin of the replay crash window** (§3 refinement): a
-  retained tool-result `message_end` reconciles a pending/running/interrupted call
-  (status from `is_error`, output from the details envelope, the normal error card, and
-  a summary row — inserted before a pending result row); `turn_end` finalizes
-  interrupted tools before the inline flush barrier releases; a result row persisted
-  before its end is removed once the end establishes a readable error; and
-  finalization scans only the tools created since the previous pass (live entries are
-  provably a suffix of the registry), keeping long sessions linear.
+Rounds 3-5 then produced nine further findings, all confined to two layers the fixes
+themselves added — retained-result/backpressure reconciliation and provider-id reuse
+(occurrence identity). Zero findings landed against the original five-concern surface
+after round 2. Per the coordinator's split ruling those layers are carved out of this
+PR and move to a design-first follow-up ("tool-call lifecycle under event loss and id
+reuse") with branch `b4a121a` preserved as the split source and all nine findings as
+design inputs; this PR keeps the model above plus the readability refinement.
 
 ## Non-goals
 
@@ -156,8 +147,8 @@ parts of the model now, recorded with their fixes:
   balanced status word.
 - PTY (`scripts/tui-pty-driver.py`): `approval-deny` asserts the readable rejection text
   renders after `n`.
-- Guard: measured `tui_loc` 14,885 → 15,693 on this branch (production for the id-link plumbing plus its
-  occurrence-scoping and reconciliation extensions over the deleted positional
-  machinery, and tests). The #266 guard asked for
+- Guard: measured `tui_loc` 14,885 → 15502 on this branch (production for the id-link
+  plumbing over the deleted positional machinery, and tests; the carved reconciliation
+  and occurrence layers live in the follow-up's split source). The #266 guard asked for
   flat-to-shrinking; this PR trades that for the identity model and the five #273
   behaviors, and reports the delta rather than claiming it passes.
