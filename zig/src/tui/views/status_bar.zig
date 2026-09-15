@@ -69,6 +69,9 @@ fn layoutSegments(allocator: std.mem.Allocator, segments: []const Segment, width
     for (segments) |seg| total += seg.width;
     total += sep_width * (segments.len - 1);
 
+    const ellipsis = try tui_theme.dim().render(allocator, "…");
+    defer allocator.free(ellipsis);
+
     var kept: usize = segments.len;
     if (total > width) {
         const cut_tail = sep_width + 1;
@@ -80,11 +83,18 @@ fn layoutSegments(allocator: std.mem.Allocator, segments: []const Segment, width
             used += lead + seg.width;
             kept = i + 1;
         }
-        if (kept == 0) return tui_text.truncateToWidth(allocator, segments[0].styled, width);
+        if (kept == 0) {
+            const first = segments[0];
+            if (first.width > width) return tui_text.truncateToWidth(allocator, first.styled, width);
+            if (first.width == width) return tui_text.truncateToWidth(allocator, first.styled, width -| 1);
+            var solo: std.Io.Writer.Allocating = .init(allocator);
+            errdefer solo.deinit();
+            try solo.writer.writeAll(first.styled);
+            try solo.writer.writeAll(ellipsis);
+            return solo.toOwnedSlice();
+        }
     }
 
-    const ellipsis = try tui_theme.dim().render(allocator, "…");
-    defer allocator.free(ellipsis);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     for (segments[0..kept], 0..) |seg, i| {
@@ -158,7 +168,6 @@ fn pushStyledValue(list: *SegmentList, allocator: std.mem.Allocator, key: []cons
     const styled_value = try value_style.render(allocator, value);
     defer allocator.free(styled_value);
     const styled = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ styled_key, styled_value });
-    errdefer allocator.free(styled);
     try pushOwned(list, allocator, styled);
 }
 
@@ -342,4 +351,30 @@ test "status bar clips model segment alone when nothing else fits" {
     try std.testing.expect(tui_text.visibleWidth(text) <= 20);
     try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "think") == null);
+}
+
+test "status bar marks the cut when the first segment leaves no separator room" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude-opus", "claude");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.visibleWidth(text) <= 20);
+    try std.testing.expect(std.mem.indexOf(u8, text, "claude/claude-opus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "think") == null);
+}
+
+test "status bar marks the cut when the first segment exactly fills the width" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude-opus-4-6-x", "aa");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.visibleWidth(text) <= 20);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
 }

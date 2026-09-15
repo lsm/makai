@@ -465,6 +465,7 @@ RATIFIED_COMMANDS = (
 )
 
 STATUS_BAR_ELLIPSIS = b"\xe2\x80\xa6"
+STATUS_BAR_CUT_MARKER = b" \xe2\x94\x82 " + STATUS_BAR_ELLIPSIS
 STATUS_BAR_PARTIAL_SEGMENTS = (
     b"ctx:" + STATUS_BAR_ELLIPSIS,
     b"perm:" + STATUS_BAR_ELLIPSIS,
@@ -483,9 +484,9 @@ def assert_status_bar_whole_segments(run, what):
                 f"keys: status bar rendered partial segment {partial!r} at 100 columns ({what}); "
                 "segments must truncate whole (#268)"
             )
-    if STATUS_BAR_ELLIPSIS not in run.session.plain:
+    if STATUS_BAR_CUT_MARKER not in run.session.plain:
         raise ScenarioError(
-            f"keys: status bar never rendered its truncation ellipsis at 100 columns ({what})"
+            f"keys: status bar never rendered its ' <sep> {STATUS_BAR_ELLIPSIS.decode()}' cut marker at 100 columns ({what})"
         )
 
 
