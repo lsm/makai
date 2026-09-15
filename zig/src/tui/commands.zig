@@ -362,7 +362,7 @@ test "dispatch reaches command handlers" {
     defer state.deinit();
     try state.status.setModel(std.testing.allocator, "model-a", "provider-a");
     try state.addSession("s1", "Saved");
-    _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
+    _ = try state.resolveToolOccurrenceForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
     const kinds = [_]CommandKind{ .help, .status, .@"resume", .permissions, .clear, .abort, .quit };
@@ -575,6 +575,7 @@ test "double abort is harmless after first cancellation" {
 const MockAbortSession = struct {
     cancel_count: usize = 0,
     clear_count: usize = 0,
+    steers_consumed: u64 = 0,
     events: tui_runtime.TuiEventStream = undefined,
     events_initialized: bool = false,
 
@@ -589,6 +590,7 @@ const MockAbortSession = struct {
                 .steer = mockSteer,
                 .clear_queued_messages = mockClearQueuedMessages,
                 .queued_counts = mockQueuedCounts,
+                .steers_consumed = mockSteersConsumed,
                 .can_steer = mockCanSteer,
                 .switch_model = mockSwitchModel,
                 .current_model = mockCurrentModel,
@@ -631,6 +633,10 @@ const MockAbortSession = struct {
     fn mockQueuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
         _ = ctx;
         return .{};
+    }
+
+    fn mockSteersConsumed(ctx: ?*anyopaque) u64 {
+        return ptr(ctx).steers_consumed;
     }
 
     fn mockCanSteer(ctx: ?*anyopaque) bool {

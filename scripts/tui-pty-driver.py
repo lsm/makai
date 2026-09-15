@@ -443,6 +443,16 @@ def check_binary(binary):
         raise ScenarioError(f"binary not found: {binary} (build with: zig build install -Doptimize=ReleaseFast)")
 
 
+def check_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        probe_fd, probe_path = tempfile.mkstemp(prefix=".write-probe-", dir=output_dir)
+        os.close(probe_fd)
+        os.unlink(probe_path)
+    except OSError as err:
+        raise ScenarioError(f"--output-dir is not writable: {output_dir}: {err}") from err
+
+
 KEY_ENTER = b"\r"
 KEY_SHIFT_ENTER_KITTY = b"\x1b[13;2u"
 KEY_UP = b"\x1b[A"
@@ -576,11 +586,11 @@ class SweepRun:
                     f"(decodes to {decoded!r} but re-encodes to {base64.b64encode(decoded)!r})"
                 )
             payloads.append(decoded)
-        if expected not in payloads:
+        if payloads != [expected]:
             tail = plain_text(stream[-400:]).decode("ascii", "replace")
             raise ScenarioError(
-                f"{self.name}: {what} wrote no OSC 52 clipboard payload decoding to {expected!r} "
-                f"(payloads: {payloads!r}); transcript tail: {tail!r}"
+                f"{self.name}: {what} must emit exactly one OSC 52 clipboard write decoding to {expected!r} "
+                f"(saw {payloads!r}); transcript tail: {tail!r}"
             )
 
     def quit(self):
@@ -694,7 +704,7 @@ def scenario_keys(args):
         run.key(KEY_CTRL_Y, "Ctrl+Y copy last reply")
         run.assert_clipboard(copy_chunks, b"keys-fixture-reply", "Ctrl+Y copy last reply")
         if run.seen("copied last reply to clipboard", copy_from):
-            run.note("Ctrl+Y with a reply present writes the reply via an OSC 52 clipboard sequence (payload asserted against the raw stream) and appends 'copied last reply to clipboard' to the transcript")
+            run.note("Ctrl+Y with a reply present writes the reply via an OSC 52 clipboard sequence (exactly one write, asserted against the raw stream) and appends 'copied last reply to clipboard' to the transcript")
         else:
             run.note("FINDING: Ctrl+Y wrote the asserted OSC 52 clipboard payload but the transcript lacks the 'copied last reply to clipboard' status line")
 
@@ -774,7 +784,7 @@ def findUserEntryEcho(plain, text, from_index):
 
 
 def scenario_steer_abort(args):
-    run = SweepRun(args, "steer-abort", "hold")
+    run = SweepRun(args, "steer-abort", 'hold|tool:shell_execute#{"description":"hold the turn open","workspace_root":"/tmp","command":"sleep 5"}|text:steer-consumed-done')
     try:
         run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
         run.settle()
@@ -807,6 +817,30 @@ def scenario_steer_abort(args):
         if aborted_at < 0 or you_at < 0 or echo_at < 0 or echo_at - you_at > 160 or echo_at >= aborted_at or aborted_at - you_at > 600:
             raise ScenarioError("steer-abort: steer echo did not flush into transcript history adjacent to the abort row")
         run.note("/abort during a held stream cancels the turn, clears the streaming status, and the flushed history renders the steered text as a permanent 'You' entry directly above the abort row")
+
+        run.session.type_text("run the slow tool")
+        run.session.send(KEY_ENTER, "Enter (submit tool turn)")
+        run.session.wait_for(b"streaming", 10.0, "streaming status after tool submit")
+        run.frame("tool-turn-streaming")
+
+        run.session.type_text("steer this turn too")
+        tool_echo_from = len(run.session.plain)
+        run.session.send(KEY_ENTER, "Enter (steer)")
+        run.session.wait_for(b"queue", 6.0, "queued steer indicator during tool run")
+        run.settle()
+        run.frame("tool-steer-queued")
+        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+            raise ScenarioError("steer-abort: steered text did not echo during the tool run")
+
+        run.session.wait_for(b"steer-consumed-done", 15.0, "turn completion after steer consumption")
+        run.settle(1.0)
+        run.frame("tool-turn-done")
+        done_at = run.session.plain.rfind(plain_text(b"steer-consumed-done"))
+        if run.session.plain.find(plain_text(b"queued"), done_at) >= 0:
+            raise ScenarioError("steer-abort: queued indicator survived steer consumption")
+        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+            raise ScenarioError("steer-abort: steered text echo vanished after consumption")
+        run.note("a steer queued during a tool run is consumed when the tool finishes: the queue indicator clears, the turn completes, and the echoed steered text stays rendered exactly as echoed (runtime-declared consumption reconciles pending steers even when consumption events never reach the app)")
 
         run.quit()
     except ScenarioError as err:
@@ -1063,7 +1097,7 @@ def main():
         )
     try:
         check_binary(args.binary)
-        os.makedirs(args.output_dir, exist_ok=True)
+        check_output_dir(args.output_dir)
     except (ScenarioError, OSError) as err:
         print(f"tui-pty-driver: FAIL: {err}", file=sys.stderr)
         return 1

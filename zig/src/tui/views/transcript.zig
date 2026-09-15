@@ -1022,6 +1022,44 @@ test "transcript collapses tool events into intent row without card" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{2570}") == null);
 }
 
+test "transcript renders reused tool call ids as distinct occurrences" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-x",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"List files\",\"command\":\"ls\"}",
+        .done,
+    ));
+    var second = try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-x\x1f2",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Read config\",\"command\":\"cat cfg\"}",
+        .@"error",
+    );
+    second.error_detail_readable = false;
+    try state.tools.append(std.testing.allocator, second);
+
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"List files\" ok", "call-x");
+    try state.appendTranscript(.tool, "ok stdout=3 stderr=0");
+    state.transcript.items[1].tool_call_id = try std.testing.allocator.dupe(u8, "call-x");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Read config\" failed", "call-x\x1f2");
+    try state.appendTranscript(.tool, "Tool execution rejected by user");
+    state.transcript.items[3].tool_call_id = try std.testing.allocator.dupe(u8, "call-x\x1f2");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} List files [ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Read config [failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tool execution rejected by user") != null);
+}
+
 test "transcript balanced mode sanitizes tool descriptions" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();

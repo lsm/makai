@@ -21,6 +21,14 @@ zig build -Doptimize=ReleaseFast  # Optimized binary (what the PTY harness uses)
 zig build -Doptimize=ReleaseSafe  # What the tagged release workflow builds
 ```
 
+### Print Mode CLI
+
+```bash
+makai -p [--agent] [--storage] [--model <id>] "<prompt>"
+```
+
+`--agent`, `--storage`, and `--model <id>` are accepted in any position — before or after the prompt. An unrecognized `--flag` or a second positional argument fails with an error instead of being ignored.
+
 ### Grouped Unit Test Steps
 
 There is no per-test filter; the smallest runnable unit is a group step. Tests are inline `test "name" { ... }` blocks in each `.zig` file.
@@ -216,6 +224,8 @@ makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream 
 makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
 makai auth login --provider <id> [--json]
 ```
+
+Print-mode options are position-independent as of #287 (see Print Mode CLI above): `--agent`, `--storage`, and `--model <id>` parse before or after the prompt, an unknown `--flag` or a second positional argument is a hard error rather than being ignored, and `--tui-runtime` must still precede the prompt.
 
 On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `com.makai.auth` is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
 

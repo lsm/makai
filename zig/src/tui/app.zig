@@ -975,6 +975,7 @@ pub const App = struct {
             try self.applyRuntimeEvent(ev);
         }
         self.refreshQueuedCounts();
+        self.state.reconcileSteers(session.steersConsumedCount());
         self.syncBackpressureState();
         if (self.pending_session_reset and !self.state.status.streaming) {
             if (self.runtime) |runtime| {
@@ -1006,7 +1007,7 @@ pub const App = struct {
             },
             .message_end => |payload| {
                 if (payload.role == .user) {
-                    if (self.state.takePendingSteer(payload.text.slice())) return;
+                    if (payload.steering) return;
                     try self.appendRuntimeUserMessage(payload.text.slice());
                     return;
                 }
@@ -2140,7 +2141,7 @@ test "App saveEvent keeps debug-visible event types" {
 test "App clear_transcript clears the tool registry" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
-    _ = try app.state.upsertToolForTest("call-1", "shell_execute", "{\"command\":\"pwd\"}", .done);
+    _ = try app.state.resolveToolOccurrenceForTest("call-1", "shell_execute", "{\"command\":\"pwd\"}", .done);
     try app.state.appendToolSummaryTranscript("◈ shell_execute \"pwd\" ok", "call-1");
 
     try app.submit("/clear");
@@ -2405,6 +2406,7 @@ const MockAppSession = struct {
     cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
+    steers_consumed: u64 = 0,
     steer_enabled: bool = true,
     events: tui_runtime.TuiEventStream = undefined,
     events_initialized: bool = false,
@@ -2420,6 +2422,7 @@ const MockAppSession = struct {
                 .steer = steer,
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
+                .steers_consumed = steersConsumed,
                 .can_steer = canSteer,
                 .switch_model = switchModel,
                 .switch_model_exact = switchModelExact,
@@ -2474,6 +2477,10 @@ const MockAppSession = struct {
 
     fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
         return ptr(ctx).queued_counts;
+    }
+
+    fn steersConsumed(ctx: ?*anyopaque) u64 {
+        return ptr(ctx).steers_consumed;
     }
 
     fn canSteer(ctx: ?*anyopaque) bool {
@@ -2857,12 +2864,14 @@ test "App drain suppresses consumption duplicate of steered message" {
     app.session = mock.session();
 
     try app.steer("steer mid turn");
+    mock.steers_consumed = 1;
     try mock.eventStream().push(.{ .message_end = .{
         .role = .assistant,
         .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "turn one done")),
     } });
     try mock.eventStream().push(.{ .message_end = .{
         .role = .user,
+        .steering = true,
         .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer mid turn")),
     } });
 
@@ -2884,12 +2893,15 @@ test "App drain keeps two steered echoes and renders unmatched user message" {
 
     try app.steer("steer one");
     try app.steer("steer two");
+    mock.steers_consumed = 2;
     try mock.eventStream().push(.{ .message_end = .{
         .role = .user,
+        .steering = true,
         .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer one")),
     } });
     try mock.eventStream().push(.{ .message_end = .{
         .role = .user,
+        .steering = true,
         .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer two")),
     } });
     try mock.eventStream().push(.{ .message_end = .{
@@ -2903,6 +2915,41 @@ test "App drain keeps two steered echoes and renders unmatched user message" {
     try std.testing.expectEqualStrings("steer one", app.state.transcript.items[0].text.items);
     try std.testing.expectEqualStrings("steer two", app.state.transcript.items[1].text.items);
     try std.testing.expectEqualStrings("submitted prompt", app.state.transcript.items[2].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
+}
+
+test "App drain reconciles pending steers when consumption events are evicted" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try app.steer("steer one");
+    try app.steer("steer two");
+    mock.steers_consumed = 2;
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .steering = true,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer two")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer one", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqualStrings("steer two", app.state.transcript.items[1].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
+
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer one")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 3), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer one", app.state.transcript.items[2].text.items);
     try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
 }
 
