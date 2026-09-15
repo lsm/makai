@@ -268,6 +268,7 @@ pub const TuiRuntime = struct {
             .execute_tool_via_protocol_fn = executeTuiToolProtocol,
             .execute_tool_via_protocol_ctx = self,
         });
+        self.steering_tagged_count = 0;
         self.local_agent.?.subscribeWithContext(self, onAgentEvent);
         self.local_agent.?.setCompactToolOutput(self.compact_output);
         const system_prompt = try self.workspaceSystemPrompt();
@@ -1252,6 +1253,7 @@ const MockProtocolCtx = struct {
     call_count: usize = 0,
     last_model_id: []const u8 = "",
     last_thinking_level: ai_types.ThinkingLevel = .off,
+    last_message_count: usize = 0,
     saw_workspace_prompt: bool = false,
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
@@ -1355,6 +1357,7 @@ fn mockStream(
     mock.call_count += 1;
     mock.last_model_id = model.id;
     mock.last_thinking_level = options.thinking_level;
+    mock.last_message_count = context.messages.len;
     const system_prompt = context.system_prompt.slice();
     mock.saw_workspace_prompt = std.mem.indexOf(u8, system_prompt, "Default workspace root: /tmp/makai-workspace") != null and
         std.mem.indexOf(u8, system_prompt, "`workspace_root`") != null;
@@ -1864,6 +1867,39 @@ test "runtime tags async auto-resumed steer prompt with steering provenance" {
         }
     }
     try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expect(tagged_user_message_end);
+}
+
+test "runtime tags post-tool consumed steer and feeds it to the model" {
+    var mock = MockProtocolCtx{ .tool_first = true, .wait_after_tool_first = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.steer("steer mid tool");
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.steersConsumedCount());
+    try std.testing.expectEqual(@as(usize, 4), mock.last_message_count);
+
+    var tagged_user_message_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and std.mem.eql(u8, payload.text.slice(), "steer mid tool")) {
+                    tagged_user_message_end = payload.steering;
+                }
+            },
+            else => {},
+        }
+    }
     try std.testing.expect(tagged_user_message_end);
 }
 

@@ -279,10 +279,6 @@ pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 pub const QueuedCounts = agent.Agent.QueuedCounts;
 pub const CompactMessagesResult = ai_types.CompactMessagesResult;
 
-fn noSteersConsumed(_: ?*anyopaque) u64 {
-    return 0;
-}
-
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     resume_session: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
@@ -292,7 +288,7 @@ pub const TuiSessionOps = struct {
     steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
-    steers_consumed: *const fn (ctx: ?*anyopaque) u64 = noSteersConsumed,
+    steers_consumed: *const fn (ctx: ?*anyopaque) u64 = undefined,
     can_steer: *const fn (ctx: ?*anyopaque) bool = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     switch_model_exact: *const fn (ctx: ?*anyopaque, model: ai_types.Model) anyerror!void = undefined,
