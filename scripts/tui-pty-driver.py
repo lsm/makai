@@ -443,6 +443,16 @@ def check_binary(binary):
         raise ScenarioError(f"binary not found: {binary} (build with: zig build install -Doptimize=ReleaseFast)")
 
 
+def check_output_dir(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        probe_fd, probe_path = tempfile.mkstemp(prefix=".write-probe-", dir=output_dir)
+        os.close(probe_fd)
+        os.unlink(probe_path)
+    except OSError as err:
+        raise ScenarioError(f"--output-dir is not writable: {output_dir}: {err}") from err
+
+
 KEY_ENTER = b"\r"
 KEY_SHIFT_ENTER_KITTY = b"\x1b[13;2u"
 KEY_UP = b"\x1b[A"
@@ -576,11 +586,11 @@ class SweepRun:
                     f"(decodes to {decoded!r} but re-encodes to {base64.b64encode(decoded)!r})"
                 )
             payloads.append(decoded)
-        if expected not in payloads:
+        if payloads != [expected]:
             tail = plain_text(stream[-400:]).decode("ascii", "replace")
             raise ScenarioError(
-                f"{self.name}: {what} wrote no OSC 52 clipboard payload decoding to {expected!r} "
-                f"(payloads: {payloads!r}); transcript tail: {tail!r}"
+                f"{self.name}: {what} must emit exactly one OSC 52 clipboard write decoding to {expected!r} "
+                f"(saw {payloads!r}); transcript tail: {tail!r}"
             )
 
     def quit(self):
@@ -694,7 +704,7 @@ def scenario_keys(args):
         run.key(KEY_CTRL_Y, "Ctrl+Y copy last reply")
         run.assert_clipboard(copy_chunks, b"keys-fixture-reply", "Ctrl+Y copy last reply")
         if run.seen("copied last reply to clipboard", copy_from):
-            run.note("Ctrl+Y with a reply present writes the reply via an OSC 52 clipboard sequence (payload asserted against the raw stream) and appends 'copied last reply to clipboard' to the transcript")
+            run.note("Ctrl+Y with a reply present writes the reply via an OSC 52 clipboard sequence (exactly one write, asserted against the raw stream) and appends 'copied last reply to clipboard' to the transcript")
         else:
             run.note("FINDING: Ctrl+Y wrote the asserted OSC 52 clipboard payload but the transcript lacks the 'copied last reply to clipboard' status line")
 
@@ -1063,7 +1073,7 @@ def main():
         )
     try:
         check_binary(args.binary)
-        os.makedirs(args.output_dir, exist_ok=True)
+        check_output_dir(args.output_dir)
     except (ScenarioError, OSError) as err:
         print(f"tui-pty-driver: FAIL: {err}", file=sys.stderr)
         return 1
