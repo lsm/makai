@@ -92,13 +92,17 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
+    var tool_index = std.StringHashMap(*const tui_state.ToolEntry).init(arena);
+    for (state.tools.items) |*tool| {
+        try tool_index.put(tool.id, tool);
+    }
     var i: usize = 0;
     while (i < state.transcript.items.len) {
         const entry = &state.transcript.items[i];
         if (entry.kind == .tool) {
             const cluster_start = i;
             while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
-            try appendToolClusterRows(allocator, arena, entries, state, cluster_start, i);
+            try appendToolClusterRows(allocator, arena, entries, state, &tool_index, cluster_start, i);
             continue;
         }
         try appendOriginal(allocator, entries, entry, null);
@@ -111,11 +115,12 @@ fn appendToolClusterRows(
     arena: std.mem.Allocator,
     entries: *std.ArrayList(DisplayEntry),
     state: *const AppState,
+    tool_index: *std.StringHashMap(*const tui_state.ToolEntry),
     start: usize,
     end: usize,
 ) !void {
     for (state.transcript.items[start..end]) |*entry| {
-        const tool = if (entry.tool_call_id.len > 0) state.lookupTool(entry.tool_call_id) else null;
+        const tool = if (entry.tool_call_id.len > 0) tool_index.get(entry.tool_call_id) else null;
         if (entry.tool_summary) {
             if (tool) |found| {
                 try appendToolSummary(allocator, arena, entries, found.*);
