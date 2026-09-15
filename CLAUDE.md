@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI/Vertex, OpenAI Codex, Gemini CLI, Ollama), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
+Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -25,7 +25,9 @@ zig build -Doptimize=ReleaseSafe  # What the tagged release workflow builds
 
 There is no per-test filter; the smallest runnable unit is a group step. Tests are inline `test "name" { ... }` blocks in each `.zig` file.
 
-Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (3-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent and tool tests to the specific subgroup (and to `test`), not just the aggregate.
+Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (3-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent tests to the specific `agent-*` subgroup (and to `test`), not just the aggregate.
+
+`tools/*` tests are the sharp edge here: none of the `agent-*` subgroups contains them. The tool artifacts are wired into **`test-unit-tui`**, which the matrix does run, and duplicated into the local-only `test-unit-agent`. So a new `tools/*` test must go into `test_unit_tui_step` (plus `test`) to be covered by CI, however odd that group name reads.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
@@ -34,7 +36,7 @@ zig build test-unit-protocol      # provider/agent/auth/tool protocol types+enve
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
 zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
-zig build test-unit-tui           # tui runtime/session/config/session_store/state/commands/login/app/views, model_catalog, scenario + e2e + mock transport tests
+zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport, AND every tools/* test (the CI-covered home for tool tests)
 zig build test-unit-agent         # aggregate: permission, agent types/loop/mod/bridge, tools/*, tui runtime, zig/test/unit/*
 zig build test-unit-agent-types   # agent types + permission
 zig build test-unit-agent-loop    # agent loop only
@@ -167,7 +169,8 @@ Ownership and auth boundary (non-negotiable):
 ### Protocol Normative Rules (from DESIGN.md §4-5)
 
 - IDs: `session_id` is a 21-char NanoID; `message_id`, `stream_id`, `flow_id` are 26-char uppercase Crockford ULIDs. Treat all as opaque.
-- Sequencing is per session/stream (provider: `stream_id`; auth: `stream_id` for queries, `flow_id` for login; agent: `session_id`), starts at 1, increments by exactly 1, no gaps or duplicates. A global counter is non-conformant.
+- Sequencing is per session/stream (provider: `stream_id`; auth: `stream_id` for queries, `flow_id` for login; agent: `session_id`) and starts at 1. A global counter is non-conformant.
+- The strict "+1, no gaps or duplicates" reading applies to **inbound** request sequences. On the agent protocol's outbound side it does not: per spec §13, `session_info`, `pong`, and `tool_list_response` echo the request's inbound sequence verbatim as a correlation value, request-validation `agent_error` envelopes carry `sequence: 0`, allocated frames can be observed out of counter order, a retried publication may burn a value and leave a gap, and a re-registered session id restarts its counter so values repeat. Consumers must not order echo frames against allocated frames or treat gaps as loss. Read `docs/v1-sdk-agent-provider-spec.md` §13 before changing any of this.
 - The auth, provider, and agent protocols multiplex concurrent sessions over one transport; ordering is guaranteed only within a session/stream. DESIGN.md §5 scopes this to those three: the tool protocol is envelope-keyed by `server_id` and its local runtime advances a single runtime-wide sequence, so per-session tool counters are not a behavior you can assume.
 - Model refs are `provider_id/api@model_id` (`protocol/model_ref.zig`); SDK consumers must not parse or construct them.
 - `session_id` is a correlation key, never a resume handle. Sessions are not resumable.
@@ -180,7 +183,7 @@ Ownership and auth boundary (non-negotiable):
 
 **`api_registry.zig` + `register_builtins.zig`**: providers register by API name. Built-ins: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`. `stream.zig` exposes `stream`/`streamSimple`/`complete`/`completeSimple` facades over the registry.
 
-**`protocol/provider/client.zig`**: `ProtocolClient` is multiplexed. Per-stream lifecycle: `startStream` (keep the `stream_id`) -> `getEventStreamFor` -> `waitResultFor`/`getLastErrorFor` -> `closeStream` -> `removeStreamState`. `partial_serializer.zig`/`partial_reconstructor.zig` move `AssistantMessage` snapshots across the wire.
+**`protocol/provider/client.zig`**: `ProtocolClient` is multiplexed. Per-stream lifecycle: `startStream` (keep the `stream_id`) -> `getEventStreamFor` -> `waitResultFor`/`getLastErrorFor` -> `closeStream` -> `removeStreamState`. **`waitResultFor` hands back a shallow copy of the message held in `stream_results`, and `removeStreamState` calls `deinit` on that stored message.** This is a different API from `EventStream.cloneResult` and the stream rules below do not cover it: if the result must outlive cleanup, `cloneAssistantMessage` it before calling `removeStreamState`, or you are left holding freed slices. `partial_serializer.zig`/`partial_reconstructor.zig` move `AssistantMessage` snapshots across the wire.
 
 **`protocol/*/runtime.zig`** files are pump/orchestration runtimes hosted on the server side of each boundary, not protocol definitions.
 
@@ -215,11 +218,11 @@ On-disk state: **credential storage is platform-dependent.** On macOS the login 
 
 ## Providers
 
-**Adding a provider**: create `zig/src/providers/<name>_api.zig` with `stream*()` functions that build JSON via `json/writer.zig`, parse SSE with `providers/sse_parser.zig`, and push into an `AssistantMessageStream` honoring the `CancelToken`; register it in `register_builtins.zig`; declare the module and tests in `build.zig` (`test-unit-providers` group); add an E2E file under `zig/test/e2e/` and a CI lane if it needs keys.
+**Adding a provider**: create `zig/src/providers/<name>_api.zig` with `stream*()` functions that build JSON via `json/writer.zig`, parse the upstream response in whatever framing it actually uses, and push into an `AssistantMessageStream` honoring the `CancelToken`. Use `providers/sse_parser.zig` only for genuine Server-Sent Events (Anthropic, both OpenAI APIs, Azure, both Google APIs); `ollama_api.zig` is the counterexample, parsing newline-delimited JSON with no SSE parser at all; register it in `register_builtins.zig`; declare the module and tests in `build.zig` (`test-unit-providers` group); add an E2E file under `zig/test/e2e/` and a CI lane if it needs keys.
 
 **Adding a transport**: implement `Sender`/`Receiver` from `transport.zig` in `zig/src/transports/<name>.zig`; wire into `build.zig` with the `transport` import and the `test-unit-transport` group.
 
-Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported: `providers/bedrock_converse_stream_api.zig` is an unwired stub returning `error.NotImplemented`.
+Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`. **Vertex is also not reachable at runtime**: `register_builtins.zig` never imports or registers `google_vertex_api.zig`, so there is no `google-vertex` API in the registry and a request for one fails provider lookup. The module is compiled only as its own test artifact. Registered APIs are exactly: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported: `providers/bedrock_converse_stream_api.zig` is an unwired stub returning `error.NotImplemented`.
 
 ## TUI
 
