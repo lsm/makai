@@ -973,11 +973,7 @@ fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, args_json: 
     }
     if (estimated_tokens > 0) try writer.print(" ~{d} tok", .{estimated_tokens});
     if (artifact_count > 0) {
-        if (raw_total_bytes > 0) {
-            try writer.print(", {d}KB artifact", .{(raw_total_bytes + 1023) / 1024});
-        } else {
-            try writer.print(" artifacts={d}", .{artifact_count});
-        }
+        try writer.print(", {d} artifact{s}", .{ artifact_count, if (artifact_count == 1) "" else "s" });
         if (artifact_on_disk) try writer.writeAll(" on disk");
     }
     if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" preview-capped");
