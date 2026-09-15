@@ -31,7 +31,8 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|std\.Random\.|DeterministicSource'
+ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|std\.Random\.'
+comment_line_filter='^[^:]+:[0-9]+:[[:space:]]*//'
 
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
@@ -64,9 +65,11 @@ for file in "${secure_random_files[@]}"; do
     echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
     exit 1
   fi
-  if grep -nE "$ordinary_entropy_pattern" "$file" >/dev/null; then
+  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" \
+    | grep -vE "^[0-9]+:[[:space:]]*//" || true)"
+  if [[ -n "$secure_file_matches" ]]; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
-    grep -nE "$ordinary_entropy_pattern" "$file" >&2
+    echo "$secure_file_matches" >&2
     echo "[patterns] use compat.random secure helpers / io.randomSecure for OAuth, WebSocket, and protocol IDs" >&2
     exit 1
   fi
@@ -80,6 +83,7 @@ fi
 
 actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
   | grep -v "^$ordinary_entropy_definition_file:" \
+  | grep -vE "$comment_line_filter" \
   | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
 
 undeclared_ordinary_entropy="$(comm -13 \
@@ -99,6 +103,30 @@ if [[ -n "$stale_ordinary_entropy" ]]; then
   echo "[patterns] expected_ordinary_entropy_sites declares a call site that no longer exists:" >&2
   echo "$stale_ordinary_entropy" >&2
   echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+  exit 1
+fi
+
+echo "[patterns] checking compat.random public exports..."
+expected_compat_random_exports="$(cat <<'EXPORTS'
+pub const DeterministicSource
+pub fn fillRandomBytes
+pub fn fillSecureBytes
+pub fn int
+pub fn randomBytes
+pub fn randomIntRangeLessThan
+pub fn secureBytes
+pub fn secureIntRangeLessThan
+EXPORTS
+)"
+
+actual_compat_random_exports="$(grep -oE '^pub (const|fn) [A-Za-z_][A-Za-z0-9_]*' \
+  "$ordinary_entropy_definition_file" | sort)"
+
+if [[ "$expected_compat_random_exports" != "$actual_compat_random_exports" ]]; then
+  echo "[patterns] public exports of $ordinary_entropy_definition_file changed:" >&2
+  diff <(printf "%s\n" "$expected_compat_random_exports") \
+       <(printf "%s\n" "$actual_compat_random_exports") >&2 || true
+  echo "[patterns] this file is exempt from the call-site sweep, so every public export must be classified as secure or ordinary and declared here" >&2
   exit 1
 fi
 
