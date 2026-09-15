@@ -31,7 +31,7 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.'
+ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.|DeterministicSource'
 
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
@@ -42,15 +42,20 @@ secure_random_files=(
   "zig/src/tui/app.zig"
 )
 
-ordinary_entropy_files=(
-  "zig/src/compat/random.zig"
-  "zig/src/model_catalog.zig"
-  "zig/src/utils/oauth/storage.zig"
-  "zig/src/utils/tool_utils.zig"
-  "zig/src/providers/sse_parser.zig"
-  "zig/src/transports/transport_retry.zig"
-  "zig/src/utils/retry.zig"
-)
+ordinary_entropy_definition_file="zig/src/compat/random.zig"
+
+expected_ordinary_entropy_sites="$(cat <<'SITES'
+zig/src/model_catalog.zig|    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}.{x}", .{ path, compat.time.nowMillis(), compat.random.int(u64) });
+zig/src/providers/sse_parser.zig|    const random = prng.random();
+zig/src/providers/sse_parser.zig|    var prng = std.Random.DefaultPrng.init(seed);
+zig/src/transports/transport_retry.zig|        return prng.random().intRangeAtMost(u64, self.base_delay_ms, capped);
+zig/src/transports/transport_retry.zig|        var prng = std.Random.DefaultPrng.init(seed);
+zig/src/utils/oauth/storage.zig|    const tmp_name = try std.fmt.allocPrint(allocator, "{s}{d}.{x}", .{ auth_temp_prefix, compat.time.nowMillis(), compat.random.int(u64) });
+zig/src/utils/retry.zig|            const rand = prng.random().float(f32);
+zig/src/utils/retry.zig|            var prng = std.Random.DefaultPrng.init(seed);
+zig/src/utils/tool_utils.zig|    return generateMistralToolCallIdWithRandom(allocator, compat.random.fillRandomBytes);
+SITES
+)"
 
 echo "[patterns] checking security-sensitive entropy call sites..."
 for file in "${secure_random_files[@]}"; do
@@ -68,26 +73,33 @@ for file in "${secure_random_files[@]}"; do
 done
 
 echo "[patterns] checking ordinary entropy call sites are declared..."
-for file in "${ordinary_entropy_files[@]}"; do
-  if [[ ! -f "$file" ]]; then
-    echo "[patterns] ordinary_entropy_files lists a path that does not exist: $file" >&2
-    echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
-    exit 1
-  fi
-done
+if [[ ! -f "$ordinary_entropy_definition_file" ]]; then
+  echo "[patterns] ordinary_entropy_definition_file does not exist: $ordinary_entropy_definition_file" >&2
+  exit 1
+fi
 
-all_ordinary_entropy="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src || true)"
-if [[ -n "$all_ordinary_entropy" ]]; then
-  undeclared_ordinary_entropy="$all_ordinary_entropy"
-  for file in "${ordinary_entropy_files[@]}"; do
-    undeclared_ordinary_entropy="$(printf "%s\n" "$undeclared_ordinary_entropy" | grep -v "^$file:" || true)"
-  done
-  if [[ -n "$undeclared_ordinary_entropy" ]]; then
-    echo "[patterns] ordinary entropy used outside the declared non-security call sites:" >&2
-    echo "$undeclared_ordinary_entropy" >&2
-    echo "[patterns] use compat.random secure helpers, or add the file to ordinary_entropy_files with rationale in the commit message" >&2
-    exit 1
-  fi
+actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
+  | grep -v "^$ordinary_entropy_definition_file:" \
+  | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
+
+undeclared_ordinary_entropy="$(comm -13 \
+  <(printf "%s\n" "$expected_ordinary_entropy_sites" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_ordinary_entropy_sites" | grep -v '^$' | sort))"
+if [[ -n "$undeclared_ordinary_entropy" ]]; then
+  echo "[patterns] undeclared ordinary entropy call site:" >&2
+  echo "$undeclared_ordinary_entropy" >&2
+  echo "[patterns] use compat.random secure helpers, or declare the exact call site in expected_ordinary_entropy_sites with rationale in the commit message" >&2
+  exit 1
+fi
+
+stale_ordinary_entropy="$(comm -23 \
+  <(printf "%s\n" "$expected_ordinary_entropy_sites" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_ordinary_entropy_sites" | grep -v '^$' | sort))"
+if [[ -n "$stale_ordinary_entropy" ]]; then
+  echo "[patterns] expected_ordinary_entropy_sites declares a call site that no longer exists:" >&2
+  echo "$stale_ordinary_entropy" >&2
+  echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+  exit 1
 fi
 
 echo "[patterns] checking compat.random secure wrapper bodies..."
