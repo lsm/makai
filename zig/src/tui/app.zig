@@ -219,10 +219,22 @@ const SavedModelRef = struct {
 
 pub const fixture_env_var = "MAKAI_TUI_FIXTURE";
 
+const fixture_step_separator = '|';
+const fixture_step_escape = '\\';
+const fixture_tool_arg_json = "{}";
+
+pub const FixtureStepError = error{
+    EmptyFixtureStep,
+    UnknownFixtureStepPrefix,
+    OutOfMemory,
+};
+
 pub const FixtureRuntime = struct {
     allocator: std.mem.Allocator,
     text: []u8,
-    steps: [1]fixture_provider.ResponseStep,
+    steps: std.ArrayList(fixture_provider.ResponseStep),
+    tool_specs: std.ArrayList([]fixture_provider.ToolCallSpec),
+    payloads: std.ArrayList([]u8),
     provider: fixture_provider.MockProvider,
 
     pub fn fromEnv(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?*FixtureRuntime {
@@ -239,14 +251,122 @@ pub const FixtureRuntime = struct {
         self.* = .{
             .allocator = allocator,
             .text = text,
-            .steps = .{.{ .text = text }},
+            .steps = .empty,
+            .tool_specs = .empty,
+            .payloads = .empty,
             .provider = undefined,
         };
-        self.provider = fixture_provider.MockProvider.init(.{ .steps = &self.steps, .repeat_last = true });
+        errdefer self.deinitSteps();
+        if (firstSegmentIsScenarioStep(text)) {
+            try self.appendScenarioSteps(text);
+        } else {
+            try self.steps.append(allocator, .{ .text = text });
+        }
+        self.provider = fixture_provider.MockProvider.init(.{ .steps = self.steps.items, .repeat_last = true });
         return self;
     }
 
+    fn firstSegmentIsScenarioStep(text: []const u8) bool {
+        const first = text[0..unescapedSeparatorIndex(text)];
+        return scenarioStepKind(first) != null;
+    }
+
+    fn scenarioStepKind(segment: []const u8) ?enum { text, tool, hold, err } {
+        if (std.mem.startsWith(u8, segment, "text:")) return .text;
+        if (std.mem.startsWith(u8, segment, "tool:")) return .tool;
+        if (std.mem.eql(u8, segment, "hold")) return .hold;
+        if (std.mem.startsWith(u8, segment, "error:")) return .err;
+        return null;
+    }
+
+    fn unescapedSeparatorIndex(text: []const u8) usize {
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == fixture_step_escape and i + 1 < text.len) {
+                i += 1;
+                continue;
+            }
+            if (text[i] == fixture_step_separator) return i;
+        }
+        return text.len;
+    }
+
+    fn unescapeStep(self: *FixtureRuntime, raw: []const u8) FixtureStepError![]const u8 {
+        if (std.mem.indexOfScalar(u8, raw, fixture_step_escape) == null) return raw;
+        const out = try self.allocator.alloc(u8, raw.len);
+        self.payloads.append(self.allocator, out) catch {
+            self.allocator.free(out);
+            return error.OutOfMemory;
+        };
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == fixture_step_escape and i + 1 < raw.len and
+                (raw[i + 1] == fixture_step_separator or raw[i + 1] == fixture_step_escape))
+            {
+                i += 1;
+            }
+            out[len] = raw[i];
+            len += 1;
+            i += 1;
+        }
+        return out[0..len];
+    }
+
+    fn appendScenarioSteps(self: *FixtureRuntime, text: []const u8) FixtureStepError!void {
+        var rest = text;
+        while (true) {
+            const segment_end = unescapedSeparatorIndex(rest);
+            const had_separator = segment_end < rest.len;
+            const segment = try self.unescapeStep(rest[0..segment_end]);
+            if (segment.len == 0) return error.EmptyFixtureStep;
+            const kind = scenarioStepKind(segment) orelse return error.UnknownFixtureStepPrefix;
+            switch (kind) {
+                .text => {
+                    const body = segment["text:".len..];
+                    if (body.len == 0) return error.EmptyFixtureStep;
+                    try self.steps.append(self.allocator, .{ .text = body });
+                },
+                .tool => {
+                    const step_rest = segment["tool:".len..];
+                    var name = step_rest;
+                    var args_json: []const u8 = fixture_tool_arg_json;
+                    if (std.mem.indexOfScalar(u8, step_rest, '#')) |hash| {
+                        name = step_rest[0..hash];
+                        args_json = step_rest[hash + 1 ..];
+                    }
+                    if (name.len == 0 or args_json.len == 0) return error.EmptyFixtureStep;
+                    const spec = try self.allocator.alloc(fixture_provider.ToolCallSpec, 1);
+                    spec[0] = .{ .id = "fixture-tool-call", .name = name, .arguments_json = args_json };
+                    self.tool_specs.append(self.allocator, spec) catch {
+                        self.allocator.free(spec);
+                        return error.OutOfMemory;
+                    };
+                    try self.steps.append(self.allocator, .{ .tool_calls = spec });
+                },
+                .hold => try self.steps.append(self.allocator, .{ .wait_for_cancel = {} }),
+                .err => {
+                    const body = segment["error:".len..];
+                    if (body.len == 0) return error.EmptyFixtureStep;
+                    try self.steps.append(self.allocator, .{ .provider_error = body });
+                },
+            }
+            if (!had_separator) return;
+            rest = rest[segment_end + 1 ..];
+            if (rest.len == 0) return error.EmptyFixtureStep;
+        }
+    }
+
+    fn deinitSteps(self: *FixtureRuntime) void {
+        for (self.tool_specs.items) |spec| self.allocator.free(spec);
+        self.tool_specs.deinit(self.allocator);
+        for (self.payloads.items) |payload| self.allocator.free(payload);
+        self.payloads.deinit(self.allocator);
+        self.steps.deinit(self.allocator);
+    }
+
     pub fn deinit(self: *FixtureRuntime) void {
+        self.deinitSteps();
         self.allocator.free(self.text);
         self.allocator.destroy(self);
     }
@@ -1884,6 +2004,59 @@ test "fixture runtime streams the env-provided text" {
     try std.testing.expectEqual(@as(usize, 1), fixture.provider.call_count);
 }
 
+test "fixture runtime parses scenario steps" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "text:one|tool:workspace_info|hold|error:boom|text:two")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), fixture.steps.items.len);
+    try std.testing.expectEqualStrings("one", fixture.steps.items[0].text);
+    try std.testing.expectEqualStrings("workspace_info", fixture.steps.items[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", fixture.steps.items[1].tool_calls[0].arguments_json);
+    try std.testing.expect(fixture.steps.items[2] == .wait_for_cancel);
+    try std.testing.expectEqualStrings("boom", fixture.steps.items[3].provider_error);
+    try std.testing.expectEqualStrings("two", fixture.steps.items[4].text);
+}
+
+test "fixture runtime parses tool args after the hash" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "tool:workspace_info#{\"workspace_root\":\"/tmp\"}")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqualStrings("workspace_info", fixture.steps.items[0].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"workspace_root\":\"/tmp\"}", fixture.steps.items[0].tool_calls[0].arguments_json);
+}
+
+test "fixture runtime keeps pipe-less text that is not a step" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "plain|reply|text")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.steps.items.len);
+    try std.testing.expectEqualStrings("plain|reply|text", fixture.steps.items[0].text);
+}
+
+test "fixture runtime unescapes separators inside step payloads" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "text:pipe\\|inside|tool:shell_execute#{\"command\":\"printf a \\| cat\"}|text:done")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), fixture.steps.items.len);
+    try std.testing.expectEqualStrings("pipe|inside", fixture.steps.items[0].text);
+    try std.testing.expectEqualStrings("shell_execute", fixture.steps.items[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf a | cat\"}", fixture.steps.items[1].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("done", fixture.steps.items[2].text);
+}
+
+test "fixture runtime unescapes backslashes and keeps lone ones literal" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "text:c:\\\\path\\\\\\|end")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqualStrings("c:\\path\\|end", fixture.steps.items[0].text);
+}
+
+test "fixture runtime rejects unknown step after a scenario prefix" {
+    try std.testing.expectError(error.UnknownFixtureStepPrefix, FixtureRuntime.fromValue(std.testing.allocator, "text:one|wat"));
+    try std.testing.expectError(error.EmptyFixtureStep, FixtureRuntime.fromValue(std.testing.allocator, "text:"));
+    try std.testing.expectError(error.EmptyFixtureStep, FixtureRuntime.fromValue(std.testing.allocator, "text:one|"));
+}
+
 test "App saveEvent keeps debug-visible event types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1976,7 +2149,6 @@ test "App submit routes help command to system transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
 }
 
-
 test "App submit starts direct OpenAI Codex login command" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2066,9 +2238,9 @@ test "multi-line /help output renders all lines into transcript view" {
     defer std.testing.allocator.free(rendered);
 
     const expect = [_][]const u8{
-        "/help",      "/model",  "/provider", "/status",
-        "/resume",    "/login",  "/permissions", "/abort",
-        "/clear",     "/quit",
+        "/help",   "/model", "/provider",    "/status",
+        "/resume", "/login", "/permissions", "/abort",
+        "/clear",  "/quit",
     };
     for (expect) |needle| {
         if (std.mem.indexOf(u8, rendered, needle) == null) {

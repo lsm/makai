@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 # PTY driver for the Makai TUI (#259): launches `makai --tui` inside a
-# pseudo-terminal, replays the core-loop scenario (launch -> type prompt ->
-# submit -> stream -> /model picker -> /resume picker -> /quit), captures
-# every rendered byte stream with timestamps, and reports a performance
-# baseline. Determinism comes from MAKAI_TUI_FIXTURE (see
-# zig/src/tui/fixture_provider.zig): the env value is the canned assistant
-# reply, so no API keys or network access are involved.
+# pseudo-terminal, replays scripted scenarios, captures every rendered byte
+# stream with timestamps, and reports a performance baseline. Determinism
+# comes from MAKAI_TUI_FIXTURE (see zig/src/tui/fixture_provider.zig): the
+# env value is the canned assistant reply, so no API keys or network access
+# are involved.
+#
+# The default `core-loop` scenario (launch -> type prompt -> submit -> stream
+# -> /model picker -> /resume picker -> /quit) feeds the performance baseline.
+# The UX-sweep scenarios (#264) cover the ratified surface: every slash
+# command, every kept key, the approval flow (y/a/n), and a session
+# save+resume round-trip. Fixture values for those scenarios use the step
+# encoding `text:...|tool:<name>[#<args-json>]|hold|error:...` (see
+# FixtureRuntime in zig/src/tui/app.zig); plain values stay a single canned
+# reply. A literal `|` or `\` inside a step payload is escaped as `\|` / `\\`.
 #
 # Usage:
 #   zig build install -Doptimize=ReleaseFast --prefix /tmp/makai-pty
 #   python3 scripts/tui-pty-driver.py --binary /tmp/makai-pty/bin/makai \
 #       --output-dir tui-pty-out
+#   python3 scripts/tui-pty-driver.py --binary ... --scenario all
 #
-# Output: one JSON object on stdout (also written to <output-dir>/metrics.json),
-# the raw terminal transcript in <output-dir>/transcript.bin, and one
-# {"t_ms", "bytes"} line per read batch in <output-dir>/batches.jsonl.
+# Output: one JSON object on stdout (also written to <output-dir>/metrics.json
+# for core-loop), the raw terminal transcript in <output-dir>/transcript.bin,
+# one {"t_ms", "bytes"} line per read batch in <output-dir>/batches.jsonl,
+# and one {"name", "t_ms", "tail"} checkpoint per named frame in
+# <output-dir>/frames.jsonl. With --scenario all, each scenario writes its own
+# subdirectory under --output-dir and a summary.json lands at the top level.
 # The script exits non-zero when any scenario assertion fails, so CI can gate
 # on it. Timings are wall-clock (time.monotonic) and host-dependent: record
 # them against a stable host class, like the bench harness baseline.
@@ -122,12 +134,13 @@ def terminal_cell_width(text):
 
 
 class PtySession:
-    def __init__(self, args):
+    def __init__(self, args, fixture_text=None, home=None):
         self.binary = args.binary
         self.width = args.width
         self.height = args.height
-        self.fixture_text = args.fixture_text
-        self.home = tempfile.mkdtemp(prefix="makai-pty-home-")
+        self.fixture_text = args.fixture_text if fixture_text is None else fixture_text
+        self.owns_home = home is None
+        self.home = home if home is not None else tempfile.mkdtemp(prefix="makai-pty-home-")
         self.chunks = []
         self.plain = b""
         self.first_output_ms = None
@@ -173,7 +186,8 @@ class PtySession:
             except OSError:
                 pass
             self.master = None
-        shutil.rmtree(self.home, ignore_errors=True)
+        if self.owns_home:
+            shutil.rmtree(self.home, ignore_errors=True)
 
     def _read_once(self, timeout):
         ready, _, _ = select.select([self.master], [], [], timeout)
@@ -330,8 +344,7 @@ def git_revision(repo_root):
 
 
 def run_scenario(args, repo_root):
-    if not os.path.isfile(args.binary):
-        raise ScenarioError(f"binary not found: {args.binary} (build with: zig build install -Doptimize=ReleaseFast)")
+    check_binary(args.binary)
 
     try:
         session = PtySession(args)
@@ -421,26 +434,413 @@ def run_scenario(args, repo_root):
     return session, metrics if error is None else None, error
 
 
-def main():
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    parser = argparse.ArgumentParser(description="Drive the Makai TUI through a pseudo-terminal and measure it.")
-    parser.add_argument("--binary", default=os.path.join(repo_root, "zig-out", "bin", "makai"))
-    parser.add_argument("--output-dir", default="tui-pty-out")
-    parser.add_argument("--width", type=int, default=100)
-    parser.add_argument("--height", type=int, default=30)
-    parser.add_argument("--prompt", default="the quick brown fox")
-    parser.add_argument("--fixture-text", default="pty-fixture-reply")
-    parser.add_argument("--startup-timeout", type=float, default=15.0)
-    parser.add_argument("--stream-timeout", type=float, default=15.0)
-    args = parser.parse_args()
-    if sys.platform == "darwin":
-        parser.error(
-            "macOS is rejected: makai reads the login keychain (com.makai.auth / Codex Auth) "
-            "regardless of HOME, so this driver cannot isolate a credential-free run there "
-            "(issue #263 tracks a file-only auth mode); run on Linux/CI"
-        )
+def check_binary(binary):
+    if not os.path.isfile(binary):
+        raise ScenarioError(f"binary not found: {binary} (build with: zig build install -Doptimize=ReleaseFast)")
+
+
+KEY_ENTER = b"\r"
+KEY_SHIFT_ENTER_KITTY = b"\x1b[13;2u"
+KEY_UP = b"\x1b[A"
+KEY_DOWN = b"\x1b[B"
+KEY_PGUP = b"\x1b[5~"
+KEY_PGDN = b"\x1b[6~"
+KEY_ESC = b"\x1b"
+KEY_CTRL_C = b"\x03"
+KEY_CTRL_T = b"\x14"
+KEY_CTRL_Y = b"\x19"
+KEY_SHIFT_TAB = b"\x1b[Z"
+
+RATIFIED_COMMANDS = (
+    "/help",
+    "/model",
+    "/login",
+    "/provider",
+    "/permissions",
+    "/resume",
+    "/status",
+    "/abort",
+    "/clear",
+    "/quit",
+)
+
+
+class SweepRun:
+    def __init__(self, args, name, fixture_text, width=None, height=None, home=None):
+        self.args = args
+        self.name = name
+        self.notes = []
+        self.frames = []
+        self.error = None
+        frame_args = argparse.Namespace(**vars(args))
+        if width is not None:
+            frame_args.width = width
+        if height is not None:
+            frame_args.height = height
+        try:
+            self.session = PtySession(frame_args, fixture_text=fixture_text, home=home)
+        except OSError as err:
+            raise ScenarioError(f"failed to start {args.binary} in a pseudo-terminal: {err}")
+
+    def note(self, text):
+        self.notes.append(text)
+
+    def frame(self, name):
+        self.frames.append({
+            "name": name,
+            "t_ms": round((self.session.last_read_at - self.session.spawned_at) * 1000.0, 3),
+            "tail": self.session.plain[-800:].decode("utf-8", "replace"),
+        })
+        return self.frames[-1]
+
+    def settle(self, secs=0.3):
+        self.session.drain_frame_tail(quiet_seconds=secs, max_drain_seconds=secs * 4)
+
+    def command(self, text, marker, timeout=6.0, what=None):
+        self.session.type_text(text)
+        self.session.send(KEY_ENTER, f"Enter ({text})")
+        self.session.wait_for(marker.encode(), timeout, what or f"{text} output")
+        self.settle()
+        return self.frame(text.strip("/").replace(" ", "-"))
+
+    def key(self, payload, what, timeout=3.0):
+        self.session.send(payload, what)
+        self.settle(timeout)
+
+    def key_wait(self, payload, what, marker, timeout=6.0):
+        self.session.send(payload, what)
+        self.session.wait_for(marker.encode(), timeout, what)
+        self.settle()
+        return self.frame(what)
+
+    def submit(self, prompt, reply_marker, timeout=10.0):
+        self.session.type_text(prompt)
+        self.session.send(KEY_ENTER, f"Enter (submit {prompt!r})")
+        self.session.wait_for(reply_marker.encode(), timeout, f"reply {reply_marker!r}")
+        self.settle()
+
+    def seen(self, needle, from_index=0):
+        return plain_text(needle.encode()) in self.session.plain[from_index:]
+
+    def try_wait(self, marker, timeout):
+        try:
+            self.session.wait_for(marker.encode(), timeout, f"optional {marker!r}")
+            return True
+        except ScenarioError:
+            return False
+
+    def quit(self):
+        self.session.type_text("/quit")
+        self.session.send(KEY_ENTER, "Enter (/quit)")
+        exit_code = self.session.wait_exit(5.0)
+        if exit_code != 0:
+            raise ScenarioError(f"{self.name}: TUI exited with code {exit_code}, expected 0")
+
+    def close(self):
+        self.session.close()
+
+    def dump(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "transcript.bin"), "wb") as handle:
+            for _, chunk in self.session.chunks:
+                handle.write(chunk)
+        with open(os.path.join(output_dir, "batches.jsonl"), "w") as handle:
+            for timestamp, chunk in self.session.chunks:
+                handle.write(json.dumps({"t_ms": round((timestamp - self.session.spawned_at) * 1000.0, 3), "bytes": len(chunk)}) + "\n")
+        with open(os.path.join(output_dir, "frames.jsonl"), "w") as handle:
+            for frame in self.frames:
+                handle.write(json.dumps(frame) + "\n")
+        with open(os.path.join(output_dir, "notes.json"), "w") as handle:
+            json.dump({"scenario": self.name, "error": self.error, "notes": self.notes}, handle, indent=2)
+            handle.write("\n")
+
+
+def scenario_commands(args):
+    run = SweepRun(args, "commands", "commands-fixture-reply")
+    try:
+        run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+        run.settle()
+        run.frame("welcome")
+
+        run.session.type_text("/help")
+        help_from = len(run.session.plain)
+        run.session.send(KEY_ENTER, "Enter (/help)")
+        run.session.wait_for(b"Available commands:", 6.0, "/help output")
+        run.settle()
+        run.frame("help")
+        help_text = run.session.plain[help_from:].decode("utf-8", "replace")
+        for usage in RATIFIED_COMMANDS:
+            if usage not in help_text:
+                raise ScenarioError(f"commands: /help output does not list {usage}")
+        run.note(f"/help lists all {len(RATIFIED_COMMANDS)} ratified commands")
+
+        status_from = len(run.session.plain)
+        run.command("/status", "session:")
+        field_positions = []
+        for field in ("session:", "model:", "provider:", "turns:", "context:", "streaming:"):
+            position = run.session.plain.find(plain_text(field.encode()), status_from)
+            if position < 0:
+                raise ScenarioError(f"commands: /status output missing {field!r}")
+            field_positions.append(position)
+        if field_positions != sorted(field_positions) or field_positions[-1] - field_positions[0] > 6 * (args.width + 8):
+            raise ScenarioError("commands: /status fields did not render as one contiguous status block")
+
+        run.command("/provider", "current provider:")
+        if not run.seen("available providers:"):
+            raise ScenarioError("commands: /provider output missing available providers list")
+
+        run.command("/model", "Select model")
+        run.key(KEY_ESC, "Escape closes model picker")
+        picker_closed_from = len(run.session.plain)
+        run.session.type_text("zz")
+        if not run.seen("zz", picker_closed_from):
+            raise ScenarioError("commands: composer input not restored after Escape closed the model picker")
+        run.session.send(b"\x7f\x7f", "Backspace clears the echo probe")
+        run.settle()
+        run.command("/model claude-sonnet-4-5", "model switched to claude-sonnet-4-5")
+
+        run.command("/login", "Login provider")
+        run.key(KEY_ESC, "Escape closes login picker")
+
+        run.command("/permissions", "Tool permissions")
+        run.key(KEY_ESC, "Escape closes permission picker")
+        run.command("/permissions ask", "permission mode set to ask")
+        run.command("/permissions frobnicate", "unknown permission mode: frobnicate")
+        run.command("/permissions bypass", "permission mode set to bypass")
+
+        run.command("/resume", "no saved sessions")
+        run.command("/abort", "Nothing to abort")
+        run.command("/bogus", "unknown command: /bogus")
+        run.command("/clear", "transcript cleared")
+
+        run.quit()
+    except ScenarioError as err:
+        run.error = str(err)
+    finally:
+        run.close()
+    return run
+
+
+def scenario_keys(args):
+    run = SweepRun(args, "keys", "keys-fixture-reply", width=132, height=15)
+    run.note("status bar at 100 columns clips its trailing segments (observed at default width: 'think:medium' -> 'think:medi…' and 'turns' dropped); this run widens to 132 so the full bar renders")
+    try:
+        run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+        run.settle()
+        run.frame("welcome")
+
+        run.submit("alpha turn one", "keys-fixture-reply")
+        run.submit("alpha turn two", "keys-fixture-reply")
+        run.submit("alpha turn three", "keys-fixture-reply")
+        run.frame("three-turns")
+
+        copy_from = len(run.session.plain)
+        run.key(KEY_CTRL_Y, "Ctrl+Y copy last reply")
+        if run.seen("copied last reply to clipboard", copy_from):
+            run.note("Ctrl+Y with a reply present appends 'copied last reply to clipboard' to the transcript")
+        elif run.seen("clipboard unavailable", copy_from):
+            run.note("FINDING: Ctrl+Y fails headless: 'clipboard unavailable' — no OSC 52 fallback for terminals without a clipboard")
+        elif run.seen("nothing to copy yet", copy_from):
+            run.note("FINDING: Ctrl+Y reports 'nothing to copy yet' although a reply exists")
+        else:
+            run.note("FINDING: Ctrl+Y produced no visible feedback")
+
+        run.session.type_text("first line")
+        before_join = len(run.session.plain)
+        run.key(KEY_SHIFT_ENTER_KITTY, "Shift+Enter (kitty encoding)")
+        run.session.type_text("second line")
+        run.settle()
+        if plain_text(b"first linesecond line") in run.session.plain[before_join - 64:]:
+            run.note("FINDING: Shift+Enter (kitty CSI 13;2u) inserted no newline — lines concatenated in the composer")
+        else:
+            run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline")
+        run.frame("shift-enter-draft")
+        run.session.send(KEY_ENTER, "Enter (submit two-line draft)")
+        run.session.wait_for(b"keys-fixture-reply", 10.0, "reply after two-line submit")
+        run.settle()
+
+        run.key_wait(KEY_UP, "Up history (latest)", "second line")
+        run.key_wait(KEY_UP, "Up history (previous)", "alpha turn three")
+        run.key_wait(KEY_DOWN, "Down history (latest)", "second line")
+        run.frame("history-recall")
+
+        pgup_from = len(run.session.plain)
+        run.key(KEY_PGUP, "PageUp scroll")
+        if run.seen("SCROLL", pgup_from):
+            run.note("PageUp shows a scroll indicator")
+        else:
+            run.note("FINDING: PgUp has no visible effect — the transcript SCROLL indicator renders only in the non-TTY fallback view path; in a real terminal history is flushed inline and transcript_scroll is never read, so terminal-native scrollback is the only scroll")
+        run.key(KEY_PGDN, "PageDown scroll")
+        run.frame("after-paging")
+
+        run.key(KEY_CTRL_T, "Ctrl+T expand latest tool")
+        run.note("FINDING: Ctrl+T (ratified keep-list: expand latest tool) is unbound in the TUI — 4ed8207 dropped the handler and trim 6/6 recorded it as already absent")
+        alive_from = len(run.session.plain)
+        run.session.type_text("z")
+        run.settle()
+        if plain_text(b"z") not in run.session.plain[alive_from:]:
+            raise ScenarioError("keys: TUI stopped echoing after Ctrl+T (input loop wedged)")
+
+        run.key_wait(KEY_SHIFT_TAB, "Shift+Tab thinking level", "medium")
+        run.key_wait(KEY_SHIFT_TAB, "Shift+Tab thinking level again", "high")
+        run.frame("thinking-cycled")
+
+        run.session.send(KEY_CTRL_C, "Ctrl+C quit")
+        exit_code = run.session.wait_exit(5.0)
+        if exit_code != 0:
+            raise ScenarioError(f"keys: Ctrl+C exited with code {exit_code}, expected 0")
+        run.note("Ctrl+C exits cleanly with code 0")
+    except ScenarioError as err:
+        run.error = str(err)
+    finally:
+        run.close()
+    return run
+
+
+def scenario_steer_abort(args):
+    run = SweepRun(args, "steer-abort", "hold")
+    try:
+        run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+        run.settle()
+        run.frame("welcome")
+
+        run.session.type_text("hold this thought")
+        run.session.send(KEY_ENTER, "Enter (submit)")
+        run.session.wait_for(b"streaming", 10.0, "streaming status after submit")
+        run.frame("streaming")
+
+        run.session.type_text("steer this turn")
+        run.session.send(KEY_ENTER, "Enter (steer)")
+        run.session.wait_for(b"queue", 6.0, "queued steer indicator")
+        run.frame("steer-queued")
+        run.note("Enter while streaming queues a steer: the composer footer shows 'queued 1' and the status bar a queue count, but the steered text itself never echoes into the transcript")
+
+        run.command("/abort", "Turn aborted.")
+        run.frame("aborted")
+        run.settle(1.0)
+        run.note("/abort during a held stream cancels the turn and clears the streaming status")
+
+        run.quit()
+    except ScenarioError as err:
+        run.error = str(err)
+    finally:
+        run.close()
+    return run
+
+
+WORKSPACE_INFO_ARGS = '{"workspace_root":"/tmp"}'
+
+
+def scenario_approval_deny(args):
+    tool_step = 'tool:shell_execute#{"command":"true --pty-probe"}'
+    run = SweepRun(args, "approval-deny", tool_step + "|" + tool_step + "|" + tool_step + "|text:deny-persist-complete")
+    try:
+        run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+        run.settle()
+        run.command("/permissions ask", "permission mode set to ask")
+
+        run.session.type_text("use the tool twice")
+        run.session.send(KEY_ENTER, "Enter (submit)")
+        run.session.wait_for(b"Approval required", 10.0, "approval view")
+        run.session.wait_for(b"Tool: shell_execute", 5.0, "approval tool name")
+        run.frame("approval-pending")
+
+        run.key_wait(b"n", "deny approval", "Approval required")
+        run.frame("denied")
+        run.note("'n' denies the first approval and the agent retries the same tool")
+
+        always_from = len(run.session.plain)
+        run.key_wait(b"a", "approve always", "deny-persist-complete")
+        run.frame("approved-always")
+        final_at = run.session.plain.find(b"deny-persist-complete", always_from)
+        if b"Approval required" in run.session.plain[always_from:final_at]:
+            raise ScenarioError("approval-deny: the third matching tool call prompted again although 'a' approved always")
+        run.note("'a' approves always for a persistable shell call: the third shell_execute runs with no new approval prompt and the turn completes")
+    except ScenarioError as err:
+        run.error = str(err)
+    finally:
+        run.close()
+    return run
+
+
+def scenario_approval_allow(args):
+    run = SweepRun(args, "approval-allow", 'tool:workspace_info#' + WORKSPACE_INFO_ARGS + "|text:allow-path-complete")
+    try:
+        run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+        run.settle()
+        run.command("/permissions ask", "permission mode set to ask")
+
+        run.session.type_text("run workspace info")
+        run.session.send(KEY_ENTER, "Enter (submit)")
+        run.session.wait_for(b"Approval required", 10.0, "approval view")
+        run.key_wait(b"y", "approve once", "allow-path-complete")
+        run.frame("approved-once")
+        run.note("'y' approves once: workspace_info executes and the turn completes")
+    except ScenarioError as err:
+        run.error = str(err)
+    finally:
+        run.close()
+    return run
+
+
+def scenario_session_roundtrip(args):
+    home = tempfile.mkdtemp(prefix="makai-pty-home-roundtrip-")
+    try:
+        first = SweepRun(args, "session-roundtrip-save", "roundtrip-reply-alpha", home=home)
+        try:
+            first.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner (run 1)")
+            first.settle()
+            first.submit("remember the alpha", "roundtrip-reply-alpha")
+            first.frame("saved-turn")
+            first.quit()
+        except ScenarioError as err:
+            first.error = str(err)
+        finally:
+            first.close()
+        if first.error is not None:
+            return first
+
+        second = SweepRun(args, "session-roundtrip-resume", "roundtrip-reply-beta", home=home)
+        try:
+            second.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner (run 2)")
+            second.settle()
+            picker_from = len(second.session.plain)
+            second.command("/resume", "Sessions")
+            picker_row = f"claude-sonnet-4-5 anthropic {time.gmtime().tm_year}"
+            if not second.seen(picker_row, picker_from):
+                raise ScenarioError("session-roundtrip: picker row does not show the saved model and provider")
+            second.frame("session-picker")
+
+            second.session.send(KEY_ENTER, "Enter (resume session)")
+            second.session.wait_for(b"roundtrip-reply-alpha", 10.0, "restored transcript reply")
+            second.frame("resumed")
+            second.note("saved session round-trips: /resume lists it and Enter replays the saved assistant reply")
+            second.quit()
+        except ScenarioError as err:
+            second.error = str(err)
+        finally:
+            second.close()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    return second
+
+
+SCENARIOS = {
+    "core-loop": None,
+    "commands": scenario_commands,
+    "keys": scenario_keys,
+    "steer-abort": scenario_steer_abort,
+    "approval-deny": scenario_approval_deny,
+    "approval-allow": scenario_approval_allow,
+    "session-roundtrip": scenario_session_roundtrip,
+}
+
+
+def validate_core_loop_args(parser, args):
     if not args.fixture_text:
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
+    if args.fixture_text.startswith(("text:", "tool:", "error:")) or args.fixture_text == "hold":
+        parser.error("--fixture-text must be a plain reply, not the scenario step encoding (text:/tool:/hold/error:): core-loop asserts the literal value, which a parsed step never emits verbatim")
     if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in args.prompt):
         parser.error("--prompt must be printable single-line text: control characters would be sent to the TUI as terminal input")
     if args.fixture_text in args.prompt or args.prompt in args.fixture_text:
@@ -461,6 +861,18 @@ def main():
     if terminal_cell_width(args.fixture_text) > body_cell_cap or terminal_cell_width(args.prompt) > body_cell_cap:
         parser.error(f"--fixture-text and --prompt must each fit one rendered transcript row (at most {body_cell_cap} terminal cells at --width {args.width}; the transcript caps and wraps rows near 106 columns regardless of terminal width): wrapping inserts layout between fragments the marker cannot match")
 
+
+def dump_core_loop(output_dir, session):
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "transcript.bin"), "wb") as handle:
+        for _, chunk in session.chunks:
+            handle.write(chunk)
+    with open(os.path.join(output_dir, "batches.jsonl"), "w") as handle:
+        for timestamp, chunk in session.chunks:
+            handle.write(json.dumps({"t_ms": round((timestamp - session.spawned_at) * 1000.0, 3), "bytes": len(chunk)}) + "\n")
+
+
+def run_core_loop(args, repo_root):
     session = None
     metrics = None
     error = None
@@ -470,13 +882,7 @@ def main():
         error = err
 
     if session is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "transcript.bin"), "wb") as handle:
-            for _, chunk in session.chunks:
-                handle.write(chunk)
-        with open(os.path.join(args.output_dir, "batches.jsonl"), "w") as handle:
-            for timestamp, chunk in session.chunks:
-                handle.write(json.dumps({"t_ms": round((timestamp - session.spawned_at) * 1000.0, 3), "bytes": len(chunk)}) + "\n")
+        dump_core_loop(args.output_dir, session)
 
     if error is not None:
         if session is not None:
@@ -490,8 +896,7 @@ def main():
             with open(os.path.join(args.output_dir, "metrics.json"), "w") as handle:
                 json.dump(failure, handle, indent=2)
                 handle.write("\n")
-        print(f"tui-pty-driver: FAIL: {error}", file=sys.stderr)
-        return 1
+        return error
 
     with open(os.path.join(args.output_dir, "metrics.json"), "w") as handle:
         json.dump(metrics, handle, indent=2)
@@ -504,6 +909,87 @@ def main():
         f"keypress-p95={metrics['keypress']['p95_ms']}ms",
         file=sys.stderr,
     )
+    return None
+
+
+def run_sweep_scenario(args, repo_root, name):
+    runner = SCENARIOS[name]
+    try:
+        run = runner(args)
+        output_dir = os.path.join(args.output_dir, name)
+        run.dump(output_dir)
+        if run.error is not None:
+            return {"scenario": name, "result": "fail", "error": run.error, "frames": len(run.frames), "notes": run.notes, "output_dir": output_dir}
+        return {
+            "scenario": name,
+            "result": "pass",
+            "frames": len(run.frames),
+            "notes": run.notes,
+            "output_dir": output_dir,
+        }
+    except (ScenarioError, OSError) as err:
+        return {"scenario": name, "result": "fail", "error": str(err), "notes": []}
+
+
+def main():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(description="Drive the Makai TUI through a pseudo-terminal and measure it.")
+    parser.add_argument("--binary", default=os.path.join(repo_root, "zig-out", "bin", "makai"))
+    parser.add_argument("--output-dir", default="tui-pty-out")
+    parser.add_argument("--width", type=int, default=100)
+    parser.add_argument("--height", type=int, default=30)
+    parser.add_argument("--prompt", default="the quick brown fox")
+    parser.add_argument("--fixture-text", default="pty-fixture-reply")
+    parser.add_argument("--scenario", default="core-loop", choices=list(SCENARIOS) + ["all"])
+    parser.add_argument("--startup-timeout", type=float, default=15.0)
+    parser.add_argument("--stream-timeout", type=float, default=15.0)
+    args = parser.parse_args()
+    if sys.platform == "darwin":
+        parser.error(
+            "macOS is rejected: makai reads the login keychain (com.makai.auth / Codex Auth) "
+            "regardless of HOME, so this driver cannot isolate a credential-free run there "
+            "(issue #263 tracks a file-only auth mode); run on Linux/CI"
+        )
+    check_binary(args.binary)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.scenario == "core-loop":
+        validate_core_loop_args(parser, args)
+        error = run_core_loop(args, repo_root)
+        if error is not None:
+            print(f"tui-pty-driver: FAIL: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    names = [name for name in SCENARIOS if name != "core-loop"] if args.scenario == "all" else [args.scenario]
+    if args.scenario == "all":
+        validate_core_loop_args(parser, args)
+        core_error = run_core_loop(args, repo_root)
+        if core_error is not None:
+            print(f"tui-pty-driver: FAIL: core-loop: {core_error}", file=sys.stderr)
+            return 1
+
+    results = []
+    for name in names:
+        result = run_sweep_scenario(args, repo_root, name)
+        results.append(result)
+        status = "OK" if result["result"] == "pass" else f"FAIL: {result.get('error', '')}"
+        print(f"tui-pty-driver: {name}: {status}", file=sys.stderr)
+
+    summary = {
+        "schema": 1,
+        "harness": "scripts/tui-pty-driver.py",
+        "scenario": args.scenario,
+        "git_revision": git_revision(repo_root),
+        "results": results,
+    }
+    with open(os.path.join(args.output_dir, "summary.json"), "w") as handle:
+        json.dump(summary, handle, indent=2)
+        handle.write("\n")
+
+    failures = [r for r in results if r["result"] == "fail"]
+    if failures:
+        return 1
     return 0
 
 
