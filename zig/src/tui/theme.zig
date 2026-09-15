@@ -167,15 +167,6 @@ fn toolNameMatches(name: []const u8, tokens: []const []const u8) bool {
     return false;
 }
 
-pub fn toolStatus(status: tui_state.ToolStatus) zz.Style {
-    return switch (status) {
-        .pending => (zz.Style{}).fg(palette.warning).bold(true).inline_style(true),
-        .running => (zz.Style{}).fg(palette.running).bold(true).inline_style(true),
-        .done => (zz.Style{}).fg(palette.success).bold(true).inline_style(true),
-        .@"error" => (zz.Style{}).fg(palette.danger).bold(true).inline_style(true),
-    };
-}
-
 pub fn errorText() zz.Style {
     return (zz.Style{}).fg(palette.danger).bold(true).inline_style(true);
 }
