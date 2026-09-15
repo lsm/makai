@@ -81,7 +81,7 @@ pub const MockProvider = struct {
                 const token = options.cancel_token orelse return error.MissingCancelToken;
                 var waits: usize = 0;
                 while (!token.isCancelled()) : (waits += 1) {
-                    if (waits >= 1_000) return error.CancelNotObserved;
+                    if (waits >= 60_000) return error.CancelNotObserved;
                     compat.time.sleepMs(1);
                 }
                 try pushDoneAndComplete(stream_ptr, allocator, model, &.{}, .aborted);

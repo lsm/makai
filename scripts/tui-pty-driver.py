@@ -562,8 +562,12 @@ def scenario_commands(args):
         run.settle()
         run.frame("welcome")
 
+        run.session.type_text("/help")
         help_from = len(run.session.plain)
-        run.command("/help", "Available commands:")
+        run.session.send(KEY_ENTER, "Enter (/help)")
+        run.session.wait_for(b"Available commands:", 6.0, "/help output")
+        run.settle()
+        run.frame("help")
         help_text = run.session.plain[help_from:].decode("utf-8", "replace")
         for usage in RATIFIED_COMMANDS:
             if usage not in help_text:
@@ -587,6 +591,12 @@ def scenario_commands(args):
 
         run.command("/model", "Select model")
         run.key(KEY_ESC, "Escape closes model picker")
+        picker_closed_from = len(run.session.plain)
+        run.session.type_text("zz")
+        if not run.seen("zz", picker_closed_from):
+            raise ScenarioError("commands: composer input not restored after Escape closed the model picker")
+        run.session.send(b"\x7f\x7f", "Backspace clears the echo probe")
+        run.settle()
         run.command("/model claude-sonnet-4-5", "model switched to claude-sonnet-4-5")
 
         run.command("/login", "Login provider")
@@ -722,8 +732,8 @@ WORKSPACE_INFO_ARGS = '{"workspace_root":"/tmp"}'
 
 
 def scenario_approval_deny(args):
-    tool_step = 'tool:workspace_info#' + WORKSPACE_INFO_ARGS
-    run = SweepRun(args, "approval-deny", tool_step + "|" + tool_step + "|text:dual-path-complete")
+    tool_step = 'tool:shell_execute#{"command":"true --pty-probe"}'
+    run = SweepRun(args, "approval-deny", tool_step + "|" + tool_step + "|" + tool_step + "|text:deny-persist-complete")
     try:
         run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
         run.settle()
@@ -732,16 +742,20 @@ def scenario_approval_deny(args):
         run.session.type_text("use the tool twice")
         run.session.send(KEY_ENTER, "Enter (submit)")
         run.session.wait_for(b"Approval required", 10.0, "approval view")
-        run.session.wait_for(b"Tool: workspace_info", 5.0, "approval tool name")
+        run.session.wait_for(b"Tool: shell_execute", 5.0, "approval tool name")
         run.frame("approval-pending")
 
         run.key_wait(b"n", "deny approval", "Approval required")
         run.frame("denied")
         run.note("'n' denies the first approval and the agent retries the same tool")
 
-        run.key_wait(b"a", "approve always", "dual-path-complete")
+        always_from = len(run.session.plain)
+        run.key_wait(b"a", "approve always", "deny-persist-complete")
         run.frame("approved-always")
-        run.note("'a' approves always: the retried tool runs without a fresh prompt and the turn completes")
+        final_at = run.session.plain.find(b"deny-persist-complete", always_from)
+        if b"Approval required" in run.session.plain[always_from:final_at]:
+            raise ScenarioError("approval-deny: the third matching tool call prompted again although 'a' approved always")
+        run.note("'a' approves always for a persistable shell call: the third shell_execute runs with no new approval prompt and the turn completes")
     except ScenarioError as err:
         run.error = str(err)
     finally:
@@ -825,6 +839,8 @@ SCENARIOS = {
 def validate_core_loop_args(parser, args):
     if not args.fixture_text:
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
+    if args.fixture_text.startswith(("text:", "tool:", "error:")) or args.fixture_text == "hold":
+        parser.error("--fixture-text must be a plain reply, not the scenario step encoding (text:/tool:/hold/error:): core-loop asserts the literal value, which a parsed step never emits verbatim")
     if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in args.prompt):
         parser.error("--prompt must be printable single-line text: control characters would be sent to the TUI as terminal input")
     if args.fixture_text in args.prompt or args.prompt in args.fixture_text:
