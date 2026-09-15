@@ -770,12 +770,26 @@ def scenario_approval_allow(args):
         run.settle()
         run.command("/permissions ask", "permission mode set to ask")
 
+        turn_from = len(run.session.plain)
         run.session.type_text("run workspace info")
         run.session.send(KEY_ENTER, "Enter (submit)")
         run.session.wait_for(b"Approval required", 10.0, "approval view")
+        run.session.wait_for(b"Tool: workspace_info", 5.0, "approval tool name")
+        run.frame("approval-pending")
         run.key_wait(b"y", "approve once", "allow-path-complete")
+        run.settle(0.5)
         run.frame("approved-once")
-        run.note("'y' approves once: workspace_info executes and the turn completes")
+        turn_plain = run.session.plain[turn_from:]
+        summary_lines = turn_plain.count(b"Workspace Info ok")
+        if summary_lines != 1:
+            raise ScenarioError(f"approval-allow: expected exactly one finalized tool summary line, saw {summary_lines}")
+        if b'   {"workspace_root"' in turn_plain:
+            raise ScenarioError("approval-allow: raw tool-args JSON echoed as a transcript row")
+        if b"Workspace Info failed" in turn_plain:
+            raise ScenarioError("approval-allow: the approved workspace_info call rendered as failed")
+        if b"project_root" not in turn_plain:
+            raise ScenarioError("approval-allow: workspace_info result text missing from the transcript")
+        run.note("'y' approves once: workspace_info executes as one summary line plus its result block, and the turn completes")
     except ScenarioError as err:
         run.error = str(err)
     finally:
