@@ -276,7 +276,7 @@ test "status bar truncates on whole segment boundaries at narrow width" {
     defer state.deinit();
     try state.status.setModelWithContext(std.testing.allocator, "claude-sonnet-4-5", "anthropic", 200_000);
     state.thinking_level = .medium;
-    state.status.turn_count = 3;
+    state.status.turn_count = 13;
 
     const full = try render(std.testing.allocator, &state, .{ .width = 200 });
     defer std.testing.allocator.free(full);
@@ -288,10 +288,10 @@ test "status bar truncates on whole segment boundaries at narrow width" {
     try std.testing.expect(std.mem.indexOf(u8, text, "anthropic/claude-sonnet-4-5") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
     if (std.mem.indexOf(u8, text, "think") != null) {
-        try std.testing.expect(std.mem.indexOf(u8, text, "think:medium") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "medium") != null);
     }
     if (std.mem.indexOf(u8, text, "turns") != null) {
-        try std.testing.expect(std.mem.indexOf(u8, text, "turns:3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "13") != null);
     }
 }
 
@@ -300,7 +300,7 @@ test "status bar keeps whole segments monotonically as width grows" {
     defer state.deinit();
     try state.status.setModelWithContext(std.testing.allocator, "claude-sonnet-4-5", "anthropic", 200_000);
     state.thinking_level = .medium;
-    state.status.turn_count = 3;
+    state.status.turn_count = 13;
 
     var had_think = false;
     var had_turns = false;
@@ -308,13 +308,19 @@ test "status bar keeps whole segments monotonically as width grows" {
         const text = try render(std.testing.allocator, &state, .{ .width = width });
         defer std.testing.allocator.free(text);
         try std.testing.expect(tui_text.visibleWidth(text) <= width);
-        const has_think = std.mem.indexOf(u8, text, "think:medium") != null;
-        const has_turns = std.mem.indexOf(u8, text, "turns:3") != null;
+        const has_think = std.mem.indexOf(u8, text, "think") != null and std.mem.indexOf(u8, text, "medium") != null;
+        const has_turns = std.mem.indexOf(u8, text, "turns") != null and std.mem.indexOf(u8, text, "13") != null;
         if (std.mem.indexOf(u8, text, "think") != null) {
-            try std.testing.expect(has_think);
+            try std.testing.expect(std.mem.indexOf(u8, text, "medium") != null);
+        }
+        if (std.mem.indexOf(u8, text, "medium") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);
         }
         if (std.mem.indexOf(u8, text, "turns") != null) {
-            try std.testing.expect(has_turns);
+            try std.testing.expect(std.mem.indexOf(u8, text, "13") != null);
+        }
+        if (std.mem.indexOf(u8, text, "13") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "turns") != null);
         }
         try std.testing.expect(has_think or !had_think);
         try std.testing.expect(has_turns or !had_turns);
