@@ -113,6 +113,31 @@ unreachable (no row links to them); clearing keeps the registry truthful and bou
 | 5 rejected-call readability (r3) | §1/§2: result row kept when the error detail is not readable |
 | `/clear` desync (issue comment) | §4 + §2: `/clear` clears tools; links make residual staleness unrenderable |
 
+## Addendum: model extensions from review rounds 2-5
+
+Three rounds extended the posted model where its assumptions were too narrow. These are
+parts of the model now, recorded with their fixes:
+
+- **Readability of error details** (§1 refinement): "readable" means the summary preview
+  and error card actually carry a human-readable sentence — an unwrapped `err`, or a
+  payload that is not a JSON object (plain text renders verbatim in both). Object
+  envelopes without a readable `err` (`{"rejected":true}`) and absent details (parsed
+  `null`) keep their result row.
+- **Occurrence-scoped identity** (§2 refinement): provider `tool_call_id`s correlate
+  only concurrently in-flight calls (`docs/oap-alignment.md`); a reused id in a later
+  turn is a new call. `ToolEntry` identity is occurrence-qualified (`id`, `id␟2`, …):
+  live-intent events (start/update/approval) reuse only a live entry, end events resolve
+  live-else-latest, and every row link, linked-row removal, and replay args recovery
+  binds to the occurrence key (recovery matches the bare provider id).
+- **Backpressure is the live twin of the replay crash window** (§3 refinement): a
+  retained tool-result `message_end` reconciles a pending/running/interrupted call
+  (status from `is_error`, output from the details envelope, the normal error card, and
+  a summary row — inserted before a pending result row); `turn_end` finalizes
+  interrupted tools before the inline flush barrier releases; a result row persisted
+  before its end is removed once the end establishes a readable error; and
+  finalization scans only the tools created since the previous pass (live entries are
+  provably a suffix of the registry), keeping long sessions linear.
+
 ## Non-goals
 
 - No change to the balanced summary line format beyond the `interrupted` status word.
@@ -131,8 +156,8 @@ unreachable (no row links to them); clearing keeps the registry truthful and bou
   balanced status word.
 - PTY (`scripts/tui-pty-driver.py`): `approval-deny` asserts the readable rejection text
   renders after `n`.
-- Guard: measured `tui_loc` 14,885 → 15,288 on this branch (+403 net at the round-2
-  fix head: ~150 production for the id-link plumbing and its review fixes over the
-  deleted positional cluster machinery, ~250 tests). The #266 guard asked for
+- Guard: measured `tui_loc` 14,885 → 15,693 on this branch (production for the id-link plumbing plus its
+  occurrence-scoping and reconciliation extensions over the deleted positional
+  machinery, and tests). The #266 guard asked for
   flat-to-shrinking; this PR trades that for the identity model and the five #273
   behaviors, and reports the delta rather than claiming it passes.
