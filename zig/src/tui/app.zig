@@ -828,7 +828,10 @@ pub const App = struct {
     fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
         const store = self.store orelse return;
         switch (event) {
-            .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .message_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .tool_execution_start => |payload| {
+                if (toolRequestPayloadSize(payload) > max_session_event_payload_bytes) return;
+            },
             .text_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
@@ -1621,9 +1624,9 @@ pub const TuiModel = struct {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         const writer = &out.writer;
-        for (indices[0..len], 0..) |idx, i| {
+        for (state.transcript.items[indices[0]..], 0..) |*entry, i| {
             if (i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, entry, width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2481,6 +2484,23 @@ test "App submit quit command requests quit" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
+}
+
+test "inline active transcript keeps later warnings visible behind a live summary" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.assistant, "working on it");
+    try state.appendTranscript(.tool, "◈ Shell Execute \"pwd\"");
+    state.transcript.items[1].is_tool_summary = true;
+    state.active_tool_summary_entry = 1;
+    try state.appendTranscript(.@"error", "dropped events warning");
+
+    const text = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 80, 20);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Shell Execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "dropped events warning") != null);
 }
 
 test "App steer handles fallback empty and session paths" {

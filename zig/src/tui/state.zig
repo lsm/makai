@@ -45,6 +45,7 @@ pub const TranscriptEntry = struct {
     kind: TranscriptKind,
     text: std.ArrayList(u8) = .empty,
     timestamp_ms: i64 = 0,
+    is_tool_summary: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8) !TranscriptEntry {
         var entry = TranscriptEntry{ .kind = kind, .timestamp_ms = compat.time.nowMillis() };
@@ -97,7 +98,6 @@ pub const ToolEntry = struct {
     estimated_returned_tokens: u64 = 0,
     artifact_count: u32 = 0,
     artifact_refs: []u8 = &.{},
-    truncated: bool = false,
     summary_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
@@ -381,6 +381,13 @@ pub const AppState = struct {
         try self.transcript.append(self.allocator, try TranscriptEntry.init(self.allocator, kind, text));
     }
 
+    fn appendToolSummaryEntry(self: *AppState, text: []const u8) !usize {
+        try self.appendTranscript(.tool, text);
+        const index = self.transcript.items.len - 1;
+        self.transcript.items[index].is_tool_summary = true;
+        return index;
+    }
+
     pub fn setRegisteredTools(self: *AppState, tools: []const agent.AgentTool) !void {
         for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
         self.registered_tools.clearRetainingCapacity();
@@ -400,6 +407,7 @@ pub const AppState = struct {
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
         self.clearActiveTranscriptEntries();
+        for (self.tools.items) |*tool| tool.summary_index = null;
     }
 
     pub fn lastAssistantText(self: *const AppState) ?[]const u8 {
@@ -552,8 +560,7 @@ pub const AppState = struct {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
                 const summary = try toolSummary(self.allocator, tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
-                try self.appendTranscript(.tool, summary);
-                tool.summary_index = self.transcript.items.len - 1;
+                tool.summary_index = try self.appendToolSummaryEntry(summary);
                 self.active_tool_summary_entry = tool.summary_index;
             },
             .tool_execution_update => |payload| {
@@ -569,7 +576,7 @@ pub const AppState = struct {
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
                 const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, tool.artifact_refs.len > 0);
                 defer self.allocator.free(summary);
-                if (!try self.finalizeToolSummary(tool, summary)) try self.appendTranscript(.tool, summary);
+                if (!try self.finalizeToolSummary(tool, summary)) _ = try self.appendToolSummaryEntry(summary);
                 tool.summary_index = null;
                 if (payload.is_error) {
                     const detail = try toolErrorDetail(self.allocator, payload.result_json.slice());
@@ -772,6 +779,7 @@ pub const AppState = struct {
         const index = tool.summary_index orelse return false;
         if (index >= self.transcript.items.len) return false;
         if (self.transcript.items[index].kind != .tool) return false;
+        if (!self.transcript.items[index].is_tool_summary) return false;
         try self.replaceEntryText(index, summary);
         if (self.active_tool_summary_entry == index) self.active_tool_summary_entry = null;
         return true;
@@ -802,7 +810,6 @@ pub const AppState = struct {
         tool.returned_total_bytes = returned_total_bytes;
         tool.estimated_returned_tokens = estimated_returned_tokens;
         tool.artifact_count = artifact_count;
-        tool.truncated = raw_total_bytes > returned_total_bytes or artifact_count > 0;
         if (tool.artifact_refs.len > 0) self.allocator.free(tool.artifact_refs);
         tool.artifact_refs = try self.allocator.dupe(u8, artifact_refs);
     }
@@ -991,7 +998,7 @@ fn toolErrorDetail(allocator: std.mem.Allocator, result_json: []const u8) !?[]u8
     if (parsed.value != .object) return null;
     const detail = firstJsonString(parsed.value.object, &.{ "err", "error" }) orelse return null;
     if (detail.len == 0) return null;
-    return try allocator.dupe(u8, detail);
+    return try sanitizeTerminalText(allocator, detail);
 }
 
 fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
@@ -1683,7 +1690,6 @@ test "AppState detects truncated tool execution end events" {
     try state.applyEvent(end_event);
 
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
-    try std.testing.expect(state.tools.items[0].truncated);
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
     var found_marker = false;
@@ -1749,6 +1755,36 @@ test "AppState finalizes one live tool summary line per execution" {
     try std.testing.expect(state.tools.items[0].summary_index == null);
 }
 
+test "AppState clear between tool start and end does not clobber later entries" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-clear"),
+        .tool_name = try ownedText("shell_command"),
+        .args_json = try ownedText("{\"command\":\"ls\"}"),
+    } };
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+
+    state.clearTranscript();
+    try state.appendTranscript(.tool, "kept result text");
+
+    var end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-clear"),
+        .tool_name = try ownedText("shell_command"),
+        .result_json = try ownedText("{\"summary\":true}"),
+        .is_error = false,
+    } };
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqualStrings("kept result text", state.transcript.items[0].text.items);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, " ok ") != null);
+    try std.testing.expect(state.transcript.items[1].is_tool_summary);
+}
+
 test "AppState unwraps tool error envelope for display" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -1777,6 +1813,35 @@ test "AppState unwraps tool error envelope for display" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"ok\":false") == null);
     const error_row = state.transcript.items[1].text.items;
     try std.testing.expectEqualStrings("workspace_info failed: MissingRequiredArgument: workspace_root", error_row);
+}
+
+test "AppState sanitizes decoded tool error details" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-esc"),
+        .tool_name = try ownedText("shell_command"),
+        .args_json = try ownedText("{\"command\":\"clear\"}"),
+    } };
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+
+    var end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-esc"),
+        .tool_name = try ownedText("shell_command"),
+        .result_json = try ownedText("{\"err\":\"boom\\u001b[2Jbell\\u0007\"}"),
+        .is_error = true,
+    } };
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    for (state.transcript.items) |*entry| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x1b) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x07) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "boom[2Jbell") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.status.last_error, 0x1b) == null);
 }
 
 test "lastAssistantText returns the most recent assistant reply" {
