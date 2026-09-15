@@ -100,7 +100,7 @@ ANSI_RE = re.compile(
     rb"|\x1b[@-Z\\-_]"
 )
 CONTROL_RE = re.compile(rb"[\x00-\x1f\x7f]")
-OSC52_RE = re.compile(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
+OSC52_RE = re.compile(rb"\x1b\]52;c;([^\x07\x1b]*)(?:\x07|\x1b\\)")
 
 
 class ScenarioError(Exception):
@@ -540,7 +540,7 @@ class SweepRun:
         for match in OSC52_RE.finditer(stream):
             encoded = match.group(1)
             try:
-                decoded = base64.b64decode(encoded)
+                decoded = base64.b64decode(encoded, validate=True)
             except ValueError as err:
                 raise ScenarioError(
                     f"{self.name}: {what} emitted a malformed OSC 52 clipboard payload {encoded!r}: {err}"
