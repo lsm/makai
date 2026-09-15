@@ -15,6 +15,14 @@ zig build test                    # Run all unit tests
 zig build run                     # Run the demo application
 ```
 
+### Print Mode CLI
+
+```bash
+makai -p [--agent] [--storage] [--model <id>] "<prompt>"
+```
+
+`--agent`, `--storage`, and `--model <id>` are accepted in any position — before or after the prompt. An unrecognized `--flag` or a second positional argument fails with an error instead of being ignored.
+
 ### Grouped Test Steps
 
 Unit tests are split into groups for parallel CI:
