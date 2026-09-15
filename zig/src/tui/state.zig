@@ -32,6 +32,7 @@ pub const ToolStatus = enum {
     running,
     done,
     @"error",
+    interrupted,
 };
 
 pub const ApprovalStatus = enum {
@@ -783,6 +784,18 @@ pub const AppState = struct {
         try self.replaceEntryText(index, summary);
         if (self.active_tool_summary_entry == index) self.active_tool_summary_entry = null;
         return true;
+    }
+
+    pub fn settleInterruptedTools(self: *AppState) !void {
+        for (self.tools.items) |*tool| {
+            if (tool.status != .pending and tool.status != .running) continue;
+            tool.status = .interrupted;
+            if (tool.summary_index == null) continue;
+            const summary = try std.fmt.allocPrint(self.allocator, "◈ {s} interrupted", .{tool.label});
+            defer self.allocator.free(summary);
+            _ = try self.finalizeToolSummary(tool, summary);
+        }
+        self.active_tool_summary_entry = null;
     }
 
     fn adjustActiveTranscriptEntryAfterRemove(self: *AppState, active_entry: *?usize, removed_index: usize) void {
@@ -1779,6 +1792,30 @@ test "AppState clear between tool start and end does not clobber later entries" 
     try std.testing.expectEqualStrings("kept result text", state.transcript.items[0].text.items);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, " ok ") != null);
     try std.testing.expect(state.transcript.items[1].is_tool_summary);
+}
+
+test "AppState settles interrupted tools after replay" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-orphan"),
+        .tool_name = try ownedText("shell_command"),
+        .args_json = try ownedText("{\"command\":\"ls\"}"),
+    } };
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    _ = try state.upsertToolForTest("call-pending", "file_read", "{\"path\":\"a\"}", .pending);
+
+    try state.settleInterruptedTools();
+
+    try std.testing.expect(state.active_tool_summary_entry == null);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "shell_command interrupted") != null);
+    try std.testing.expect(state.transcript.items[0].is_tool_summary);
+    for (state.tools.items) |*tool| {
+        try std.testing.expectEqual(ToolStatus.interrupted, tool.status);
+    }
 }
 
 test "AppState unwraps tool error envelope for display" {
