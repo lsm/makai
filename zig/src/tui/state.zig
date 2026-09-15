@@ -545,7 +545,10 @@ pub const AppState = struct {
             .message_end => |payload| switch (payload.role) {
                 .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
                 .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), &self.active_user_entry, true),
-                .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice(), &self.active_tool_result_entry),
+                .tool_result => {
+                    const suppress_text = if (self.findTool(payload.tool_call_id.slice())) |tool| tool.status == .@"error" else false;
+                    try self.finishTranscriptEntry(.tool, if (suppress_text) "" else payload.text.slice(), &self.active_tool_result_entry);
+                },
             },
             .tool_approval_requested => |payload| {
                 const label = self.toolLabel(payload.tool_name.slice());
@@ -690,7 +693,6 @@ pub const AppState = struct {
     fn appendDelta(self: *AppState, kind: TranscriptKind, delta: []const u8) !void {
         const index = switch (kind) {
             .assistant => try self.activeOrTrailingEntry(kind, &self.active_assistant_entry),
-            .tool => try self.activeOrTrailingEntry(kind, &self.active_tool_result_entry),
             else => try self.ensureTrailingEntry(kind),
         };
         try self.transcript.items[index].text.appendSlice(self.allocator, delta);
@@ -1780,6 +1782,29 @@ test "AppState sanitizes unwrapped tool error messages" {
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "before[2Jafter") != null);
     try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command failed: before[2Jafter") != null);
+}
+
+test "AppState drops redundant result text for failed tool calls" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-f", "shell", "{\"command\":\"ls\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    var end_event = try toolEndEvent("call-f", "shell", "{\"ok\":false,\"err\":\"FileNotFound\"}", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .tool_result, .tool_call_id = try ownedText("call-f"), .text = try ownedText("Tool execution failed: FileNotFound") } };
+    defer result_end.deinit(std.testing.allocator);
+    try state.applyEvent(result_end);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ shell \"ls\" failed") != null);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "Tool execution failed") == null);
+    try std.testing.expect(state.active_tool_result_entry == null);
 }
 
 test "lastAssistantText returns the most recent assistant reply" {
