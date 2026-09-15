@@ -464,6 +464,30 @@ RATIFIED_COMMANDS = (
     "/quit",
 )
 
+STATUS_BAR_ELLIPSIS = b"\xe2\x80\xa6"
+STATUS_BAR_PARTIAL_SEGMENTS = (
+    b"ctx:" + STATUS_BAR_ELLIPSIS,
+    b"perm:" + STATUS_BAR_ELLIPSIS,
+    b"perm:bypas" + STATUS_BAR_ELLIPSIS,
+    b"think:" + STATUS_BAR_ELLIPSIS,
+    b"think:medi" + STATUS_BAR_ELLIPSIS,
+    b"think:mediu" + STATUS_BAR_ELLIPSIS,
+    b"turns:" + STATUS_BAR_ELLIPSIS,
+)
+
+
+def assert_status_bar_whole_segments(run, what):
+    for partial in STATUS_BAR_PARTIAL_SEGMENTS:
+        if partial in run.session.plain:
+            raise ScenarioError(
+                f"keys: status bar rendered partial segment {partial!r} at 100 columns ({what}); "
+                "segments must truncate whole (#268)"
+            )
+    if STATUS_BAR_ELLIPSIS not in run.session.plain:
+        raise ScenarioError(
+            f"keys: status bar never rendered its truncation ellipsis at 100 columns ({what})"
+        )
+
 
 class SweepRun:
     def __init__(self, args, name, fixture_text, width=None, height=None, home=None):
@@ -622,8 +646,8 @@ def scenario_commands(args):
 
 
 def scenario_keys(args):
-    run = SweepRun(args, "keys", "keys-fixture-reply", width=132, height=15)
-    run.note("status bar at 100 columns clips its trailing segments (observed at default width: 'think:medium' -> 'think:medi…' and 'turns' dropped); this run widens to 132 so the full bar renders")
+    run = SweepRun(args, "keys", "keys-fixture-reply", width=100, height=15)
+    run.note("status bar truncates on whole-segment boundaries at 100 columns (#268): trailing segments drop cleanly behind an ellipsis marker and no segment renders half-word; think/turns sit at the tail, so the Shift+Tab level cycle itself is covered by unit tests rather than a visible marker")
     try:
         run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
         run.settle()
@@ -633,6 +657,7 @@ def scenario_keys(args):
         run.submit("alpha turn two", "keys-fixture-reply")
         run.submit("alpha turn three", "keys-fixture-reply")
         run.frame("three-turns")
+        assert_status_bar_whole_segments(run, "three turns in")
 
         copy_from = len(run.session.plain)
         run.key(KEY_CTRL_Y, "Ctrl+Y copy last reply")
@@ -681,9 +706,10 @@ def scenario_keys(args):
         if plain_text(b"z") not in run.session.plain[alive_from:]:
             raise ScenarioError("keys: TUI stopped echoing after Ctrl+T (input loop wedged)")
 
-        run.key_wait(KEY_SHIFT_TAB, "Shift+Tab thinking level", "medium")
-        run.key_wait(KEY_SHIFT_TAB, "Shift+Tab thinking level again", "high")
+        run.key(KEY_SHIFT_TAB, "Shift+Tab thinking level")
+        run.key(KEY_SHIFT_TAB, "Shift+Tab thinking level again")
         run.frame("thinking-cycled")
+        assert_status_bar_whole_segments(run, "after thinking cycle")
 
         run.session.send(KEY_CTRL_C, "Ctrl+C quit")
         exit_code = run.session.wait_exit(5.0)
