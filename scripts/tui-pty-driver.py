@@ -538,12 +538,19 @@ class SweepRun:
         stream = b"".join(chunk for _, chunk in self.session.chunks[from_chunk:])
         payloads = []
         for match in OSC52_RE.finditer(stream):
+            encoded = match.group(1)
             try:
-                payloads.append(base64.b64decode(match.group(1)))
+                decoded = base64.b64decode(encoded)
             except ValueError as err:
                 raise ScenarioError(
-                    f"{self.name}: {what} emitted a malformed OSC 52 clipboard payload {match.group(1)!r}: {err}"
+                    f"{self.name}: {what} emitted a malformed OSC 52 clipboard payload {encoded!r}: {err}"
                 ) from err
+            if base64.b64encode(decoded) != encoded:
+                raise ScenarioError(
+                    f"{self.name}: {what} emitted a non-canonical OSC 52 clipboard payload {encoded!r} "
+                    f"(decodes to {decoded!r} but re-encodes to {base64.b64encode(decoded)!r})"
+                )
+            payloads.append(decoded)
         if expected not in payloads:
             tail = plain_text(stream[-400:]).decode("ascii", "replace")
             raise ScenarioError(
@@ -675,14 +682,15 @@ def scenario_keys(args):
         run.session.wait_for(b"keys-fixture-reply", 10.0, "reply after two-line submit")
         run.settle()
         echo = run.session.plain[echo_from:]
+        row_gap = run.session.width // 2
         first_at = echo.find(plain_text(b"first line"))
         second_at = echo.find(plain_text(b"second line"), first_at + len(b"first line"))
-        if first_at < 0 or second_at < 0 or second_at - first_at < args.width // 2:
+        if first_at < 0 or second_at < 0 or second_at - first_at < row_gap:
             gap = second_at - first_at if second_at >= 0 else None
             raise ScenarioError(
                 f"keys: Shift+Enter (kitty CSI 13;2u) did not produce a two-line draft: the submitted "
                 f"echo must render 'first line' and 'second line' on separate transcript rows "
-                f"(first_at={first_at}, second_at={second_at}, gap={gap}, need at least {args.width // 2})"
+                f"(first_at={first_at}, second_at={second_at}, gap={gap}, need at least {row_gap})"
             )
         run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline: the submitted draft echoes as two transcript rows")
 
