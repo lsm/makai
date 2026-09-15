@@ -582,7 +582,9 @@ pub const AppState = struct {
                 if (payload.is_error) {
                     const detail = try toolErrorDetail(self.allocator, payload.result_json.slice());
                     defer if (detail) |value| self.allocator.free(value);
-                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, if (detail) |value| value else payload.result_json.slice() });
+                    const raw = try sanitizeTerminalText(self.allocator, payload.result_json.slice());
+                    defer self.allocator.free(raw);
+                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, if (detail) |value| value else raw });
                     defer self.allocator.free(message);
                     try self.status.setError(self.allocator, message);
                     try self.appendTranscript(.@"error", message);
@@ -1875,6 +1877,21 @@ test "AppState sanitizes decoded tool error details" {
     }
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "boom[2Jbell") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, state.status.last_error, 0x1b) == null);
+
+    var raw_end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-esc-2"),
+        .tool_name = try ownedText("shell_command"),
+        .result_json = try ownedText("raw boom\x1b[2Jbell\x07"),
+        .is_error = true,
+    } };
+    defer raw_end_event.deinit(std.testing.allocator);
+    try state.applyEvent(raw_end_event);
+
+    for (state.transcript.items) |*entry| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x1b) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x07) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, state.status.last_error, "raw boom[2Jbell") != null);
 }
 
 test "lastAssistantText returns the most recent assistant reply" {
