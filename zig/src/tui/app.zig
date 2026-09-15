@@ -1628,6 +1628,15 @@ pub const TuiModel = struct {
             const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
+            if (state.active_user_entry != null and idx == state.active_user_entry.?) {
+                var next = idx + 1;
+                while (next < state.transcript.items.len and state.transcript.items[next].kind == .user) : (next += 1) {
+                    const extra = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[next], width);
+                    defer allocator.free(extra);
+                    try writer.writeAll("\n\n");
+                    try writer.writeAll(extra);
+                }
+            }
         }
         const rendered_active = try out.toOwnedSlice();
         defer allocator.free(rendered_active);
@@ -2865,6 +2874,22 @@ test "App drain keeps two steered echoes and renders unmatched user message" {
     try std.testing.expectEqualStrings("steer two", app.state.transcript.items[1].text.items);
     try std.testing.expectEqualStrings("submitted prompt", app.state.transcript.items[2].text.items);
     try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
+}
+
+test "TuiModel inline render shows every steer echo while assistant streams" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    try state.appendSteeredMessage("first steer");
+    try state.appendSteeredMessage("second steer");
+    try std.testing.expectEqual(@as(usize, 0), state.active_assistant_entry.?);
+    try std.testing.expectEqual(@as(usize, 1), state.active_user_entry.?);
+
+    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "first steer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "second steer") != null);
 }
 
 test "App drain auto-resumes remaining steering after completed turn" {
