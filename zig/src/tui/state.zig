@@ -351,6 +351,7 @@ pub const AppState = struct {
     active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
+    active_tool_summary_entry: ?usize = null,
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
     backpressure_active: bool = false,
@@ -519,7 +520,6 @@ pub const AppState = struct {
         switch (event) {
             .agent_start => {
                 self.status.streaming = true;
-                try self.appendTranscript(.system, "agent started");
             },
             .turn_start => {
                 self.status.streaming = true;
@@ -533,7 +533,7 @@ pub const AppState = struct {
             },
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
             .thinking_delta => |payload| try self.appendDelta(.thinking, payload.delta.slice()),
-            .tool_call_delta => |payload| try self.appendDelta(.tool, payload.delta.slice()),
+            .tool_call_delta => {},
             .provider_event => {},
             .message_end => |payload| switch (payload.role) {
                 .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
@@ -552,6 +552,7 @@ pub const AppState = struct {
                 const summary = try toolSummary(self.allocator, tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
                 try self.appendTranscript(.tool, summary);
+                self.active_tool_summary_entry = self.transcript.items.len - 1;
             },
             .tool_execution_update => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
@@ -566,9 +567,12 @@ pub const AppState = struct {
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
                 const summary = try toolResultSummary(self.allocator, tool.label, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
-                try self.appendTranscript(.tool, summary);
+                try self.finalizeToolSummaryEntry(summary);
                 if (payload.is_error) {
-                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, payload.result_json.slice() });
+                    const unwrapped = try toolErrorMessage(self.allocator, payload.result_json.slice());
+                    defer if (unwrapped) |message| self.allocator.free(message);
+                    const detail = if (unwrapped) |message| message else payload.result_json.slice();
+                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, detail });
                     defer self.allocator.free(message);
                     try self.status.setError(self.allocator, message);
                     try self.appendTranscript(.@"error", message);
@@ -729,13 +733,26 @@ pub const AppState = struct {
         self.active_user_entry = null;
         self.active_assistant_entry = null;
         self.active_tool_result_entry = null;
+        self.active_tool_summary_entry = null;
     }
 
     fn cleanupActiveTranscriptEntries(self: *AppState) void {
         self.removeEmptyActiveTranscriptEntry(&self.active_user_entry, .user);
         self.removeEmptyActiveTranscriptEntry(&self.active_assistant_entry, .assistant);
         self.removeEmptyActiveTranscriptEntry(&self.active_tool_result_entry, .tool);
+        self.removeEmptyActiveTranscriptEntry(&self.active_tool_summary_entry, .tool);
         self.clearActiveTranscriptEntries();
+    }
+
+    fn finalizeToolSummaryEntry(self: *AppState, summary: []const u8) !void {
+        if (self.active_tool_summary_entry) |index| {
+            self.active_tool_summary_entry = null;
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == .tool) {
+                try self.replaceEntryText(index, summary);
+                return;
+            }
+        }
+        try self.appendTranscript(.tool, summary);
     }
 
     fn removeEmptyActiveTranscriptEntry(self: *AppState, active_entry: *?usize, kind: TranscriptKind) void {
@@ -752,6 +769,7 @@ pub const AppState = struct {
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_summary_entry, index);
     }
 
     fn adjustActiveTranscriptEntryAfterRemove(self: *AppState, active_entry: *?usize, removed_index: usize) void {
@@ -782,17 +800,6 @@ pub const AppState = struct {
         tool.truncated = raw_total_bytes > returned_total_bytes or artifact_count > 0;
         if (tool.artifact_refs.len > 0) self.allocator.free(tool.artifact_refs);
         tool.artifact_refs = try self.allocator.dupe(u8, artifact_refs);
-        if (tool.truncated) {
-            var out: std.Io.Writer.Allocating = .init(self.allocator);
-            defer out.deinit();
-            const writer = &out.writer;
-            try writer.print("{s} [preview {d}->{d} bytes", .{ tool.label, raw_total_bytes, returned_total_bytes });
-            if (artifact_refs.len > 0) try writer.writeAll("; artifact on disk");
-            try writer.writeAll("]");
-            const indicator = try out.toOwnedSlice();
-            defer self.allocator.free(indicator);
-            try self.appendTranscript(.tool, indicator);
-        }
     }
 
     fn findTool(self: *AppState, id: []const u8) ?*ToolEntry {
@@ -824,10 +831,6 @@ pub const AppState = struct {
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
-
-pub fn isLowValueSystem(entry: *const TranscriptEntry) bool {
-    return entry.kind == .system and std.mem.eql(u8, entry.text.items, "agent started");
-}
 
 fn approvalScopeHint(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
     const safe_tool_name = try sanitizeTerminalText(allocator, tool_name);
@@ -949,14 +952,27 @@ fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, result_json
         try writer.print(" output={d}B", .{result_json.len});
     }
     if (estimated_tokens > 0) try writer.print(" ~{d} tok", .{estimated_tokens});
-    if (artifact_count > 0) try writer.print(" artifacts={d}", .{artifact_count});
+    if (artifact_count > 0) try writer.print(" artifacts={d} on disk", .{artifact_count});
     if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" preview-capped");
     if (is_error and result_json.len > 0) {
-        const preview = try clipSummaryArg(allocator, result_json);
+        const unwrapped = try toolErrorMessage(allocator, result_json);
+        defer if (unwrapped) |message| allocator.free(message);
+        const preview_source = if (unwrapped) |message| message else result_json;
+        const preview = try clipSummaryArg(allocator, preview_source);
         defer allocator.free(preview);
         try writer.print(" \"{s}\"", .{preview});
     }
     return out.toOwnedSlice();
+}
+
+fn toolErrorMessage(allocator: std.mem.Allocator, result_json: []const u8) !?[]u8 {
+    if (result_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const message = jsonString(parsed.value.object, "err") orelse return null;
+    if (message.len == 0) return null;
+    return try allocator.dupe(u8, message);
 }
 
 fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
@@ -1017,6 +1033,23 @@ fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
 
+fn toolStartEvent(id: []const u8, name: []const u8, args_json: []const u8) !tui_runtime.TuiEvent {
+    return .{ .tool_execution_start = .{
+        .tool_call_id = try ownedText(id),
+        .tool_name = try ownedText(name),
+        .args_json = try ownedText(args_json),
+    } };
+}
+
+fn toolEndEvent(id: []const u8, name: []const u8, result_json: []const u8, is_error: bool) !tui_runtime.TuiEvent {
+    return .{ .tool_execution_end = .{
+        .tool_call_id = try ownedText(id),
+        .tool_name = try ownedText(name),
+        .result_json = try ownedText(result_json),
+        .is_error = is_error,
+    } };
+}
+
 
 pub fn noopToolForTest(
     tool_call_id: []const u8,
@@ -1065,20 +1098,16 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello world", state.transcript.items[0].text.items);
 
-    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
-        .tool_call_id = try ownedText("call-1"),
-        .tool_name = try ownedText("shell_command"),
-        .args_json = try ownedText("{\"description\":\"Check the current workspace directory\",\"command\":\"pwd\"}"),
-    } };
+    var start_event = try toolStartEvent("call-1", "shell_command", "{\"description\":\"Check the current workspace directory\",\"command\":\"pwd\"}");
     defer start_event.deinit(std.testing.allocator);
     try state.applyEvent(start_event);
 
-    var end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
-        .tool_call_id = try ownedText("call-1"),
-        .tool_name = try ownedText("shell_command"),
-        .result_json = try ownedText("{\"ok\":true}"),
-        .is_error = false,
-    } };
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), state.active_tool_summary_entry.?);
+
+    var end_event = try toolEndEvent("call-1", "shell_command", "{\"ok\":true}", false);
     defer end_event.deinit(std.testing.allocator);
     try state.applyEvent(end_event);
 
@@ -1086,19 +1115,17 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
     try std.testing.expectEqualStrings("Shell Execute", state.tools.items[0].label);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\"") != null);
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command") == null);
+    try std.testing.expect(state.active_tool_summary_entry == null);
 }
 
 test "AppState strips control bytes from tool summaries" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
-    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
-        .tool_call_id = try ownedText("call-1"),
-        .tool_name = try ownedText("shell_command"),
-        .args_json = try ownedText("{\"command\":\"before\\u001b[2Jafter\\u0007\"}"),
-    } };
+    var start_event = try toolStartEvent("call-1", "shell_command", "{\"command\":\"before\\u001b[2Jafter\\u0007\"}");
     defer start_event.deinit(std.testing.allocator);
     try state.applyEvent(start_event);
 
@@ -1177,9 +1204,9 @@ test "AppState message_end updates active assistant before trailing tool" {
     defer text_delta.deinit(std.testing.allocator);
     try state.applyEvent(text_delta);
 
-    var tool_delta = tui_runtime.TuiEvent{ .tool_call_delta = .{ .content_index = 1, .delta = try ownedText("{\"name\":\"shell\"}") } };
-    defer tool_delta.deinit(std.testing.allocator);
-    try state.applyEvent(tool_delta);
+    var tool_start = try toolStartEvent("call-1", "shell", "{\"command\":\"ls\"}");
+    defer tool_start.deinit(std.testing.allocator);
+    try state.applyEvent(tool_start);
 
     var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText("final assistant") } };
     defer assistant_end.deinit(std.testing.allocator);
@@ -1269,13 +1296,11 @@ test "AppState finalizes active assistant after reasoning and tool deltas" {
     defer assistant_end.deinit(std.testing.allocator);
     try state.applyEvent(assistant_end);
 
-    try std.testing.expectEqual(@as(usize, 3), state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("final", state.transcript.items[0].text.items);
     try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[1].kind);
     try std.testing.expectEqualStrings("plan", state.transcript.items[1].text.items);
-    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[2].kind);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[2].text.items, "shell") != null);
 }
 
 test "AppState keeps identical inline assistant message_end turns" {
@@ -1576,7 +1601,7 @@ test "AppState applies thinking tool call and lifecycle events" {
 
     try state.applyEvent(.{ .agent_start = .{} });
     try std.testing.expect(state.status.streaming);
-    try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), state.transcript.items.len);
 
     var thinking_event = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = try ownedText("plan") } };
     defer thinking_event.deinit(std.testing.allocator);
@@ -1586,10 +1611,9 @@ test "AppState applies thinking tool call and lifecycle events" {
     defer call_event.deinit(std.testing.allocator);
     try state.applyEvent(call_event);
 
-    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[1].kind);
-    try std.testing.expectEqualStrings("plan", state.transcript.items[1].text.items);
-    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[2].kind);
-    try std.testing.expectEqualStrings("{\"name\":\"shell\"}", state.transcript.items[2].text.items);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("plan", state.transcript.items[0].text.items);
 
     try state.applyEvent(tui_runtime.TuiEvent{ .agent_end = .{ .reason = .cancelled } });
     try std.testing.expect(!state.status.streaming);
@@ -1656,11 +1680,9 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expect(state.tools.items[0].truncated);
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
-    var found_marker = false;
-    for (state.transcript.items) |entry| {
-        if (std.mem.indexOf(u8, entry.text.items, "artifact on disk") != null) found_marker = true;
-    }
-    try std.testing.expect(found_marker);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "artifacts=1 on disk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ shell_command ok") != null);
 }
 
 
@@ -1681,6 +1703,53 @@ test "AppState appends visible transcript row for tool execution errors" {
     try std.testing.expectEqual(ToolStatus.@"error", state.tools.items[0].status);
     try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[state.transcript.items.len - 1].kind);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "shell_command failed: OutOfMemory") != null);
+}
+
+test "AppState unwraps tool error envelope for display" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-err", "workspace_list", "{\"workspace_root\":\"/tmp\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+
+    var end_event = try toolEndEvent("call-err", "workspace_list", "{\"ok\":false,\"err\":\"FileNotFound\",\"duration_ms\":2}", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ workspace_list failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "\"FileNotFound\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "{\"ok\":false") == null);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("workspace_list failed: FileNotFound", state.transcript.items[1].text.items);
+}
+
+test "AppState renders one summary line per tool call across a turn" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendUserMessage("run two tools");
+
+    const calls = [_]struct { id: []const u8, name: []const u8 }{
+        .{ .id = "call-a", .name = "workspace_info" },
+        .{ .id = "call-b", .name = "workspace_list" },
+    };
+    for (calls) |call| {
+        var start_event = try toolStartEvent(call.id, call.name, "{\"workspace_root\":\"/tmp\"}");
+        defer start_event.deinit(std.testing.allocator);
+        try state.applyEvent(start_event);
+        var end_event = try toolEndEvent(call.id, call.name, "{\"ok\":true}", false);
+        defer end_event.deinit(std.testing.allocator);
+        try state.applyEvent(end_event);
+    }
+
+    var tool_rows: usize = 0;
+    for (state.transcript.items) |entry| {
+        if (entry.kind == .tool) tool_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), tool_rows);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ workspace_info ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[2].text.items, "◈ workspace_list ok") != null);
 }
 
 test "lastAssistantText returns the most recent assistant reply" {

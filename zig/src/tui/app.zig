@@ -1609,11 +1609,12 @@ pub const TuiModel = struct {
     fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize) ![]const u8 {
         if (max_lines == 0) return allocator.dupe(u8, "");
 
-        var indices: [3]usize = undefined;
+        var indices: [4]usize = undefined;
         var len: usize = 0;
         addActiveTranscriptIndex(&indices, &len, state.active_user_entry, state.transcript.items.len);
         addActiveTranscriptIndex(&indices, &len, state.active_assistant_entry, state.transcript.items.len);
         addActiveTranscriptIndex(&indices, &len, state.active_tool_result_entry, state.transcript.items.len);
+        addActiveTranscriptIndex(&indices, &len, state.active_tool_summary_entry, state.transcript.items.len);
         if (len == 0) return allocator.dupe(u8, "");
         sortSmallIndices(indices[0..len]);
 
@@ -1631,7 +1632,7 @@ pub const TuiModel = struct {
         return tailLines(allocator, rendered_active, max_lines);
     }
 
-    fn addActiveTranscriptIndex(indices: *[3]usize, len: *usize, maybe_index: ?usize, transcript_len: usize) void {
+    fn addActiveTranscriptIndex(indices: *[4]usize, len: *usize, maybe_index: ?usize, transcript_len: usize) void {
         const idx = maybe_index orelse return;
         if (idx >= transcript_len) return;
         for (indices[0..len.*]) |existing| {
@@ -1710,6 +1711,7 @@ pub const TuiModel = struct {
         if (app.state.active_user_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_assistant_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_tool_summary_entry) |idx| stop = @min(stop, idx);
         return stop;
     }
 

@@ -96,10 +96,6 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
     var i: usize = 0;
     while (i < state.transcript.items.len) {
         const entry = &state.transcript.items[i];
-        if (isLowValueSystem(entry)) {
-            i += 1;
-            continue;
-        }
         if (entry.kind == .tool) {
             const cluster_start = i;
             while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
@@ -123,7 +119,7 @@ fn appendBalancedToolCluster(
     var tool_index = initial_tool_index;
     if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
         for (state.transcript.items[start..end]) |*entry| {
-            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry);
+            try appendOriginal(allocator, entries, entry);
         }
         return tool_index;
     }
@@ -148,12 +144,7 @@ fn countToolStarts(entries: []const TranscriptEntry) usize {
 }
 
 fn isToolStartSummary(text: []const u8) bool {
-    if (!std.mem.startsWith(u8, text, "◈ ")) return false;
-    const rest = text["◈ ".len..];
-    const quote = std.mem.indexOfScalar(u8, rest, '"') orelse return false;
-    const ok = std.mem.indexOf(u8, rest, " ok ") orelse rest.len;
-    const failed = std.mem.indexOf(u8, rest, " failed ") orelse rest.len;
-    return quote < @min(ok, failed);
+    return std.mem.startsWith(u8, text, "◈ ");
 }
 
 fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
@@ -164,10 +155,6 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     });
-}
-
-fn isLowValueSystem(entry: *const TranscriptEntry) bool {
-    return tui_state.isLowValueSystem(entry);
 }
 
 fn appendToolSummary(
@@ -837,7 +824,6 @@ fn roleColor(kind: TranscriptKind, tool_name: []const u8) zz.Color {
 
 fn inferredToolName(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, "◈ ")) return firstToolNameToken(text["◈ ".len..]);
-    if (std.mem.startsWith(u8, text, "tool state: ")) return firstToolNameToken(text["tool state: ".len..]);
     return firstToolNameToken(text);
 }
 
@@ -849,17 +835,7 @@ fn inferredToolTitle(text: []const u8) []const u8 {
         const end = @min(quote, status);
         return std.mem.trim(u8, rest[0..end], " \t\r\n");
     }
-    if (std.mem.startsWith(u8, text, "tool state: ")) {
-        const rest = text["tool state: ".len..];
-        const bracket = std.mem.indexOfScalar(u8, rest, '[') orelse rest.len;
-        return std.mem.trim(u8, rest[0..bracket], " \t\r\n");
-    }
     return "";
-}
-
-fn isRawToolArgs(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    return std.mem.startsWith(u8, trimmed, "{") or std.mem.startsWith(u8, trimmed, "[");
 }
 
 fn firstToolNameToken(text: []const u8) []const u8 {
@@ -1034,8 +1010,6 @@ test "transcript collapses tool events into intent row without card" {
     state.tools.items[0].raw_total_bytes = 342;
     state.tools.items[0].estimated_returned_tokens = 87;
 
-    try state.appendTranscript(.tool, "{\"command\":\"pwd\",\"description\":\"Run pwd to show current working directory\",\"workspace_root\":\"/tmp\"}");
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Run pwd to show current working directory\"");
     try state.appendTranscript(.tool, "◈ Shell Execute ok raw=342B returned=342B ~87 tok");
     try state.appendTranscript(.tool, "ok stdout=43 stderr=0");
 
@@ -1095,11 +1069,9 @@ test "transcript balanced mode preserves tool call order across turns" {
     ));
 
     try state.appendUserMessage("first request");
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect pwd now\"");
     try state.appendTranscript(.tool, "◈ Shell Execute ok output=10B");
     try state.appendTranscript(.assistant, "PWD done");
     try state.appendUserMessage("second request");
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect uname now\"");
     try state.appendTranscript(.tool, "◈ Shell Execute ok output=20B");
     try state.appendTranscript(.assistant, "UNAME done");
 
