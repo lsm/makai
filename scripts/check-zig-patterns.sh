@@ -31,7 +31,7 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.|DeterministicSource'
+ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|std\.Random\.|DeterministicSource'
 
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
