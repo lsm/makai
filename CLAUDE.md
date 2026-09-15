@@ -27,7 +27,9 @@ There is no per-test filter; the smallest runnable unit is a group step. Tests a
 
 Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (3-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent tests to the specific `agent-*` subgroup (and to `test`), not just the aggregate.
 
-`tools/*` tests are the sharp edge here: none of the `agent-*` subgroups contains them. The tool artifacts are wired into **`test-unit-tui`**, which the matrix does run, and duplicated into the local-only `test-unit-agent`. So a new `tools/*` test must go into `test_unit_tui_step` (plus `test`) to be covered by CI, however odd that group name reads.
+`tools/*` tests are the sharp edge here: none of the `agent-*` subgroups contains them. Ten tool artifacts are wired into **`test-unit-tui`**, which the matrix does run, and duplicated into the local-only `test-unit-agent`. So a new `tools/*` test must go into `test_unit_tui_step` (plus `test`) to be covered by CI, however odd that group name reads.
+
+One exception is live today: `tools_artifact_test` (`zig/src/tools/artifact.zig`) is wired only into the global `test` step and the local-only `test-unit-agent`, so **no CI matrix job runs it**. `zig build test` covers it locally; CI does not. Do not copy that file's wiring as the pattern.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
@@ -36,7 +38,7 @@ zig build test-unit-protocol      # provider/agent/auth/tool protocol types+enve
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
 zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
-zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport, AND every tools/* test (the CI-covered home for tool tests)
+zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport, plus 10 of the 11 tools/* tests (the CI-covered home for tool tests; see the artifact exception below)
 zig build test-unit-agent         # aggregate: permission, agent types/loop/mod/bridge, tools/*, tui runtime, zig/test/unit/*
 zig build test-unit-agent-types   # agent types + permission
 zig build test-unit-agent-loop    # agent loop only
@@ -105,10 +107,11 @@ The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see
 
 - Source files import by module name, not path: `@import("ai_types")`, `@import("oauth/storage")`, `@import("tools/registry")`, `@import("compat")`. The name is whatever `build.zig` assigned; `oauth/*` names map to `zig/src/utils/oauth/*`.
 - **Module roots** are reached by name. Adding one means: create the module in `build.zig`, list every import it needs, add an `addTest`, and add the run artifact to both `test_step` and the right group step. A missing import fails at compile time with "no module named ...".
-- **Files compiled through an existing root** are reached by relative `@import("sibling.zig")` and need no `build.zig` entry at all; their tests run as part of the root's test artifact. `zig/src/compat/{time,random,fs,stdio,http,net}.zig` hang off `compat/mod.zig` this way, as does `agent/agent.zig` off `agent/mod.zig`. Adding build wiring for one of these is wrong. Check for an existing importer before you touch `build.zig`.
+- **Files compiled through an existing root** are reached by relative `@import("sibling.zig")` and may need no `build.zig` entry; their tests then run as part of the root's test artifact. `zig/src/compat/{time,random,fs,stdio,http,net}.zig` hang off `compat/mod.zig` this way, as does `agent/agent.zig` off `agent/mod.zig`.
+- **A relative import does not by itself mean a file has no module.** `protocol/provider/{partial_serializer,partial_reconstructor}.zig` are imported relatively by `server.zig` and `client.zig` *and* have their own modules and test artifacts wired into `test-unit-protocol`, deliberately, so their tests run as a named group. Decide by checking both the existing importers and `build.zig`, never from the import syntax alone.
 - Some tracked files are neither: `utils/aws_sigv4.zig`, `utils/message_transform.zig`, `utils/tokens.zig`, `utils/tool_utils.zig`, `utils/streaming_json.zig`, `utils/oauth.zig`, `utils/oauth/google.zig`, `utils/oauth/callback_server.zig`, `tools/anthropic_login.zig`, `tools/copilot_login.zig`, `providers/bedrock_converse_stream_api.zig`, and `zig/src/oauth/{github_copilot,openai_codex,google_gemini_cli,google_antigravity}.zig` have no module and no live importer. They compile only if you wire them up; do not assume they are reachable code. Confirm with a grep for an `@import` of the file before treating one as load-bearing.
 - The live OAuth code is the `zig/src/utils/oauth/` module roots: `storage`, `refresh_lock`, `pkce`, `anthropic`, `github_copilot`, `openai_codex`. Its `google.zig` and `callback_server.zig` are reachable only through the unreferenced `utils/oauth.zig`, and `zig/src/oauth/` contributes just `mod.zig` + `pkce.zig` to the utils test group. Prefer `utils/oauth/` when adding OAuth code.
-- The only external dependency is `zigzag`, a vendored TUI framework at `zig/vendor/zigzag` declared as a path dependency in `build.zig.zon`. It is subject to the zero-comments policy like everything else.
+- `zigzag` is the only **`build.zig.zon`** dependency: a vendored TUI framework at `zig/vendor/zigzag`, declared as a path dependency, and subject to the zero-comments policy like everything else. The repo is not dependency-free overall — `package.json` adds runtime deps (`nanoid`, `ulid`), dev deps (`typescript`, `@types/node`), and six optional `@makai/cli-*` platform packages, all of which `npm ci` resolves. Count both graphs for offline-build or supply-chain work.
 
 ## Architecture
 
@@ -242,6 +245,8 @@ Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completion
 ## Docs and PR Process
 
 - Commits follow `type(scope): subject (#PR)` (e.g. `fix(tui): ...`, `feat(agent): ...`, `docs(spec): ...`). `CHANGELOG.md` follows Keep a Changelog; add entries under `Unreleased`.
-- The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) and `docs/review-process.md` require: linked spec clauses (`docs/v1-sdk-agent-provider-spec.md`, `docs/ts-sdk-chat-integration-plan.md`, `DESIGN.md`), updated rows in `docs/implementation-traceability-matrix.md`, a backward-compatibility statement, test evidence, and external review rounds with no unresolved P0/P1. If behavior changes, update the spec/docs in the same PR (no spec drift). Keep PRs to one phase/sub-phase.
+- `.github/PULL_REQUEST_TEMPLATE.md` is the repo-wide template, so every PR is prompted for a scope statement, backward-compatibility impact, test evidence, and review rounds. Fill in what applies and mark the rest N/A.
+- The heavier gate in `docs/review-process.md` is **scoped**: by its own §2 it is required for V1 implementation PRs across Phases 1, 1.25, 1.5, 2a, 2b, 2c, and 3 through 6. Those PRs must link exact spec clauses (`docs/v1-sdk-agent-provider-spec.md`, `docs/ts-sdk-chat-integration-plan.md`, `DESIGN.md`), update rows in `docs/implementation-traceability-matrix.md`, stay inside one phase/sub-phase, and clear at least two external review rounds with no unresolved P0/P1. Unrelated docs, tooling, release, or TUI work is not bound by the traceability-matrix and spec-clause requirements.
+- Either way, if behavior changes, update the spec/docs in the same PR. No spec drift.
 - `docs/oap-alignment.md` is the Open Agent Protocol deviations ledger; `docs/zig-0.16.0-*.md` record the completed Zig 0.16 migration and its I/O decision; `docs/persisted-tool-call-rendering.md` and `docs/markdown-rendering-investigation.md` cover TUI rendering decisions.
 - Release: tagging `v*` runs `.github/workflows/release-binaries.yml` (six targets) and `scripts/package-npm.ts` builds the `@makai/cli-<platform>` optional-dependency packages that `bin/makai.js` dispatches to. CI's cross-compile smoke job builds the non-native targets on every PR.
