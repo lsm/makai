@@ -356,6 +356,7 @@ pub const AppState = struct {
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
     backpressure_active: bool = false,
+    pending_steers: std.ArrayList([]u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) AppState {
         return .{ .allocator = allocator };
@@ -374,6 +375,8 @@ pub const AppState = struct {
         self.approval.deinit(self.allocator);
         self.status.deinit(self.allocator);
         self.preview.deinit(self.allocator);
+        self.clearPendingSteers();
+        self.pending_steers.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -406,6 +409,7 @@ pub const AppState = struct {
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
         self.clearActiveTranscriptEntries();
+        self.clearPendingSteers();
     }
 
     pub fn lastAssistantText(self: *const AppState) ?[]const u8 {
@@ -443,6 +447,31 @@ pub const AppState = struct {
 
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {
         try self.appendTranscript(.user, text);
+    }
+
+    pub fn appendSteeredMessage(self: *AppState, text: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.pending_steers.append(self.allocator, owned);
+        errdefer _ = self.pending_steers.pop();
+        try self.appendUserMessage(text);
+        if (self.active_user_entry) |index| {
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == .user) return;
+        }
+        self.active_user_entry = self.transcript.items.len - 1;
+    }
+
+    pub fn takePendingSteer(self: *AppState, text: []const u8) bool {
+        if (self.pending_steers.items.len == 0) return false;
+        if (!std.mem.eql(u8, self.pending_steers.items[0], text)) return false;
+        const matched = self.pending_steers.orderedRemove(0);
+        self.allocator.free(matched);
+        return true;
+    }
+
+    pub fn clearPendingSteers(self: *AppState) void {
+        for (self.pending_steers.items) |pending| self.allocator.free(pending);
+        self.pending_steers.clearRetainingCapacity();
     }
 
     pub fn submitComposer(self: *AppState) !?[]u8 {
@@ -1207,6 +1236,54 @@ test "AppState user message_start and message_end do not leave empty transcript 
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("queued prompt", state.transcript.items[0].text.items);
+}
+
+test "AppState appendSteeredMessage echoes and tracks pending steer" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendSteeredMessage("steer mid turn");
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("steer mid turn", state.transcript.items[0].text.items);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_steers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.active_user_entry.?);
+
+    try state.appendSteeredMessage("steer again");
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.active_user_entry.?);
+
+    try std.testing.expect(state.takePendingSteer("steer mid turn"));
+    try std.testing.expect(state.takePendingSteer("steer again"));
+    try std.testing.expect(!state.takePendingSteer("steer again"));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+}
+
+test "AppState takePendingSteer only matches the queued head" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendSteeredMessage("first steer");
+    try state.appendSteeredMessage("second steer");
+    try std.testing.expect(!state.takePendingSteer("second steer"));
+    try std.testing.expect(state.takePendingSteer("first steer"));
+    try std.testing.expect(state.takePendingSteer("second steer"));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+}
+
+test "AppState clearTranscript drops pending steers" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendSteeredMessage("aborted steer");
+    state.clearTranscript();
+    try std.testing.expectEqual(@as(usize, 0), state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+    try std.testing.expect(state.active_user_entry == null);
+
+    try state.appendUserMessage("aborted steer");
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqualStrings("aborted steer", state.transcript.items[0].text.items);
 }
 
 test "AppState message_end updates active assistant before trailing tool" {

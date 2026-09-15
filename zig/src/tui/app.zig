@@ -1002,6 +1002,7 @@ pub const App = struct {
             },
             .message_end => |payload| {
                 if (payload.role == .user) {
+                    if (self.state.takePendingSteer(payload.text.slice())) return;
                     try self.appendRuntimeUserMessage(payload.text.slice());
                     return;
                 }
@@ -1096,6 +1097,7 @@ pub const App = struct {
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
+            try self.state.appendSteeredMessage(trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -1626,6 +1628,16 @@ pub const TuiModel = struct {
             const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
+            if (state.active_user_entry != null and idx == state.active_user_entry.?) {
+                var next = idx + 1;
+                while (next < state.transcript.items.len) : (next += 1) {
+                    if (state.transcript.items[next].kind != .user) continue;
+                    const extra = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[next], width);
+                    defer allocator.free(extra);
+                    try writer.writeAll("\n\n");
+                    try writer.writeAll(extra);
+                }
+            }
         }
         const rendered_active = try out.toOwnedSlice();
         defer allocator.free(rendered_active);
@@ -2500,7 +2512,10 @@ test "App steer handles fallback empty and session paths" {
 
     try app.steer(" steer me ");
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("steer me", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqual(@as(usize, 1), app.state.pending_steers.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
 }
 
@@ -2803,6 +2818,80 @@ test "App drain keeps consecutive user messages distinct" {
     try std.testing.expectEqualStrings("run pwd", app.state.transcript.items[0].text.items);
     try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[1].kind);
     try std.testing.expectEqualStrings("run uname -a", app.state.transcript.items[1].text.items);
+}
+
+test "App drain suppresses consumption duplicate of steered message" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try app.steer("steer mid turn");
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .assistant,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "turn one done")),
+    } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer mid turn")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("steer mid turn", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqualStrings("turn one done", app.state.transcript.items[1].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
+}
+
+test "App drain keeps two steered echoes and renders unmatched user message" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try app.steer("steer one");
+    try app.steer("steer two");
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer one")),
+    } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "steer two")),
+    } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "submitted prompt")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 3), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer one", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqualStrings("steer two", app.state.transcript.items[1].text.items);
+    try std.testing.expectEqualStrings("submitted prompt", app.state.transcript.items[2].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.pending_steers.items.len);
+}
+
+test "TuiModel inline render shows every steer echo while assistant streams" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    try state.appendSteeredMessage("first steer");
+    try state.appendTranscript(.system, "status row between steers");
+    try state.appendSteeredMessage("second steer");
+    try std.testing.expectEqual(@as(usize, 0), state.active_assistant_entry.?);
+    try std.testing.expectEqual(@as(usize, 1), state.active_user_entry.?);
+
+    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "first steer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "second steer") != null);
 }
 
 test "App drain auto-resumes remaining steering after completed turn" {

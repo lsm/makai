@@ -298,13 +298,16 @@ fn handleAbort(ctx: CommandContext, command: Command) !CommandResult {
     if (active) {
         if (ctx.session) |session| {
             session.cancel();
+            session.clearQueuedMessages();
         } else if (ctx.runtime) |runtime| {
             runtime.cancel();
+            runtime.clearQueuedMessages();
         } else {
             return .{ .output = try ctx.allocator.dupe(u8, "Nothing to abort — agent is idle.") };
         }
         ctx.state.status.streaming = false;
         ctx.state.stream_aborted = true;
+        ctx.state.clearPendingSteers();
         if (ctx.state.mode == .approval) {
             ctx.state.approval.deinit(ctx.allocator);
             ctx.state.mode = .normal;
@@ -492,6 +495,26 @@ test "abort when streaming cancels session" {
     try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
 }
 
+test "abort when streaming drops queued steers but keeps their echoes" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    try state.appendSteeredMessage("steer before abort");
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expectEqual(@as(usize, 1), mock.clear_count);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer before abort", state.transcript.items[0].text.items);
+}
+
 test "abort cancels active turn before streaming status is set" {
     var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     defer runtime.deinit();
@@ -551,6 +574,7 @@ test "double abort is harmless after first cancellation" {
 
 const MockAbortSession = struct {
     cancel_count: usize = 0,
+    clear_count: usize = 0,
     events: tui_runtime.TuiEventStream = undefined,
     events_initialized: bool = false,
 
@@ -601,7 +625,7 @@ const MockAbortSession = struct {
     }
 
     fn mockClearQueuedMessages(ctx: ?*anyopaque) void {
-        _ = ctx;
+        ptr(ctx).clear_count += 1;
     }
 
     fn mockQueuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {

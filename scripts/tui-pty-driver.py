@@ -697,6 +697,20 @@ def scenario_keys(args):
     return run
 
 
+def findUserEntryEcho(plain, text, from_index):
+    needle = plain_text(text.encode())
+    header = plain_text(b"You")
+    search_from = from_index
+    while True:
+        header_at = plain.find(header, search_from)
+        if header_at < 0:
+            return -1
+        text_at = plain.find(needle, header_at)
+        if text_at >= 0 and text_at - header_at <= 160:
+            return text_at
+        search_from = header_at + len(header)
+
+
 def scenario_steer_abort(args):
     run = SweepRun(args, "steer-abort", "hold")
     try:
@@ -710,15 +724,27 @@ def scenario_steer_abort(args):
         run.frame("streaming")
 
         run.session.type_text("steer this turn")
+        echo_from = len(run.session.plain)
         run.session.send(KEY_ENTER, "Enter (steer)")
         run.session.wait_for(b"queue", 6.0, "queued steer indicator")
+        run.settle()
         run.frame("steer-queued")
-        run.note("Enter while streaming queues a steer: the composer footer shows 'queued 1' and the status bar a queue count, but the steered text itself never echoes into the transcript")
+        if findUserEntryEcho(run.session.plain, "steer this turn", echo_from) < 0:
+            raise ScenarioError("steer-abort: steered text did not echo into the transcript as a user entry at steer time")
+        run.note("Enter while streaming queues the steer and echoes the steered text into the transcript immediately as a 'You' entry, alongside the 'queued 1' composer footer")
 
-        run.command("/abort", "Turn aborted.")
+        run.session.type_text("/abort")
+        abort_from = len(run.session.plain)
+        run.session.send(KEY_ENTER, "Enter (/abort)")
+        run.session.wait_for(b"Turn aborted.", 6.0, "abort confirmation")
         run.frame("aborted")
         run.settle(1.0)
-        run.note("/abort during a held stream cancels the turn and clears the streaming status")
+        aborted_at = run.session.plain.find(plain_text(b"Turn aborted."), abort_from)
+        you_at = run.session.plain.rfind(plain_text(b"You"), abort_from, aborted_at)
+        echo_at = run.session.plain.find(plain_text(b"steer this turn"), you_at)
+        if aborted_at < 0 or you_at < 0 or echo_at < 0 or echo_at - you_at > 160 or echo_at >= aborted_at or aborted_at - you_at > 600:
+            raise ScenarioError("steer-abort: steer echo did not flush into transcript history adjacent to the abort row")
+        run.note("/abort during a held stream cancels the turn, clears the streaming status, and the flushed history renders the steered text as a permanent 'You' entry directly above the abort row")
 
         run.quit()
     except ScenarioError as err:
