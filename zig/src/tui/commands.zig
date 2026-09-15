@@ -362,7 +362,7 @@ test "dispatch reaches command handlers" {
     defer state.deinit();
     try state.status.setModel(std.testing.allocator, "model-a", "provider-a");
     try state.addSession("s1", "Saved");
-    _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
+    _ = try state.resolveToolOccurrenceForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
     const kinds = [_]CommandKind{ .help, .status, .@"resume", .permissions, .clear, .abort, .quit };
