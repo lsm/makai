@@ -66,6 +66,17 @@ TERMINAL_IDENTIFICATION_VARS = (
     "ZELLIJ",
     "ZZ_UNICODE_WIDTH",
 )
+CREDENTIAL_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+    "GH_COPILOT_ACCESS",
+    "GH_COPILOT_REFRESH",
+    "GOOGLE_API_KEY",
+    "KIMI_API_KEY",
+    "OLLAMA_API_KEY",
+    "OPENAI_API_KEY",
+)
 
 ANSI_RE = re.compile(
     rb"\x1b\[[0-9;?<=>! \-/]*[@-~]"
@@ -130,6 +141,8 @@ class PtySession:
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
                 env = dict(os.environ)
                 for name in TERMINAL_IDENTIFICATION_VARS:
+                    env.pop(name, None)
+                for name in CREDENTIAL_ENV_VARS:
                     env.pop(name, None)
                 env["HOME"] = self.home
                 env["TERM"] = "xterm-256color"
@@ -420,6 +433,12 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=15.0)
     parser.add_argument("--stream-timeout", type=float, default=15.0)
     args = parser.parse_args()
+    if sys.platform == "darwin":
+        parser.error(
+            "macOS is rejected: makai reads the login keychain (com.makai.auth / Codex Auth) "
+            "regardless of HOME, so this driver cannot isolate a credential-free run there "
+            "(issue #263 tracks a file-only auth mode); run on Linux/CI"
+        )
     if not args.fixture_text:
         parser.error("--fixture-text must be non-empty: an empty MAKAI_TUI_FIXTURE disables fixture mode in the TUI and would let a submit reach real providers")
     if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in args.prompt):
