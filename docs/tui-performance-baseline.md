@@ -52,9 +52,10 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   `/login` (picker, escape without triggering a real OAuth flow), `/permissions`
   (picker + `ask`/`bypass`/invalid-arg), `/resume` on an empty store, `/abort`
   while idle, an unknown command, `/clear`, `/quit`.
-- `keys` — the kept keys: Ctrl+Y copy (asserts the raw stream carries an
-  `OSC 52 ; c` clipboard sequence whose base64 payload decodes to the last
-  reply; a malformed payload is itself a failure), Shift+Enter (kitty
+- `keys` — the kept keys: Ctrl+Y copy (asserts the raw stream carries
+  exactly one `OSC 52 ; c` clipboard write whose base64 payload decodes to
+  the last reply; a malformed payload — or any second write — is itself a
+  failure), Shift+Enter (kitty
   `CSI 13;2u` encoding) composer newline (asserted positively: the submitted
   draft must echo as two separate transcript rows), Up/Down history recall,
   PgUp/PgDn, Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
