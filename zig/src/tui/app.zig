@@ -2140,7 +2140,7 @@ test "App saveEvent keeps debug-visible event types" {
 test "App clear_transcript clears the tool registry" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
-    _ = try app.state.upsertToolForTest("call-1", "shell_execute", "{\"command\":\"pwd\"}", .done);
+    _ = try app.state.resolveToolOccurrenceForTest("call-1", "shell_execute", "{\"command\":\"pwd\"}", .done);
     try app.state.appendToolSummaryTranscript("◈ shell_execute \"pwd\" ok", "call-1");
 
     try app.submit("/clear");
