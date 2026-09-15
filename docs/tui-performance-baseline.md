@@ -67,9 +67,10 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
 These scenarios use the fixture step encoding, which extends the plain
 canned-reply value: `|`-separated steps `text:<body>`, `tool:<name>` or
 `tool:<name>#<args-json>` (args default to `{}`), `hold` (block until
-cancelled — for steer/abort coverage), and `error:<message>`. A value whose
-first segment carries no step prefix stays a single text reply, so existing
-`MAKAI_TUI_FIXTURE` usage is unchanged.
+cancelled — for steer/abort coverage), and `error:<message>`. A literal `|`
+or `\` inside a step payload (common in shell tool arguments) is escaped as
+`\|` / `\\`. A value whose first segment carries no step prefix stays a single
+text reply, so existing `MAKAI_TUI_FIXTURE` usage is unchanged.
 
 ## Metric definitions
 

@@ -13,7 +13,7 @@
 # save+resume round-trip. Fixture values for those scenarios use the step
 # encoding `text:...|tool:<name>[#<args-json>]|hold|error:...` (see
 # FixtureRuntime in zig/src/tui/app.zig); plain values stay a single canned
-# reply.
+# reply. A literal `|` or `\` inside a step payload is escaped as `\|` / `\\`.
 #
 # Usage:
 #   zig build install -Doptimize=ReleaseFast --prefix /tmp/makai-pty
@@ -471,6 +471,7 @@ class SweepRun:
         self.name = name
         self.notes = []
         self.frames = []
+        self.error = None
         frame_args = argparse.Namespace(**vars(args))
         if width is not None:
             frame_args.width = width
@@ -550,7 +551,7 @@ class SweepRun:
             for frame in self.frames:
                 handle.write(json.dumps(frame) + "\n")
         with open(os.path.join(output_dir, "notes.json"), "w") as handle:
-            json.dump({"scenario": self.name, "notes": self.notes}, handle, indent=2)
+            json.dump({"scenario": self.name, "error": self.error, "notes": self.notes}, handle, indent=2)
             handle.write("\n")
 
 
@@ -569,10 +570,16 @@ def scenario_commands(args):
                 raise ScenarioError(f"commands: /help output does not list {usage}")
         run.note(f"/help lists all {len(RATIFIED_COMMANDS)} ratified commands")
 
+        status_from = len(run.session.plain)
         run.command("/status", "session:")
-        for field in ("model:", "provider:", "turns:", "context:", "streaming:"):
-            if not run.seen(field):
+        field_positions = []
+        for field in ("session:", "model:", "provider:", "turns:", "context:", "streaming:"):
+            position = run.session.plain.find(plain_text(field.encode()), status_from)
+            if position < 0:
                 raise ScenarioError(f"commands: /status output missing {field!r}")
+            field_positions.append(position)
+        if field_positions != sorted(field_positions) or field_positions[-1] - field_positions[0] > 6 * (args.width + 8):
+            raise ScenarioError("commands: /status fields did not render as one contiguous status block")
 
         run.command("/provider", "current provider:")
         if not run.seen("available providers:"):
@@ -597,6 +604,8 @@ def scenario_commands(args):
         run.command("/clear", "transcript cleared")
 
         run.quit()
+    except ScenarioError as err:
+        run.error = str(err)
     finally:
         run.close()
     return run
@@ -671,6 +680,8 @@ def scenario_keys(args):
         if exit_code != 0:
             raise ScenarioError(f"keys: Ctrl+C exited with code {exit_code}, expected 0")
         run.note("Ctrl+C exits cleanly with code 0")
+    except ScenarioError as err:
+        run.error = str(err)
     finally:
         run.close()
     return run
@@ -700,6 +711,8 @@ def scenario_steer_abort(args):
         run.note("/abort during a held stream cancels the turn and clears the streaming status")
 
         run.quit()
+    except ScenarioError as err:
+        run.error = str(err)
     finally:
         run.close()
     return run
@@ -729,6 +742,8 @@ def scenario_approval_deny(args):
         run.key_wait(b"a", "approve always", "dual-path-complete")
         run.frame("approved-always")
         run.note("'a' approves always: the retried tool runs without a fresh prompt and the turn completes")
+    except ScenarioError as err:
+        run.error = str(err)
     finally:
         run.close()
     return run
@@ -747,6 +762,8 @@ def scenario_approval_allow(args):
         run.key_wait(b"y", "approve once", "allow-path-complete")
         run.frame("approved-once")
         run.note("'y' approves once: workspace_info executes and the turn completes")
+    except ScenarioError as err:
+        run.error = str(err)
     finally:
         run.close()
     return run
@@ -762,16 +779,22 @@ def scenario_session_roundtrip(args):
             first.submit("remember the alpha", "roundtrip-reply-alpha")
             first.frame("saved-turn")
             first.quit()
+        except ScenarioError as err:
+            first.error = str(err)
         finally:
             first.close()
+        if first.error is not None:
+            return first
 
         second = SweepRun(args, "session-roundtrip-resume", "roundtrip-reply-beta", home=home)
         try:
             second.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner (run 2)")
             second.settle()
+            picker_from = len(second.session.plain)
             second.command("/resume", "Sessions")
-            if not second.seen("claude-sonnet-4-5"):
-                raise ScenarioError("session-roundtrip: picker row does not show the saved model")
+            picker_row = f"claude-sonnet-4-5 anthropic {time.gmtime().tm_year}"
+            if not second.seen(picker_row, picker_from):
+                raise ScenarioError("session-roundtrip: picker row does not show the saved model and provider")
             second.frame("session-picker")
 
             second.session.send(KEY_ENTER, "Enter (resume session)")
@@ -779,6 +802,8 @@ def scenario_session_roundtrip(args):
             second.frame("resumed")
             second.note("saved session round-trips: /resume lists it and Enter replays the saved assistant reply")
             second.quit()
+        except ScenarioError as err:
+            second.error = str(err)
         finally:
             second.close()
     finally:
@@ -875,17 +900,19 @@ def run_sweep_scenario(args, repo_root, name):
     runner = SCENARIOS[name]
     try:
         run = runner(args)
-    except ScenarioError as err:
+        output_dir = os.path.join(args.output_dir, name)
+        run.dump(output_dir)
+        if run.error is not None:
+            return {"scenario": name, "result": "fail", "error": run.error, "frames": len(run.frames), "notes": run.notes, "output_dir": output_dir}
+        return {
+            "scenario": name,
+            "result": "pass",
+            "frames": len(run.frames),
+            "notes": run.notes,
+            "output_dir": output_dir,
+        }
+    except (ScenarioError, OSError) as err:
         return {"scenario": name, "result": "fail", "error": str(err), "notes": []}
-    output_dir = os.path.join(args.output_dir, name)
-    run.dump(output_dir)
-    return {
-        "scenario": name,
-        "result": "pass",
-        "frames": len(run.frames),
-        "notes": run.notes,
-        "output_dir": output_dir,
-    }
 
 
 def main():
@@ -908,6 +935,7 @@ def main():
             "(issue #263 tracks a file-only auth mode); run on Linux/CI"
         )
     check_binary(args.binary)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     if args.scenario == "core-loop":
         validate_core_loop_args(parser, args)
@@ -919,6 +947,7 @@ def main():
 
     names = [name for name in SCENARIOS if name != "core-loop"] if args.scenario == "all" else [args.scenario]
     if args.scenario == "all":
+        validate_core_loop_args(parser, args)
         core_error = run_core_loop(args, repo_root)
         if core_error is not None:
             print(f"tui-pty-driver: FAIL: core-loop: {core_error}", file=sys.stderr)
