@@ -590,7 +590,13 @@ pub const AppState = struct {
                 },
                 .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), &self.active_user_entry, true),
                 .tool_result => {
-                    const suppress_text = if (self.findTool(payload.tool_call_id.slice())) |tool| tool.status == .@"error" and tool.error_detail_readable else false;
+                    const tool = self.findTool(payload.tool_call_id.slice());
+                    if (tool) |found| {
+                        if (found.status == .pending or found.status == .running or found.status == .interrupted) {
+                            try self.reconcileRetainedResult(found, payload);
+                        }
+                    }
+                    const suppress_text = if (tool) |found| found.status == .@"error" and found.error_detail_readable else false;
                     try self.finishToolResultEntry(if (suppress_text) "" else payload.text.slice(), payload.tool_call_id.slice());
                 },
             },
@@ -848,6 +854,25 @@ pub const AppState = struct {
             if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
             self.removeTranscriptEntry(i);
         }
+    }
+
+    fn reconcileRetainedResult(self: *AppState, tool: *ToolEntry, payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).message_end)) !void {
+        tool.status = if (payload.is_error) .@"error" else .done;
+        const envelope = payload.details_json.slice();
+        const result_json = if (envelope.len > 0) envelope else payload.text.slice();
+        if (result_json.len > 0) {
+            if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
+            try tool.output.appendSlice(self.allocator, result_json);
+        }
+        tool.error_detail_readable = false;
+        if (payload.is_error) {
+            const unwrapped = try toolErrorMessage(self.allocator, result_json);
+            defer if (unwrapped) |message| self.allocator.free(message);
+            tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, result_json);
+        }
+        const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, result_json, payload.is_error, 0, 0, 0, 0);
+        defer self.allocator.free(summary);
+        _ = try self.replaceLinkedSummaryRow(summary, tool.id);
     }
 
     fn removeEmptyActiveTranscriptEntry(self: *AppState, active_entry: *?usize, kind: TranscriptKind) void {
@@ -1152,7 +1177,7 @@ fn plainTextErrorDetail(allocator: std.mem.Allocator, result_json: []const u8) b
     if (result_json.len == 0) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch return true;
     defer parsed.deinit();
-    return parsed.value != .object;
+    return parsed.value != .object and parsed.value != .null;
 }
 
 fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
@@ -2098,7 +2123,7 @@ test "AppState finalizes running tools as interrupted on aborted turn end" {
     try state.applyEvent(start_event);
 
     state.stream_aborted = true;
-    try state.applyEvent(.{ .turn_end = .{} });
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
 
     try std.testing.expectEqual(ToolStatus.interrupted, state.tools.items[0].status);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "interrupted") != null);
@@ -2122,6 +2147,50 @@ test "AppState reconciles result rows when an end arrives after the result" {
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ shell failed") != null);
     try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "Tool execution failed") == null);
+}
+
+test "AppState keeps result text when error details are absent" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-n", "shell", "{\"command\":\"ls\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    var end_event = try toolEndEvent("call-n", "shell", "null", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .tool_result, .tool_call_id = try ownedText("call-n"), .text = try ownedText("connection reset by peer") } };
+    defer result_end.deinit(std.testing.allocator);
+    try state.applyEvent(result_end);
+
+    try std.testing.expectEqual(@as(usize, 3), state.transcript.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "failed") != null);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
+    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[2].kind);
+    try std.testing.expectEqualStrings("connection reset by peer", state.transcript.items[2].text.items);
+    try std.testing.expect(!state.tools.items[0].error_detail_readable);
+}
+
+test "AppState reconciles interrupted tools when the retained result arrives" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-x", "shell", "{\"command\":\"ls\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .tool_result, .tool_call_id = try ownedText("call-x"), .text = try ownedText("all good") } };
+    defer result_end.deinit(std.testing.allocator);
+    try state.applyEvent(result_end);
+
+    try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ shell \"ls\" ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "interrupted") == null);
+    try std.testing.expectEqualStrings("all good", state.transcript.items[1].text.items);
 }
 
 test "AppState recovers replayed tool arguments from assistant tool calls" {
