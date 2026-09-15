@@ -784,7 +784,7 @@ def findUserEntryEcho(plain, text, from_index):
 
 
 def scenario_steer_abort(args):
-    run = SweepRun(args, "steer-abort", 'hold|tool:shell_execute#{"command":"sleep 5"}|text:steer-consumed-done')
+    run = SweepRun(args, "steer-abort", 'hold|tool:shell_execute#{"description":"hold the turn open","workspace_root":"/tmp","command":"sleep 5"}|text:steer-consumed-done')
     try:
         run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
         run.settle()
