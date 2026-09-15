@@ -45,6 +45,7 @@ pub const TranscriptEntry = struct {
     kind: TranscriptKind,
     text: std.ArrayList(u8) = .empty,
     timestamp_ms: i64 = 0,
+    tool_summary: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8) !TranscriptEntry {
         var entry = TranscriptEntry{ .kind = kind, .timestamp_ms = compat.time.nowMillis() };
@@ -380,6 +381,12 @@ pub const AppState = struct {
         try self.transcript.append(self.allocator, try TranscriptEntry.init(self.allocator, kind, text));
     }
 
+    pub fn appendToolSummaryTranscript(self: *AppState, text: []const u8) !void {
+        var entry = try TranscriptEntry.init(self.allocator, .tool, text);
+        entry.tool_summary = true;
+        try self.transcript.append(self.allocator, entry);
+    }
+
     pub fn setRegisteredTools(self: *AppState, tools: []const agent.AgentTool) !void {
         for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
         self.registered_tools.clearRetainingCapacity();
@@ -549,9 +556,9 @@ pub const AppState = struct {
             },
             .tool_execution_start => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
-                const summary = try toolSummary(self.allocator, tool.label, payload.args_json.slice());
+                const summary = try toolInvocation(self.allocator, tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
-                try self.appendTranscript(.tool, summary);
+                try self.appendToolSummaryTranscript(summary);
                 self.active_tool_summary_entry = self.transcript.items.len - 1;
             },
             .tool_execution_update => |payload| {
@@ -565,13 +572,15 @@ pub const AppState = struct {
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                const summary = try toolResultSummary(self.allocator, tool.label, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
+                const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
                 try self.finalizeToolSummaryEntry(summary);
                 if (payload.is_error) {
                     const unwrapped = try toolErrorMessage(self.allocator, payload.result_json.slice());
                     defer if (unwrapped) |message| self.allocator.free(message);
-                    const detail = if (unwrapped) |message| message else payload.result_json.slice();
+                    const raw_detail = if (unwrapped) |message| message else payload.result_json.slice();
+                    const detail = try sanitizeTerminalText(self.allocator, raw_detail);
+                    defer self.allocator.free(detail);
                     const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, detail });
                     defer self.allocator.free(message);
                     try self.status.setError(self.allocator, message);
@@ -752,7 +761,7 @@ pub const AppState = struct {
                 return;
             }
         }
-        try self.appendTranscript(.tool, summary);
+        try self.appendToolSummaryTranscript(summary);
     }
 
     fn removeEmptyActiveTranscriptEntry(self: *AppState, active_entry: *?usize, kind: TranscriptKind) void {
@@ -930,7 +939,7 @@ fn jsonUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
     };
 }
 
-fn toolSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
+fn toolInvocation(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
     const primary = primaryToolArg(allocator, args_json) catch null;
     defer if (primary) |value| allocator.free(value);
     if (primary) |value| {
@@ -941,11 +950,13 @@ fn toolSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []cons
     return std.fmt.allocPrint(allocator, "◈ {s}", .{name});
 }
 
-fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, result_json: []const u8, is_error: bool, raw_total_bytes: u64, returned_total_bytes: u64, estimated_tokens: u64, artifact_count: u32) ![]u8 {
+fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8, result_json: []const u8, is_error: bool, raw_total_bytes: u64, returned_total_bytes: u64, estimated_tokens: u64, artifact_count: u32) ![]u8 {
+    const invocation = try toolInvocation(allocator, name, args_json);
+    defer allocator.free(invocation);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.print("◈ {s} {s}", .{ name, if (is_error) "failed" else "ok" });
+    try writer.print("{s} {s}", .{ invocation, if (is_error) "failed" else "ok" });
     if (raw_total_bytes > 0 or returned_total_bytes > 0) {
         try writer.print(" raw={d}B returned={d}B", .{ raw_total_bytes, returned_total_bytes });
     } else {
@@ -1104,6 +1115,7 @@ test "AppState applies transcript and tool events" {
 
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[1].kind);
+    try std.testing.expect(state.transcript.items[1].tool_summary);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\"") != null);
     try std.testing.expectEqual(@as(usize, 1), state.active_tool_summary_entry.?);
 
@@ -1116,7 +1128,7 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqualStrings("Shell Execute", state.tools.items[0].label);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\" ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command") == null);
     try std.testing.expect(state.active_tool_summary_entry == null);
 }
@@ -1750,6 +1762,24 @@ test "AppState renders one summary line per tool call across a turn" {
     try std.testing.expectEqual(@as(usize, 2), tool_rows);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ workspace_info ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[2].text.items, "◈ workspace_list ok") != null);
+}
+
+test "AppState sanitizes unwrapped tool error messages" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var end_event = try toolEndEvent("call-esc", "shell_command", "{\"ok\":false,\"err\":\"before\\u001b[2Jafter\\u0007\"}", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    for (state.transcript.items) |entry| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x1b) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, entry.text.items, 0x07) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "before[2Jafter") != null);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command failed: before[2Jafter") != null);
 }
 
 test "lastAssistantText returns the most recent assistant reply" {

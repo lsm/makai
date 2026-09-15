@@ -138,13 +138,9 @@ fn appendBalancedToolCluster(
 fn countToolStarts(entries: []const TranscriptEntry) usize {
     var count: usize = 0;
     for (entries) |entry| {
-        if (isToolStartSummary(entry.text.items)) count += 1;
+        if (entry.tool_summary) count += 1;
     }
     return count;
-}
-
-fn isToolStartSummary(text: []const u8) bool {
-    return std.mem.startsWith(u8, text, "◈ ");
 }
 
 fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
@@ -1010,7 +1006,8 @@ test "transcript collapses tool events into intent row without card" {
     state.tools.items[0].raw_total_bytes = 342;
     state.tools.items[0].estimated_returned_tokens = 87;
 
-    try state.appendTranscript(.tool, "◈ Shell Execute ok raw=342B returned=342B ~87 tok");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Run pwd to show current working directory\" ok raw=342B returned=342B ~87 tok");
+    try state.appendTranscript(.tool, "◈ not-a-summary tool output row");
     try state.appendTranscript(.tool, "ok stdout=43 stderr=0");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
@@ -1020,6 +1017,7 @@ test "transcript collapses tool events into intent row without card" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Run pwd to show current working directory [ok, 342B, ~87 tok]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "{\"command\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "not-a-summary") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ok stdout=43 stderr=0") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{2570}") == null);
@@ -1037,7 +1035,7 @@ test "transcript balanced mode sanitizes tool descriptions" {
         "{\"description\":\"before\\u001b[2Jafter\\u0007\",\"command\":\"pwd\"}",
         .done,
     ));
-    try state.appendTranscript(.tool, "◈ Shell Execute \"before\"");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"before\"");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
@@ -1069,10 +1067,10 @@ test "transcript balanced mode preserves tool call order across turns" {
     ));
 
     try state.appendUserMessage("first request");
-    try state.appendTranscript(.tool, "◈ Shell Execute ok output=10B");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect pwd now\" ok output=10B");
     try state.appendTranscript(.assistant, "PWD done");
     try state.appendUserMessage("second request");
-    try state.appendTranscript(.tool, "◈ Shell Execute ok output=20B");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect uname now\" ok output=20B");
     try state.appendTranscript(.assistant, "UNAME done");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 140, .height = 30 });
