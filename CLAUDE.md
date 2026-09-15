@@ -23,7 +23,9 @@ zig build -Doptimize=ReleaseSafe  # What the tagged release workflow builds
 
 ### Grouped Unit Test Steps
 
-There is no per-test filter; the smallest runnable unit is a group step (each maps to a CI matrix job, 3-minute timeout). Tests are inline `test "name" { ... }` blocks in each `.zig` file.
+There is no per-test filter; the smallest runnable unit is a group step. Tests are inline `test "name" { ... }` blocks in each `.zig` file.
+
+Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (3-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent and tool tests to the specific subgroup (and to `test`), not just the aggregate.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
@@ -56,7 +58,7 @@ zig build test-e2e-github-copilot               # GH_COPILOT_REFRESH, GH_COPILOT
 zig build test-e2e-provider-protocol-fullstack-ollama
 zig build test-e2e-provider-protocol-fullstack-github
 zig build test-e2e-distributed-fullstack-github
-zig build test-e2e                              # aggregate, but omits BOTH distributed-fullstack steps
+zig build test-e2e                              # aggregate; runs distributed-fullstack via test-e2e-protocol, but omits the -github variant
 ```
 
 See `.github/workflows/ci.yml` for the exact env wiring and which lanes are currently gated off.
@@ -209,7 +211,7 @@ makai auth providers [--json]                   # thin wrappers over the auth pr
 makai auth login --provider <id> [--json]
 ```
 
-On-disk state: credentials in `~/.makai/auth.json` (mode 0600, written via same-directory temp + rename; macOS keychain service `com.makai.auth`), TUI sessions in `~/.makai/sessions`, TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
+On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `com.makai.auth` is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
 
 ## Providers
 
@@ -217,7 +219,7 @@ On-disk state: credentials in `~/.makai/auth.json` (mode 0600, written via same-
 
 **Adding a transport**: implement `Sender`/`Receiver` from `transport.zig` in `zig/src/transports/<name>.zig`; wire into `build.zig` with the `transport` import and the `test-unit-transport` group.
 
-Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). `model_catalog.zig` is the static fallback catalog behind `models.list`. AWS Bedrock is **not** supported: `providers/bedrock_converse_stream_api.zig` is an unwired stub returning `error.NotImplemented`.
+Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported: `providers/bedrock_converse_stream_api.zig` is an unwired stub returning `error.NotImplemented`.
 
 ## TUI
 
