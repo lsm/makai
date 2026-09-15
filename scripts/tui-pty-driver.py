@@ -784,7 +784,7 @@ def findUserEntryEcho(plain, text, from_index):
 
 
 def scenario_steer_abort(args):
-    run = SweepRun(args, "steer-abort", "hold")
+    run = SweepRun(args, "steer-abort", 'hold|tool:shell_execute#{"description":"hold the turn open","workspace_root":"/tmp","command":"sleep 5"}|text:steer-consumed-done')
     try:
         run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
         run.settle()
@@ -817,6 +817,30 @@ def scenario_steer_abort(args):
         if aborted_at < 0 or you_at < 0 or echo_at < 0 or echo_at - you_at > 160 or echo_at >= aborted_at or aborted_at - you_at > 600:
             raise ScenarioError("steer-abort: steer echo did not flush into transcript history adjacent to the abort row")
         run.note("/abort during a held stream cancels the turn, clears the streaming status, and the flushed history renders the steered text as a permanent 'You' entry directly above the abort row")
+
+        run.session.type_text("run the slow tool")
+        run.session.send(KEY_ENTER, "Enter (submit tool turn)")
+        run.session.wait_for(b"streaming", 10.0, "streaming status after tool submit")
+        run.frame("tool-turn-streaming")
+
+        run.session.type_text("steer this turn too")
+        tool_echo_from = len(run.session.plain)
+        run.session.send(KEY_ENTER, "Enter (steer)")
+        run.session.wait_for(b"queue", 6.0, "queued steer indicator during tool run")
+        run.settle()
+        run.frame("tool-steer-queued")
+        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+            raise ScenarioError("steer-abort: steered text did not echo during the tool run")
+
+        run.session.wait_for(b"steer-consumed-done", 15.0, "turn completion after steer consumption")
+        run.settle(1.0)
+        run.frame("tool-turn-done")
+        done_at = run.session.plain.rfind(plain_text(b"steer-consumed-done"))
+        if run.session.plain.find(plain_text(b"queued"), done_at) >= 0:
+            raise ScenarioError("steer-abort: queued indicator survived steer consumption")
+        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+            raise ScenarioError("steer-abort: steered text echo vanished after consumption")
+        run.note("a steer queued during a tool run is consumed when the tool finishes: the queue indicator clears, the turn completes, and the echoed steered text stays rendered exactly as echoed (runtime-declared consumption reconciles pending steers even when consumption events never reach the app)")
 
         run.quit()
     except ScenarioError as err:

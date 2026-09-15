@@ -77,6 +77,7 @@ pub const Agent = struct {
     _follow_up_queue: std.ArrayList(ai_types.Message),
     _steering_mode: QueueMode,
     _follow_up_mode: QueueMode,
+    _steering_consumed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     _skip_initial_steering_poll: bool,
 
@@ -484,6 +485,7 @@ pub const Agent = struct {
         if (messages[messages.len - 1] == .assistant) {
             if (self._steering_queue.items.len > 0) {
                 const steering = try self.dequeueSteeringMessagesLocked();
+                _ = self._steering_consumed.fetchAdd(steering.len, .release);
                 return .{ .messages = steering, .skip_steering = true };
             }
 
@@ -983,7 +985,13 @@ pub const Agent = struct {
         defer self._mutex.unlock(defaultIo());
 
         if (self._steering_queue.items.len == 0) return null;
-        return try self.dequeueSteeringMessagesLocked();
+        const dequeued = try self.dequeueSteeringMessagesLocked();
+        _ = self._steering_consumed.fetchAdd(dequeued.len, .release);
+        return dequeued;
+    }
+
+    pub fn steeringConsumedCount(self: *Agent) u64 {
+        return self._steering_consumed.load(.acquire);
     }
 
     fn dequeueFollowUpMessagesLocked(self: *Agent) ![]ai_types.Message {

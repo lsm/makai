@@ -1174,7 +1174,7 @@ fn runLoop(
                     break :outer;
                 },
                 .tool_use => {
-                    const tool_result = try executeToolCalls(
+                    var tool_result = try executeToolCalls(
                         allocator,
                         assistant_message,
                         config,
@@ -1201,6 +1201,21 @@ fn runLoop(
                         try appendClonedStateMessage(&state.messages, allocator, msg);
                     }
 
+                    if (tool_result.steering_messages) |steering_msgs| {
+                        tool_result.steering_messages = null;
+                        for (steering_msgs) |steering_msg| {
+                            try context.appendMessage(steering_msg);
+                            try pushAgentEvent(event_stream, .{ .message_start = .{
+                                .message = steering_msg,
+                            } });
+                            try pushAgentEvent(event_stream, .{ .message_end = .{
+                                .message = steering_msg,
+                            } });
+                            try appendClonedStateMessage(&state.messages, allocator, steering_msg);
+                        }
+                        const mutable_msgs: []ai_types.Message = @constCast(steering_msgs);
+                        allocator.free(mutable_msgs);
+                    }
                 },
             }
         }

@@ -365,6 +365,7 @@ pub const AppState = struct {
     dropped_event_count: u64 = 0,
     backpressure_active: bool = false,
     pending_steers: std.ArrayList([]u8) = .empty,
+    steers_reconciled: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) AppState {
         return .{ .allocator = allocator };
@@ -479,12 +480,13 @@ pub const AppState = struct {
         self.active_user_entry = self.transcript.items.len - 1;
     }
 
-    pub fn takePendingSteer(self: *AppState, text: []const u8) bool {
-        if (self.pending_steers.items.len == 0) return false;
-        if (!std.mem.eql(u8, self.pending_steers.items[0], text)) return false;
-        const matched = self.pending_steers.orderedRemove(0);
-        self.allocator.free(matched);
-        return true;
+    pub fn reconcileSteers(self: *AppState, consumed_total: u64) void {
+        while (self.steers_reconciled < consumed_total and self.pending_steers.items.len > 0) {
+            const matched = self.pending_steers.orderedRemove(0);
+            self.allocator.free(matched);
+            self.steers_reconciled += 1;
+        }
+        self.steers_reconciled = consumed_total;
     }
 
     pub fn clearPendingSteers(self: *AppState) void {
@@ -1431,21 +1433,45 @@ test "AppState appendSteeredMessage echoes and tracks pending steer" {
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.active_user_entry.?);
 
-    try std.testing.expect(state.takePendingSteer("steer mid turn"));
-    try std.testing.expect(state.takePendingSteer("steer again"));
-    try std.testing.expect(!state.takePendingSteer("steer again"));
+    state.reconcileSteers(1);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_steers.items.len);
+    try std.testing.expectEqualStrings("steer again", state.pending_steers.items[0]);
+    state.reconcileSteers(2);
     try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
 }
 
-test "AppState takePendingSteer only matches the queued head" {
+test "AppState reconcileSteers pops queued heads without text matching" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
     try state.appendSteeredMessage("first steer");
     try state.appendSteeredMessage("second steer");
-    try std.testing.expect(!state.takePendingSteer("second steer"));
-    try std.testing.expect(state.takePendingSteer("first steer"));
-    try std.testing.expect(state.takePendingSteer("second steer"));
+    state.reconcileSteers(1);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_steers.items.len);
+    try std.testing.expectEqualStrings("second steer", state.pending_steers.items[0]);
+    state.reconcileSteers(1);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_steers.items.len);
+    state.reconcileSteers(2);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+
+    try state.appendSteeredMessage("same text steer");
+    state.reconcileSteers(3);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+}
+
+test "AppState reconcileSteers fast-forwards when no pending steer remains" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendSteeredMessage("consumed steer");
+    state.clearPendingSteers();
+    state.reconcileSteers(4);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
+
+    try state.appendSteeredMessage("later steer");
+    state.reconcileSteers(4);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_steers.items.len);
+    state.reconcileSteers(5);
     try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
 }
 
