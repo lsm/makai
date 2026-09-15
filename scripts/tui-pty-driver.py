@@ -26,7 +26,9 @@
 # one {"t_ms", "bytes"} line per read batch in <output-dir>/batches.jsonl,
 # and one {"name", "t_ms", "tail"} checkpoint per named frame in
 # <output-dir>/frames.jsonl. With --scenario all, each scenario writes its own
-# subdirectory under --output-dir and a summary.json lands at the top level.
+# subdirectory under --output-dir and a summary.json lands at the top level;
+# session-roundtrip dumps each half into its own save/ and resume/
+# subdirectory so a passing round-trip keeps both transcripts.
 # The script exits non-zero when any scenario assertion fails, so CI can gate
 # on it. Timings are wall-clock (time.monotonic) and host-dependent: record
 # them against a stable host class, like the bench harness baseline.
@@ -39,6 +41,7 @@
 # never satisfy the next keypress's wait.
 
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -97,6 +100,7 @@ ANSI_RE = re.compile(
     rb"|\x1b[@-Z\\-_]"
 )
 CONTROL_RE = re.compile(rb"[\x00-\x1f\x7f]")
+OSC52_RE = re.compile(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
 
 
 class ScenarioError(Exception):
@@ -472,6 +476,7 @@ class SweepRun:
         self.notes = []
         self.frames = []
         self.error = None
+        self.dump_dir = None
         frame_args = argparse.Namespace(**vars(args))
         if width is not None:
             frame_args.width = width
@@ -528,6 +533,16 @@ class SweepRun:
             return True
         except ScenarioError:
             return False
+
+    def assert_clipboard(self, from_chunk, expected, what):
+        stream = b"".join(chunk for _, chunk in self.session.chunks[from_chunk:])
+        payloads = [base64.b64decode(match.group(1)) for match in OSC52_RE.finditer(stream)]
+        if expected not in payloads:
+            tail = plain_text(stream[-400:]).decode("ascii", "replace")
+            raise ScenarioError(
+                f"{self.name}: {what} wrote no OSC 52 clipboard payload decoding to {expected!r} "
+                f"(payloads: {payloads!r}); transcript tail: {tail!r}"
+            )
 
     def quit(self):
         self.session.type_text("/quit")
@@ -635,15 +650,13 @@ def scenario_keys(args):
         run.frame("three-turns")
 
         copy_from = len(run.session.plain)
+        copy_chunks = len(run.session.chunks)
         run.key(KEY_CTRL_Y, "Ctrl+Y copy last reply")
+        run.assert_clipboard(copy_chunks, b"keys-fixture-reply", "Ctrl+Y copy last reply")
         if run.seen("copied last reply to clipboard", copy_from):
-            run.note("Ctrl+Y with a reply present appends 'copied last reply to clipboard' to the transcript")
-        elif run.seen("clipboard unavailable", copy_from):
-            run.note("FINDING: Ctrl+Y fails headless: 'clipboard unavailable' — no OSC 52 fallback for terminals without a clipboard")
-        elif run.seen("nothing to copy yet", copy_from):
-            run.note("FINDING: Ctrl+Y reports 'nothing to copy yet' although a reply exists")
+            run.note("Ctrl+Y with a reply present writes the reply via an OSC 52 clipboard sequence (payload asserted against the raw stream) and appends 'copied last reply to clipboard' to the transcript")
         else:
-            run.note("FINDING: Ctrl+Y produced no visible feedback")
+            run.note("FINDING: Ctrl+Y wrote the asserted OSC 52 clipboard payload but the transcript lacks the 'copied last reply to clipboard' status line")
 
         run.session.type_text("first line")
         before_join = len(run.session.plain)
@@ -651,9 +664,8 @@ def scenario_keys(args):
         run.session.type_text("second line")
         run.settle()
         if plain_text(b"first linesecond line") in run.session.plain[before_join - 64:]:
-            run.note("FINDING: Shift+Enter (kitty CSI 13;2u) inserted no newline — lines concatenated in the composer")
-        else:
-            run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline")
+            raise ScenarioError("keys: Shift+Enter (kitty CSI 13;2u) inserted no newline — lines concatenated in the composer")
+        run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline")
         run.frame("shift-enter-draft")
         run.session.send(KEY_ENTER, "Enter (submit two-line draft)")
         run.session.wait_for(b"keys-fixture-reply", 10.0, "reply after two-line submit")
@@ -825,8 +837,11 @@ def scenario_approval_allow(args):
 
 def scenario_session_roundtrip(args):
     home = tempfile.mkdtemp(prefix="makai-pty-home-roundtrip-")
+    save_dir = os.path.join(args.output_dir, "session-roundtrip", "save")
+    resume_dir = os.path.join(args.output_dir, "session-roundtrip", "resume")
     try:
         first = SweepRun(args, "session-roundtrip-save", "roundtrip-reply-alpha", home=home)
+        first.dump_dir = save_dir
         try:
             first.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner (run 1)")
             first.settle()
@@ -837,10 +852,12 @@ def scenario_session_roundtrip(args):
             first.error = str(err)
         finally:
             first.close()
+            first.dump(save_dir)
         if first.error is not None:
             return first
 
         second = SweepRun(args, "session-roundtrip-resume", "roundtrip-reply-beta", home=home)
+        second.dump_dir = resume_dir
         try:
             second.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner (run 2)")
             second.settle()
@@ -956,7 +973,7 @@ def run_sweep_scenario(args, repo_root, name):
     runner = SCENARIOS[name]
     try:
         run = runner(args)
-        output_dir = os.path.join(args.output_dir, name)
+        output_dir = run.dump_dir or os.path.join(args.output_dir, name)
         run.dump(output_dir)
         if run.error is not None:
             return {"scenario": name, "result": "fail", "error": run.error, "frames": len(run.frames), "notes": run.notes, "output_dir": output_dir}
@@ -990,8 +1007,12 @@ def main():
             "regardless of HOME, so this driver cannot isolate a credential-free run there "
             "(issue #263 tracks a file-only auth mode); run on Linux/CI"
         )
-    check_binary(args.binary)
-    os.makedirs(args.output_dir, exist_ok=True)
+    try:
+        check_binary(args.binary)
+        os.makedirs(args.output_dir, exist_ok=True)
+    except (ScenarioError, OSError) as err:
+        print(f"tui-pty-driver: FAIL: {err}", file=sys.stderr)
+        return 1
 
     if args.scenario == "core-loop":
         validate_core_loop_args(parser, args)
