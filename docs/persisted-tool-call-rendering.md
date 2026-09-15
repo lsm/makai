@@ -131,8 +131,8 @@ unreachable (no row links to them); clearing keeps the registry truthful and bou
   balanced status word.
 - PTY (`scripts/tui-pty-driver.py`): `approval-deny` asserts the readable rejection text
   renders after `n`.
-- Guard: measured `tui_loc` 14,885 → 15,175 on this branch (+290 net: ~120 production
-  for the id-link plumbing over the deleted positional cluster machinery, ~170 tests).
-  The #266 guard asked for flat-to-shrinking; this PR trades that for the identity
-  model and the five #273 behaviors, and reports the delta rather than claiming it
-  passes.
+- Guard: measured `tui_loc` 14,885 → 15,288 on this branch (+403 net at the round-2
+  fix head: ~150 production for the id-link plumbing and its review fixes over the
+  deleted positional cluster machinery, ~250 tests). The #266 guard asked for
+  flat-to-shrinking; this PR trades that for the identity model and the five #273
+  behaviors, and reports the delta rather than claiming it passes.
