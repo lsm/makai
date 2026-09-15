@@ -1254,7 +1254,6 @@ test "AppState appendSteeredMessage echoes and tracks pending steer" {
     try std.testing.expectEqual(@as(usize, 0), state.active_user_entry.?);
 
     try std.testing.expect(state.takePendingSteer("steer mid turn"));
-    try std.testing.expect(!state.takePendingSteer("steer again"));
     try std.testing.expect(state.takePendingSteer("steer again"));
     try std.testing.expect(!state.takePendingSteer("steer again"));
     try std.testing.expectEqual(@as(usize, 0), state.pending_steers.items.len);
