@@ -771,9 +771,12 @@ def scenario_approval_deny(args):
         run.session.wait_for(b"Tool: shell_execute", 5.0, "approval tool name")
         run.frame("approval-pending")
 
+        deny_from = len(run.session.plain)
         run.key_wait(b"n", "deny approval", "Approval required")
         run.frame("denied")
-        run.note("'n' denies the first approval and the agent retries the same tool")
+        if b"Tool execution rejected by user" not in run.session.plain[deny_from:]:
+            raise ScenarioError("approval-deny: the readable rejection text did not render after 'n'")
+        run.note("'n' denies the first approval, the readable rejection text renders, and the agent retries the same tool")
 
         always_from = len(run.session.plain)
         run.key_wait(b"a", "approve always", "deny-persist-complete")

@@ -92,64 +92,55 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
-    var tool_index: usize = 0;
     var i: usize = 0;
     while (i < state.transcript.items.len) {
         const entry = &state.transcript.items[i];
         if (entry.kind == .tool) {
             const cluster_start = i;
             while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
-            tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
+            try appendToolClusterRows(allocator, arena, entries, state, cluster_start, i);
             continue;
         }
-        try appendOriginal(allocator, entries, entry);
+        try appendOriginal(allocator, entries, entry, null);
         i += 1;
     }
 }
 
-fn appendBalancedToolCluster(
+fn appendToolClusterRows(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
     entries: *std.ArrayList(DisplayEntry),
     state: *const AppState,
     start: usize,
     end: usize,
-    initial_tool_index: usize,
-) !usize {
-    var tool_index = initial_tool_index;
-    if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
-        for (state.transcript.items[start..end]) |*entry| {
-            try appendOriginal(allocator, entries, entry);
+) !void {
+    for (state.transcript.items[start..end]) |*entry| {
+        const tool = if (entry.tool_call_id.len > 0) state.lookupTool(entry.tool_call_id) else null;
+        if (entry.tool_summary) {
+            if (tool) |found| {
+                try appendToolSummary(allocator, arena, entries, found.*);
+                continue;
+            }
+            try appendOriginal(allocator, entries, entry, null);
+            continue;
         }
-        return tool_index;
+        if (tool) |found| {
+            if (found.status == .done) continue;
+            if (found.status == .@"error" and found.error_detail_readable) continue;
+            try appendOriginal(allocator, entries, entry, found.*);
+            continue;
+        }
+        try appendOriginal(allocator, entries, entry, null);
     }
-
-    const calls_in_cluster = @max(countToolStarts(state.transcript.items[start..end]), 1);
-    var emitted: usize = 0;
-    while (emitted < calls_in_cluster and tool_index < state.tools.items.len) : ({
-        emitted += 1;
-        tool_index += 1;
-    }) {
-        try appendToolSummary(allocator, arena, entries, state.tools.items[tool_index]);
-    }
-    return tool_index;
 }
 
-fn countToolStarts(entries: []const TranscriptEntry) usize {
-    var count: usize = 0;
-    for (entries) |entry| {
-        if (entry.tool_summary) count += 1;
-    }
-    return count;
-}
-
-fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
+fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry, tool: ?tui_state.ToolEntry) !void {
     try entries.append(allocator, .{
         .kind = entry.kind,
         .text = entry.text.items,
         .timestamp_ms = entry.timestamp_ms,
-        .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
-        .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
+        .tool_name = if (entry.kind == .tool) (if (tool) |found| found.name else inferredToolName(entry.text.items)) else "",
+        .title = if (entry.kind == .tool) (if (tool) |found| found.label else inferredToolTitle(entry.text.items)) else "",
     });
 }
 
@@ -165,6 +156,7 @@ fn appendToolSummary(
         .running => "running",
         .done => "ok",
         .@"error" => "failed",
+        .interrupted => "interrupted",
     };
 
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -827,7 +819,7 @@ fn inferredToolTitle(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, "◈ ")) {
         const rest = text["◈ ".len..];
         const quote = std.mem.indexOfScalar(u8, rest, '"') orelse rest.len;
-        const status = std.mem.indexOf(u8, rest, " ok ") orelse std.mem.indexOf(u8, rest, " failed ") orelse quote;
+        const status = std.mem.indexOf(u8, rest, " ok ") orelse std.mem.indexOf(u8, rest, " failed ") orelse std.mem.indexOf(u8, rest, " interrupted") orelse quote;
         const end = @min(quote, status);
         return std.mem.trim(u8, rest[0..end], " \t\r\n");
     }
@@ -1006,9 +998,11 @@ test "transcript collapses tool events into intent row without card" {
     state.tools.items[0].raw_total_bytes = 342;
     state.tools.items[0].estimated_returned_tokens = 87;
 
-    try state.appendToolSummaryTranscript("◈ Shell Execute \"Run pwd to show current working directory\" ok raw=342B returned=342B ~87 tok");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Run pwd to show current working directory\" ok raw=342B returned=342B ~87 tok", "call-1");
     try state.appendTranscript(.tool, "◈ not-a-summary tool output row");
+    state.transcript.items[1].tool_call_id = try std.testing.allocator.dupe(u8, "call-1");
     try state.appendTranscript(.tool, "ok stdout=43 stderr=0");
+    state.transcript.items[2].tool_call_id = try std.testing.allocator.dupe(u8, "call-1");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
@@ -1035,7 +1029,7 @@ test "transcript balanced mode sanitizes tool descriptions" {
         "{\"description\":\"before\\u001b[2Jafter\\u0007\",\"command\":\"pwd\"}",
         .done,
     ));
-    try state.appendToolSummaryTranscript("◈ Shell Execute \"before\"");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"before\"", "call-1");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
@@ -1067,10 +1061,10 @@ test "transcript balanced mode preserves tool call order across turns" {
     ));
 
     try state.appendUserMessage("first request");
-    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect pwd now\" ok output=10B");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect pwd now\" ok output=10B", "call-1");
     try state.appendTranscript(.assistant, "PWD done");
     try state.appendUserMessage("second request");
-    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect uname now\" ok output=20B");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect uname now\" ok output=20B", "call-2");
     try state.appendTranscript(.assistant, "UNAME done");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 140, .height = 30 });
@@ -1090,6 +1084,90 @@ test "transcript balanced mode preserves tool call order across turns" {
     try std.testing.expect(second_tool < second_answer);
 }
 
+test "transcript keeps rejected result text without consuming later calls" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var rejected = try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-r",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Read config\",\"command\":\"cat cfg\"}",
+        .@"error",
+    );
+    rejected.error_detail_readable = false;
+    try state.tools.append(std.testing.allocator, rejected);
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-l",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"List files\",\"command\":\"ls\"}",
+        .done,
+    ));
+
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Read config\" failed output=17B", "call-r");
+    try state.appendTranscript(.@"error", "Shell Execute failed: {\"rejected\":true}");
+    try state.appendTranscript(.tool, "Tool execution rejected by user");
+    state.transcript.items[2].tool_call_id = try std.testing.allocator.dupe(u8, "call-r");
+    try state.appendTranscript(.assistant, "trying something else");
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"List files\" ok output=4B", "call-l");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 140, .height = 30 });
+    defer std.testing.allocator.free(text);
+
+    const rejected_row = std.mem.indexOf(u8, text, "Tool execution rejected by user") orelse return error.MissingRejectedText;
+    const rejected_summary = std.mem.indexOf(u8, text, "Read config") orelse return error.MissingRejectedSummary;
+    const later = std.mem.indexOf(u8, text, "List files") orelse return error.MissingLaterCall;
+    const occurrences = std.mem.count(u8, text, "List files");
+
+    try std.testing.expectEqual(@as(usize, 1), occurrences);
+    try std.testing.expect(rejected_summary < rejected_row);
+    try std.testing.expect(rejected_row < later);
+}
+
+test "transcript renders interrupted balanced summaries from linked tools" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-i",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Inspect pwd now\",\"command\":\"pwd\"}",
+        .interrupted,
+    ));
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Inspect pwd now\" interrupted", "call-i");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Inspect pwd now [interrupted]") != null);
+}
+
+test "transcript renders unlinked tool rows as original text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-1",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Run pwd now\",\"command\":\"pwd\"}",
+        .done,
+    ));
+    try state.appendToolSummaryTranscript("◈ Shell Execute \"Run pwd now\" ok", "call-1");
+    try state.appendTranscript(.tool, "orphan output row");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Run pwd now [ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "orphan output row") != null);
+}
 
 test "transcript colors tool cards by inferred operation" {
     var state = AppState.init(std.testing.allocator);
