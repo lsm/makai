@@ -536,7 +536,14 @@ class SweepRun:
 
     def assert_clipboard(self, from_chunk, expected, what):
         stream = b"".join(chunk for _, chunk in self.session.chunks[from_chunk:])
-        payloads = [base64.b64decode(match.group(1)) for match in OSC52_RE.finditer(stream)]
+        payloads = []
+        for match in OSC52_RE.finditer(stream):
+            try:
+                payloads.append(base64.b64decode(match.group(1)))
+            except ValueError as err:
+                raise ScenarioError(
+                    f"{self.name}: {what} emitted a malformed OSC 52 clipboard payload {match.group(1)!r}: {err}"
+                ) from err
         if expected not in payloads:
             tail = plain_text(stream[-400:]).decode("ascii", "replace")
             raise ScenarioError(
@@ -659,17 +666,25 @@ def scenario_keys(args):
             run.note("FINDING: Ctrl+Y wrote the asserted OSC 52 clipboard payload but the transcript lacks the 'copied last reply to clipboard' status line")
 
         run.session.type_text("first line")
-        before_join = len(run.session.plain)
         run.key(KEY_SHIFT_ENTER_KITTY, "Shift+Enter (kitty encoding)")
         run.session.type_text("second line")
         run.settle()
-        if plain_text(b"first linesecond line") in run.session.plain[before_join - 64:]:
-            raise ScenarioError("keys: Shift+Enter (kitty CSI 13;2u) inserted no newline — lines concatenated in the composer")
-        run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline")
         run.frame("shift-enter-draft")
+        echo_from = len(run.session.plain)
         run.session.send(KEY_ENTER, "Enter (submit two-line draft)")
         run.session.wait_for(b"keys-fixture-reply", 10.0, "reply after two-line submit")
         run.settle()
+        echo = run.session.plain[echo_from:]
+        first_at = echo.find(plain_text(b"first line"))
+        second_at = echo.find(plain_text(b"second line"), first_at + len(b"first line"))
+        if first_at < 0 or second_at < 0 or second_at - first_at < args.width // 2:
+            gap = second_at - first_at if second_at >= 0 else None
+            raise ScenarioError(
+                f"keys: Shift+Enter (kitty CSI 13;2u) did not produce a two-line draft: the submitted "
+                f"echo must render 'first line' and 'second line' on separate transcript rows "
+                f"(first_at={first_at}, second_at={second_at}, gap={gap}, need at least {args.width // 2})"
+            )
+        run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline: the submitted draft echoes as two transcript rows")
 
         run.key_wait(KEY_UP, "Up history (latest)", "second line")
         run.key_wait(KEY_UP, "Up history (previous)", "alpha turn three")
@@ -839,6 +854,7 @@ def scenario_session_roundtrip(args):
     home = tempfile.mkdtemp(prefix="makai-pty-home-roundtrip-")
     save_dir = os.path.join(args.output_dir, "session-roundtrip", "save")
     resume_dir = os.path.join(args.output_dir, "session-roundtrip", "resume")
+    shutil.rmtree(os.path.join(args.output_dir, "session-roundtrip"), ignore_errors=True)
     try:
         first = SweepRun(args, "session-roundtrip-save", "roundtrip-reply-alpha", home=home)
         first.dump_dir = save_dir

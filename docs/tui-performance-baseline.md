@@ -54,9 +54,11 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   while idle, an unknown command, `/clear`, `/quit`.
 - `keys` — the kept keys: Ctrl+Y copy (asserts the raw stream carries an
   `OSC 52 ; c` clipboard sequence whose base64 payload decodes to the last
-  reply), Shift+Enter (kitty `CSI 13;2u` encoding) composer newline (line
-  concatenation fails the scenario), Up/Down history recall, PgUp/PgDn,
-  Ctrl+T, Shift+Tab thinking cycle (status `think:` segment), Ctrl+C exit.
+  reply; a malformed payload is itself a failure), Shift+Enter (kitty
+  `CSI 13;2u` encoding) composer newline (asserted positively: the submitted
+  draft must echo as two separate transcript rows), Up/Down history recall,
+  PgUp/PgDn, Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
+  Ctrl+C exit.
 - `steer-abort` — a `hold` fixture step keeps the stream open so Enter mid-turn
   steers (queue indicator) and `/abort` cancels.
 - `approval-deny` — `ask` mode + a tool fixture step: the approval view
