@@ -41,3 +41,4 @@ tmp/
 
 # TUI PTY harness output (scripts/tui-pty-driver.py)
 tui-pty-out/
+scripts/__pycache__/
