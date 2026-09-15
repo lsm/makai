@@ -773,9 +773,17 @@ def scenario_approval_allow(args):
         run.session.type_text("run workspace info")
         run.session.send(KEY_ENTER, "Enter (submit)")
         run.session.wait_for(b"Approval required", 10.0, "approval view")
+        pre_approve = len(run.session.plain)
         run.key_wait(b"y", "approve once", "allow-path-complete")
         run.frame("approved-once")
-        run.note("'y' approves once: workspace_info executes and the turn completes")
+        tail = run.session.plain[pre_approve:]
+        if b'{"workspace_root"' in tail:
+            raise ScenarioError("approval-allow: raw tool args JSON echoed into the transcript after approval")
+        if b"Workspace Info ok" not in tail:
+            raise ScenarioError("approval-allow: single-line tool summary with ok status missing from the transcript")
+        if b"workspace_root:" not in tail:
+            raise ScenarioError("approval-allow: tool result text missing from the transcript")
+        run.note("'y' approves once: workspace_info renders one summary line (no raw args JSON) and the result text, then the turn completes")
     except ScenarioError as err:
         run.error = str(err)
     finally:

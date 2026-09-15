@@ -96,10 +96,6 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
     var i: usize = 0;
     while (i < state.transcript.items.len) {
         const entry = &state.transcript.items[i];
-        if (isLowValueSystem(entry)) {
-            i += 1;
-            continue;
-        }
         if (entry.kind == .tool) {
             const cluster_start = i;
             while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
@@ -148,12 +144,7 @@ fn countToolStarts(entries: []const TranscriptEntry) usize {
 }
 
 fn isToolStartSummary(text: []const u8) bool {
-    if (!std.mem.startsWith(u8, text, "◈ ")) return false;
-    const rest = text["◈ ".len..];
-    const quote = std.mem.indexOfScalar(u8, rest, '"') orelse return false;
-    const ok = std.mem.indexOf(u8, rest, " ok ") orelse rest.len;
-    const failed = std.mem.indexOf(u8, rest, " failed ") orelse rest.len;
-    return quote < @min(ok, failed);
+    return std.mem.startsWith(u8, text, "◈ ");
 }
 
 fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
@@ -164,10 +155,6 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     });
-}
-
-fn isLowValueSystem(entry: *const TranscriptEntry) bool {
-    return tui_state.isLowValueSystem(entry);
 }
 
 fn appendToolSummary(
@@ -1095,12 +1082,10 @@ test "transcript balanced mode preserves tool call order across turns" {
     ));
 
     try state.appendUserMessage("first request");
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect pwd now\"");
-    try state.appendTranscript(.tool, "◈ Shell Execute ok output=10B");
+    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect pwd now\" ok output=10B");
     try state.appendTranscript(.assistant, "PWD done");
     try state.appendUserMessage("second request");
-    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect uname now\"");
-    try state.appendTranscript(.tool, "◈ Shell Execute ok output=20B");
+    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect uname now\" ok output=20B");
     try state.appendTranscript(.assistant, "UNAME done");
 
     const text = try render(std.testing.allocator, &state, .{ .width = 140, .height = 30 });
