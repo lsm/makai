@@ -2278,7 +2278,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --tui
-        \\  makai -p [--agent] [--storage] "<prompt>" [--model <id>]
+        \\  makai -p [--agent] [--storage] [--model <id>] "<prompt>"
         \\  makai auth providers [--json]
         \\  makai auth login --provider <id> [--json]
         \\
@@ -2289,8 +2289,11 @@ fn printUsage(file: std.Io.File) !void {
         \\  -p               Non-interactive print mode: stream a prompt using
         \\                   stored credentials and print every event to stdout.
         \\                   Useful for debugging provider streaming.
+        \\                   Options may appear before or after the prompt.
         \\                   Use --agent to run through the full agent loop.
         \\                   Use --storage to resolve credentials like the TUI.
+        \\                   Use --model <id> to pick the model
+        \\                   (default kimi-k2.7-code).
         \\  auth providers   List oauth-capable providers
         \\  auth login       Run OAuth flow and persist credentials
         \\
@@ -2301,45 +2304,106 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
     try tui_app.run(allocator, io);
 }
 
-fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len < 1) {
-        perr("error: -p requires a prompt argument\n");
-        return error.InvalidArgument;
-    }
+const DEFAULT_PRINT_MODEL_ID = "kimi-k2.7-code";
 
-    var prompt_index: usize = 0;
+const PrintModeOptions = struct {
+    prompt: []const u8,
+    model_id: []const u8 = DEFAULT_PRINT_MODEL_ID,
+    use_agent_loop: bool = false,
+    use_storage_auth: bool = false,
+};
+
+const PrintModeInvocation = union(enum) {
+    print: PrintModeOptions,
+    tui_runtime: []const u8,
+};
+
+const PrintModeArgError = union(enum) {
+    missing_prompt,
+    missing_option_value: []const u8,
+    unsupported_option: []const u8,
+    unexpected_argument: []const u8,
+};
+
+fn parsePrintModeArgs(
+    args: []const []const u8,
+    err_out: *PrintModeArgError,
+) error{InvalidArgument}!PrintModeInvocation {
+    var prompt: ?[]const u8 = null;
+    var model_id: []const u8 = DEFAULT_PRINT_MODEL_ID;
     var use_agent_loop = false;
     var use_storage_auth = false;
-    var model_id: []const u8 = "kimi-k2.7-code";
-    while (prompt_index < args.len and std.mem.startsWith(u8, args[prompt_index], "--")) : (prompt_index += 1) {
-        if (std.mem.eql(u8, args[prompt_index], "--agent")) {
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (!std.mem.startsWith(u8, arg, "--")) {
+            if (prompt != null) {
+                err_out.* = .{ .unexpected_argument = arg };
+                return error.InvalidArgument;
+            }
+            prompt = arg;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--agent")) {
             use_agent_loop = true;
-        } else if (std.mem.eql(u8, args[prompt_index], "--storage")) {
+        } else if (std.mem.eql(u8, arg, "--storage")) {
             use_storage_auth = true;
-        } else if (std.mem.eql(u8, args[prompt_index], "--tui-runtime")) {
-            prompt_index += 1;
-            if (prompt_index >= args.len) {
-                perr("error: --tui-runtime requires a prompt\n");
+        } else if (std.mem.eql(u8, arg, "--tui-runtime")) {
+            index += 1;
+            if (index >= args.len) {
+                err_out.* = .{ .missing_option_value = arg };
                 return error.InvalidArgument;
             }
-            return runPrintTuiRuntime(allocator, args[prompt_index]);
-        } else if (std.mem.eql(u8, args[prompt_index], "--model")) {
-            prompt_index += 1;
-            if (prompt_index >= args.len) {
-                perr("error: --model requires a value\n");
+            return .{ .tui_runtime = args[index] };
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            index += 1;
+            if (index >= args.len) {
+                err_out.* = .{ .missing_option_value = arg };
                 return error.InvalidArgument;
             }
-            model_id = args[prompt_index];
+            model_id = args[index];
         } else {
-            perrf("error: unsupported -p option: {s}\n", .{args[prompt_index]});
+            err_out.* = .{ .unsupported_option = arg };
             return error.InvalidArgument;
         }
     }
-    if (prompt_index >= args.len) {
-        perr("error: -p requires a prompt argument\n");
+
+    const resolved_prompt = prompt orelse {
+        err_out.* = .missing_prompt;
         return error.InvalidArgument;
+    };
+    return .{ .print = .{
+        .prompt = resolved_prompt,
+        .model_id = model_id,
+        .use_agent_loop = use_agent_loop,
+        .use_storage_auth = use_storage_auth,
+    } };
+}
+
+fn reportPrintModeArgError(err: PrintModeArgError) void {
+    switch (err) {
+        .missing_prompt => perr("error: -p requires a prompt argument\n"),
+        .missing_option_value => |flag| perrf("error: {s} requires a value\n", .{flag}),
+        .unsupported_option => |flag| perrf("error: unsupported -p option: {s}\n", .{flag}),
+        .unexpected_argument => |arg| perrf("error: unexpected -p argument: {s}\n", .{arg}),
     }
-    const prompt = args[prompt_index];
+}
+
+fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = parsePrintModeArgs(args, &arg_error) catch |err| {
+        reportPrintModeArgError(arg_error);
+        return err;
+    };
+    const options = switch (invocation) {
+        .tui_runtime => |tui_prompt| return runPrintTuiRuntime(allocator, tui_prompt),
+        .print => |parsed| parsed,
+    };
+    const prompt = options.prompt;
+    const model_id = options.model_id;
+    const use_agent_loop = options.use_agent_loop;
+    const use_storage_auth = options.use_storage_auth;
 
     perr("[print] building kimi model from env...\n");
 
@@ -4661,8 +4725,7 @@ test "tool-request publication failure keeps the request queued and retries exac
         try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, generation, "call-1", "lookup", "{}");
 
         failing.fail_index = failing.alloc_index + k;
-        if (stdio_loop.publishPendingToolRequests()) |_| {
-        } else |err| {
+        if (stdio_loop.publishPendingToolRequests()) |_| {} else |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
             try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.requests.items.len);
             try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
@@ -6306,4 +6369,120 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
         defer legacy_model.deinit(allocator);
         try std.testing.expect(!legacy_model.reasoning);
     }
+}
+
+test "print mode parses options that follow the prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(
+        &[_][]const u8{ "write a haiku", "--model", "claude-sonnet-4-5" },
+        &arg_error,
+    );
+    try std.testing.expect(std.meta.activeTag(invocation) == .print);
+    try std.testing.expectEqualStrings("write a haiku", invocation.print.prompt);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", invocation.print.model_id);
+    try std.testing.expect(!invocation.print.use_agent_loop);
+    try std.testing.expect(!invocation.print.use_storage_auth);
+}
+
+test "print mode parses options that precede the prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(
+        &[_][]const u8{ "--agent", "--storage", "--model", "claude-sonnet-4-5", "write a haiku" },
+        &arg_error,
+    );
+    try std.testing.expectEqualStrings("write a haiku", invocation.print.prompt);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", invocation.print.model_id);
+    try std.testing.expect(invocation.print.use_agent_loop);
+    try std.testing.expect(invocation.print.use_storage_auth);
+}
+
+test "print mode parses options split around the prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(
+        &[_][]const u8{ "--agent", "write a haiku", "--storage", "--model", "claude-sonnet-4-5" },
+        &arg_error,
+    );
+    try std.testing.expectEqualStrings("write a haiku", invocation.print.prompt);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", invocation.print.model_id);
+    try std.testing.expect(invocation.print.use_agent_loop);
+    try std.testing.expect(invocation.print.use_storage_auth);
+}
+
+test "print mode keeps the default model when --model is absent" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(&[_][]const u8{"write a haiku"}, &arg_error);
+    try std.testing.expectEqualStrings(DEFAULT_PRINT_MODEL_ID, invocation.print.model_id);
+}
+
+test "print mode takes the last --model when repeated on both sides" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(
+        &[_][]const u8{ "--model", "first", "write a haiku", "--model", "second" },
+        &arg_error,
+    );
+    try std.testing.expectEqualStrings("second", invocation.print.model_id);
+}
+
+test "print mode rejects a trailing --model without a value" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "write a haiku", "--model" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .missing_option_value);
+    try std.testing.expectEqualStrings("--model", arg_error.missing_option_value);
+}
+
+test "print mode rejects an unsupported option after the prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "write a haiku", "--bogus" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .unsupported_option);
+    try std.testing.expectEqualStrings("--bogus", arg_error.unsupported_option);
+}
+
+test "print mode rejects a second positional argument" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "write a haiku", "and a limerick" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .unexpected_argument);
+    try std.testing.expectEqualStrings("and a limerick", arg_error.unexpected_argument);
+}
+
+test "print mode rejects options without a prompt" {
+    var arg_error: PrintModeArgError = .{ .unsupported_option = "--sentinel" };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{ "--agent", "--model", "claude-sonnet-4-5" }, &arg_error),
+    );
+    try std.testing.expect(std.meta.activeTag(arg_error) == .missing_prompt);
+
+    var empty_error: PrintModeArgError = .{ .unsupported_option = "--sentinel" };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{}, &empty_error),
+    );
+    try std.testing.expect(std.meta.activeTag(empty_error) == .missing_prompt);
+}
+
+test "print mode short-circuits on --tui-runtime with its prompt" {
+    var arg_error: PrintModeArgError = .missing_prompt;
+    const invocation = try parsePrintModeArgs(
+        &[_][]const u8{ "--tui-runtime", "write a haiku", "--model", "ignored" },
+        &arg_error,
+    );
+    try std.testing.expect(std.meta.activeTag(invocation) == .tui_runtime);
+    try std.testing.expectEqualStrings("write a haiku", invocation.tui_runtime);
+
+    var missing_error: PrintModeArgError = .missing_prompt;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parsePrintModeArgs(&[_][]const u8{"--tui-runtime"}, &missing_error),
+    );
+    try std.testing.expect(std.meta.activeTag(missing_error) == .missing_option_value);
+    try std.testing.expectEqualStrings("--tui-runtime", missing_error.missing_option_value);
 }
