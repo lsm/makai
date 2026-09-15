@@ -2021,7 +2021,7 @@ test "AppState recovers replayed tool arguments from assistant tool calls" {
     defer state.deinit();
 
     try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
-    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText(""), .tool_calls_json = try ownedText("[{\"type\":\"tool_call\",\"id\":\"call-old\",\"name\":\"shell\",\"arguments_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"]") } };
+    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText(""), .tool_calls_json = try ownedText("[{\"type\":\"tool_call\",\"id\":\"call-old\",\"name\":\"shell\",\"arguments_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}]") } };
     defer assistant_end.deinit(std.testing.allocator);
     try state.applyEvent(assistant_end);
 
