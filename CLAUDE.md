@@ -74,12 +74,14 @@ node --test scripts/check-no-comments.test.mjs   # checker self-tests
 ```bash
 npm ci
 npm run build:sdk                 # tsc -> dist/
-npm run test:sdk                  # build + node --test dist/test/**/*.test.js; needs a makai binary
+npm run test:sdk                  # build + node --test dist/test/**/*.test.js (passes with no binary)
 npm run check:declarations        # verifies the packed tarball ships .d.ts and type-checks in a fresh consumer
 npm run demo:start                # builds then runs dist/demo/server.js
 ```
 
 `resolveMakaiBinary` picks the binary in this order: `MAKAI_BINARY_PATH` or an explicit `binaryPath`; `MAKAI_BINARY_URL`/`binaryUrl` (checksum required); the platform package `@makai/cli-<platform>-<arch>`; `./zig-out/bin/makai`; `./zig/zig-out/bin/makai`; then `PATH`. **The platform package outranks both local build paths**, so if an optional `@makai/cli-*` package is installed, `zig build` alone does not make the SDK tests exercise your fresh binary. Set `MAKAI_BINARY_PATH` to be sure which one runs (CI builds with `zig build install --prefix /tmp/makai-smoke` and points `MAKAI_BINARY_PATH` at it).
+
+That variable is also what gates real-binary coverage. Every test in `typescript/test/makai_binary_smoke.test.ts` calls `t.skip("MAKAI_BINARY_PATH is not set")` when it is unset, so `npm run test:sdk` passes green with **zero** end-to-end binary coverage, and a binary found through `zig-out` or the platform package does not switch those tests on. Export `MAKAI_BINARY_PATH` explicitly when you mean to exercise the real runtime.
 
 ### TUI PTY Harness and Benchmarks
 
@@ -172,7 +174,7 @@ Ownership and auth boundary (non-negotiable):
 
 **`ai_types.zig`**: `ContentBlock` (text, tool_use, thinking, image, tool_result), `AssistantMessageEvent` (start; text/thinking/toolcall start/delta/end; done; error; keepalive, each carrying a `partial: AssistantMessage`), `AssistantMessage`, `Usage` (+ `calculateCost`), `Model` (with `OpenAICompatOptions`), `StreamOptions`, `CancelToken`, `ToolCall`, plus `clone*`/`deinit*` helpers.
 
-**`event_stream.zig`**: `EventStream(T, R)`, a lock-free ring buffer with futex wakeups (`RING_BUFFER_SIZE = 1024`, `usable_capacity = 1023` because one slot separates full from empty; read the constants rather than hard-coding either number). `AssistantMessageStream = EventStream(AssistantMessageEvent, AssistantMessage)`. Methods: `push`, `poll`, `pollBatch`, `wait`, `complete`, `completeWithError`, `getError`, `getResult` (borrowed), `cloneResult` (owned). `owns_events` (default false) flips a stream into deep-copy-on-push mode where the consumer frees each polled event.
+**`event_stream.zig`**: `EventStream(T, R)`, a lock-free ring buffer with futex wakeups (`RING_BUFFER_SIZE = 1024`, `usable_capacity = 1023` because one slot separates full from empty; read the constants rather than hard-coding either number). `AssistantMessageStream = EventStream(AssistantMessageEvent, AssistantMessage)`. Methods: `push`, `poll`, `pollBatch`, `wait`, `complete`, `completeWithError`, `getError`, `getResult` (borrowed), `cloneResult` (owned). `owns_events` (default false) is an **ownership** flag, not a cloning switch: it says the consumer frees each polled event and that `deinit()` frees whatever is still queued. `push` deep-copies only when `clone_event_fn` is **also** set. Both production routes exist, and you must pick one deliberately: the stdio host and TUI set `owns_events` together with `clone_event_fn = ai_types.cloneAssistantMessageEvent` and let `push` clone, while `ProtocolClient` and the OpenAI Completions provider set `owns_events` alone and call `cloneAssistantMessageEvent` themselves before pushing. Setting `owns_events` with neither is a use-after-free: `push` stores your borrowed slices and they are later freed as owned memory.
 
 **`api_registry.zig` + `register_builtins.zig`**: providers register by API name. Built-ins: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`. `stream.zig` exposes `stream`/`streamSimple`/`complete`/`completeSimple` facades over the registry.
 
