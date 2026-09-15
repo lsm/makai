@@ -165,7 +165,6 @@ fn appendToolSummary(
         .running => "running",
         .done => "ok",
         .@"error" => "failed",
-        .interrupted => "interrupted",
     };
 
     var out: std.Io.Writer.Allocating = .init(arena);

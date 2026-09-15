@@ -512,7 +512,6 @@ pub const App = struct {
         for (loaded.events.items) |*event| {
             try self.applyRuntimeEvent(event.*);
         }
-        self.state.finalizeInterruptedTools();
         if (self.session) |*session| session.clearQueuedMessages();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
@@ -829,7 +828,7 @@ pub const App = struct {
     fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
         const store = self.store orelse return;
         switch (event) {
-            .message_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             .text_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
@@ -838,9 +837,6 @@ pub const App = struct {
             },
             .tool_call_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
-            },
-            .tool_execution_start => |payload| {
-                if (toolRequestPayloadSize(payload) > max_session_event_payload_bytes) return;
             },
             .provider_event => |payload| {
                 if (jsonStringBudget(payload.event_json.slice()) > max_session_event_payload_bytes) return;
@@ -2103,25 +2099,15 @@ test "App saveEvent keeps debug-visible event types" {
     defer err.deinit(std.testing.allocator);
     app.saveEvent(err);
 
-    var start = tui_runtime.TuiEvent{ .tool_execution_start = .{
-        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-1")),
-        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
-        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"command\":\"pwd\"}")),
-    } };
-    defer start.deinit(std.testing.allocator);
-    app.saveEvent(start);
-
     var loaded = try app.store.?.load("save-debug-events");
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 6), loaded.events.items.len);
+    try std.testing.expectEqual(@as(usize, 5), loaded.events.items.len);
     try std.testing.expect(loaded.events.items[0] == .thinking_delta);
     try std.testing.expect(loaded.events.items[1] == .tool_approval_requested);
     try std.testing.expect(loaded.events.items[2] == .tool_execution_update);
     try std.testing.expect(loaded.events.items[3] == .provider_event);
     try std.testing.expectEqualStrings("{\"type\":\"done\"}", loaded.events.items[3].provider_event.event_json.slice());
     try std.testing.expect(loaded.events.items[4] == .@"error");
-    try std.testing.expect(loaded.events.items[5] == .tool_execution_start);
-    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", loaded.events.items[5].tool_execution_start.args_json.slice());
 }
 
 test "App approval decisions map to requested choices" {
