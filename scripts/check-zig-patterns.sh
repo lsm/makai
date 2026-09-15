@@ -31,7 +31,7 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.DefaultPrng'
+ordinary_entropy_pattern='compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(|std\.Random\.'
 
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
@@ -89,6 +89,42 @@ if [[ -n "$all_ordinary_entropy" ]]; then
     exit 1
   fi
 fi
+
+echo "[patterns] checking compat.random secure wrapper bodies..."
+compat_random_file="zig/src/compat/random.zig"
+secure_wrappers=(
+  "fillSecureBytes:randomSecure("
+  "secureBytes:fillSecureBytes("
+  "secureIntRangeLessThan:fillSecureBytes("
+)
+
+for wrapper in "${secure_wrappers[@]}"; do
+  wrapper_fn="${wrapper%%:*}"
+  wrapper_requires="${wrapper##*:}"
+  wrapper_body="$(awk -v target="pub fn $wrapper_fn(" \
+    'index($0, target) == 1 { inside = 1 } inside { print } inside && $0 == "}" { exit }' \
+    "$compat_random_file")"
+
+  if [[ -z "$wrapper_body" ]]; then
+    echo "[patterns] secure wrapper $wrapper_fn not found in $compat_random_file" >&2
+    echo "[patterns] update scripts/check-zig-patterns.sh when the compat.random secure helpers are renamed" >&2
+    exit 1
+  fi
+
+  if ! printf "%s\n" "$wrapper_body" | grep -qF "$wrapper_requires"; then
+    echo "[patterns] secure wrapper $wrapper_fn no longer calls $wrapper_requires in $compat_random_file" >&2
+    printf "%s\n" "$wrapper_body" >&2
+    echo "[patterns] every secure call site depends on this wrapper staying on secure entropy" >&2
+    exit 1
+  fi
+
+  if printf "%s\n" "$wrapper_body" | grep -qE "$ordinary_entropy_pattern"; then
+    echo "[patterns] secure wrapper $wrapper_fn uses ordinary entropy in $compat_random_file" >&2
+    printf "%s\n" "$wrapper_body" | grep -nE "$ordinary_entropy_pattern" >&2
+    echo "[patterns] every secure call site depends on this wrapper staying on secure entropy" >&2
+    exit 1
+  fi
+done
 
 echo "[patterns] checking deinit poisoning in critical types..."
 required_files=(
