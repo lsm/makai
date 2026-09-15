@@ -13,57 +13,102 @@ const gauge_thresholds = [_]zz.Gauge.Threshold{
     .{ .value = 90, .color = tui_theme.palette.danger },
 };
 
+const Segment = struct {
+    styled: []const u8,
+    width: usize,
+};
+
+const SegmentList = std.ArrayList(Segment);
+
 pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
+    var segments: SegmentList = .empty;
+    defer {
+        for (segments.items) |seg| allocator.free(seg.styled);
+        segments.deinit(allocator);
+    }
+
     const model = if (state.status.model.len > 0) state.status.model else "no-model";
     const provider = if (state.status.provider.len > 0) state.status.provider else "local";
 
-    try writeOwnedValue(writer, allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model }), tui_theme.statusSegment());
-    try writeSep(writer, allocator);
-    try writeContext(writer, allocator, state);
-    try writeSep(writer, allocator);
-    try writeOwnedValue(writer, allocator, try estimatedCost(allocator, state), tui_theme.statusSegment());
-    try writeSep(writer, allocator);
-    try writeState(writer, allocator, state);
+    try pushOwnedValue(&segments, allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model }), tui_theme.statusSegment());
+    try writeContext(&segments, allocator, state);
+    try pushOwnedValue(&segments, allocator, try estimatedCost(allocator, state), tui_theme.statusSegment());
+    try writeState(&segments, allocator, state);
     if (state.queue.total() > 0) {
-        try writeSep(writer, allocator);
-        try writeOwnedSegment(writer, allocator, "queue", try std.fmt.allocPrint(allocator, "{d}", .{state.queue.total()}));
+        try pushOwnedSegment(&segments, allocator, "queue", try std.fmt.allocPrint(allocator, "{d}", .{state.queue.total()}));
     }
     if (state.backpressure_active or state.dropped_event_count > 0) {
-        try writeSep(writer, allocator);
         const label: []const u8 = if (state.backpressure_active) "backpressure" else "drops";
         const value = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ label, state.dropped_event_count });
         if (state.backpressure_active) {
-            try writeOwnedValue(writer, allocator, value, tui_theme.warningText());
+            try pushOwnedValue(&segments, allocator, value, tui_theme.warningText());
         } else {
-            try writeOwnedSegment(writer, allocator, "drops", value);
+            try pushOwnedSegment(&segments, allocator, "drops", value);
         }
     }
-    try writeSep(writer, allocator);
     if (state.mode == .approval) {
-        try writeStyledValue(writer, allocator, "perm", "pending", tui_theme.warningText());
+        try pushStyledValue(&segments, allocator, "perm", "pending", tui_theme.warningText());
     } else if (state.permission_mode == .bypass) {
-        try writeStyledValue(writer, allocator, "perm", "bypass", tui_theme.warningText());
+        try pushStyledValue(&segments, allocator, "perm", "bypass", tui_theme.warningText());
     } else {
-        try writeSegment(writer, allocator, "perm", @tagName(state.permission_mode));
+        try pushSegment(&segments, allocator, "perm", @tagName(state.permission_mode));
     }
-    try writeSep(writer, allocator);
-    try writeSegment(writer, allocator, "think", @tagName(state.thinking_level));
-    try writeSep(writer, allocator);
-    try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
+    try pushSegment(&segments, allocator, "think", @tagName(state.thinking_level));
+    try pushOwnedSegment(&segments, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
 
-    const items = out.written();
-    if (tui_text.visibleWidth(items) > options.width) {
-        const clipped = try tui_text.truncateToWidth(allocator, items, options.width);
-        out.deinit();
-        return clipped;
+    return layoutSegments(allocator, segments.items, options.width);
+}
+
+fn layoutSegments(allocator: std.mem.Allocator, segments: []const Segment, width: usize) ![]u8 {
+    if (segments.len == 0) return allocator.dupe(u8, "");
+    const sep = try tui_theme.dim().render(allocator, " " ++ tui_theme.glyph.sep ++ " ");
+    defer allocator.free(sep);
+    const sep_width = tui_text.visibleWidth(sep);
+
+    var total: usize = 0;
+    for (segments) |seg| total += seg.width;
+    total += sep_width * (segments.len - 1);
+
+    const ellipsis = try tui_theme.dim().render(allocator, "…");
+    defer allocator.free(ellipsis);
+
+    var kept: usize = segments.len;
+    if (total > width) {
+        const cut_tail = sep_width + 1;
+        kept = 0;
+        var used: usize = 0;
+        for (segments, 0..) |seg, i| {
+            const lead: usize = if (i == 0) 0 else sep_width;
+            if (used + lead + seg.width + cut_tail > width) break;
+            used += lead + seg.width;
+            kept = i + 1;
+        }
+        if (kept == 0) {
+            const first = segments[0];
+            if (first.width > width) return tui_text.truncateToWidth(allocator, first.styled, width);
+            if (first.width == width) return tui_text.truncateToWidth(allocator, first.styled, width -| 1);
+            var solo: std.Io.Writer.Allocating = .init(allocator);
+            errdefer solo.deinit();
+            try solo.writer.writeAll(first.styled);
+            try solo.writer.writeAll(ellipsis);
+            return solo.toOwnedSlice();
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (segments[0..kept], 0..) |seg, i| {
+        if (i > 0) try out.writer.writeAll(sep);
+        try out.writer.writeAll(seg.styled);
+    }
+    if (kept < segments.len) {
+        try out.writer.writeAll(sep);
+        try out.writer.writeAll(ellipsis);
     }
     return out.toOwnedSlice();
 }
 
-fn writeContext(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
+fn writeContext(list: *SegmentList, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
     const used: u64 = if (state.telemetry.estimated_tokens > 0) state.telemetry.estimated_tokens else state.status.context_used;
     const limit: u64 = if (state.telemetry.context_window > 0) state.telemetry.context_window else state.status.context_limit;
     const pct: u64 = if (limit > 0) (used * 100) / limit else 0;
@@ -86,25 +131,19 @@ fn writeContext(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *co
     if (limit > 0) {
         const limit_text = try tui_text.compactNumber(allocator, limit);
         defer allocator.free(limit_text);
-        try writeOwnedSegment(writer, allocator, "ctx", try std.fmt.allocPrint(allocator, "{s} {d}% {s}/{s}", .{ gauge_text, pct, used_text, limit_text }));
+        try pushOwnedSegment(list, allocator, "ctx", try std.fmt.allocPrint(allocator, "{s} {d}% {s}/{s}", .{ gauge_text, pct, used_text, limit_text }));
     } else {
-        try writeOwnedSegment(writer, allocator, "ctx", try std.fmt.allocPrint(allocator, "{s} {s}", .{ gauge_text, used_text }));
+        try pushOwnedSegment(list, allocator, "ctx", try std.fmt.allocPrint(allocator, "{s} {s}", .{ gauge_text, used_text }));
     }
 }
 
-fn writeSep(writer: *std.Io.Writer, allocator: std.mem.Allocator) !void {
-    const sep = try tui_theme.dim().render(allocator, " " ++ tui_theme.glyph.sep ++ " ");
-    defer allocator.free(sep);
-    try writer.writeAll(sep);
-}
-
-fn writeState(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
+fn writeState(list: *SegmentList, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
     if (state.status.streaming) {
         const value = try std.fmt.allocPrint(allocator, "{s} streaming", .{tui_theme.spinnerFrame(state.anim_tick)});
         defer allocator.free(value);
-        try writeValue(writer, allocator, value, tui_theme.runningText());
+        try pushValue(list, allocator, value, tui_theme.runningText());
     } else {
-        try writeValue(writer, allocator, tui_theme.glyph.system ++ " idle", tui_theme.muted());
+        try pushValue(list, allocator, tui_theme.glyph.system ++ " idle", tui_theme.muted());
     }
 }
 
@@ -114,32 +153,36 @@ fn estimatedCost(allocator: std.mem.Allocator, state: *const tui_state.AppState)
     return std.fmt.allocPrint(allocator, "${d:.4}", .{dollars});
 }
 
-fn writeSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    try writeStyledValue(writer, allocator, key, value, tui_theme.statusSegment());
+fn pushSegment(list: *SegmentList, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    try pushStyledValue(list, allocator, key, value, tui_theme.statusSegment());
 }
 
-fn writeStyledValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: []const u8, value: []const u8, value_style: zz.Style) !void {
+fn pushOwnedSegment(list: *SegmentList, allocator: std.mem.Allocator, key: []const u8, value: []u8) !void {
+    defer allocator.free(value);
+    try pushSegment(list, allocator, key, value);
+}
+
+fn pushStyledValue(list: *SegmentList, allocator: std.mem.Allocator, key: []const u8, value: []const u8, value_style: zz.Style) !void {
     const styled_key = try tui_theme.statusKey().render(allocator, key);
     defer allocator.free(styled_key);
     const styled_value = try value_style.render(allocator, value);
     defer allocator.free(styled_value);
-    try writer.print("{s}:{s}", .{ styled_key, styled_value });
+    const styled = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ styled_key, styled_value });
+    try pushOwned(list, allocator, styled);
 }
 
-fn writeOwnedSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: []const u8, value: []u8) !void {
+fn pushValue(list: *SegmentList, allocator: std.mem.Allocator, value: []const u8, value_style: zz.Style) !void {
+    try pushOwned(list, allocator, try value_style.render(allocator, value));
+}
+
+fn pushOwnedValue(list: *SegmentList, allocator: std.mem.Allocator, value: []u8, value_style: zz.Style) !void {
     defer allocator.free(value);
-    try writeSegment(writer, allocator, key, value);
+    try pushValue(list, allocator, value, value_style);
 }
 
-fn writeValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, value: []const u8, value_style: zz.Style) !void {
-    const styled_value = try value_style.render(allocator, value);
-    defer allocator.free(styled_value);
-    try writer.writeAll(styled_value);
-}
-
-fn writeOwnedValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, value: []u8, value_style: zz.Style) !void {
-    defer allocator.free(value);
-    try writeValue(writer, allocator, value, value_style);
+fn pushOwned(list: *SegmentList, allocator: std.mem.Allocator, styled: []const u8) !void {
+    errdefer allocator.free(styled);
+    try list.append(allocator, .{ .styled = styled, .width = tui_text.visibleWidth(styled) });
 }
 
 test "status bar renders model and clips width" {
@@ -235,4 +278,103 @@ test "status bar does not render last error" {
     try std.testing.expect(std.mem.indexOf(u8, text, "turns") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "7") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "agent error") == null);
+}
+
+test "status bar truncates on whole segment boundaries at narrow width" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModelWithContext(std.testing.allocator, "claude-sonnet-4-5", "anthropic", 200_000);
+    state.thinking_level = .medium;
+    state.status.turn_count = 13;
+
+    const full = try render(std.testing.allocator, &state, .{ .width = 200 });
+    defer std.testing.allocator.free(full);
+    try std.testing.expect(tui_text.visibleWidth(full) > 100);
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100 });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(tui_text.visibleWidth(text) <= 100);
+    try std.testing.expect(std.mem.indexOf(u8, text, "anthropic/claude-sonnet-4-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
+    if (std.mem.indexOf(u8, text, "think") != null) {
+        try std.testing.expect(std.mem.indexOf(u8, text, "medium") != null);
+    }
+    if (std.mem.indexOf(u8, text, "turns") != null) {
+        try std.testing.expect(std.mem.indexOf(u8, text, "13") != null);
+    }
+}
+
+test "status bar keeps whole segments monotonically as width grows" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModelWithContext(std.testing.allocator, "claude-sonnet-4-5", "anthropic", 200_000);
+    state.thinking_level = .medium;
+    state.status.turn_count = 13;
+
+    var had_think = false;
+    var had_turns = false;
+    for ([_]usize{ 30, 60, 80, 100, 120, 160, 200 }) |width| {
+        const text = try render(std.testing.allocator, &state, .{ .width = width });
+        defer std.testing.allocator.free(text);
+        try std.testing.expect(tui_text.visibleWidth(text) <= width);
+        const has_think = std.mem.indexOf(u8, text, "think") != null and std.mem.indexOf(u8, text, "medium") != null;
+        const has_turns = std.mem.indexOf(u8, text, "turns") != null and std.mem.indexOf(u8, text, "13") != null;
+        if (std.mem.indexOf(u8, text, "think") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "medium") != null);
+        }
+        if (std.mem.indexOf(u8, text, "medium") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);
+        }
+        if (std.mem.indexOf(u8, text, "turns") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "13") != null);
+        }
+        if (std.mem.indexOf(u8, text, "13") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, text, "turns") != null);
+        }
+        try std.testing.expect(has_think or !had_think);
+        try std.testing.expect(has_turns or !had_turns);
+        had_think = has_think;
+        had_turns = has_turns;
+    }
+    try std.testing.expect(had_think);
+    try std.testing.expect(had_turns);
+}
+
+test "status bar clips model segment alone when nothing else fits" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude-opus-4-6-with-a-very-long-name", "anthropic");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.visibleWidth(text) <= 20);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "think") == null);
+}
+
+test "status bar marks the cut when the first segment leaves no separator room" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude-opus", "claude");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.visibleWidth(text) <= 20);
+    try std.testing.expect(std.mem.indexOf(u8, text, "claude/claude-opus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "think") == null);
+}
+
+test "status bar marks the cut when the first segment exactly fills the width" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude-opus-4-6-x", "aa");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.visibleWidth(text) <= 20);
+    try std.testing.expect(std.mem.indexOf(u8, text, "…") != null);
 }
