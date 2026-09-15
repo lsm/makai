@@ -219,10 +219,20 @@ const SavedModelRef = struct {
 
 pub const fixture_env_var = "MAKAI_TUI_FIXTURE";
 
+const fixture_step_separator = '|';
+const fixture_tool_arg_json = "{}";
+
+pub const FixtureStepError = error{
+    EmptyFixtureStep,
+    UnknownFixtureStepPrefix,
+    OutOfMemory,
+};
+
 pub const FixtureRuntime = struct {
     allocator: std.mem.Allocator,
     text: []u8,
-    steps: [1]fixture_provider.ResponseStep,
+    steps: std.ArrayList(fixture_provider.ResponseStep),
+    tool_specs: std.ArrayList([]fixture_provider.ToolCallSpec),
     provider: fixture_provider.MockProvider,
 
     pub fn fromEnv(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?*FixtureRuntime {
@@ -239,14 +249,80 @@ pub const FixtureRuntime = struct {
         self.* = .{
             .allocator = allocator,
             .text = text,
-            .steps = .{.{ .text = text }},
+            .steps = .empty,
+            .tool_specs = .empty,
             .provider = undefined,
         };
-        self.provider = fixture_provider.MockProvider.init(.{ .steps = &self.steps, .repeat_last = true });
+        errdefer self.deinitSteps();
+        if (firstSegmentIsScenarioStep(text)) {
+            try self.appendScenarioSteps(text);
+        } else {
+            try self.steps.append(allocator, .{ .text = text });
+        }
+        self.provider = fixture_provider.MockProvider.init(.{ .steps = self.steps.items, .repeat_last = true });
         return self;
     }
 
+    fn firstSegmentIsScenarioStep(text: []const u8) bool {
+        var first = text;
+        if (std.mem.indexOfScalar(u8, first, fixture_step_separator)) |sep| first = first[0..sep];
+        return scenarioStepKind(first) != null;
+    }
+
+    fn scenarioStepKind(segment: []const u8) ?enum { text, tool, hold, err } {
+        if (std.mem.startsWith(u8, segment, "text:")) return .text;
+        if (std.mem.startsWith(u8, segment, "tool:")) return .tool;
+        if (std.mem.eql(u8, segment, "hold")) return .hold;
+        if (std.mem.startsWith(u8, segment, "error:")) return .err;
+        return null;
+    }
+
+    fn appendScenarioSteps(self: *FixtureRuntime, text: []const u8) FixtureStepError!void {
+        var seen_any = false;
+        var iter = std.mem.splitScalar(u8, text, fixture_step_separator);
+        while (iter.next()) |segment| {
+            if (segment.len == 0) return error.EmptyFixtureStep;
+            const kind = scenarioStepKind(segment) orelse return error.UnknownFixtureStepPrefix;
+            seen_any = true;
+            switch (kind) {
+                .text => {
+                    const body = segment["text:".len..];
+                    if (body.len == 0) return error.EmptyFixtureStep;
+                    try self.steps.append(self.allocator, .{ .text = body });
+                },
+                .tool => {
+                    const rest = segment["tool:".len..];
+                    var name = rest;
+                    var args_json: []const u8 = fixture_tool_arg_json;
+                    if (std.mem.indexOfScalar(u8, rest, '#')) |hash| {
+                        name = rest[0..hash];
+                        args_json = rest[hash + 1 ..];
+                    }
+                    if (name.len == 0 or args_json.len == 0) return error.EmptyFixtureStep;
+                    const spec = try self.allocator.alloc(fixture_provider.ToolCallSpec, 1);
+                    spec[0] = .{ .id = "fixture-tool-call", .name = name, .arguments_json = args_json };
+                    try self.tool_specs.append(self.allocator, spec);
+                    try self.steps.append(self.allocator, .{ .tool_calls = spec });
+                },
+                .hold => try self.steps.append(self.allocator, .{ .wait_for_cancel = {} }),
+                .err => {
+                    const body = segment["error:".len..];
+                    if (body.len == 0) return error.EmptyFixtureStep;
+                    try self.steps.append(self.allocator, .{ .provider_error = body });
+                },
+            }
+        }
+        if (!seen_any) return error.EmptyFixtureStep;
+    }
+
+    fn deinitSteps(self: *FixtureRuntime) void {
+        for (self.tool_specs.items) |spec| self.allocator.free(spec);
+        self.tool_specs.deinit(self.allocator);
+        self.steps.deinit(self.allocator);
+    }
+
     pub fn deinit(self: *FixtureRuntime) void {
+        self.deinitSteps();
         self.allocator.free(self.text);
         self.allocator.destroy(self);
     }
@@ -1884,6 +1960,41 @@ test "fixture runtime streams the env-provided text" {
     try std.testing.expectEqual(@as(usize, 1), fixture.provider.call_count);
 }
 
+test "fixture runtime parses scenario steps" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "text:one|tool:workspace_info|hold|error:boom|text:two")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), fixture.steps.items.len);
+    try std.testing.expectEqualStrings("one", fixture.steps.items[0].text);
+    try std.testing.expectEqualStrings("workspace_info", fixture.steps.items[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", fixture.steps.items[1].tool_calls[0].arguments_json);
+    try std.testing.expect(fixture.steps.items[2] == .wait_for_cancel);
+    try std.testing.expectEqualStrings("boom", fixture.steps.items[3].provider_error);
+    try std.testing.expectEqualStrings("two", fixture.steps.items[4].text);
+}
+
+test "fixture runtime parses tool args after the hash" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "tool:workspace_info#{\"workspace_root\":\"/tmp\"}")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqualStrings("workspace_info", fixture.steps.items[0].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"workspace_root\":\"/tmp\"}", fixture.steps.items[0].tool_calls[0].arguments_json);
+}
+
+test "fixture runtime keeps pipe-less text that is not a step" {
+    const fixture = (try FixtureRuntime.fromValue(std.testing.allocator, "plain|reply|text")).?;
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.steps.items.len);
+    try std.testing.expectEqualStrings("plain|reply|text", fixture.steps.items[0].text);
+}
+
+test "fixture runtime rejects unknown step after a scenario prefix" {
+    try std.testing.expectError(error.UnknownFixtureStepPrefix, FixtureRuntime.fromValue(std.testing.allocator, "text:one|wat"));
+    try std.testing.expectError(error.EmptyFixtureStep, FixtureRuntime.fromValue(std.testing.allocator, "text:"));
+    try std.testing.expectError(error.EmptyFixtureStep, FixtureRuntime.fromValue(std.testing.allocator, "text:one|"));
+}
+
 test "App saveEvent keeps debug-visible event types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1976,7 +2087,6 @@ test "App submit routes help command to system transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
 }
 
-
 test "App submit starts direct OpenAI Codex login command" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2066,9 +2176,9 @@ test "multi-line /help output renders all lines into transcript view" {
     defer std.testing.allocator.free(rendered);
 
     const expect = [_][]const u8{
-        "/help",      "/model",  "/provider", "/status",
-        "/resume",    "/login",  "/permissions", "/abort",
-        "/clear",     "/quit",
+        "/help",   "/model", "/provider",    "/status",
+        "/resume", "/login", "/permissions", "/abort",
+        "/clear",  "/quit",
     };
     for (expect) |needle| {
         if (std.mem.indexOf(u8, rendered, needle) == null) {

@@ -33,12 +33,43 @@ terminal-identification variables (`TERM_PROGRAM`, `TMUX`, `KITTY_WINDOW_ID`,
 
 ## Scenario
 
-Launch → wait for the welcome frame → type a prompt one keystroke at a time
-(recording keypress-to-render latency per key) → Enter (submit) → wait for the
-fixture reply to render → `/model` (model picker opens) → Escape → `/resume`
-(session picker opens) → Escape → `/quit` (process exits with status 0). Each
-wait is an assertion: the driver exits non-zero if any marker fails to appear,
-so the scenario doubles as a regression gate.
+The default `core-loop` scenario (the perf baseline) is: launch → wait for the
+welcome frame → type a prompt one keystroke at a time (recording
+keypress-to-render latency per key) → Enter (submit) → wait for the fixture
+reply to render → `/model` (model picker opens) → Escape → `/resume` (session
+picker opens) → Escape → `/quit` (process exits with status 0). Each wait is an
+assertion: the driver exits non-zero if any marker fails to appear, so the
+scenario doubles as a regression gate.
+
+## UX-sweep scenarios
+
+`--scenario all` additionally runs the #264 UX-sweep scenarios, each in its own
+subdirectory with `transcript.bin`, `batches.jsonl`, `frames.jsonl` (named
+ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
+
+- `commands` — every ratified slash command: `/help` (asserts all ten usage
+  strings render), `/status`, `/provider`, `/model` (picker + explicit switch),
+  `/login` (picker, escape without triggering a real OAuth flow), `/permissions`
+  (picker + `ask`/`bypass`/invalid-arg), `/resume` on an empty store, `/abort`
+  while idle, an unknown command, `/clear`, `/quit`.
+- `keys` — the kept keys: Ctrl+Y copy, Shift+Enter (kitty `CSI 13;2u` encoding)
+  composer newline, Up/Down history recall, PgUp/PgDn, Ctrl+T, Shift+Tab
+  thinking cycle (status `think:` segment), Ctrl+C exit.
+- `steer-abort` — a `hold` fixture step keeps the stream open so Enter mid-turn
+  steers (queue indicator) and `/abort` cancels.
+- `approval-deny` — `ask` mode + a tool fixture step: the approval view
+  renders, `n` denies and the agent retries, `a` approves always and the tool
+  runs.
+- `approval-allow` — `y` approves once and the tool runs.
+- `session-roundtrip` — two runs share one `HOME`: the first saves a session,
+  the second lists it via `/resume` and replays the saved transcript.
+
+These scenarios use the fixture step encoding, which extends the plain
+canned-reply value: `|`-separated steps `text:<body>`, `tool:<name>` or
+`tool:<name>#<args-json>` (args default to `{}`), `hold` (block until
+cancelled — for steer/abort coverage), and `error:<message>`. A value whose
+first segment carries no step prefix stays a single text reply, so existing
+`MAKAI_TUI_FIXTURE` usage is unchanged.
 
 ## Metric definitions
 
@@ -69,17 +100,20 @@ All timings are wall-clock (`time.monotonic`) measured at the PTY master:
 
 Artifacts per run: `metrics.json` (also printed to stdout), `transcript.bin`
 (raw terminal bytes), `batches.jsonl` (one `{"t_ms", "bytes"}` line per read
-batch).
+batch); with `--scenario all`, a `summary.json` plus one subdirectory per
+scenario (its own transcript/batches plus `frames.jsonl` and `notes.json`).
 
 ## Running it
 
 ```bash
 zig build install -Doptimize=ReleaseFast --prefix /tmp/makai-pty
 python3 scripts/tui-pty-driver.py --binary /tmp/makai-pty/bin/makai --output-dir tui-pty-out
+python3 scripts/tui-pty-driver.py --binary /tmp/makai-pty/bin/makai --output-dir tui-pty-out --scenario all
 ```
 
-CI runs the same command in the `TUI PTY Harness` job on every pull request
-and records `metrics.json` in the job summary and run artifacts.
+CI runs the `--scenario all` invocation in the `TUI PTY Harness` job on every
+pull request and records `metrics.json` and `summary.json` in the job summary
+and run artifacts.
 
 Timings are host-class dependent. Record baselines against a stable host class
 (`github-ubuntu-latest` for the CI numbers) and re-measure before drawing
