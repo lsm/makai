@@ -270,6 +270,16 @@ class StdioTransport:
                 f"failed to spawn makai binary {command!r}: {exc}", kind="transport_error"
             ) from exc
 
+        if self._closed:
+            # close() ran while we were resolving the binary or spawning: it
+            # saw no process to reap and returned. Installing this one anyway
+            # would leave a live child behind a transport that refuses every
+            # send until someone calls close() a second time.
+            await _reap_child(process)
+            raise MakaiStreamError(
+                "transport was closed while connecting", kind="transport_error"
+            )
+
         self._process = process
         loop = asyncio.get_running_loop()
         self._handshake = loop.create_future()
@@ -427,11 +437,12 @@ class StdioTransport:
             return
 
         code = await process.wait() if process.returncode is None else process.returncode
-        error = MakaiStreamError(
-            f"makai process exited (code={code}) before the request completed",
-            kind="transport_error",
+        self._abandon(
+            MakaiStreamError(
+                f"makai process exited (code={code}) before the request completed",
+                kind="transport_error",
+            )
         )
-        self._fail_all(error)
 
     def _on_invalid_line(self, text: str) -> None:
         preview = text if len(text) <= 200 else text[:200] + "..."

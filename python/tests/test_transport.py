@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+from typing import Any, List
 
 import pytest
 
@@ -301,3 +303,63 @@ async def test_an_oversized_frame_tears_the_transport_down(
     assert not process_alive(pid)
     await transport.close()
     await transport.close()
+
+
+async def test_a_child_that_exits_marks_the_transport_disconnected(
+    fake: FakeServerFactory,
+) -> None:
+    """After the child exits, connected and pid must stop claiming a live host.
+
+    The clean-EOF path used to fail the open routes and stop there, leaving
+    _closed False and _process set, so only the next request's typed error
+    revealed that the host was gone.
+    """
+    transport = await fake.transport({"exit_after": 1, "ack": False})
+    async with transport.route(stream_id="GONE") as route:
+        await transport.send(build_stream_envelope("probe", "GONE", {}))
+        with pytest.raises(MakaiStreamError, match="exited"):
+            await route.next_frame(3.0)
+
+    assert not transport.connected
+    assert transport.pid is None
+    with pytest.raises(MakaiStreamError, match="not connected"):
+        await transport.send(build_stream_envelope("probe", "AFTER", {}))
+
+
+async def test_close_during_connect_does_not_orphan_the_child(
+    fake: FakeServerFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """close() landing mid-spawn must not leave a live child behind.
+
+    close() finds no process to reap and returns; connect() then installed the
+    one it had just spawned, so the handshake succeeded and every later send
+    raised 'not connected' with the child still running.
+    """
+    env = dict(os.environ)
+    env["MAKAI_FAKE_CONFIG"] = fake.write_config({})
+    env.pop("MAKAI_BINARY_PATH", None)
+    transport = StdioTransport(command=sys.executable, args=[FIXTURE_SERVER], env=env)
+
+    spawned: List[Any] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def exec_then_close(*args: Any, **kwargs: Any) -> Any:
+        process = await real_exec(*args, **kwargs)
+        spawned.append(process)
+        await transport.close()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_then_close)
+    with pytest.raises(MakaiStreamError, match="closed while connecting"):
+        await transport.connect()
+    monkeypatch.undo()
+
+    assert len(spawned) == 1
+    assert not transport.connected
+    assert transport.pid is None
+    pid = spawned[0].pid
+    for _ in range(50):
+        if not process_alive(pid):
+            break
+        await asyncio.sleep(0.05)
+    assert not process_alive(pid)
