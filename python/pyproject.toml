@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "makai"
+version = "0.1.0"
+description = "Python SDK for the Makai streaming AI runtime's stdio protocol"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "ISC" }
+authors = [{ name = "makai contributors" }]
+keywords = ["makai", "sdk", "streaming", "llm", "stdio"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "mypy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/lsm/makai"
+Source = "https://github.com/lsm/makai"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/makai"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/makai", "tests", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "real_binary: needs MAKAI_BINARY_PATH pointing at a built makai runtime",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/makai", "tests"]
