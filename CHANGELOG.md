@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- `makai --version` reported `0.0.1` in every build, including the tagged `v0.1.0` and `v0.2.0` release binaries, because `zig/src/tools/makai.zig` hardcoded the string while the release workflow only bumped `package.json`. The version now comes from `build.zig.zon` through a shared build-options module that also feeds the MCP bridge handshake, so the binary, the package and the manifest cannot drift.
+
 ### Added
+
+- A `preflight` job now gates the release workflow. It fails the run when `build.zig.zon` and `package.json` disagree, when a `v*` tag does not match `build.zig.zon`, or when `NPM_TOKEN` or the macOS signing secrets are missing on a tag. `v0.2.0` built every target, published its GitHub release, and only then failed publishing to npm with `ENEEDAUTH`, leaving a tag whose binaries shipped but whose npm packages never existed; the preflight turns that into an immediate, named failure before anything is built.
 
 - macOS release binaries are now Developer ID signed and notarized ([`docs/macos-code-signing.md`](docs/macos-code-signing.md)). Zig emits an ad-hoc linker signature with no team identifier, which made keychain access lists bind to the code hash — so "Always Allow" could never survive a rebuild or an update — and made a browser-downloaded tarball unrunnable under Gatekeeper. `scripts/sign-macos.sh` imports the certificate into a temporary keychain, signs with the hardened runtime and a secure timestamp, verifies, and restores the keychain search list; `scripts/notarize-macos.sh` submits the signed binaries, prints Apple's log on rejection, and re-checks a quarantined copy through `spctl`. Both run in `release-binaries.yml` between build and packaging, so the tarball, the checksum and the `@makai/cli-darwin-*` npm payload ship the same signed bytes, and a tag build fails rather than publishing unsigned macOS binaries. `make sign` applies the same signature to a local build, which is what ends the per-rebuild keychain prompt during development. A bare executable cannot carry a stapled ticket, so Gatekeeper resolves notarization online on first run; that limit and the `.pkg`/`.dmg` alternative are documented.
 

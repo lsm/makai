@@ -125,9 +125,10 @@ in the repository. Neither is recoverable from GitHub once stored.
 
 ## Rollout order
 
-The signing step is deliberately strict: once this is on `main`, a `v*` tag with no
-signing secrets **fails the release** instead of publishing unsigned macOS binaries.
-So configure the secrets before the next tag:
+The release is deliberately strict: once this is on `main`, a `v*` tag with no
+signing secrets **fails in the preflight job**, before anything is built or
+published, instead of shipping unsigned macOS binaries. So configure the secrets
+before the next tag:
 
 1. Complete the Apple setup and add the five required secrets.
 2. Run the workflow manually (**Actions → Release Binaries → Run workflow**) on the

@@ -26,7 +26,7 @@ const tui_app = @import("tui_app");
 const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
 
-pub const VERSION = "0.0.1";
+pub const VERSION = @import("build_options").version;
 
 const ProviderProtocolServer = provider_protocol_server.ProtocolServer;
 const ProviderProtocolRuntime = provider_protocol_runtime.ProviderProtocolRuntime;

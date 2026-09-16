@@ -10,8 +10,55 @@ permissions:
   contents: write
 
 jobs:
+  # v0.2.0 published its GitHub release and then failed on npm with ENEEDAUTH,
+  # leaving a half-released tag. Check the versions agree and every credential a
+  # tag needs exists before anything is built or published.
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check versions agree and release credentials exist
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          ZON_VERSION="$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -n 1)"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "build.zig.zon : $ZON_VERSION"
+          echo "package.json  : $PKG_VERSION"
+          failed=0
+          if [ "$ZON_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::build.zig.zon ($ZON_VERSION) and package.json ($PKG_VERSION) disagree; the binary reports the build.zig.zon value"
+            failed=1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "tag           : $TAG_VERSION"
+            if [ "$TAG_VERSION" != "$ZON_VERSION" ]; then
+              echo "::error::tag v$TAG_VERSION does not match build.zig.zon ($ZON_VERSION); makai --version would report $ZON_VERSION"
+              failed=1
+            fi
+            for name in NPM_TOKEN MACOS_CERTIFICATE_P12 MACOS_NOTARY_KEY; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::$name is not configured; this tag would publish partially and then fail (docs/macos-code-signing.md)"
+                failed=1
+              fi
+            done
+          fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "preflight ok"
+
   build-binaries:
     name: Build ${{ matrix.os_name }}-${{ matrix.arch_name }}
+    needs: [preflight]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
