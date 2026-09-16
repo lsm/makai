@@ -269,3 +269,35 @@ async def test_concurrent_connects_do_not_spawn_two_children(
     await transport.close()
     await asyncio.sleep(0.1)
     assert not process_alive(pid)
+
+
+async def test_an_oversized_frame_tears_the_transport_down(
+    fake: FakeServerFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A line past the limit must close the transport and reap the child.
+
+    The reader stops consuming stdout on this path, so leaving the transport
+    open reports ``connected`` while every later route waits for frames that
+    can no longer arrive, with the child still running behind it.
+    """
+    monkeypatch.setattr("makai.transport._MAX_LINE_BYTES", 4096)
+    transport = await fake.transport(
+        {"ack": False, "handlers": {"probe": [{"raw": "x" * 16384}]}}
+    )
+    pid = transport.pid
+    assert pid is not None
+    async with transport.route(stream_id="HUGE") as route:
+        await transport.send(build_stream_envelope("probe", "HUGE", {}))
+        with pytest.raises(MakaiStreamError, match="oversized frame"):
+            await route.next_frame(3.0)
+
+    assert not transport.connected
+    with pytest.raises(MakaiStreamError, match="not connected"):
+        await transport.send(build_stream_envelope("probe", "LATER", {}))
+    for _ in range(50):
+        if not process_alive(pid):
+            break
+        await asyncio.sleep(0.05)
+    assert not process_alive(pid)
+    await transport.close()
+    await transport.close()

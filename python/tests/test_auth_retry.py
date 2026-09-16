@@ -288,3 +288,68 @@ async def test_auto_once_uses_client_level_handlers(fake: FakeServerFactory) -> 
     )
     assert response.text == "ok"
     assert answered == ["P1"]
+
+
+async def test_auto_once_does_not_replay_a_run_whose_tools_already_ran(
+    fake: FakeServerFactory,
+) -> None:
+    """A tool round is a side effect; an auth failure after one must not retry.
+
+    The result path already refuses with ``allow_retry=not tools_executed``,
+    but a terminal ``error`` event leaves ``_run_once`` as a stream error
+    before that gate, so ``run()`` has to be told what the attempt did.
+    """
+    log = fake.log_path()
+    client = await fake.client(
+        {
+            "log": log,
+            "handlers": {
+                "agent_start": [
+                    {"type": "agent_started", "payload": {"session_id": "$session_id"}}
+                ],
+                "agent_message": [
+                    {
+                        "type": "agent_event",
+                        "payload": {},
+                        "correlate": False,
+                        "event_json": {
+                            "type": "tool_execution_start",
+                            "tool_call_id": "c1",
+                            "tool_name": "charge_card",
+                        },
+                    },
+                    {
+                        "type": "agent_event",
+                        "payload": {},
+                        "correlate": False,
+                        "event_json": {
+                            "type": "tool_execution_end",
+                            "tool_call_id": "c1",
+                            "is_error": False,
+                        },
+                    },
+                    {
+                        "type": "agent_event",
+                        "payload": {},
+                        "correlate": False,
+                        "event_json": {
+                            "type": "error",
+                            "message": "auth_required",
+                            "code": "auth_required",
+                            "provider_id": "anthropic",
+                        },
+                    },
+                ],
+                "auth_login_start": LOGIN_SUCCESS,
+            },
+        },
+        auth=AuthOptions(auth_retry_policy="auto_once"),
+    )
+    with pytest.raises(MakaiAuthRequiredError) as excinfo:
+        await client.agent.run(
+            model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}]
+        )
+    assert excinfo.value.provider_id == "anthropic"
+    frames = read_log(log)
+    assert [frame["type"] for frame in frames].count("agent_start") == 1
+    assert not any(frame["type"] == "auth_login_start" for frame in frames)

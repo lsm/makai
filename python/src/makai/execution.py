@@ -318,18 +318,21 @@ class AgentApi(_ExecutionBase):
         """Run the agent loop to completion and return the final message."""
         policy = self._policy(options)
         fallback_provider_id = _provider_id_from_ref(model_ref)
+        progress: Dict[str, bool] = {"tools_executed": False}
         try:
-            return await self._run_once(model_ref, messages, tools, options, policy)
+            return await self._run_once(model_ref, messages, tools, options, policy, progress)
         except MakaiStreamError as exc:
             provider_id = _retryable_auth_provider(exc, fallback_provider_id)
             if provider_id is None:
                 raise
-            if policy != "auto_once" or self._auth is None:
+            if policy != "auto_once" or self._auth is None or progress["tools_executed"]:
                 raise MakaiAuthRequiredError(provider_id, exc.message) from exc
             await self._relogin(provider_id, exc)
             retry_options = _with_fresh_session_id(options)
             try:
-                return await self._run_once(model_ref, messages, tools, retry_options, policy)
+                return await self._run_once(
+                    model_ref, messages, tools, retry_options, policy, progress
+                )
             except MakaiStreamError as retry_exc:
                 retry_provider = _retryable_auth_provider(retry_exc, fallback_provider_id)
                 if retry_provider is not None:
@@ -343,22 +346,29 @@ class AgentApi(_ExecutionBase):
         tools: Optional[Sequence[ToolDefinition]],
         options: Optional[RunOptions],
         policy: Optional[str],
+        progress: Optional[Dict[str, bool]] = None,
     ) -> CompletionResponse:
         events: List[AgentStreamEvent] = []
         response: Optional[CompletionResponse] = None
         tools_executed = False
 
+        def mark_tools_executed() -> None:
+            nonlocal tools_executed
+            tools_executed = True
+            if progress is not None:
+                progress["tools_executed"] = True
+
         session = self._session(model_ref, messages, tools, options, policy)
         async with contextlib.aclosing(session):
             async for kind, value in session:
                 if kind == "tool_executed":
-                    tools_executed = True
+                    mark_tools_executed()
                     continue
                 if kind == "response":
                     response = value
                     break
                 if isinstance(value, (ToolExecutionStart, ToolExecutionEnd)):
-                    tools_executed = True
+                    mark_tools_executed()
                 events.append(value)
                 if isinstance(value, AgentEnd):
                     response = build_response_from_events(events)

@@ -54,6 +54,33 @@ _TERMINATE_GRACE_S = 1.0
 _MAX_LINE_BYTES = 64 * 1024 * 1024
 
 
+async def _reap_child(process: "asyncio.subprocess.Process") -> None:
+    """Close stdin, then escalate wait -> terminate -> kill until the child exits."""
+    if process.stdin is not None:
+        with contextlib.suppress(Exception):
+            process.stdin.close()
+    try:
+        await asyncio.wait_for(process.wait(), _EXIT_GRACE_S)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), _TERMINATE_GRACE_S)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await process.wait()
+
+    # Release asyncio's subprocess transport now that the child has exited.
+    # Left to the garbage collector it would run its own cleanup later,
+    # potentially after the OS has recycled the pid.
+    child_transport = getattr(process, "_transport", None)
+    if child_transport is not None:
+        with contextlib.suppress(Exception):
+            child_transport.close()
+
+
 class FrameRoute:
     """A queue of frames for one ``stream_id`` or ``session_id``.
 
@@ -183,6 +210,7 @@ class StdioTransport:
 
         self._process: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
+        self._teardown_task: Optional[asyncio.Task[None]] = None
         self._stream_routes: Dict[str, FrameRoute] = {}
         self._session_routes: Dict[str, FrameRoute] = {}
         self._handshake: Optional[asyncio.Future[None]] = None
@@ -320,36 +348,24 @@ class StdioTransport:
         Safe to call more than once, and safe to call while requests are in
         flight -- open routes are failed rather than left hanging.
         """
-        if self._closed and self._process is None:
+        teardown = self._teardown_task
+        if self._closed and self._process is None and teardown is None:
             return
         self._closed = True
         process = self._process
         self._process = None
 
         if process is not None:
-            if process.stdin is not None:
-                with contextlib.suppress(Exception):
-                    process.stdin.close()
-            try:
-                await asyncio.wait_for(process.wait(), _EXIT_GRACE_S)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                with contextlib.suppress(ProcessLookupError):
-                    process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), _TERMINATE_GRACE_S)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await process.wait()
+            await _reap_child(process)
 
-            # Release asyncio's subprocess transport now that the child has
-            # exited. Left to the garbage collector it would run its own
-            # cleanup later, potentially after the OS has recycled the pid.
-            child_transport = getattr(process, "_transport", None)
-            if child_transport is not None:
-                with contextlib.suppress(Exception):
-                    child_transport.close()
+        # A fatal reader exit detaches its own teardown because it cannot
+        # cancel-and-await itself; adopt it here so close() still returns only
+        # once the child is gone.
+        if teardown is not None:
+            self._teardown_task = None
+            if not teardown.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await teardown
 
         task = self._reader_task
         self._reader_task = None
@@ -381,7 +397,7 @@ class StdioTransport:
                 try:
                     line = await stdout.readline()
                 except (asyncio.LimitOverrunError, ValueError) as exc:
-                    self._fail_all(
+                    self._abandon(
                         MakaiStreamError(
                             f"makai emitted an oversized frame: {exc}", kind="transport_error"
                         )
@@ -405,7 +421,7 @@ class StdioTransport:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("reader loop failed: %r", exc)
-            self._fail_all(
+            self._abandon(
                 MakaiStreamError(f"stdio reader failed: {exc}", kind="transport_error")
             )
             return
@@ -493,6 +509,26 @@ class StdioTransport:
             )
             return
         handshake.set_result(None)
+
+    def _abandon(self, error: MakaiStreamError) -> None:
+        """Give up on the connection from inside the reader loop.
+
+        The reader stops consuming stdout on these paths, so leaving the
+        transport open would strand a live child and hand later callers a
+        ``connected`` transport whose routes never receive a frame. ``close()``
+        cancels and awaits the reader, so the reader cannot call it on itself;
+        mark the transport closed synchronously and reap the child in a
+        detached task that ``close()`` adopts.
+        """
+        self._closed = True
+        process = self._process
+        self._process = None
+        self._reader_task = None
+        self._fail_all(error)
+        if process is not None:
+            self._teardown_task = asyncio.create_task(
+                _reap_child(process), name="makai-stdio-teardown"
+            )
 
     def _fail_all(self, error: BaseException) -> None:
         handshake = self._handshake
