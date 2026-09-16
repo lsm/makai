@@ -31,7 +31,7 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|std\.Random\.'
+ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|\.Random[[:space:]]*[.;]'
 comment_line_filter='^[^:]+:[0-9]+:[[:space:]]*//'
 
 secure_random_files=(
@@ -46,6 +46,31 @@ secure_random_files=(
 ordinary_entropy_definition_file="zig/src/compat/random.zig"
 
 expected_ordinary_entropy_sites="$(cat <<'SITES'
+zig/src/compat/random.zig|        const ordinary_value = randomIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        return .{ .prng = std.Random.DefaultPrng.init(seed) };
+zig/src/compat/random.zig|        self.prng.random().bytes(buf);
+zig/src/compat/random.zig|    const OrdinaryHelper = @TypeOf(fillRandomBytes);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 0);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 17);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    defaultIo().random(buf);
+zig/src/compat/random.zig|    fillRandomBytes(&empty);
+zig/src/compat/random.zig|    fillRandomBytes(buf);
+zig/src/compat/random.zig|    prng: std.Random.DefaultPrng,
+zig/src/compat/random.zig|    pub fn allocBytes(self: *DeterministicSource, allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|    pub fn bytes(self: *DeterministicSource, buf: []u8) void {
+zig/src/compat/random.zig|    pub fn init(seed: u64) DeterministicSource {
+zig/src/compat/random.zig|    try std.testing.expect(fillSecureBytes != fillRandomBytes);
+zig/src/compat/random.zig|    try std.testing.expectEqual(@as(usize, 0), randomIntRangeLessThan(usize, 1));
+zig/src/compat/random.zig|    var different_source = DeterministicSource.init(0x8765_4321);
+zig/src/compat/random.zig|    var first_source = DeterministicSource.init(0x1234_5678);
+zig/src/compat/random.zig|    var second_source = DeterministicSource.init(0x1234_5678);
+zig/src/compat/random.zig|    var source: std.Random.IoSource = .{ .io = defaultIo() };
+zig/src/compat/random.zig|    var source: std.Random.IoSource = .{ .io = defaultIo() };
+zig/src/compat/random.zig|pub const DeterministicSource = struct {
+zig/src/compat/random.zig|pub fn fillRandomBytes(buf: []u8) void {
+zig/src/compat/random.zig|pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|pub fn randomIntRangeLessThan(comptime T: type, upper_bound: T) T {
 zig/src/model_catalog.zig|    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}.{x}", .{ path, compat.time.nowMillis(), compat.random.int(u64) });
 zig/src/providers/sse_parser.zig|    const random = prng.random();
 zig/src/providers/sse_parser.zig|    var prng = std.Random.DefaultPrng.init(seed);
@@ -82,7 +107,6 @@ if [[ ! -f "$ordinary_entropy_definition_file" ]]; then
 fi
 
 actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
-  | grep -v "^$ordinary_entropy_definition_file:" \
   | grep -vE "$comment_line_filter" \
   | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
 
@@ -126,14 +150,14 @@ if [[ "$expected_compat_random_exports" != "$actual_compat_random_exports" ]]; t
   echo "[patterns] public exports of $ordinary_entropy_definition_file changed:" >&2
   diff <(printf "%s\n" "$expected_compat_random_exports") \
        <(printf "%s\n" "$actual_compat_random_exports") >&2 || true
-  echo "[patterns] this file is exempt from the call-site sweep, so every public export must be classified as secure or ordinary and declared here" >&2
+  echo "[patterns] every public export of the entropy module must be classified as secure or ordinary and declared here" >&2
   exit 1
 fi
 
 echo "[patterns] checking compat.random secure wrapper bodies..."
 compat_random_file="zig/src/compat/random.zig"
 secure_wrappers=(
-  "fillSecureBytes:randomSecure("
+  "fillSecureBytes:defaultIo().randomSecure("
   "secureBytes:fillSecureBytes("
   "secureIntRangeLessThan:fillSecureBytes("
 )
