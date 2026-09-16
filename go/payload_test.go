@@ -332,3 +332,45 @@ func TestUsageAddHandlesNils(t *testing.T) {
 		t.Errorf("add mutated the receiver: %+v", base)
 	}
 }
+
+func TestBuildResponseFromEventsAggregatesUsageAcrossTurns(t *testing.T) {
+	events := []AgentEvent{
+		&MessageStart{ProviderID: "anthropic", API: "anthropic-messages", ModelID: "m"},
+		&TextDelta{Delta: "first"},
+		&MessageEnd{Usage: &Usage{Input: 10, Output: 4, CacheRead: 1}},
+		&MessageStart{ProviderID: "anthropic", API: "anthropic-messages", ModelID: "m"},
+		&TextDelta{Delta: "second"},
+		&MessageEnd{Usage: &Usage{Input: 20, Output: 6, CacheWrite: 2}},
+		&AgentEnd{StopReason: "end_turn", Usage: &Usage{Input: 20, Output: 6, CacheWrite: 2}},
+	}
+
+	response := buildResponseFromEvents(events)
+
+	if response.Message.Text != "second" {
+		t.Errorf("Text = %q, want second", response.Message.Text)
+	}
+	if response.Usage == nil {
+		t.Fatal("Usage should be aggregated, got nil")
+	}
+	want := Usage{Input: 30, Output: 10, CacheRead: 1, CacheWrite: 2}
+	if *response.Usage != want {
+		t.Errorf("Usage = %+v, want %+v", *response.Usage, want)
+	}
+}
+
+func TestBuildResponseFromEventsFallsBackToTheAgentEndUsage(t *testing.T) {
+	events := []AgentEvent{
+		&MessageStart{ModelID: "m"},
+		&TextDelta{Delta: "only"},
+		&AgentEnd{StopReason: "end_turn", Usage: &Usage{Input: 7, Output: 3}},
+	}
+
+	response := buildResponseFromEvents(events)
+
+	if response.Usage == nil {
+		t.Fatal("Usage should come from agent_end when no message_end carried one")
+	}
+	if want := (Usage{Input: 7, Output: 3}); *response.Usage != want {
+		t.Errorf("Usage = %+v, want %+v", *response.Usage, want)
+	}
+}

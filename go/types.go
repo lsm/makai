@@ -209,7 +209,9 @@ type CompletionResponse struct {
 	// Message is the assistant's reply.
 	Message ResponseMessage
 	// Usage is the call's token usage, or nil when the provider reported
-	// none. For agent runs it aggregates every provider turn.
+	// none. An agent run that settles through events sums every provider
+	// turn, matching AgentStream; one that settles through a result frame
+	// reports whatever that frame carried.
 	Usage *Usage
 	// ProviderID, API and ModelID identify what actually served the call.
 	ProviderID string

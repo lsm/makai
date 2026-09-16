@@ -490,10 +490,16 @@ func buildResponseFromEvents(events []AgentEvent) *CompletionResponse {
 
 	// Terminal fields come from the last agent_end, falling back to the last
 	// message_end of the run.
+	//
+	// Usage is the exception: the runtime's agent_end reports only the last
+	// provider turn, so a multi-turn run is summed from every message_end,
+	// which is what AgentStream.Next does for the streamed path.
 	var messageEnd *MessageEnd
+	var aggregated *Usage
 	for _, event := range events {
 		if value, ok := event.(*MessageEnd); ok {
 			messageEnd = value
+			aggregated = aggregated.add(value.Usage)
 		}
 	}
 	for i := len(events) - 1; i >= 0; i-- {
@@ -505,6 +511,9 @@ func buildResponseFromEvents(events []AgentEvent) *CompletionResponse {
 			response.API = firstNonEmpty(response.API, value.API)
 			break
 		}
+	}
+	if aggregated != nil {
+		response.Usage = aggregated
 	}
 	if response.Usage == nil && messageEnd != nil {
 		response.Usage = messageEnd.Usage

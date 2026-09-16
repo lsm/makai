@@ -414,3 +414,70 @@ func TestTailBufferKeepsLastBytes(t *testing.T) {
 		t.Errorf("String() = %q, want the last 8 bytes", got)
 	}
 }
+
+func TestFrameReaderSkipsAnOversizedFrameAndResynchronizes(t *testing.T) {
+	oversized := strings.Repeat("x", maxFrameBytes+1024)
+	reader := newFrameReader(strings.NewReader(oversized + "\n" + `{"type":"after"}` + "\n"))
+
+	_, err := reader.next()
+	if !errors.Is(err, errMalformedFrame) {
+		t.Fatalf("an oversized frame should be recoverable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("error should name the limit, got %v", err)
+	}
+
+	f, err := reader.next()
+	if err != nil {
+		t.Fatalf("the frame after an oversized one should still be read: %v", err)
+	}
+	if f.Type != "after" {
+		t.Errorf("Type = %q, want after", f.Type)
+	}
+}
+
+func TestDispatchPromotesTheAcceptedSessionAttempt(t *testing.T) {
+	tr := &transport{
+		logger:     discardLogger,
+		streams:    map[string][]*subscription{},
+		sessions:   map[string][]*subscription{},
+		correlates: map[string]*subscription{},
+		done:       make(chan struct{}),
+		exited:     make(chan struct{}),
+	}
+	const sessionID = "testNanoIdSess1234567"
+
+	loser := tr.subscribeSession(sessionID)
+	defer loser.close()
+	winner := tr.subscribeSession(sessionID)
+	defer winner.close()
+	winner.correlate("WINNER")
+
+	tr.dispatch(&frame{Type: "agent_started", SessionID: sessionID, InReplyTo: "WINNER",
+		Payload: mustMarshal(map[string]any{"session_id": sessionID})})
+
+	tr.dispatch(&frame{Type: "agent_event", SessionID: sessionID,
+		Payload: mustMarshal(map[string]any{"event_json": `{"type":"text_delta","delta":"mine"}`})})
+
+	select {
+	case f := <-winner.queue:
+		if f.Type != "agent_started" {
+			t.Fatalf("first frame = %q, want agent_started", f.Type)
+		}
+	default:
+		t.Fatal("the accepted attempt should have received its own agent_started")
+	}
+	select {
+	case f := <-winner.queue:
+		if f.Type != "agent_event" {
+			t.Fatalf("second frame = %q, want agent_event", f.Type)
+		}
+	default:
+		t.Fatal("uncorrelated session output should follow the accepted attempt")
+	}
+	select {
+	case f := <-loser.queue:
+		t.Fatalf("the losing attempt received %q", f.Type)
+	default:
+	}
+}

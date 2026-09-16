@@ -3,6 +3,7 @@ package makai
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -518,4 +519,31 @@ func TestProviderCompleteSerializesStructuredContent(t *testing.T) {
 	if got := jsonObject(tools[0].(map[string]any)).str("parameters_schema_json"); got != `{"type":"object"}` {
 		t.Errorf("schema = %q", got)
 	}
+}
+
+func TestProviderCompleteAbandonsTheStreamOnATimeout(t *testing.T) {
+	logPath, readLog := requestLogPath(t)
+	client, err := newTestClientWithOptions(t, &Options{
+		BinaryPath:     os.Args[0],
+		Env:            fakeHostEnv(scenarioProtocol, envRequestLog+"="+logPath, envSuppress+"=complete_request"),
+		RequestTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = client.Provider.Complete(testContext(t), CompletionRequest{
+		ModelRef: testModelRef, Messages: []Message{UserMessage("hi")},
+	})
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || streamErr.Kind != KindTransportError {
+		t.Fatalf("expected a transport error, got %v", err)
+	}
+
+	// The completion is still running upstream, so the SDK must abandon it
+	// rather than leave it generating tokens with no handle to stop it.
+	waitForFrameType(t, readLog, "abort_request")
 }

@@ -223,6 +223,13 @@ func (t *transport) dispatch(f *frame) {
 			target = subs[0]
 		}
 	}
+	// A session id can carry more than one attempt: two runs may start with
+	// the same caller-supplied id, and only one is accepted. Registration
+	// order does not say which, so the acceptance itself promotes its own
+	// subscription to receive the run's uncorrelated output.
+	if target != nil && f.SessionID != "" && f.Type == "agent_started" {
+		t.promoteSessionLocked(f.SessionID, target)
+	}
 	t.mu.Unlock()
 
 	if target == nil {
@@ -231,6 +238,22 @@ func (t *transport) dispatch(f *frame) {
 		return
 	}
 	target.deliver(f)
+}
+
+// promoteSessionLocked moves sub to the front of its session route, so
+// frames that name only the session are delivered to it. t.mu must be held.
+func (t *transport) promoteSessionLocked(sessionID string, sub *subscription) {
+	subs := t.sessions[sessionID]
+	for i, candidate := range subs {
+		if candidate != sub {
+			continue
+		}
+		if i > 0 {
+			copy(subs[1:i+1], subs[:i])
+			subs[0] = sub
+		}
+		return
+	}
 }
 
 // send writes one envelope to the runtime. Writes are serialized so frames
@@ -248,6 +271,9 @@ func (t *transport) send(f *frame) error {
 	case <-t.done:
 		return t.terminalError("send")
 	default:
+	}
+	if t.closing.Load() {
+		return t.terminalError("send")
 	}
 
 	t.logger.Debug("makai: frame sent",
@@ -381,9 +407,12 @@ func (t *transport) close() error {
 		t.closing.Store(true)
 		t.logger.Debug("makai: closing transport")
 
-		t.writeMu.Lock()
+		// Deliberately not under writeMu: a send blocked in Write on a full
+		// pipe holds that mutex, and taking it here would stop Close from
+		// ever reaching the grace timer that is meant to bound exactly this
+		// case. Closing an *os.File under a concurrent Write is safe and is
+		// what unblocks the wedged writer.
 		closeErr := t.stdin.Close()
-		t.writeMu.Unlock()
 
 		grace := t.shutdownGrace
 		if grace <= 0 {

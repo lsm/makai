@@ -157,7 +157,9 @@ for stream.Next() {
 return stream.Err()
 ```
 
-A run emits exactly one terminal event, `*AgentEnd` or `*ErrorEvent`. Reaching `*AgentEnd` is not by itself proof of success: a failed provider turn still settles that way, with `StopReason` `"error"` and the detail in `ErrorMessage`.
+A run ends in one of two ways, and a type switch only sees one of them. A run that completes emits `*AgentEnd` as its last event; a run that fails ends the loop instead, with the failure available from `stream.Err()` — `*ErrorEvent` is converted there and is never delivered as an event, so a `case *makai.ErrorEvent` is dead code. Always check `stream.Err()` after the loop.
+
+Reaching `*AgentEnd` is not by itself proof of success either: a failed provider turn still settles that way, with `StopReason` `"error"` and the detail in `ErrorMessage`.
 
 ### Sessions are not resumable
 

@@ -116,8 +116,8 @@ func (o jsonObject) soleKey() string {
 // bufferedLineReader reads newline-terminated lines with an explicit size cap.
 //
 // bufio.Scanner is not used because its token limit is a hard failure for the
-// whole stream; this reader reports an over-long line as an error the caller
-// can attribute to one frame.
+// whole stream; this reader discards an over-long line and resynchronizes on
+// the next newline, so one oversized frame costs that frame and nothing else.
 type bufferedLineReader struct {
 	reader *bufio.Reader
 	limit  int
@@ -134,7 +134,10 @@ func (lr *bufferedLineReader) readLine() ([]byte, error) {
 	for {
 		chunk, err := lr.reader.ReadSlice('\n')
 		if len(accumulated)+len(chunk) > lr.limit {
-			return nil, fmt.Errorf("makai: frame exceeds the %d byte limit", lr.limit)
+			if discardErr := lr.discardLine(err); discardErr != nil {
+				return nil, discardErr
+			}
+			return nil, fmt.Errorf("%w: frame exceeds the %d byte limit", errMalformedFrame, lr.limit)
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			accumulated = append(accumulated, chunk...)
@@ -152,6 +155,23 @@ func (lr *bufferedLineReader) readLine() ([]byte, error) {
 		}
 		return append(accumulated, chunk...), nil
 	}
+}
+
+// discardLine consumes the remainder of an over-long line so the next read
+// starts at a frame boundary instead of in the middle of one.
+//
+// err is what the read that tripped the limit returned: a newline was already
+// consumed when it is nil, and there is more of the line to drop when it is
+// bufio.ErrBufferFull. A read failure is reported; end of stream is not,
+// since the caller still has an oversized-frame error to return.
+func (lr *bufferedLineReader) discardLine(err error) error {
+	for errors.Is(err, bufio.ErrBufferFull) {
+		_, err = lr.reader.ReadSlice('\n')
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 // errReader yields a fixed error, used to replay the underlying stream's

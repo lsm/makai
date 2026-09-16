@@ -41,10 +41,12 @@ func (s *ProviderService) Complete(ctx context.Context, req CompletionRequest) (
 	for {
 		f, err := sub.next(ctx, s.timeout, "provider complete_response")
 		if err != nil {
-			if isAbort(err) {
-				cancelStream(s.transport, streamID)
-				sub.drain(drainIdle, drainBudget)
-			}
+			// Every failure here leaves the completion running upstream,
+			// not just a cancelled context: a frame timeout or a dropped
+			// frame would otherwise keep generating billable tokens with
+			// no handle left for the caller to abandon it with.
+			cancelStream(s.transport, streamID)
+			sub.drain(drainIdle, drainBudget)
 			return nil, withStreamID(err, streamID)
 		}
 		switch f.Type {
@@ -57,6 +59,8 @@ func (s *ProviderService) Complete(ctx context.Context, req CompletionRequest) (
 		case "result", "complete_response":
 			return responseOrAuthError(parseCompletionResponse(f.payload()), fallbackProvider)
 		default:
+			cancelStream(s.transport, streamID)
+			sub.drain(drainIdle, drainBudget)
 			return nil, &StreamError{
 				Kind:     KindTransportError,
 				Message:  fmt.Sprintf("unexpected frame type %q while awaiting a provider result", f.Type),
