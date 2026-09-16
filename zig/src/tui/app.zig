@@ -2322,6 +2322,7 @@ const StderrRedirect = struct {
     }
 
     fn restore(self: *StderrRedirect) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         if (self.saved_fd) |saved| {
             _ = std.c.dup2(saved, std.posix.STDERR_FILENO);
             _ = std.c.close(saved);
@@ -2337,6 +2338,7 @@ pub fn stderrLogPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
 
 fn redirectStderrToLog(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map) StderrRedirect {
     var redirect: StderrRedirect = .{};
+    if (comptime @import("builtin").os.tag == .windows) return redirect;
     const fd = openStderrLog(allocator, environ_map) catch openDevNull() catch return redirect;
     const saved = std.c.dup(std.posix.STDERR_FILENO);
     if (saved < 0) {
