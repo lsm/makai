@@ -21,7 +21,7 @@ test("e2e: connect to makai binary over stdio", async (t) => {
   await client.close();
 });
 
-test("e2e: send frame and timeout waiting for response", async (t) => {
+test("e2e: nextFrame times out when the runtime sends nothing", async (t) => {
   if (!binaryPath) {
     t.skip("MAKAI_BINARY_PATH is not set");
     return;
@@ -32,8 +32,36 @@ test("e2e: send frame and timeout waiting for response", async (t) => {
     handshakeTimeoutMs: 1000,
   });
   await client.connect();
-  client.send({ type: "stream_request", stream_id: "e2e-smoke" });
   await assert.rejects(() => client.nextFrame(150), /timed out waiting for frame/);
+  await client.close();
+});
+
+test("e2e: malformed envelope is rejected with a nack and the runtime stays up", async (t) => {
+  if (!binaryPath) {
+    t.skip("MAKAI_BINARY_PATH is not set");
+    return;
+  }
+
+  const client = await createMakaiStdioClient({
+    resolver: { binaryPath },
+    handshakeTimeoutMs: 1000,
+  });
+  await client.connect();
+
+  client.send({ type: "stream_request", stream_id: "e2e-smoke" });
+  const rejection = (await client.nextFrame(2000)) as {
+    type?: string;
+    payload?: { reason?: string; error_code?: string };
+  };
+  assert.equal(rejection.type, "nack");
+  assert.equal(rejection.payload?.error_code, "invalid_request");
+  assert.equal(typeof rejection.payload?.reason, "string");
+  assert.ok((rejection.payload?.reason?.length ?? 0) > 0);
+
+  client.send({ type: "stream_request", stream_id: "e2e-smoke-again" });
+  const second = (await client.nextFrame(2000)) as { type?: string };
+  assert.equal(second.type, "nack");
+
   await client.close();
 });
 

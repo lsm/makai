@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat");
 pub const protocol_types = @import("protocol_types");
 const ai_types = @import("ai_types");
+const fields = @import("envelope_fields");
 const json_writer = @import("json_writer");
 const transport = @import("transport");
 
@@ -62,8 +63,7 @@ fn serializePayload(
     try w.beginObject();
 
     switch (payload) {
-        .ping => {
-        },
+        .ping => {},
         .pong => |pong| {
             try w.writeStringField("ping_id", pong.ping_id.slice());
         },
@@ -515,7 +515,7 @@ fn serializeEventPayload(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, event_json, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try fields.rootObject(parsed.value);
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "type")) continue;
@@ -535,7 +535,7 @@ fn serializeResultPayload(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try fields.rootObject(parsed.value);
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         try w.writeKey(entry.key_ptr.*);
@@ -633,31 +633,28 @@ pub fn deserializeEnvelope(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try fields.rootObject(parsed.value);
 
-    const version: u8 = if (obj.get("version")) |v|
-        @intCast(v.integer)
-    else
-        1;
+    const version = try fields.optionalInt(u8, obj, "version", 1);
 
-    const stream_id_str = obj.get("stream_id").?.string;
+    const stream_id_str = try fields.requiredString(obj, "stream_id");
     const stream_id = protocol_types.parseUlid(stream_id_str) orelse return error.InvalidUlid;
 
-    const message_id_str = obj.get("message_id").?.string;
+    const message_id_str = try fields.requiredString(obj, "message_id");
     const message_id = protocol_types.parseUlid(message_id_str) orelse return error.InvalidUlid;
 
-    const sequence: u64 = @intCast(obj.get("sequence").?.integer);
+    const sequence = try fields.requiredInt(u64, obj, "sequence");
 
-    const timestamp: i64 = obj.get("timestamp").?.integer;
+    const timestamp = try fields.requiredInteger(obj, "timestamp");
 
     var in_reply_to: ?protocol_types.Ulid = null;
-    if (obj.get("in_reply_to")) |reply_val| {
-        in_reply_to = protocol_types.parseUlid(reply_val.string) orelse return error.InvalidUlid;
+    if (try fields.optionalString(obj, "in_reply_to")) |reply_val| {
+        in_reply_to = protocol_types.parseUlid(reply_val) orelse return error.InvalidUlid;
     }
 
-    const type_str = obj.get("type").?.string;
+    const type_str = try fields.requiredString(obj, "type");
 
-    const payload_obj = obj.get("payload").?.object;
+    const payload_obj = try fields.requiredObject(obj, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return protocol_types.Envelope{
@@ -787,14 +784,14 @@ fn deserializeModel(
         .input = input,
         .cost = if (obj.get("cost")) |value| blk: {
             if (value != .object) return error.InvalidUserContent;
-            break :blk try deserializeCost(value.object);
+            break :blk try deserializeCost(try fields.asObject(value));
         } else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = try optionalU32(obj, "context_window", 0),
         .max_tokens = try optionalU32(obj, "max_tokens", 0),
         .headers = headers,
         .compat = if (obj.get("compat")) |value| blk: {
             if (value != .object) return error.InvalidUserContent;
-            break :blk try deserializeOpenAICompatOptions(value.object);
+            break :blk try deserializeOpenAICompatOptions(try fields.asObject(value));
         } else null,
         .is_owned = true,
     };
@@ -806,7 +803,7 @@ fn dupeValidatedString(
     field: []const u8,
     max_len: usize,
 ) ![]u8 {
-    const value = obj.get(field).?.string;
+    const value = try fields.requiredString(obj, field);
     try validateLength(value, max_len);
     return try allocator.dupe(u8, value);
 }
@@ -817,7 +814,7 @@ fn deserializeInputModalities(
 ) ![]const []const u8 {
     const input_val = obj.get("input") orelse return try allocator.alloc([]const u8, 0);
     if (input_val != .array) return error.InvalidUserContent;
-    const input_arr = input_val.array;
+    const input_arr = try fields.asArray(input_val);
     const input = try allocator.alloc([]const u8, input_arr.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -827,8 +824,8 @@ fn deserializeInputModalities(
 
     for (input_arr.items, 0..) |item, idx| {
         if (item != .string) return error.InvalidUserContent;
-        try validateLength(item.string, MAX_IDENTIFIER_LENGTH);
-        input[idx] = try allocator.dupe(u8, item.string);
+        try validateLength(try fields.asString(item), MAX_IDENTIFIER_LENGTH);
+        input[idx] = try allocator.dupe(u8, try fields.asString(item));
         initialized += 1;
     }
 
@@ -853,17 +850,17 @@ fn deserializeHeaderPairs(
 
     for (array.items, 0..) |item, idx| {
         if (item != .object) return error.InvalidUserContent;
-        const header_obj = item.object;
+        const header_obj = try fields.asObject(item);
         const name_field = header_obj.get("name") orelse return error.InvalidUserContent;
         if (name_field != .string) return error.InvalidUserContent;
-        const name_value = name_field.string;
+        const name_value = try fields.asString(name_field);
         try validateLength(name_value, MAX_HEADER_NAME_LENGTH);
         const name = try allocator.dupe(u8, name_value);
         errdefer allocator.free(name);
 
         const value_field = header_obj.get("value") orelse return error.InvalidUserContent;
         if (value_field != .string) return error.InvalidUserContent;
-        const header_value = value_field.string;
+        const header_value = try fields.asString(value_field);
         try validateLength(header_value, MAX_HEADER_VALUE_LENGTH);
         const value = try allocator.dupe(u8, header_value);
         errdefer allocator.free(value);
@@ -880,7 +877,7 @@ fn deserializeHeaderPairsValue(
     allocator: std.mem.Allocator,
 ) ![]ai_types.HeaderPair {
     if (value != .array) return error.InvalidUserContent;
-    return try deserializeHeaderPairs(value.array, allocator);
+    return try deserializeHeaderPairs(try fields.asArray(value), allocator);
 }
 
 fn freeHeaderPairs(allocator: std.mem.Allocator, headers: []const ai_types.HeaderPair) void {
@@ -950,7 +947,7 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
         .supports_usage_in_streaming = try optionalBool(obj, "supports_usage_in_streaming"),
         .max_tokens_field = if (obj.get("max_tokens_field")) |value| blk: {
             if (value != .string) return error.InvalidUserContent;
-            break :blk try parseMaxTokensField(value.string);
+            break :blk try parseMaxTokensField(try fields.asString(value));
         } else .max_completion_tokens,
         .requires_tool_result_name = try optionalBool(obj, "requires_tool_result_name"),
         .requires_assistant_after_tool_result = try optionalBool(obj, "requires_assistant_after_tool_result"),
@@ -958,7 +955,7 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
         .requires_mistral_tool_ids = try optionalBool(obj, "requires_mistral_tool_ids"),
         .thinking_format = if (obj.get("thinking_format")) |value| blk: {
             if (value != .string) return error.InvalidUserContent;
-            break :blk try parseThinkingFormat(value.string);
+            break :blk try parseThinkingFormat(try fields.asString(value));
         } else .openai,
         .supports_strict_mode = try optionalBool(obj, "supports_strict_mode"),
         .supports_anthropic_cache_ttl = try optionalBool(obj, "supports_anthropic_cache_ttl"),
@@ -982,7 +979,7 @@ fn deserializeStreamRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamRequest {
-    const model_obj = obj.get("model").?.object;
+    const model_obj = try fields.requiredObject(obj, "model");
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
         var mutable_model = model;
@@ -990,7 +987,7 @@ fn deserializeStreamRequest(
     }
 
     const context = if (obj.get("context")) |ctx_val|
-        try deserializeContext(ctx_val.object, allocator)
+        try deserializeContext(try fields.asObject(ctx_val), allocator)
     else
         ai_types.Context{ .messages = &.{} };
     errdefer {
@@ -999,12 +996,12 @@ fn deserializeStreamRequest(
     }
 
     const include_partial = if (obj.get("include_partial")) |ip|
-        ip.bool
+        try fields.asBool(ip)
     else
         false;
 
     const options = if (obj.get("options")) |opts_val|
-        try deserializeStreamOptions(opts_val.object, allocator)
+        try deserializeStreamOptions(try fields.asObject(opts_val), allocator)
     else
         null;
     errdefer if (options) |opts| {
@@ -1024,7 +1021,7 @@ fn deserializeCompleteRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.CompleteRequest {
-    const model_obj = obj.get("model").?.object;
+    const model_obj = try fields.requiredObject(obj, "model");
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
         var mutable_model = model;
@@ -1032,7 +1029,7 @@ fn deserializeCompleteRequest(
     }
 
     const context = if (obj.get("context")) |ctx_val|
-        try deserializeContext(ctx_val.object, allocator)
+        try deserializeContext(try fields.asObject(ctx_val), allocator)
     else
         ai_types.Context{ .messages = &.{} };
     errdefer {
@@ -1041,7 +1038,7 @@ fn deserializeCompleteRequest(
     }
 
     const options = if (obj.get("options")) |opts_val|
-        try deserializeStreamOptions(opts_val.object, allocator)
+        try deserializeStreamOptions(try fields.asObject(opts_val), allocator)
     else
         null;
     errdefer if (options) |opts| {
@@ -1060,11 +1057,11 @@ fn deserializeAbortRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.AbortRequest {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try fields.requiredString(obj, "target_stream_id");
     const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     const reason = if (obj.get("reason")) |r|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(r)))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1079,8 +1076,8 @@ fn deserializeModelsRequest(
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsRequest {
     const provider_id = if (obj.get("provider_id")) |value| blk: {
-        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
-        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+        try validateLength(try fields.asString(value), MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(value)));
     } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = provider_id;
@@ -1088,7 +1085,7 @@ fn deserializeModelsRequest(
     }
 
     const api = if (obj.get("api")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(value)))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -1097,8 +1094,8 @@ fn deserializeModelsRequest(
     }
 
     const model_id = if (obj.get("model_id")) |value| blk: {
-        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
-        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+        try validateLength(try fields.asString(value), MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(value)));
     } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = model_id;
@@ -1106,11 +1103,11 @@ fn deserializeModelsRequest(
     }
 
     const include_deprecated = if (obj.get("include_deprecated")) |value|
-        value.bool
+        try fields.asBool(value)
     else
         false;
     const include_login_required = if (obj.get("include_login_required")) |value|
-        value.bool
+        try fields.asBool(value)
     else
         true;
 
@@ -1127,9 +1124,9 @@ fn deserializeModelsResponse(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsResponse {
-    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
-    const cache_max_age_ms = try valueAsU64(obj.get("cache_max_age_ms").?);
-    const models_array = obj.get("models").?.array;
+    const fetched_at_ms = try fields.requiredInteger(obj, "fetched_at_ms");
+    const cache_max_age_ms = try valueAsU64(try fields.required(obj, "cache_max_age_ms"));
+    const models_array = try fields.requiredArray(obj, "models");
 
     const models = try allocator.alloc(protocol_types.ModelDescriptor, models_array.items.len);
     var allocated_count: usize = 0;
@@ -1139,7 +1136,7 @@ fn deserializeModelsResponse(
     }
 
     for (models_array.items, 0..) |item, idx| {
-        models[idx] = try deserializeModelDescriptor(item.object, allocator);
+        models[idx] = try deserializeModelDescriptor(try fields.asObject(item), allocator);
         allocated_count += 1;
     }
 
@@ -1154,38 +1151,38 @@ fn deserializeModelDescriptor(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelDescriptor {
-    const model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    const model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "model_ref")));
     errdefer {
         var mutable = model_ref;
         mutable.deinit(allocator);
     }
 
-    const model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    const model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "model_id")));
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    const display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "display_name")));
     errdefer {
         var mutable = display_name;
         mutable.deinit(allocator);
     }
 
-    const provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    const provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "provider_id")));
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    const api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "api")));
     errdefer {
         var mutable = api;
         mutable.deinit(allocator);
     }
 
     const base_url = if (obj.get("base_url")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(value)))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -1193,16 +1190,16 @@ fn deserializeModelDescriptor(
         mutable.deinit(allocator);
     }
 
-    const capabilities_array = obj.get("capabilities").?.array;
+    const capabilities_array = try fields.requiredArray(obj, "capabilities");
     const capabilities = try allocator.alloc(protocol_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = try parseModelCapability(item.string);
+        capabilities[idx] = try parseModelCapability(try fields.asString(item));
     }
 
     var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
     if (obj.get("metadata")) |metadata_value| {
-        const metadata_obj = metadata_value.object;
+        const metadata_obj = try fields.asObject(metadata_value);
         const metadata_items = try allocator.alloc(protocol_types.MetadataEntry, metadata_obj.count());
         var metadata_count: usize = 0;
         errdefer {
@@ -1214,7 +1211,7 @@ fn deserializeModelDescriptor(
         while (iter.next()) |entry| {
             metadata_items[metadata_count] = .{
                 .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(entry.value_ptr.*))),
             };
             metadata_count += 1;
         }
@@ -1229,19 +1226,19 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
-        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
+        .auth_status = parseAuthStatus(try fields.requiredString(obj, "auth_status")),
+        .lifecycle = try parseModelLifecycle(try fields.requiredString(obj, "lifecycle")),
         .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(obj.get("source").?.string),
+        .source = try parseModelSource(try fields.requiredString(obj, "source")),
         .context_window = if (obj.get("context_window")) |value| try valueAsU32(value) else null,
         .max_output_tokens = if (obj.get("max_output_tokens")) |value| try valueAsU32(value) else null,
-        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
+        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(try fields.asString(value)) else null,
         .metadata = metadata,
     };
 }
 
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
-    const acknowledged_id_str = obj.get("acknowledged_id").?.string;
+    const acknowledged_id_str = try fields.requiredString(obj, "acknowledged_id");
     const acknowledged_id = protocol_types.parseUlid(acknowledged_id_str) orelse return error.InvalidUlid;
 
     return .{
@@ -1253,23 +1250,23 @@ fn deserializeNack(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Nack {
-    const rejected_id_str = obj.get("rejected_id").?.string;
+    const rejected_id_str = try fields.requiredString(obj, "rejected_id");
     const rejected_id = protocol_types.parseUlid(rejected_id_str) orelse return error.InvalidUlid;
 
-    const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("reason").?.string));
+    const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "reason")));
     errdefer {
         var mutable_reason = reason;
         mutable_reason.deinit(allocator);
     }
 
     const error_code = if (obj.get("error_code")) |code_val|
-        parseErrorCode(code_val.string)
+        parseErrorCode(try fields.asString(code_val))
     else
         null;
 
     var supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initBorrowed(&.{});
     if (obj.get("supported_versions")) |versions_val| {
-        const versions_arr = versions_val.array;
+        const versions_arr = try fields.asArray(versions_val);
         const versions = try allocator.alloc(protocol_types.OwnedSlice(u8), versions_arr.items.len);
         var allocated_count: usize = 0;
         errdefer {
@@ -1277,7 +1274,7 @@ fn deserializeNack(
             allocator.free(versions);
         }
         for (versions_arr.items, 0..) |item, i| {
-            versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, item.string));
+            versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(item)));
             allocated_count += 1;
         }
         supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initOwned(versions);
@@ -1295,10 +1292,10 @@ fn deserializeStreamError(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamError {
-    const code_str = obj.get("code").?.string;
+    const code_str = try fields.requiredString(obj, "code");
     const code = parseErrorCode(code_str);
 
-    const message = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("message").?.string));
+    const message = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "message")));
 
     return .{
         .code = code,
@@ -1310,7 +1307,7 @@ fn deserializePong(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Pong {
-    const ping_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("ping_id").?.string));
+    const ping_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "ping_id")));
     return .{ .ping_id = ping_id };
 }
 
@@ -1319,7 +1316,7 @@ fn deserializeGoodbye(
     allocator: std.mem.Allocator,
 ) !protocol_types.Goodbye {
     const reason = if (obj.get("reason")) |r|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(r)))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1327,7 +1324,7 @@ fn deserializeGoodbye(
 }
 
 fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try fields.requiredString(obj, "target_stream_id");
     const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     return .{ .target_stream_id = target_id };
@@ -1337,11 +1334,11 @@ fn deserializeSync(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Sync {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try fields.requiredString(obj, "target_stream_id");
     const target_stream_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     const partial = if (obj.get("partial")) |p|
-        try transport.parseAssistantMessage(p.object, allocator)
+        try transport.parseAssistantMessage(try fields.asObject(p), allocator)
     else
         null;
 
@@ -1421,13 +1418,13 @@ fn deserializeContext(
     allocator: std.mem.Allocator,
 ) !ai_types.Context {
     var system_prompt = if (obj.get("system_prompt")) |sp|
-        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp.string))
+        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(sp)))
     else
         ai_types.OwnedSlice(u8).initBorrowed("");
     errdefer system_prompt.deinit(allocator);
 
     const messages_arr = if (obj.get("messages")) |msgs_val|
-        msgs_val.array
+        try fields.asArray(msgs_val)
     else {
         const empty_messages = try allocator.alloc(ai_types.Message, 0);
         return ai_types.Context{
@@ -1438,19 +1435,30 @@ fn deserializeContext(
     };
 
     const messages = try allocator.alloc(ai_types.Message, messages_arr.items.len);
-    errdefer allocator.free(messages);
+    var messages_initialized: usize = 0;
+    errdefer {
+        for (messages[0..messages_initialized]) |*message| message.deinit(allocator);
+        allocator.free(messages);
+    }
 
     for (messages_arr.items, 0..) |item, i| {
-        messages[i] = try deserializeMessage(item.object, allocator);
+        messages[i] = try deserializeMessage(try fields.asObject(item), allocator);
+        messages_initialized += 1;
     }
 
     var tools: ?[]ai_types.Tool = null;
-    if (obj.get("tools")) |tools_val| {
-        const tools_arr = tools_val.array;
-        tools = try allocator.alloc(ai_types.Tool, tools_arr.items.len);
-        for (tools_arr.items, 0..) |item, i| {
-            tools.?[i] = try deserializeTool(item.object, allocator);
+    if (try fields.optionalArray(obj, "tools")) |tools_arr| {
+        const allocated = try allocator.alloc(ai_types.Tool, tools_arr.items.len);
+        var tools_initialized: usize = 0;
+        errdefer {
+            for (allocated[0..tools_initialized]) |*tool| tool.deinit(allocator);
+            allocator.free(allocated);
         }
+        for (tools_arr.items, 0..) |item, i| {
+            allocated[i] = try deserializeTool(try fields.asObject(item), allocator);
+            tools_initialized += 1;
+        }
+        tools = allocated;
     }
 
     return .{
@@ -1465,11 +1473,11 @@ fn deserializeMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Message {
-    const role = obj.get("role").?.string;
+    const role = try fields.requiredString(obj, "role");
 
     if (std.mem.eql(u8, role, "user")) {
-        const timestamp: i64 = if (obj.get("timestamp")) |ts| ts.integer else 0;
-        const content = try deserializeUserContent(obj.get("content").?, allocator);
+        const timestamp: i64 = if (obj.get("timestamp")) |ts| try fields.asInteger(ts) else 0;
+        const content = try deserializeUserContent(try fields.required(obj, "content"), allocator);
 
         return .{ .user = .{
             .content = content,
@@ -1482,19 +1490,27 @@ fn deserializeMessage(
     }
 
     if (std.mem.eql(u8, role, "tool")) {
-        const tool_call_id = try allocator.dupe(u8, obj.get("tool_call_id").?.string);
-        const tool_name = try allocator.dupe(u8, obj.get("tool_name").?.string);
-        const timestamp: i64 = if (obj.get("timestamp")) |ts| ts.integer else 0;
-        const is_error = if (obj.get("is_error")) |ie| ie.bool else false;
+        const tool_call_id = try allocator.dupe(u8, try fields.requiredString(obj, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, try fields.requiredString(obj, "tool_name"));
+        errdefer allocator.free(tool_name);
+        const timestamp: i64 = if (obj.get("timestamp")) |ts| try fields.asInteger(ts) else 0;
+        const is_error = if (obj.get("is_error")) |ie| try fields.asBool(ie) else false;
 
-        const content_arr = if (obj.get("content")) |c| c.array else return error.MissingContent;
+        const content_arr = if (obj.get("content")) |c| try fields.asArray(c) else return error.MissingContent;
         const content = try allocator.alloc(ai_types.UserContentPart, content_arr.items.len);
+        var content_initialized: usize = 0;
+        errdefer {
+            for (content[0..content_initialized]) |*part| part.deinit(allocator);
+            allocator.free(content);
+        }
         for (content_arr.items, 0..) |item, i| {
-            content[i] = try deserializeUserContentPart(item.object, allocator);
+            content[i] = try deserializeUserContentPart(try fields.asObject(item), allocator);
+            content_initialized += 1;
         }
 
         const details_json = if (obj.get("details_json")) |dj|
-            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj.string))
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(dj)))
         else
             ai_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1519,8 +1535,14 @@ fn deserializeUserContent(
         .string => |s| return .{ .text = try allocator.dupe(u8, s) },
         .array => |arr| {
             const parts = try allocator.alloc(ai_types.UserContentPart, arr.items.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (parts[0..initialized]) |*part| part.deinit(allocator);
+                allocator.free(parts);
+            }
             for (arr.items, 0..) |item, i| {
-                parts[i] = try deserializeUserContentPart(item.object, allocator);
+                parts[i] = try deserializeUserContentPart(try fields.asObject(item), allocator);
+                initialized += 1;
             }
             return .{ .parts = parts };
         },
@@ -1532,20 +1554,22 @@ fn deserializeUserContentPart(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.UserContentPart {
-    const type_str = obj.get("type").?.string;
+    const type_str = try fields.requiredString(obj, "type");
 
     if (std.mem.eql(u8, type_str, "text")) {
-        const text = try allocator.dupe(u8, obj.get("text").?.string);
+        const text = try allocator.dupe(u8, try fields.requiredString(obj, "text"));
+        errdefer allocator.free(text);
         const text_signature = if (obj.get("text_signature")) |sig|
-            try allocator.dupe(u8, sig.string)
+            try allocator.dupe(u8, try fields.asString(sig))
         else
             null;
         return .{ .text = .{ .text = text, .text_signature = text_signature } };
     }
 
     if (std.mem.eql(u8, type_str, "image")) {
-        const data = try allocator.dupe(u8, obj.get("data").?.string);
-        const mime_type = try allocator.dupe(u8, obj.get("mime_type").?.string);
+        const data = try allocator.dupe(u8, try fields.requiredString(obj, "data"));
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, try fields.requiredString(obj, "mime_type"));
         return .{ .image = .{ .data = data, .mime_type = mime_type } };
     }
 
@@ -1556,8 +1580,10 @@ fn deserializeTool(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Tool {
-    const name = try allocator.dupe(u8, obj.get("name").?.string);
-    const description = try allocator.dupe(u8, obj.get("description").?.string);
+    const name = try allocator.dupe(u8, try fields.requiredString(obj, "name"));
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, try fields.requiredString(obj, "description"));
+    errdefer allocator.free(description);
 
     const schema_json = if (obj.get("parameters_schema_json")) |schema| switch (schema) {
         .string => |s| try allocator.dupe(u8, s),
@@ -1585,7 +1611,7 @@ fn deserializeStreamOptions(
     errdefer opts.deinit(allocator);
 
     if (obj.get("api_key")) |key| {
-        opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key.string));
+        opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(key)));
     }
     if (obj.get("temperature")) |temp| {
         opts.temperature = switch (temp) {
@@ -1598,45 +1624,45 @@ fn deserializeStreamOptions(
         opts.max_tokens = try valueAsU32(max);
     }
     if (obj.get("cache_retention")) |ret| {
-        opts.cache_retention = parseCacheRetention(ret.string);
+        opts.cache_retention = parseCacheRetention(try fields.asString(ret));
     }
     if (obj.get("session_id")) |sid| {
-        opts.session_id = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sid.string));
+        opts.session_id = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(sid)));
     }
     if (obj.get("thinking_enabled")) |te| {
-        opts.thinking_enabled = te.bool;
+        opts.thinking_enabled = try fields.asBool(te);
     }
     if (obj.get("thinking_budget_tokens")) |tbt| {
         opts.thinking_budget_tokens = try valueAsU32(tbt);
     }
     if (obj.get("thinking_effort")) |effort| {
-        opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
+        opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(effort)));
     }
     if (obj.get("reasoning_effort")) |effort| {
-        opts.reasoning_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
+        opts.reasoning_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(effort)));
     }
     if (obj.get("reasoning_summary")) |summary| {
-        opts.reasoning_summary = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, summary.string));
+        opts.reasoning_summary = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(summary)));
     }
     if (obj.get("include_reasoning_encrypted")) |ire| {
-        opts.include_reasoning_encrypted = ire.bool;
+        opts.include_reasoning_encrypted = try fields.asBool(ire);
     }
     if (obj.get("reasoning_enabled")) |re| {
-        opts.reasoning_enabled = re.bool;
+        opts.reasoning_enabled = try fields.asBool(re);
     }
     if (obj.get("service_tier")) |tier| {
-        opts.service_tier = parseServiceTier(tier.string);
+        opts.service_tier = parseServiceTier(try fields.asString(tier));
     }
     if (obj.get("metadata")) |meta| {
         opts.metadata = .{
-            .user_id = if (meta.object.get("user_id")) |uid|
-                ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, uid.string))
+            .user_id = if ((try fields.asObject(meta)).get("user_id")) |uid|
+                ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(uid)))
             else
                 ai_types.OwnedSlice(u8).initBorrowed(""),
         };
     }
     if (obj.get("tool_choice")) |choice| {
-        const choice_type = choice.object.get("type").?.string;
+        const choice_type = try fields.requiredString(try fields.asObject(choice), "type");
         if (std.mem.eql(u8, choice_type, "auto")) {
             opts.tool_choice = .auto;
         } else if (std.mem.eql(u8, choice_type, "none")) {
@@ -1644,7 +1670,7 @@ fn deserializeStreamOptions(
         } else if (std.mem.eql(u8, choice_type, "required")) {
             opts.tool_choice = .required;
         } else if (std.mem.eql(u8, choice_type, "function")) {
-            const function_name = try allocator.dupe(u8, choice.object.get("function").?.string);
+            const function_name = try allocator.dupe(u8, try fields.requiredString(try fields.asObject(choice), "function"));
             opts.tool_choice = .{ .function = function_name };
             opts.owned_tool_choice_function = ai_types.OwnedSlice(u8).initOwned(function_name);
         }
@@ -2480,7 +2506,6 @@ test "deserializeEnvelope with stream_request frees all memory" {
     try std.testing.expectEqualStrings("GPT-4o", envelope.payload.stream_request.model.name);
     try std.testing.expect(envelope.payload.stream_request.model.is_owned);
     try std.testing.expect(envelope.payload.stream_request.context.is_owned);
-
 }
 
 test "deserializeEnvelope with complete_request frees all memory" {
@@ -2516,7 +2541,6 @@ test "deserializeEnvelope with complete_request frees all memory" {
     try std.testing.expectEqualStrings("claude-3", envelope.payload.complete_request.model.id);
     try std.testing.expect(envelope.payload.complete_request.model.is_owned);
     try std.testing.expect(envelope.payload.complete_request.context.is_owned);
-
 }
 
 test "deserializeEnvelope with complex context frees all memory" {
@@ -2567,7 +2591,6 @@ test "deserializeEnvelope with complex context frees all memory" {
 
     try std.testing.expect(envelope.payload == .stream_request);
     try std.testing.expect(envelope.payload.stream_request.context.messages.len == 2);
-
 }
 
 test "serializeEnvelope with goodbye payload" {
@@ -3123,4 +3146,132 @@ test "deserializeEnvelope accepts stream_request with model id at exactly 512 ch
     defer env.deinit(allocator);
     try std.testing.expect(env.payload == .stream_request);
     try std.testing.expectEqualStrings(exact_id, env.payload.stream_request.model.id);
+}
+
+const VALID_COMPLETE_REQUEST =
+    \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"role":"user","content":"hi"}]}}}
+;
+
+test "provider envelope accepts the malformed-input baseline" {
+    const allocator = std.testing.allocator;
+    var env = try deserializeEnvelope(VALID_COMPLETE_REQUEST, allocator);
+    defer env.deinit(allocator);
+    try std.testing.expect(env.payload == .complete_request);
+    try std.testing.expectEqual(@as(u64, 1), env.sequence);
+}
+
+test "provider envelope rejects missing required root fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "provider envelope rejects wrong-typed root fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":7,"stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":7,"message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":7,"sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":"1","version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"in_reply_to":7,"payload":{}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "provider envelope rejects out-of-range root numbers" {
+    const allocator = std.testing.allocator;
+    const negative_sequence =
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":-1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const oversized_version =
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":99999,"payload":{}}
+    ;
+
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_sequence, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_version, allocator));
+}
+
+test "provider envelope rejects non-object documents" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("[1,2,3]", allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("\"hello\"", allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("null", allocator));
+}
+
+test "provider envelope rejects malformed complete_request payloads" {
+    const allocator = std.testing.allocator;
+    const missing_model =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"context":{"messages":[]}}}
+    ;
+    const model_as_string =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":"m","context":{"messages":[]}}}
+    ;
+    const model_as_null =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":null,"context":{"messages":[]}}}
+    ;
+    const model_missing_id =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[]}}}
+    ;
+    const messages_not_array =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":"hi"}}}
+    ;
+    const message_missing_role =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"content":"hi"}]}}}
+    ;
+    const message_missing_content =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"role":"user"}]}}}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_model, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(model_as_string, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(model_as_null, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(model_missing_id, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(messages_not_array, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(message_missing_role, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(message_missing_content, allocator));
+}
+
+test "provider envelope rejects malformed assistant content without leaking" {
+    const allocator = std.testing.allocator;
+    const bad_tool_result =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"role":"tool","tool_call_id":"c1"}]}}}
+    ;
+    const bad_content_part =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"role":"user","content":[{"type":"text"}]}]}}}
+    ;
+    const bad_tool_definition =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[],"tools":[{"name":"t"}]}}}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_tool_result, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_content_part, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_tool_definition, allocator));
 }

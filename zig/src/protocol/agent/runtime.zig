@@ -3,10 +3,13 @@ const agent_server = @import("agent_server");
 const agent_client = @import("agent_client");
 const agent_envelope = @import("agent_envelope");
 const in_process = @import("transports/in_process");
+const compat = @import("compat");
+const fields = @import("envelope_fields");
 
 const AgentProtocolServer = agent_server.AgentProtocolServer;
 const AgentProtocolClient = agent_client.AgentProtocolClient;
 const PipeTransport = in_process.SerializedPipe;
+const agent_types = agent_envelope.protocol_types;
 
 pub const AgentProtocolRuntime = struct {
     server: *AgentProtocolServer,
@@ -20,7 +23,10 @@ pub const AgentProtocolRuntime = struct {
         while (try recv.readLine(self.allocator)) |line| {
             defer self.allocator.free(line);
 
-            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch continue;
+            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
+                self.sendErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                continue;
+            };
             defer env.deinit(self.allocator);
 
             if (try self.server.handleEnvelope(env)) |response| {
@@ -35,6 +41,43 @@ pub const AgentProtocolRuntime = struct {
                 try sender.flush();
             }
         }
+    }
+
+    fn sendErrorForRejectedInput(self: *Self, raw_json: []const u8, reason: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
+        defer parsed.deinit();
+
+        const obj = fields.rootObject(parsed.value) catch return;
+
+        const session_id = blk: {
+            const text = (fields.optionalString(obj, "session_id") catch break :blk null) orelse break :blk null;
+            break :blk agent_types.parseSessionId(text);
+        } orelse std.mem.zeroes(agent_types.SessionId);
+
+        const in_reply_to = blk: {
+            const text = (fields.optionalString(obj, "message_id") catch break :blk null) orelse break :blk null;
+            break :blk agent_types.parseUlid(text);
+        } orelse std.mem.zeroes(agent_types.Ulid);
+
+        var env = agent_types.Envelope{
+            .session_id = session_id,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = in_reply_to,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{
+                .code = .invalid_request,
+                .message = try self.allocator.dupe(u8, reason),
+            } },
+        };
+        defer env.deinit(self.allocator);
+
+        const json = try agent_envelope.serializeEnvelope(env, self.allocator);
+        defer self.allocator.free(json);
+
+        var sender = self.pipe.serverSender();
+        try sender.write(json);
+        try sender.flush();
     }
 
     pub fn pumpServerOutbox(self: *Self) !usize {
@@ -210,4 +253,48 @@ test "AgentProtocolRuntime outbox delivery is transactional under allocation fai
         if (std.mem.find(u8, line, "agent_result") != null) result_lines += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), result_lines);
+}
+
+test "AgentProtocolRuntime answers malformed inbound envelopes with agent_error" {
+    const allocator = std.testing.allocator;
+
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    var pipe = PipeTransport.init(allocator);
+    defer pipe.deinit();
+
+    const malformed = [_][]const u8{
+        \\{"type":"agent_message","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"agent_message","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"agent_start","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
+        ,
+    };
+
+    for (malformed) |line| {
+        var sender = pipe.clientSender();
+        try sender.write(line);
+        try sender.flush();
+
+        var runtime = AgentProtocolRuntime{
+            .server = &server,
+            .pipe = &pipe,
+            .allocator = allocator,
+        };
+        try runtime.pumpClientMessages();
+
+        var recv = pipe.clientReceiver();
+        const reply = (try recv.readLine(allocator)) orelse return error.NoAgentErrorEmitted;
+        defer allocator.free(reply);
+
+        var parsed = try agent_envelope.deserializeEnvelope(reply, allocator);
+        defer parsed.deinit(allocator);
+        try std.testing.expect(parsed.payload == .agent_error);
+        try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, parsed.payload.agent_error.code);
+        try std.testing.expectEqual(@as(u64, 0), parsed.sequence);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
 }

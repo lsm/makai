@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat");
 const tool_envelope = @import("tool_envelope");
 const in_process = @import("transports/in_process");
+const fields = @import("envelope_fields");
 
 const protocol_types = tool_envelope.protocol_types;
 const PipeTransport = in_process.SerializedPipe;
@@ -23,6 +24,12 @@ pub const ProcessServerEnvelopeFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!void;
 
+fn ulidFieldOrZero(obj: std.json.ObjectMap, field: []const u8) protocol_types.Ulid {
+    const value = fields.optionalString(obj, field) catch return std.mem.zeroes(protocol_types.Ulid);
+    const text = value orelse return std.mem.zeroes(protocol_types.Ulid);
+    return protocol_types.parseUlid(text) orelse std.mem.zeroes(protocol_types.Ulid);
+}
+
 pub const ToolProtocolRuntime = struct {
     pipe: *PipeTransport,
     allocator: std.mem.Allocator,
@@ -39,7 +46,10 @@ pub const ToolProtocolRuntime = struct {
         while (try recv.readLine(self.allocator)) |line| {
             defer self.allocator.free(line);
 
-            var env = tool_envelope.deserializeEnvelope(line, self.allocator) catch continue;
+            var env = tool_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
+                self.sendToolErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                continue;
+            };
             defer env.deinit(self.allocator);
 
             if (try self.handle_client_envelope_fn(self.server_ctx, env, self.allocator)) |response| {
@@ -54,6 +64,39 @@ pub const ToolProtocolRuntime = struct {
                 try sender.flush();
             }
         }
+    }
+
+    fn sendToolErrorForRejectedInput(self: *Self, raw_json: []const u8, reason: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
+        defer parsed.deinit();
+
+        const obj = fields.rootObject(parsed.value) catch return;
+
+        const server_id = ulidFieldOrZero(obj, "server_id");
+        const message_id = ulidFieldOrZero(obj, "message_id");
+        const execution_id = ulidFieldOrZero(fields.optionalObject(obj, "payload") catch null orelse obj, "execution_id");
+
+        const message = try self.allocator.dupe(u8, reason);
+        var env = protocol_types.Envelope{
+            .server_id = server_id,
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = message_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .tool_error = .{
+                .execution_id = execution_id,
+                .code = .invalid_request,
+                .message = message,
+            } },
+        };
+        defer env.deinit(self.allocator);
+
+        const json = try tool_envelope.serializeEnvelope(env, self.allocator);
+        defer self.allocator.free(json);
+
+        var sender = self.pipe.serverSender();
+        try sender.write(json);
+        try sender.flush();
     }
 
     pub fn pumpServerOutbox(self: *Self) !usize {
