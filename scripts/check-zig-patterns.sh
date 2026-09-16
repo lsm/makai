@@ -32,7 +32,22 @@ if [[ -n "$all_crypto_random" ]]; then
 fi
 
 ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|\.Random[[:space:]]*[.;]'
-comment_line_filter='^[^:]+:[0-9]+:[[:space:]]*//'
+secure_entropy_pattern='\b(fillSecureBytes|secureBytes|secureIntRangeLessThan|randomSecure)\b'
+
+strip_noncode() {
+  sed 's/\\"//g; s/"[^"]*"//g; s|//.*||'
+}
+
+code_matches_only() {
+  local pattern="$1" prefix_fields="$2" hit content stripped
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    content="$hit"
+    for ((i = 0; i < prefix_fields; i++)); do content="${content#*:}"; done
+    stripped="$(printf '%s' "$content" | strip_noncode)"
+    if printf '%s' "$stripped" | grep -qE "$pattern"; then printf '%s\n' "$hit"; fi
+  done
+}
 
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
@@ -46,6 +61,7 @@ secure_random_files=(
 ordinary_entropy_definition_file="zig/src/compat/random.zig"
 
 expected_ordinary_entropy_sites="$(cat <<'SITES'
+zig/src/compat/random.zig|        const ordinary_value = randomIntRangeLessThan(usize, 62);
 zig/src/compat/random.zig|        const ordinary_value = randomIntRangeLessThan(usize, 62);
 zig/src/compat/random.zig|        return .{ .prng = std.Random.DefaultPrng.init(seed) };
 zig/src/compat/random.zig|        self.prng.random().bytes(buf);
@@ -91,7 +107,7 @@ for file in "${secure_random_files[@]}"; do
     exit 1
   fi
   secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" \
-    | grep -vE "^[0-9]+:[[:space:]]*//" || true)"
+    | code_matches_only "$ordinary_entropy_pattern" 1 || true)"
   if [[ -n "$secure_file_matches" ]]; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
     echo "$secure_file_matches" >&2
@@ -107,7 +123,7 @@ if [[ ! -f "$ordinary_entropy_definition_file" ]]; then
 fi
 
 actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
-  | grep -vE "$comment_line_filter" \
+  | code_matches_only "$ordinary_entropy_pattern" 2 \
   | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
 
 undeclared_ordinary_entropy="$(comm -13 \
@@ -127,6 +143,48 @@ if [[ -n "$stale_ordinary_entropy" ]]; then
   echo "[patterns] expected_ordinary_entropy_sites declares a call site that no longer exists:" >&2
   echo "$stale_ordinary_entropy" >&2
   echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+  exit 1
+fi
+
+echo "[patterns] checking secure entropy call sites are present..."
+expected_secure_entropy_sites="$(cat <<'SECURE'
+zig/src/compat/random.zig|        const secure_value = secureIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        const secure_value = secureIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        fillSecureBytes(&bytes);
+zig/src/compat/random.zig|    const SecureHelper = @TypeOf(fillSecureBytes);
+zig/src/compat/random.zig|    const first = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const second = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 0);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    defaultIo().randomSecure(buf) catch |err| {
+zig/src/compat/random.zig|    fillSecureBytes(&empty);
+zig/src/compat/random.zig|    fillSecureBytes(buf);
+zig/src/compat/random.zig|    try std.testing.expect(fillSecureBytes != fillRandomBytes);
+zig/src/compat/random.zig|    try std.testing.expectEqual(@as(usize, 0), secureIntRangeLessThan(usize, 1));
+zig/src/compat/random.zig|pub fn fillSecureBytes(buf: []u8) void {
+zig/src/compat/random.zig|pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
+zig/src/oauth/pkce.zig|    return generatePKCEWithRandom(compat.random.fillSecureBytes);
+zig/src/protocol/provider/types.zig|    return generateSessionIdWithRandomInt(compat.random.secureIntRangeLessThan);
+zig/src/protocol/provider/types.zig|    return generateUlidWithRandom(compat.random.fillSecureBytes);
+zig/src/transports/websocket.zig|        compat.random.fillSecureBytes(&mask);
+zig/src/transports/websocket.zig|    compat.random.fillSecureBytes(&nonce);
+zig/src/tui/app.zig|    compat.random.fillSecureBytes(&random_bytes);
+zig/src/utils/oauth/openai_codex.zig|    compat.random.fillSecureBytes(&random_bytes);
+zig/src/utils/oauth/pkce.zig|    return generateWithRandom(allocator, compat.random.fillSecureBytes);
+SECURE
+)"
+
+actual_secure_entropy_sites="$(grep -RnsE --include="*.zig" "$secure_entropy_pattern" zig/src \
+  | code_matches_only "$secure_entropy_pattern" 2 \
+  | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
+
+if [[ "$(printf "%s\n" "$expected_secure_entropy_sites" | sort)" != "$(printf "%s\n" "$actual_secure_entropy_sites" | sort)" ]]; then
+  echo "[patterns] secure entropy call sites changed:" >&2
+  diff <(printf "%s\n" "$expected_secure_entropy_sites" | sort) \
+       <(printf "%s\n" "$actual_secure_entropy_sites" | sort) >&2 || true
+  echo "[patterns] a security-sensitive generator must keep consuming secure entropy; declare intentional changes here" >&2
   exit 1
 fi
 
