@@ -152,7 +152,7 @@ The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see
 │    register_builtins                                         │
 ├──────────────────────────────────────────────────────────────┤
 │  Utils, auth, compat: utils/ (oauth/*, auth_resolver, retry, │
-│    sanitize, overflow, pre_transform, aws_sigv4, ...),       │
+│    sanitize, overflow, pre_transform, provider_caps, ...),   │
 │    auth/providers.zig, compat/ (time, random, fs, stdio,     │
 │    http, net wrappers over Zig 0.16 std.Io)                  │
 └──────────────────────────────────────────────────────────────┘
@@ -200,7 +200,7 @@ Ownership and auth boundary (non-negotiable):
 
 The four protocol directories are **not** symmetric, so do not go looking for a file by analogy: `provider/` has `client.zig` + `server.zig` (plus the partial serializer/reconstructor and `content_partial.zig`), `agent/` has `client.zig` + `server.zig`, `auth/` has `server.zig` and **no client module**, and `tool/` has neither at top level. `tool/local_runtime.zig` holds `ToolProtocolServer`, `ToolProtocolClient`, and `LocalToolProtocol` together, with `tool/runtime.zig` providing `ToolProtocolRuntime`.
 
-**`agent/`**: `AgentEvent` (agent_start, turn_start, message_start/update, tool_execution_start/end, turn_end, agent_end, error), `AgentTool`, `AgentLoopConfig`, `AgentContext`, `AgentEventStream`. `agent_loop.zig` supports steering/follow-up messages and sequential tool execution with streaming updates. `zig/docs/agent-loop-design.md` describes the design.
+**`agent/`**: `AgentEvent` has twelve variants — `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update`, `message_end`, `context_usage`, `prompt_segment_usage`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`. There is **no** `error` variant: failure and cancellation surface through `AgentEndPayload.termination`, an optional `AgentTermination` of `max_turns` or `cancelled`. Also `AgentTool`, `AgentLoopConfig`, `AgentContext`, `AgentEventStream`. `agent_loop.zig` supports steering/follow-up messages and sequential tool execution with streaming updates. `zig/docs/agent-loop-design.md` describes the design.
 
 **`tools/registry.zig`**: `ToolRegistry.registerDefaults()` installs the built-in local tools; `registerMcpBridge` adds MCP-provided tools. `tools/permission.zig` classifies calls (read/write/shell) into allow/deny/prompt decisions and drives the TUI approval flow.
 
@@ -239,7 +239,7 @@ Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completion
 
 ## TUI
 
-`zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (the ratified 10 slash commands), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
+`zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (10 ratified `CommandKind`s — help, model, login, provider, status, resume, permissions, clear, abort, quit — exposed as 12 accepted names, since `/sessions` aliases `/resume` and `/perm` aliases `/permissions`), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
 
 ## Zig Conventions
 
