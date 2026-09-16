@@ -87,7 +87,11 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
 
 fn placeholderFor(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]u8 {
     if (state.mode == .login_input) return allocator.dupe(u8, if (state.login_input_secret) "paste the secret and press Enter" else "type your answer and press Enter");
-    if (state.mode == .approval) return allocator.dupe(u8, "y / a / n to decide, or type /abort");
+    if (state.mode == .approval) {
+        const queued = state.queue.total();
+        if (queued > 0) return std.fmt.allocPrint(allocator, "y / a / n to decide · {d} queued", .{queued});
+        return allocator.dupe(u8, "y / a / n to decide, or type /abort");
+    }
     if (state.status.streaming) {
         const queued = state.queue.total();
         if (queued > 0) return std.fmt.allocPrint(allocator, "{d} queued · type to steer more…", .{queued});
@@ -295,6 +299,12 @@ test "streaming placeholder carries the queued count at any width" {
     const rendered = try render(std.testing.allocator, &state, .{ .width = 30 });
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "1 queued") != null);
+
+    state.mode = .approval;
+    const approval = try placeholderFor(std.testing.allocator, &state);
+    defer std.testing.allocator.free(approval);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "y / a / n to decide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "1 queued") != null);
 }
 
 test "composer border reflects mode and streaming state" {
