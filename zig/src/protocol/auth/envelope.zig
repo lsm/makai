@@ -271,8 +271,9 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         if (providers_value != .array) return error.InvalidPayloadType;
 
         const providers = try allocator.alloc(auth_types.AuthProviderInfo, providers_value.array.items.len);
+        var initialized: usize = 0;
         errdefer {
-            for (providers) |*provider| {
+            for (providers[0..initialized]) |*provider| {
                 provider.deinit(allocator);
             }
             allocator.free(providers);
@@ -286,15 +287,19 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             var name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(provider_obj, "name")));
             errdefer name.deinit(allocator);
             const auth_status = std.meta.stringToEnum(auth_types.AuthStatus, try fields.requiredString(provider_obj, "auth_status")) orelse .unknown;
+
+            var last_error = OwnedSlice(u8).initBorrowed("");
+            if (try fields.optionalString(provider_obj, "last_error")) |value| {
+                last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
+            }
+
             providers[i] = .{
                 .id = id,
                 .name = name,
                 .auth_status = auth_status,
+                .last_error = last_error,
             };
-
-            if (try fields.optionalString(provider_obj, "last_error")) |last_error| {
-                providers[i].last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, last_error));
-            }
+            initialized = i + 1;
         }
 
         return .{ .auth_providers_response = .{
@@ -544,4 +549,34 @@ test "auth envelope rejects malformed payload fields without leaking" {
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_url_wrong_typed, allocator));
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_instructions_wrong_typed, allocator));
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_error_code_wrong_typed, allocator));
+}
+
+fn authProvidersResponseProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated","last_error":"none"},{"id":"openai","name":"OpenAI","auth_status":"unknown","last_error":"expired"}]}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "auth_providers_response survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, authProvidersResponseProbe, .{});
+}
+
+test "a malformed provider entry after a good one is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai"}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai","name":7,"auth_status":"unknown"}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai","name":"OpenAI","auth_status":"unknown","last_error":7}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},7]}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }

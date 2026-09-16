@@ -264,8 +264,18 @@ fn parseSessionIdOrError(str: []const u8) ?agent_types.SessionId {
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
     if (std.mem.eql(u8, type_str, "agent_start")) {
         const config = try allocator.dupe(u8, try fields.requiredString(payload, "config_json"));
-        var result = agent_types.AgentStartRequest{ .config_json = config };
-        if (try fields.optionalString(payload, "system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        errdefer allocator.free(config);
+
+        var system_prompt = OwnedSlice(u8).initBorrowed("");
+        errdefer system_prompt.deinit(allocator);
+        if (try fields.optionalString(payload, "system_prompt")) |v| {
+            system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        }
+
+        var result = agent_types.AgentStartRequest{
+            .config_json = config,
+            .system_prompt = system_prompt,
+        };
         if (try fields.optionalString(payload, "session_id")) |v| {
             result.session_id = try parseSessionIdRequired(v);
         } else if (try fields.optionalString(payload, "resume_session_id")) |v| {
@@ -275,12 +285,19 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
         const msg = try allocator.dupe(u8, try fields.requiredString(payload, "message_json"));
-        var req = agent_types.AgentMessageRequest{
-            .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")),
+        errdefer allocator.free(msg);
+        const session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id"));
+
+        var options_json = OwnedSlice(u8).initBorrowed("");
+        if (try fields.optionalString(payload, "options_json")) |v| {
+            options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        }
+
+        return .{ .agent_message = .{
+            .session_id = session_id,
             .message_json = msg,
-        };
-        if (try fields.optionalString(payload, "options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        return .{ .agent_message = req };
+            .options_json = options_json,
+        } };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
         var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")) };
@@ -992,4 +1009,24 @@ test "agent envelope rejects malformed payload fields without leaking" {
     try std.testing.expectError(error.MissingField, deserializeEnvelope(tool_list_missing_description, allocator));
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(tool_list_not_array, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(tool_execute_missing_args, allocator));
+}
+
+test "a wrong-typed optional after an owned field is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","system_prompt":7}}
+        ,
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","system_prompt":"hi","session_id":"too-short"}}
+        ,
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","resume_session_id":"too-short"}}
+        ,
+        \\{"type":"agent_message","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":2,"timestamp":1,"version":1,"payload":{"message_json":"{}","session_id":"too-short"}}
+        ,
+        \\{"type":"agent_message","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":2,"timestamp":1,"version":1,"payload":{"message_json":"{}","session_id":"Abcdefghijklmnopqrstu","options_json":7}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }

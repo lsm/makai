@@ -313,6 +313,7 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
     if (std.mem.eql(u8, type_str, "tool_register")) {
         const tool = try deserializeToolMetadata(try fields.requiredObject(payload, "tool"), allocator);
+        errdefer freeToolMetadata(allocator, tool);
         var req = tool_types.ToolRegisterRequest{ .tool = tool };
         if (try fields.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_register = req };
@@ -342,8 +343,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
         const tools_arr = try fields.requiredArray(payload, "tools");
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tools[0..initialized]) |tool| freeToolMetadata(allocator, tool);
+            allocator.free(tools);
+        }
         for (tools_arr.items, 0..) |t, i| {
             tools[i] = try deserializeToolMetadata(try fields.asObject(t), allocator);
+            initialized = i + 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
@@ -592,15 +599,31 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     return error.InvalidPayloadType;
 }
 
+fn freeToolMetadata(allocator: std.mem.Allocator, tool: tool_types.ToolMetadata) void {
+    allocator.free(tool.name);
+    allocator.free(tool.description);
+    allocator.free(tool.parameters_schema_json);
+    allocator.free(tool.version);
+    if (tool.required_permissions) |perms| {
+        for (perms) |p| allocator.free(p);
+        allocator.free(perms);
+    }
+}
+
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
     var required_permissions: ?[]const []const u8 = null;
-    if (obj.get("required_permissions")) |permissions_value| {
-        const permissions_arr = permissions_value.array;
+    var permissions_filled: usize = 0;
+    errdefer if (required_permissions) |perms| {
+        for (perms[0..permissions_filled]) |p| allocator.free(p);
+        allocator.free(perms);
+    };
+    if (try fields.optionalArray(obj, "required_permissions")) |permissions_arr| {
         const permissions = try allocator.alloc([]const u8, permissions_arr.items.len);
-        for (permissions_arr.items, 0..) |permission, i| {
-            permissions[i] = try allocator.dupe(u8, permission.string);
-        }
         required_permissions = permissions;
+        for (permissions_arr.items, 0..) |permission, i| {
+            permissions[i] = try allocator.dupe(u8, try fields.asString(permission));
+            permissions_filled = i + 1;
+        }
     }
 
     const meta_name = try allocator.dupe(u8, try fields.requiredString(obj, "name"));
@@ -609,11 +632,13 @@ fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator
     errdefer allocator.free(meta_description);
     const meta_schema = try allocator.dupe(u8, try fields.requiredString(obj, "parameters_schema_json"));
     errdefer allocator.free(meta_schema);
+    const meta_version = try allocator.dupe(u8, try fields.optionalString(obj, "version") orelse "1.0.0");
+    errdefer allocator.free(meta_version);
     return .{
         .name = meta_name,
         .description = meta_description,
         .parameters_schema_json = meta_schema,
-        .version = try allocator.dupe(u8, try fields.optionalString(obj, "version") orelse "1.0.0"),
+        .version = meta_version,
         .supports_streaming = try fields.optionalBool(obj, "supports_streaming", false),
         .estimated_duration_ms = try fields.optionalIntValue(u32, obj.get("estimated_duration_ms")),
         .is_destructive = try fields.optionalBool(obj, "is_destructive", false),
@@ -1025,4 +1050,48 @@ test "tool envelope rejects malformed execute payloads without leaking" {
     try std.testing.expectError(error.MissingField, deserializeEnvelope(register_missing_tool, allocator));
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(register_tool_not_object, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(result_missing_duration, allocator));
+}
+
+fn toolRegisterProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool":{"name":"grep","description":"search","parameters_schema_json":"{}","version":"2.0.0","required_permissions":["read","shell"]},"callback_url":"https://example.test/cb"}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "tool_register survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolRegisterProbe, .{});
+}
+
+fn toolListResponseProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},{"name":"edit","description":"write","parameters_schema_json":"{}","required_permissions":["write"]}]}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "tool_list_response survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolListResponseProbe, .{});
+}
+
+test "a malformed tool entry after a good one is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},{"name":"edit"}]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},7]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}","required_permissions":7}]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}","required_permissions":[7]}]}}
+        ,
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool":{"name":"grep","description":"search","parameters_schema_json":"{}"},"callback_url":7}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }
