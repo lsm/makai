@@ -398,11 +398,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
             };
             self.mutex.lockUncancelable(defaultIo());
-            const snapshot = self.result;
-            const err = self.err_msg;
-            self.mutex.unlock(defaultIo());
-            if (err != null) return null;
-            const result = snapshot orelse return null;
+            defer self.mutex.unlock(defaultIo());
+            if (self.err_msg != null) return null;
+            const result = self.result orelse return null;
             return try ai_types.cloneAssistantMessage(allocator, result);
         }
 
