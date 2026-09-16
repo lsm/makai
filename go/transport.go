@@ -577,6 +577,11 @@ func (s *subscription) sessionID() string {
 	return ""
 }
 
+// isPipeClosed backs up the errors.Is(err, os.ErrClosed) check at the read
+// loop's exit. Closing the runtime's pipes is an ordinary part of shutdown,
+// and a "file already closed" that reaches the loop through a wrapping this
+// Go version or platform does not expose as os.ErrClosed would otherwise be
+// logged and reported as a stream failure.
 func isPipeClosed(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "file already closed")
 }
