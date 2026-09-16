@@ -265,6 +265,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "agent_start")) {
         const config = try allocator.dupe(u8, try jf.requireString(payload, "config_json"));
         var result = agent_types.AgentStartRequest{ .config_json = config };
+        errdefer {
+            allocator.free(config);
+            result.system_prompt.deinit(allocator);
+        }
         if (try jf.optionalString(payload, "system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         if (try jf.optionalString(payload, "session_id")) |v| {
             result.session_id = try parseSessionIdRequired(v);
@@ -605,6 +609,28 @@ test "deserializeEnvelope rejects invalid ulid" {
     );
     defer allocator.free(bad);
     try std.testing.expectError(error.InvalidUlid, deserializeEnvelope(bad, allocator));
+}
+
+test "agent_start failure after config_json frees duplicated fields" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const bad_session = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{\\\"max_turns\\\":4}}\",\"session_id\":\"not-a-nanoid\"}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(bad_session);
+    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad_session, allocator));
+
+    const bad_session_with_prompt = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{\\\"max_turns\\\":4}}\",\"system_prompt\":\"be brief\",\"session_id\":\"not-a-nanoid\"}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(bad_session_with_prompt);
+    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad_session_with_prompt, allocator));
 }
 
 test "deserializeEnvelope rejects unknown payload type" {

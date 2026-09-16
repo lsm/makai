@@ -392,6 +392,13 @@ def group_envelope(ctx):
         ("provider: in_reply_to is a number", prov(in_reply_to=123), spec_agent),
         ("provider: models_request provider_id is a number",
          prov(type="models_request", payload={"provider_id": 5}), spec_agent),
+        ("provider: stream_request user message without content",
+         prov(type="stream_request", payload={
+             "model": MODEL_REF,
+             "context": {"messages": [{"role": "user", "timestamp": 1}]},
+         }), spec_agent),
+        ("provider: models_response without cache_max_age_ms",
+         prov(type="models_response", payload={"fetched_at_ms": 1, "models": []}), spec_agent),
 
         ("auth: sequence is negative", auth(sequence=-1), spec_agent),
         ("auth: version is negative", auth(version=-1), spec_agent),

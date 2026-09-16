@@ -265,8 +265,9 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         if (providers_value != .array) return error.InvalidPayloadType;
 
         const providers = try allocator.alloc(auth_types.AuthProviderInfo, providers_value.array.items.len);
+        var initialized: usize = 0;
         errdefer {
-            for (providers) |*provider| {
+            for (providers[0..initialized]) |*provider| {
                 provider.deinit(allocator);
             }
             allocator.free(providers);
@@ -276,15 +277,20 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             if (provider_value != .object) return error.InvalidPayloadType;
             const provider_obj = try jf.elementAsObject(provider_value);
 
-            providers[i] = .{
-                .id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "id"))),
-                .name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "name"))),
-                .auth_status = std.meta.stringToEnum(auth_types.AuthStatus, try jf.requireString(provider_obj, "auth_status")) orelse .unknown,
+            var info = auth_types.AuthProviderInfo{
+                .id = OwnedSlice(u8).initBorrowed(""),
+                .name = OwnedSlice(u8).initBorrowed(""),
+                .auth_status = .unknown,
             };
-
+            errdefer info.deinit(allocator);
+            info.id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "id")));
+            info.name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "name")));
+            info.auth_status = std.meta.stringToEnum(auth_types.AuthStatus, try jf.requireString(provider_obj, "auth_status")) orelse .unknown;
             if (try jf.optionalString(provider_obj, "last_error")) |last_error| {
-                providers[i].last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, last_error));
+                info.last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, last_error));
             }
+            providers[i] = info;
+            initialized += 1;
         }
 
         return .{ .auth_providers_response = .{
@@ -420,4 +426,11 @@ test "auth envelope rejects unknown payload type" {
     const bad =
         "{\"type\":\"not_real\",\"stream_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(bad, allocator));
+}
+
+test "auth_providers_response rejects a half-built entry without touching uninitialized slots" {
+    const allocator = std.testing.allocator;
+    const bad =
+        "{\"type\":\"auth_providers_response\",\"stream_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"providers\":[{\"id\":\"anthropic\"},{\"id\":\"openai\",\"name\":\"OpenAI\",\"auth_status\":\"logged_in\"}]}}";
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(bad, allocator));
 }

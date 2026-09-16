@@ -413,7 +413,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
             .args_json = args_json,
         };
-        if (try jf.optionalInteger(payload, "timeout_ms")) |v| req.timeout_ms = @as(u32, @intCast(v));
+        if (try jf.optionalUnsigned(u32, payload, "timeout_ms")) |v| req.timeout_ms = v;
         if (try jf.optionalString(payload, "stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
@@ -423,7 +423,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
             .partial_result_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_result_json")),
         };
-        if (try jf.optionalInteger(payload, "progress")) |v| update.progress = @as(u8, @intCast(v));
+        if (try jf.optionalUnsigned(u8, payload, "progress")) |v| update.progress = v;
         if (try jf.optionalString(payload, "status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_stream = update };
     }
@@ -641,7 +641,7 @@ fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator
         .parameters_schema_json = try allocator.dupe(u8, try jf.requireString(obj, "parameters_schema_json")),
         .version = if (try jf.optionalString(obj, "version")) |v| try allocator.dupe(u8, v) else try allocator.dupe(u8, "1.0.0"),
         .supports_streaming = if (try jf.optionalBool(obj, "supports_streaming")) |v| v else false,
-        .estimated_duration_ms = if (try jf.optionalInteger(obj, "estimated_duration_ms")) |v| @as(u32, @intCast(v)) else null,
+        .estimated_duration_ms = try jf.optionalUnsigned(u32, obj, "estimated_duration_ms"),
         .is_destructive = try jf.boolOr(obj, "is_destructive", false),
         .required_permissions = required_permissions,
     };
@@ -737,6 +737,26 @@ test "tool envelope negative malformed args" {
         "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{bad json\"}}";
 
     try std.testing.expectError(error.InvalidArgumentsJson, deserializeEnvelope(json, allocator));
+}
+
+test "tool envelope rejects out-of-range numeric payload fields" {
+    const allocator = std.testing.allocator;
+
+    const negative_timeout =
+        "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{}\",\"timeout_ms\":-1}}";
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_timeout, allocator));
+
+    const oversized_timeout =
+        "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{}\",\"timeout_ms\":4294967296}}";
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_timeout, allocator));
+
+    const oversized_progress =
+        "{\"type\":\"tool_stream\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"partial_result_json\":\"{}\",\"progress\":256}}";
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_progress, allocator));
+
+    const oversized_duration =
+        "{\"type\":\"tool_list_response\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"tools\":[{\"name\":\"grep\",\"description\":\"Search text\",\"parameters_schema_json\":\"{}\",\"is_destructive\":false,\"estimated_duration_ms\":4294967296}]}}";
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_duration, allocator));
 }
 
 test "tool envelope negative timeout error" {

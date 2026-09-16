@@ -1125,7 +1125,7 @@ fn deserializeModelsResponse(
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsResponse {
     const fetched_at_ms = try jf.requireInteger(obj, "fetched_at_ms");
-    const cache_max_age_ms = try valueAsU64(obj.get("cache_max_age_ms").?);
+    const cache_max_age_ms = try jf.requireUnsigned(u64, obj, "cache_max_age_ms");
     const models_array = try jf.requireArray(obj, "models");
 
     const models = try allocator.alloc(protocol_types.ModelDescriptor, models_array.items.len);
@@ -1466,7 +1466,8 @@ fn deserializeMessage(
 
     if (std.mem.eql(u8, role, "user")) {
         const timestamp: i64 = if (try jf.optionalInteger(obj, "timestamp")) |ts| ts else 0;
-        const content = try deserializeUserContent(obj.get("content").?, allocator);
+        const content_value = jf.lookup(obj, "content") orelse return error.MissingField;
+        const content = try deserializeUserContent(content_value, allocator);
 
         return .{ .user = .{
             .content = content,
@@ -2513,7 +2514,58 @@ test "deserializeEnvelope with complete_request frees all memory" {
     try std.testing.expectEqualStrings("claude-3", envelope.payload.complete_request.model.id);
     try std.testing.expect(envelope.payload.complete_request.model.is_owned);
     try std.testing.expect(envelope.payload.complete_request.context.is_owned);
+}
 
+test "user message without content is rejected, not fatal" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "stream_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {
+        \\    "model": {
+        \\      "id": "claude-3",
+        \\      "name": "Claude 3",
+        \\      "api": "anthropic-messages",
+        \\      "provider": "anthropic",
+        \\      "base_url": "https://api.anthropic.com"
+        \\    },
+        \\    "context": {
+        \\      "messages": [
+        \\        { "role": "user", "timestamp": 1 }
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
+}
+
+test "models_response without cache_max_age_ms is rejected, not fatal" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "models_response",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {
+        \\    "fetched_at_ms": 1708234567890,
+        \\    "models": []
+        \\  }
+        \\}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
 }
 
 test "deserializeEnvelope with complex context frees all memory" {
@@ -2564,7 +2616,6 @@ test "deserializeEnvelope with complex context frees all memory" {
 
     try std.testing.expect(envelope.payload == .stream_request);
     try std.testing.expect(envelope.payload.stream_request.context.messages.len == 2);
-
 }
 
 test "serializeEnvelope with goodbye payload" {
