@@ -61,6 +61,11 @@ type ExecutionOptions = {
   logger?: MakaiLogger;
 };
 
+type ActiveStreamState = {
+  value?: string;
+  cancelled?: boolean;
+};
+
 type ActiveAgentSession = {
   sessionId?: string;
   nextSequence: number;
@@ -128,7 +133,7 @@ class StdioProviderApi implements MakaiProviderApi {
     const signal = request.options?.signal;
     checkAbort(signal, "provider.complete aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
-    const activeStreamId: { value?: string } = {};
+    const activeStreamId: ActiveStreamState = {};
     return withAuthRetry(
       () => this.completeOnce(request, effectivePolicy, signal, activeStreamId),
       {
@@ -138,26 +143,23 @@ class StdioProviderApi implements MakaiProviderApi {
         fallbackProviderId: providerIdFromRequest(request),
         signal,
         logger: this.logger,
-        onAbort: () => {
-          const streamId = activeStreamId.value;
-          if (streamId) {
-            bestEffortCancelStream(this.transport, streamId);
-            drainStreamFrames(this.transport, streamId);
-          }
-        },
+        onAbort: () => this.cancelActiveStream(activeStreamId),
       },
     );
   }
 
-  private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeStreamId?: { value?: string }): Promise<ProviderCompleteResponse> {
+  private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeStreamId?: ActiveStreamState): Promise<ProviderCompleteResponse> {
     checkAbort(signal, "provider.complete aborted");
     const streamId = ulid();
-    if (activeStreamId) activeStreamId.value = streamId;
+    if (activeStreamId) {
+      activeStreamId.value = streamId;
+      activeStreamId.cancelled = false;
+    }
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
       this.logger.debug("provider: sending complete_request", { stream_id: streamId, model_ref: request.model_ref });
     }
-    this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
+    sendOrStreamError(this.transport, buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider complete_response", this.responseTimeoutMs, streamId, request);
     try {
       while (true) {
@@ -185,11 +187,13 @@ class StdioProviderApi implements MakaiProviderApi {
     checkAbort(signal, "provider.stream aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     const fallbackProviderId = providerIdFromRequest(request);
-    const activeStreamId: { value?: string } = {};
+    const activeStreamId: ActiveStreamState = {};
     let attempt = this.streamAttempt(request, effectivePolicy, signal, activeStreamId);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
     let retried = false;
+    let settled = false;
+    let sawTerminal = false;
 
     if (!isNoopLogger(this.logger)) {
       this.logger.debug("provider: starting stream", { model_ref: request.model_ref });
@@ -228,31 +232,47 @@ class StdioProviderApi implements MakaiProviderApi {
           }
           throw error;
         }
-        if (result.done) return;
+        if (result.done) {
+          settled = true;
+          return;
+        }
         yielded = true;
+        if (result.value.type === "message_end" || result.value.type === "error") sawTerminal = true;
         yield result.value;
       }
     } catch (error) {
-      if (isAbortError(error)) {
-        const streamId = activeStreamId.value;
-        if (streamId) {
-          bestEffortCancelStream(this.transport, streamId);
-          drainStreamFrames(this.transport, streamId);
-        }
-      }
+      settled = true;
+      if (isAbortError(error)) this.cancelActiveStream(activeStreamId);
       throw error;
+    } finally {
+      if (!settled && !sawTerminal) this.cancelActiveStream(activeStreamId);
+      const closed = iterator.return?.();
+      if (closed) void closed.catch(() => undefined);
     }
   }
 
-  private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeStreamId?: { value?: string }): AsyncIterable<ProviderStreamEvent> {
+  private cancelActiveStream(state: ActiveStreamState): void {
+    if (state.cancelled) return;
+    const streamId = state.value;
+    if (!streamId) return;
+    state.cancelled = true;
+    this.logger.debug("provider: cancelling active stream", { stream_id: streamId });
+    bestEffortCancelStream(this.transport, streamId);
+    void drainStreamFrames(this.transport, streamId);
+  }
+
+  private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeStreamId?: ActiveStreamState): AsyncIterable<ProviderStreamEvent> {
     checkAbort(signal, "provider.stream aborted");
     const streamId = ulid();
-    if (activeStreamId) activeStreamId.value = streamId;
+    if (activeStreamId) {
+      activeStreamId.value = streamId;
+      activeStreamId.cancelled = false;
+    }
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
       this.logger.debug("provider: sending stream_request", { stream_id: streamId, model_ref: request.model_ref });
     }
-    this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
+    sendOrStreamError(this.transport, buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider stream event", this.responseTimeoutMs, streamId, request);
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -406,7 +426,7 @@ class StdioAgentApi implements MakaiAgentApi {
       this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
     }
     const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
-    this.transport.send(startEnvelope);
+    sendOrStreamError(this.transport, startEnvelope);
     const startMessageId = startEnvelope.message_id as string;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
@@ -612,7 +632,7 @@ class StdioAgentApi implements MakaiAgentApi {
       this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
     }
     const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
-    this.transport.send(startEnvelope);
+    sendOrStreamError(this.transport, startEnvelope);
     const startMessageId = startEnvelope.message_id as string;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
@@ -743,6 +763,15 @@ class StdioAgentApi implements MakaiAgentApi {
         await this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed", { drain: "quiescent" });
       }
     }
+  }
+}
+
+function sendOrStreamError(transport: MakaiStdioClient, envelope: StdioFrame): void {
+  try {
+    transport.send(envelope);
+  } catch (error) {
+    if (error instanceof MakaiStreamError) throw error;
+    throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
   }
 }
 

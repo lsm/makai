@@ -103,12 +103,14 @@ export class MakaiStdioClient {
     this.child = child;
 
     child.on("error", (error) => {
+      if (this.child !== child) return;
       this.logger.error("stdio: process error event", { error: error.message });
       this.failHandshakeIfPending(error);
       this.failPendingFrameWaiters(error);
     });
 
     child.on("exit", (code, signal) => {
+      if (this.child !== child) return;
       this.logger.debug("stdio: process exited", { code, signal: signal ?? undefined });
       const error = new Error(`stdio process exited (code=${code}, signal=${signal})`);
       this.failHandshakeIfPending(error);
@@ -120,14 +122,50 @@ export class MakaiStdioClient {
     this.lineReader.on("line", (line) => this.handleLine(line));
 
     this.logger.debug("stdio: waiting for handshake", { timeout_ms: this.options.handshakeTimeoutMs });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`stdio handshake timed out after ${this.options.handshakeTimeoutMs}ms`));
-        this.pendingHandshake = null;
-      }, this.options.handshakeTimeoutMs);
-      this.pendingHandshake = { resolve, reject, timer };
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`stdio handshake timed out after ${this.options.handshakeTimeoutMs}ms`));
+          this.pendingHandshake = null;
+        }, this.options.handshakeTimeoutMs);
+        this.pendingHandshake = { resolve, reject, timer };
+      });
+    } catch (error) {
+      this.terminateChild();
+      throw error;
+    }
     this.logger.info("stdio: handshake complete");
+  }
+
+  private terminateChild(): void {
+    const child = this.child;
+    if (!child) return;
+    this.logger.debug("stdio: terminating process after failed handshake", { pid: child.pid });
+    this.failPendingFrameWaiters(new Error("stdio handshake failed"));
+    this.lineReader?.close();
+    this.lineReader = null;
+    this.child = null;
+    try {
+      child.stdin.end();
+    } catch {
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill();
+      } catch {
+      }
+      const killer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+          }
+        }
+      }, 500);
+      killer.unref();
+      child.once("exit", () => clearTimeout(killer));
+    }
+    child.unref();
   }
 
   send(frame: StdioFrame): void {
