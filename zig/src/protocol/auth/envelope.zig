@@ -346,19 +346,20 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const flow_id = try parseUlidRequired(try fields.requiredString(auth_url, "flow_id"));
         var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(auth_url, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(auth_url, "url")));
-        var result: auth_types.AuthEvent = .{ .auth_url = .{
+        var url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(auth_url, "url")));
+        errdefer url.deinit(allocator);
+
+        var instructions = OwnedSlice(u8).initBorrowed("");
+        if (try fields.optionalString(auth_url, "instructions")) |value| {
+            instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
+        }
+
+        return .{ .auth_url = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
             .url = url,
+            .instructions = instructions,
         } };
-        errdefer result.deinit(allocator);
-
-        if (try fields.optionalString(auth_url, "instructions")) |instructions| {
-            result.auth_url.instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, instructions));
-        }
-
-        return result;
     }
 
     if (payload.get("prompt")) |prompt_value| {
@@ -407,19 +408,20 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const flow_id = try parseUlidRequired(try fields.requiredString(event_error, "flow_id"));
         var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(event_error, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(event_error, "message")));
-        var result: auth_types.AuthEvent = .{ .@"error" = .{
+        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(event_error, "message")));
+        errdefer message.deinit(allocator);
+
+        var code = OwnedSlice(u8).initBorrowed("");
+        if (try fields.optionalString(event_error, "code")) |value| {
+            code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
+        }
+
+        return .{ .@"error" = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
             .message = message,
+            .code = code,
         } };
-        errdefer result.deinit(allocator);
-
-        if (try fields.optionalString(event_error, "code")) |code| {
-            result.@"error".code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, code));
-        }
-
-        return result;
     }
 
     return error.InvalidPayloadType;
@@ -529,8 +531,17 @@ test "auth envelope rejects malformed payload fields without leaking" {
         \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"auth_url":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","url":7}}}
     ;
 
+    const event_instructions_wrong_typed =
+        \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"auth_url":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","url":"https://example.test/login","instructions":7}}}
+    ;
+    const event_error_code_wrong_typed =
+        \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"error":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","message":"denied","code":7}}}
+    ;
+
     try std.testing.expectError(error.MissingField, deserializeEnvelope(login_missing_provider, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(prompt_response_missing_answer, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(providers_missing_name, allocator));
     try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_url_wrong_typed, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_instructions_wrong_typed, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_error_code_wrong_typed, allocator));
 }
