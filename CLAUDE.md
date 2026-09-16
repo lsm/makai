@@ -1,0 +1,274 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
+
+`DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
+
+## Build and Test Commands
+
+All Zig commands run from the repo root (where `build.zig` and `build.zig.zon` live). Requires Zig 0.16.0 (`mlugg/setup-zig` in CI). Node 22 for the TypeScript SDK and scripts.
+
+```bash
+zig build                         # Build + install zig-out/bin/makai
+zig build run -- --version        # Run the makai CLI (args after --)
+zig build run-tui                 # Run the terminal UI
+zig build test                    # Run every unit test module
+zig build -Doptimize=ReleaseFast  # Optimized binary (what the PTY harness uses)
+zig build -Doptimize=ReleaseSafe  # What the tagged release workflow builds
+```
+
+A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, then start
+`makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
+(project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
+
+### Print Mode CLI
+
+```bash
+makai -p [--agent] [--storage] [--model <id>] "<prompt>"
+```
+
+`--agent`, `--storage`, and `--model <id>` are accepted in any position — before or after the prompt. An unrecognized `--flag` or a second positional argument fails with an error instead of being ignored.
+
+### Grouped Unit Test Steps
+
+There is no per-test filter; the smallest runnable unit is a group step. Tests are inline `test "name" { ... }` blocks in each `.zig` file.
+
+Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (6-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent tests to the specific `agent-*` subgroup (and to `test`), not just the aggregate.
+
+`tools/*` tests have their own matrix-covered group, **`test-unit-tools`**; none of the `agent-*` subgroups contains them. All eleven tool artifacts are wired there, and `test_unit_agent_step` pulls that step in rather than re-listing its members. So a new `tools/*` test goes into `test_unit_tools_step` (plus `test`).
+
+The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`.
+
+```bash
+zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
+zig build test-unit-transport     # transport, stdio, sse, websocket, in_process, transport_retry
+zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
+zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
+zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
+zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
+zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport
+zig build test-unit-tools         # all 11 tools/*: common, process_runner, artifact, shell, file, edit, hashline, search, workspace, mcp_bridge, registry
+zig build test-unit-agent         # aggregate (local-only, not in the CI matrix): permission, agent types/loop/mod/bridge, tools/*, tui runtime, zig/test/unit/*
+zig build test-unit-agent-types   # agent types + permission
+zig build test-unit-agent-loop    # agent loop only
+zig build test-unit-agent-mod     # agent module only
+zig build test-unit-agent-bridge  # agent provider-protocol bridge
+zig build test-unit-agent-unit    # zig/test/unit/agent.zig
+zig build test-unit-agent-chain   # zig/test/unit/agent_protocol_chain.zig
+```
+
+### E2E Steps
+
+```bash
+zig build test-e2e-protocol                     # mock-based, no keys; runs in CI
+zig build test-e2e-distributed-fullstack        # mock-based, no keys
+zig build test-e2e-anthropic                    # ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL
+zig build test-e2e-openai                       # OPENAI_API_KEY, OPENAI_MODEL, OPENAI_RESPONSES_MODEL
+zig build test-e2e-google                       # GOOGLE_API_KEY, GOOGLE_MODEL
+zig build test-e2e-ollama                       # OLLAMA_API_KEY, OLLAMA_MODEL
+zig build test-e2e-azure                        # AZURE_OPENAI_API_KEY, AZURE_OPENAI_BASE_URL, AZURE_OPENAI_MODEL (disabled in CI)
+zig build test-e2e-github-copilot               # GH_COPILOT_REFRESH, GH_COPILOT_ACCESS (disabled in CI, quota)
+zig build test-e2e-provider-protocol-fullstack-ollama
+zig build test-e2e-provider-protocol-fullstack-github
+zig build test-e2e-distributed-fullstack-github
+zig build test-e2e                              # aggregate; runs distributed-fullstack via test-e2e-protocol, but omits the -github variant
+```
+
+See `.github/workflows/ci.yml` for the exact env wiring and which lanes are currently gated off.
+
+### Guardrails (CI runs both before unit tests)
+
+```bash
+./scripts/check-zig-patterns.sh                  # no runtime `catch unreachable`, no direct std.crypto.random, deinit poisoning in critical types
+node scripts/check-no-comments.mjs --check       # zero-comments policy over every tracked .zig/.ts (--stats for counts, --write to strip)
+node --test scripts/check-no-comments.test.mjs   # checker self-tests
+```
+
+### TypeScript SDK
+
+```bash
+npm ci
+npm run build:sdk                 # tsc -> dist/
+npm run test:sdk                  # build + node --test dist/test/**/*.test.js (passes with no binary)
+npm run check:declarations        # verifies the packed tarball ships .d.ts and type-checks in a fresh consumer
+npm run demo:start                # builds then runs dist/demo/server.js
+```
+
+`resolveMakaiBinary` picks the binary in this order: `MAKAI_BINARY_PATH` or an explicit `binaryPath`; `MAKAI_BINARY_URL`/`binaryUrl` (checksum required); the platform package `@makai/cli-<platform>-<arch>`; `./zig-out/bin/makai`; `./zig/zig-out/bin/makai`; then `PATH`. **The platform package outranks both local build paths**, so if an optional `@makai/cli-*` package is installed, `zig build` alone does not make the SDK tests exercise your fresh binary. Set `MAKAI_BINARY_PATH` to be sure which one runs (CI builds with `zig build install --prefix /tmp/makai-smoke` and points `MAKAI_BINARY_PATH` at it).
+
+That variable is also what gates real-binary coverage. Every test in `typescript/test/makai_binary_smoke.test.ts` calls `t.skip("MAKAI_BINARY_PATH is not set")` when it is unset, so `npm run test:sdk` passes green with **zero** end-to-end binary coverage, and a binary found through `zig-out` or the platform package does not switch those tests on. Export `MAKAI_BINARY_PATH` explicitly when you mean to exercise the real runtime.
+
+### TUI PTY Harness and Benchmarks
+
+```bash
+zig build install -Doptimize=ReleaseFast --prefix /tmp/makai-pty
+python3 scripts/tui-pty-driver.py --binary /tmp/makai-pty/bin/makai --output-dir tui-pty-out --scenario all
+zig build bench -Doptimize=ReleaseFast -- --mode latency --samples 30 --iterations 100 --host-class <host>
+zig build bench-compare -Doptimize=ReleaseFast -- baseline.jsonl candidate.jsonl
+./scripts/capture-benchmark-baseline.sh <out-dir> <host-class> [git-revision]
+```
+
+The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see `zig/src/tui/fixture_provider.zig`), so no keys or network are needed. It is Linux-only (rejects macOS). Details in `docs/tui-performance-baseline.md` and `docs/performance-baseline.md`.
+
+## Build System Conventions
+
+`build.zig` (~2000 lines) declares a `b.createModule` per **module root** with an explicit `.imports` list, then a `b.addTest` per module, then wires each test into `test` and the matching `test-unit-*` group. Most source files are roots, but not all, and the distinction decides how you add a file:
+
+- Source files import by module name, not path: `@import("ai_types")`, `@import("oauth/storage")`, `@import("tools/registry")`, `@import("compat")`. The name is whatever `build.zig` assigned; `oauth/*` names map to `zig/src/utils/oauth/*`.
+- **Module roots** are reached by name. Adding one means: create the module in `build.zig`, list every import it needs, add an `addTest`, and add the run artifact to both `test_step` and the right group step. A missing import fails at compile time with "no module named ...".
+- **Files compiled through an existing root** are reached by relative `@import("sibling.zig")` and may need no `build.zig` entry; their tests then run as part of the root's test artifact. `zig/src/compat/{time,random,fs,stdio,http,net}.zig` hang off `compat/mod.zig` this way, as does `agent/agent.zig` off `agent/mod.zig`.
+- **A relative import does not by itself mean a file has no module.** `protocol/provider/{partial_serializer,partial_reconstructor}.zig` are imported relatively by `server.zig` and `client.zig` *and* have their own modules and test artifacts wired into `test-unit-protocol`, deliberately, so their tests run as a named group. Decide by checking both the existing importers and `build.zig`, never from the import syntax alone.
+- Some tracked files are neither. Four files, about 2,300 lines, have no module, no importer, and are **never compiled by any build step**: `utils/streaming_json.zig` (a different and larger file than the live top-level `streaming_json.zig`), `utils/message_transform.zig`, `utils/tool_utils.zig`, and `utils/tokens.zig`. Nothing type-checks them, so they rot silently rather than loudly, and `utils/tool_utils.zig` still holds a declared entry in `check-zig-patterns.sh`'s `expected_ordinary_entropy_sites` — a security allowlist carrying an exemption for code that never runs, which cannot be removed while the file stays. Confirm with a grep for an `@import` of the file before treating one as load-bearing, and do not copy their wiring as a pattern.
+- The live OAuth code is the `zig/src/utils/oauth/` module roots: `storage`, `refresh_lock`, `pkce`, `anthropic`, `github_copilot`, `openai_codex`. The unreferenced `utils/oauth.zig` aggregator and the Google OAuth island it alone reached (`google.zig`, `callback_server.zig`) were deleted; `zig/src/oauth/` contributes just `mod.zig` + `pkce.zig` to the utils test group. Prefer `utils/oauth/` when adding OAuth code.
+- `zigzag` is the only **`build.zig.zon`** dependency: a vendored TUI framework at `zig/vendor/zigzag`, declared as a path dependency, and subject to the zero-comments policy like everything else. The repo is not dependency-free overall — `package.json` adds runtime deps (`nanoid`, `ulid`), dev deps (`typescript`, `@types/node`), and six optional `@makai/cli-*` platform packages, all of which `npm ci` resolves. Count both graphs for offline-build or supply-chain work.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Hosts: zig/src/tools/makai.zig (CLI: --stdio, --tui, -p,    │
+│         auth), zig/src/tui/ (zigzag TUI), typescript/ (SDK)  │
+├──────────────────────────────────────────────────────────────┤
+│  Agent Layer (agent/): agent.zig, agent_loop.zig, types.zig, │
+│    provider_protocol_bridge.zig                              │
+│  Local tools (tools/): shell, file, edit, search, workspace, │
+│    artifact, hashline, mcp_bridge, registry, permission      │
+├──────────────────────────────────────────────────────────────┤
+│  Protocol Layer (protocol/): auth/, provider/, agent/, tool/ │
+│    all: types + envelope + runtime. provider/agent add       │
+│    client+server; auth adds server; tool keeps its           │
+│    server/client/pipe inside local_runtime.zig               │
+│    model_ref.zig, model_catalog_types.zig                    │
+├──────────────────────────────────────────────────────────────┤
+│  Transport Layer: transport.zig (Sender/Receiver, ByteStream)│
+│    transports/: stdio, sse, websocket, in_process, retry     │
+├──────────────────────────────────────────────────────────────┤
+│  Streaming Core: ai_types, event_stream, api_registry,       │
+│    stream, streaming_json, tool_call_tracker, json/writer,   │
+│    providers/sse_parser, model_catalog, provider_base_url    │
+├──────────────────────────────────────────────────────────────┤
+│  Providers (providers/): anthropic_messages, openai_         │
+│    completions, openai_responses, azure_openai_responses,    │
+│    google_generative, google_vertex, ollama,                 │
+│    register_builtins                                         │
+├──────────────────────────────────────────────────────────────┤
+│  Utils, auth, compat: utils/ (oauth/*, auth_resolver, retry, │
+│    sanitize, overflow, pre_transform, provider_caps, ...),   │
+│    auth/providers.zig, compat/ (time, random, fs, stdio,     │
+│    http, net wrappers over Zig 0.16 std.Io)                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Canonical Distributed Topology
+
+```
+End user code -> Agent Protocol Client -> transport -> Agent Protocol Server
+  -> Agent -> Agent Loop -> Provider Protocol Client -> transport
+  -> Provider Protocol Server -> Provider
+Agent Loop -> Tool Protocol Client -> transport -> Tool Protocol Server -> Tool Runtime
+```
+
+Ownership and auth boundary (non-negotiable):
+- **Agent layer is auth-agnostic**: no API keys or OAuth handling in agent logic.
+- **Auth protocol/runtime owns interactive OAuth flows and credential persistence**; **providers own request-time credential consumption/refresh** (`utils/auth_resolver.zig`, `utils/oauth/storage.zig`).
+- **Tool auth/permissions live at the tool protocol / tool runtime boundary** (`tools/permission.zig`, `protocol/tool/local_runtime.zig`).
+- SDKs never see raw tokens and must not spawn `makai auth ...` subprocesses as their auth path.
+
+### How the `makai --stdio` host is wired
+
+`runStdioMode` in `zig/src/tools/makai.zig` hosts all three protocol servers (auth, provider, agent) in one process, each behind its own `in_process.SerializedPipe`, and routes inbound stdin frames by envelope type. The agent server drives `agent_loop` through `agent/provider_protocol_bridge.zig` (`InProcessProviderProtocolBridge`), so even in-process the agent talks to providers through the provider protocol. Distributed tools are executed by the SDK client: the host publishes `tool_execute`, waits for a correlated `tool_result` (`in_reply_to` must match the request `message_id`), and cancels parked waits on stdin EOF. `MAKAI_AGENT_SESSION_IDLE_TTL_MS` tunes server-side idle-session eviction (default 30 min, `0` disables).
+
+### Protocol Normative Rules (from DESIGN.md §4-5)
+
+- IDs: `session_id` is a 21-char NanoID; `message_id`, `stream_id`, `flow_id` are 26-char uppercase Crockford ULIDs. Treat all as opaque.
+- Sequencing is per session/stream (provider: `stream_id`; auth: `stream_id` for queries, `flow_id` for login; agent: `session_id`) and starts at 1. A global counter is non-conformant.
+- The strict "+1, no gaps or duplicates" reading applies to **inbound** request sequences. On the agent protocol's outbound side it does not: per spec §13, `session_info`, `pong`, and `tool_list_response` echo the request's inbound sequence verbatim as a correlation value, request-validation `agent_error` envelopes carry `sequence: 0`, allocated frames can be observed out of counter order, a retried publication may burn a value and leave a gap, and a re-registered session id restarts its counter so values repeat. Consumers must not order echo frames against allocated frames or treat gaps as loss. Read `docs/v1-sdk-agent-provider-spec.md` §13 before changing any of this.
+- The auth, provider, and agent protocols multiplex concurrent sessions over one transport; ordering is guaranteed only within a session/stream. DESIGN.md §5 scopes this to those three: the tool protocol is envelope-keyed by `server_id` and its local runtime advances a single runtime-wide sequence, so per-session tool counters are not a behavior you can assume.
+- Model refs are `provider_id/api@<percent-encoded model_id>` (`protocol/model_ref.zig`). `formatModelRef` percent-encodes every byte outside the unreserved set (`A-Z a-z 0-9 - . _ ~`), and `parseModelRef` rejects a raw one, so Ollama's `gemma4:31b` travels as `gemma4%3A31b`. Build refs with `formatModelRef` rather than concatenating; SDK consumers must treat the result as opaque and neither parse nor construct it.
+- `session_id` is a correlation key, never a resume handle. Sessions are not resumable.
+
+### Key Abstractions
+
+**`ai_types.zig`**: `AssistantContent` is the assistant-side content union — variants `text: TextContent`, `thinking: ThinkingContent`, `tool_call: ToolCall`, `image: ImageContent`. There is **no** `ContentBlock` type and no `tool_use` variant; `tool_result` is a variant of the top-level `Message` union (`user`, `assistant`, `tool_result`), not of assistant content. `AssistantMessageEvent` (start, the text/thinking/toolcall start/delta/end triples, `done`, `@"error"`, `keepalive`). Only the first ten carry a `partial: AssistantMessage`; `done` carries `message`, `@"error"` carries `err`, and `keepalive` is `void`, `AssistantMessage`, `Usage` (+ `calculateCost`), `Model` (with `OpenAICompatOptions`), `StreamOptions`, `CancelToken`, `ToolCall`, plus `clone*`/`deinit*` helpers.
+
+**`event_stream.zig`**: `EventStream(T, R)`, a lock-free ring buffer with futex wakeups (`RING_BUFFER_SIZE = 1024`, `usable_capacity = 1023` because one slot separates full from empty; read the constants rather than hard-coding either number). `AssistantMessageStream = EventStream(AssistantMessageEvent, AssistantMessage)`. Methods: `push`, `poll`, `pollBatch`, `wait`, `complete`, `completeWithError`, `getError`, `getResult` (borrowed), `cloneResult` (owned). `owns_events` (default false) is an **ownership** flag, not a cloning switch: it says the consumer frees each polled event and that `deinit()` frees whatever is still queued. `push` deep-copies only when `clone_event_fn` is **also** set. Both production routes exist, and you must pick one deliberately: the stdio host and TUI set `owns_events` together with `clone_event_fn = ai_types.cloneAssistantMessageEvent` and let `push` clone, while `ProtocolClient` and the OpenAI Completions provider set `owns_events` alone and call `cloneAssistantMessageEvent` themselves before pushing. Setting `owns_events` with neither is a use-after-free: `push` stores your borrowed slices and they are later freed as owned memory.
+
+**`api_registry.zig` + `register_builtins.zig`**: providers register by API name. Built-ins: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`. `stream.zig` exposes `stream`/`streamSimple`/`complete`/`completeSimple` facades over the registry.
+
+**`protocol/provider/client.zig`**: `ProtocolClient` is multiplexed. Per-stream lifecycle: `startStream` (keep the `stream_id`) -> `getEventStreamFor` -> `waitResultFor`/`getLastErrorFor` -> `closeStream` -> `removeStreamState`. **`waitResultFor` hands back a shallow copy of the message held in `stream_results`, and `removeStreamState` calls `deinit` on that stored message.** This is a different API from `EventStream.cloneResult` and the stream rules below do not cover it: if the result must outlive cleanup, `cloneAssistantMessage` it before calling `removeStreamState`, or you are left holding freed slices. `partial_serializer.zig`/`partial_reconstructor.zig` move `AssistantMessage` snapshots across the wire.
+
+**`protocol/*/runtime.zig`** files are pump/orchestration runtimes hosted on the server side of each boundary, not protocol definitions.
+
+The four protocol directories are **not** symmetric, so do not go looking for a file by analogy: `provider/` has `client.zig` + `server.zig` (plus the partial serializer/reconstructor and `content_partial.zig`), `agent/` has `client.zig` + `server.zig`, `auth/` has `server.zig` and **no client module**, and `tool/` has neither at top level. `tool/local_runtime.zig` holds `ToolProtocolServer`, `ToolProtocolClient`, and `LocalToolProtocol` together, with `tool/runtime.zig` providing `ToolProtocolRuntime`.
+
+**`agent/`**: `AgentEvent` has twelve variants — `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update`, `message_end`, `context_usage`, `prompt_segment_usage`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`. There is **no** `error` variant, and failure does not arrive through one channel. Check three things, in this order:
+
+1. **`stream.getError()`** — when `runLoop` returns an error the thread calls `completeWithError` *instead of* pushing `agent_end` (`agent_loop.zig`), so no terminal event ever arrives. A consumer that waits for `agent_end` hangs. Check this first.
+2. **`final_message.stop_reason == .@"error"`** — a provider failure still produces a normal `agent_end`, with `termination` left `null`. `Agent.` code treats this as `error.AgentLoopFailed` (`agent.zig`).
+3. **`AgentEndPayload.termination`** — an optional `AgentTermination` that encodes only `max_turns` or `cancelled`. It is `null` both on a clean finish and on the provider-failure case above, so **a null `termination` is not proof of success.** Also `AgentTool`, `AgentLoopConfig`, `AgentContext`, `AgentEventStream`. `agent_loop.zig` supports steering/follow-up messages and sequential tool execution with streaming updates. `zig/docs/agent-loop-design.md` describes the design.
+
+**`tools/registry.zig`**: `ToolRegistry.registerDefaults()` installs the built-in local tools; `registerMcpBridge` adds MCP-provided tools. `tools/permission.zig` classifies calls (read/write/shell) into allow/deny/prompt decisions and drives the TUI approval flow.
+
+**`compat/`**: Makai-owned wrappers over Zig 0.16 `std.Io` (time, random, fs, stdio, http, net). Per `docs/zig-0.16.0-io-architecture-decision.md`, public constructors and entry points must not take `std.Io` in their signatures; only internal helpers may. Use `compat.random` secure helpers for OAuth state, PKCE, WebSocket masks, and protocol IDs. `check-zig-patterns.sh` enforces this two ways. Its `secure_random_files` list — both `pkce.zig` files, `utils/oauth/openai_codex.zig`, `transports/websocket.zig`, `protocol/provider/types.zig`, and `tui/app.zig` — fails on *any* ordinary-entropy call, matched as raw text on purpose so a scanner bug cannot quietly unprotect them, and it also fails if a listed path stops existing, so moving one of these files is loud rather than silent. Separately it scans every `zig/src/**/*.zig` for ordinary-entropy calls and fails on any site not declared in `expected_ordinary_entropy_sites`, and on any declared site that has gone away. Adding an ordinary-entropy call anywhere under `zig/src` therefore means declaring that exact line with rationale in the commit message.
+
+### Stream Completion and Memory Ownership (CRITICAL)
+
+A stream ends via `complete(result)` / `completeWithError(msg)`. Never gate on a `.done` event: no built-in provider pushes one (pushing `.done` would alias the same `AssistantMessage` in an event and the result and double-free). Consumer pattern: drain `wait()` until it returns `null`, check `getError()`, then `cloneResult(allocator)` before `deinit()`.
+
+**EventStream does not own event strings** unless `owns_events` is true. Provider events carry borrowed slices into SSE/JSON buffers owned by the producer thread. `ProtocolClient` deep-copies with `cloneAssistantMessageEvent()` before it queues. **Do not make event cleanup in `EventStream.deinit()` unconditional**; an unguarded `deinitAssistantMessageEvent()` double-frees borrowed paths (CI, 2026-02-19). The existing guarded call must stay: `deinit` drains through `deinitGenericEvent`, which calls `deinitAssistantMessageEvent` **only when `owns_events` is true**, and that is what frees unread events on owned streams. Removing or bypassing the guarded call leaks every queued event on the owned-stream paths. Providers and mocks must hand `complete()` a fully heap-owned result because the stream frees it at `deinit()`. Full contract: `docs/zig-stream-memory-ownership.md`.
+
+Passing an explicit `std.mem.Allocator` is the convention, not a guarantee the codebase currently meets everywhere: `transports/stdio.zig` builds its compatibility framer on `std.heap.page_allocator` and `utils/oauth/storage.zig` parses JWT expiry through it, so neither shows up in a test allocator's leak accounting. Tests use `std.testing.allocator` for leak detection. The ring buffer's 1024 slots are preallocated and streaming never grows them, but streaming is not allocation-free: on an owned-event stream with `clone_event_fn` set, every `push` deep-copies the event.
+
+## The `makai` Binary
+
+```
+makai --version
+makai --stdio                                   # protocol host for the TS SDK (NDJSON frames on stdin/stdout)
+makai --tui                                     # local-only terminal UI
+makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream one prompt, dump every event
+makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
+makai auth login --provider <id> [--json]
+```
+
+Print-mode options are position-independent as of #287 (see Print Mode CLI above): `--agent`, `--storage`, and `--model <id>` parse before or after the prompt, an unknown `--flag` or a second positional argument is a hard error rather than being ignored, and `--tui-runtime` must still precede the prompt.
+
+On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `com.makai.auth` is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
+
+## Providers
+
+**Adding a provider**: create `zig/src/providers/<name>_api.zig` with `stream*()` functions that build JSON via `json/writer.zig`, parse the upstream response in whatever framing it actually uses, and push into an `AssistantMessageStream` honoring the `CancelToken`. Use `providers/sse_parser.zig` only for genuine Server-Sent Events (Anthropic, both OpenAI APIs, Azure, both Google APIs); `ollama_api.zig` is the counterexample, parsing newline-delimited JSON with no SSE parser at all; register it in `register_builtins.zig`; declare the module and tests in `build.zig` (`test-unit-providers` group); add an E2E file under `zig/test/e2e/` and a CI lane if it needs keys.
+
+**Adding a transport**: implement `Sender`/`Receiver` from `transport.zig` in `zig/src/transports/<name>.zig`; wire into `build.zig` with the `transport` import and the `test-unit-transport` group.
+
+Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`. **Vertex is also not reachable at runtime**: `register_builtins.zig` never imports or registers `google_vertex_api.zig`, so there is no `google-vertex` API in the registry and a request for one fails provider lookup. The module is compiled only as its own test artifact. Registered APIs are exactly: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported and has no implementation in the tree; the unwired stub and the unused SigV4 signing helper were deleted rather than left to rot.
+
+## TUI
+
+`zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (10 ratified `CommandKind`s — help, model, login, provider, status, resume, permissions, clear, abort, quit — exposed as 12 accepted names, since `/sessions` aliases `/resume` and `/perm` aliases `/permissions`), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
+
+`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS; unsigned dev builds get one keychain prompt per new binary because access lists bind to the code hash (signed releases are keyed by team ID). Never move credentials to a plain file. `MAKAI_KEYCHAIN_SERVICE` isolates keychain items in local runs. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
+
+## Zig Conventions
+
+- **Zero comments** in every tracked `.zig` and `.ts` file, including `build.zig`, tests, fixtures, and `zig/vendor`: no `//`, `///`, `//!`, block, or JSDoc comments. The only exemptions are functional directives: `// zig fmt: off|on`; in TypeScript, shebangs, file-leading `/// <reference>` and `@ts-check`/`@ts-nocheck`, `@ts-ignore`/`@ts-expect-error`, JSDoc `@deprecated`, `biome-ignore`, `eslint-*`, `oxlint-*`, knip `@public`/`knip-ignore`, and `v8`/`istanbul`/`c8` ignores. The allowlist ratchet is retired (`scripts/no-comments-allowlist.txt.retired`); there is no grandfathering. Rationale goes in commit messages, PR descriptions, `docs/`, and tests.
+- snake_case functions/variables, PascalCase types, inline tests, error unions, comptime generics.
+- **Poison after deinit**: critical `deinit()` methods end with `self.* = undefined;`. The pattern script requires it in event_stream, api_registry, agent, protocol client/server, tool_call_tracker, streaming_json, sse_parser, partial_reconstructor.
+- **`OwnedSlice(T)`** (`owned_slice.zig`) instead of ad-hoc `owned_*: bool` flags.
+- **`oom.unreachableOnOom(...)`** (`utils/oom.zig`) instead of `catch unreachable` (only `utils/retry.zig` is exempt).
+- **Two-phase `StringBuilder`** (`string_builder.zig`): `count`/`countFmt`, one `allocate`, then `append`/`appendFmt`.
+- **`HiveArray(T, capacity)`** (`hive_array.zig`) for bounded high-churn pools.
+- **Artifact-store tests must isolate their root.** `tools/common.zig`'s `storeArtifact`/`retrieveArtifact`/`cleanupArtifacts` resolve `.makai/tool-artifacts` against an injectable root: the process cwd in production (the override is typed `void` outside test builds, so the branch is comptime-dead and the shipped binary is unchanged), a per-test `std.testing.tmpDir` in tests. Any test that reaches the store — directly, or through a tool like `file_read`/`shell_execute` that stores large output — must open with `var artifact_root = common.TestArtifactRoot.init(); defer artifact_root.deinit();`. Reaching it without one **panics** in test builds rather than silently falling back to the real cwd store, so a forgotten isolation fails deterministically on first run instead of flaking. This replaced the `build.zig` run-step chain that used to serialize `tools_common -> artifact -> shell -> search -> file`: those five binaries shared one cwd directory, and `cleanupArtifacts()`'s `deleteTree` in one wiped files another was mid-read on. Membership was by static reachability (grep `makeTextResultWithArtifact|storeArtifact|retrieveArtifact|cleanupArtifacts` under `zig/src/tools/`); the panic now enforces that rule at runtime, so tool tests run in parallel again.
+- Background reading: `docs/bun-zig-patterns.md`, `docs/tigerbeetle-zig-patterns.md` (invariant helpers, explicit limits at external accumulation points, validate-at-boundary vs assert-internal).
+
+## Docs and PR Process
+
+- Commits follow `type(scope): subject (#PR)` (e.g. `fix(tui): ...`, `feat(agent): ...`, `docs(spec): ...`). `CHANGELOG.md` follows Keep a Changelog; add entries under `Unreleased`.
+- `.github/PULL_REQUEST_TEMPLATE.md` is the repo-wide template, so every PR is prompted for a scope statement, backward-compatibility impact, test evidence, and review rounds. Fill in what applies and mark the rest N/A.
+- The heavier gate in `docs/review-process.md` is **scoped**: by its own §2 it is required for V1 implementation PRs across Phases 1, 1.25, 1.5, 2a, 2b, 2c, and 3 through 6. Those PRs must link exact spec clauses (`docs/v1-sdk-agent-provider-spec.md`, `docs/ts-sdk-chat-integration-plan.md`, `DESIGN.md`), update rows in `docs/implementation-traceability-matrix.md`, stay inside one phase/sub-phase, and clear at least two external review rounds with no unresolved P0/P1. Unrelated docs, tooling, release, or TUI work is not bound by the traceability-matrix and spec-clause requirements.
+- Either way, if behavior changes, update the spec/docs in the same PR. No spec drift.
+- `docs/oap-alignment.md` is the Open Agent Protocol deviations ledger; `docs/zig-0.16.0-*.md` record the completed Zig 0.16 migration and its I/O decision; `docs/persisted-tool-call-rendering.md` and `docs/markdown-rendering-investigation.md` cover TUI rendering decisions.
+- Release: tagging `v*` runs `.github/workflows/release-binaries.yml` (six targets) and `scripts/package-npm.ts` builds the `@makai/cli-<platform>` optional-dependency packages that `bin/makai.js` dispatches to. CI's cross-compile smoke job builds the non-native targets on every PR.
