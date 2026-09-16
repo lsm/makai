@@ -15,6 +15,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         result: ?R = null,
         completed: std.atomic.Value(bool),
         err_msg: ?[]const u8 = null,
+        err_msg_static: bool = false,
         mutex: std.Io.Mutex = .init,
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
@@ -119,7 +120,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
 
             if (self.err_msg) |msg| {
-                self.allocator.free(msg);
+                if (!self.err_msg_static) self.allocator.free(msg);
             }
 
             self.* = undefined;
@@ -203,11 +204,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defer self.mutex.unlock(defaultIo());
 
             if (self.err_msg) |old| {
-                self.allocator.free(old);
+                if (!self.err_msg_static) self.allocator.free(old);
                 self.err_msg = null;
+                self.err_msg_static = false;
             }
 
-            self.err_msg = self.allocator.dupe(u8, msg) catch null;
+            self.err_msg = self.allocator.dupe(u8, msg) catch blk: {
+                self.err_msg_static = true;
+                break :blk "out of memory";
+            };
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);

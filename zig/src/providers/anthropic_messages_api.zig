@@ -1306,7 +1306,10 @@ fn runThread(ctx: *ThreadCtx) void {
     defer tc_tracker.deinit();
 
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
-    defer content_blocks.deinit(allocator);
+    defer {
+        ai_types.deinitAssistantContent(allocator, content_blocks.items);
+        content_blocks.deinit(allocator);
+    }
     var current_text = std.ArrayList(u8).empty;
     defer current_text.deinit(allocator);
     var current_thinking = std.ArrayList(u8).empty;
