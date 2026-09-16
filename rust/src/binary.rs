@@ -153,6 +153,11 @@ impl BinaryResolver {
         if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
             match verify_checksum(&cache_path, checksum).await {
                 Ok(()) => {
+                    // A pre-populated entry — `curl -o`, a CI cache restore, a
+                    // plain file write — commonly lands at 0644, so the
+                    // checksum can pass and the spawn still fail with
+                    // permission denied.
+                    ensure_executable(&cache_path).await?;
                     tracing::debug!(path = %cache_path.display(), "cached binary checksum verified");
                     return Ok(cache_path);
                 }
@@ -214,26 +219,81 @@ async fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
             ))
         })?;
     }
-    let temp = target.with_extension("tmp");
-    tokio::fs::write(&temp, bytes)
-        .await
-        .map_err(|err| Error::transport(format!("failed to write {}: {err}", temp.display())))?;
+    // Two clients resolving the same uncached url would otherwise write and
+    // rename one shared `<target>.tmp`: the first rename removes it and the
+    // second fails, after an otherwise successful download.
+    let temp = unique_temp_path(target);
+    let install = async {
+        tokio::fs::write(&temp, bytes).await.map_err(|err| {
+            Error::transport(format!("failed to write {}: {err}", temp.display()))
+        })?;
+        set_executable(&temp).await?;
+        tokio::fs::rename(&temp, target).await.map_err(|err| {
+            Error::transport(format!(
+                "failed to install {} -> {}: {err}",
+                temp.display(),
+                target.display()
+            ))
+        })
+    }
+    .await;
+    if install.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    install
+}
+
+/// Names one download's temporary file so concurrent installs of the same
+/// cache entry cannot collide on it.
+#[cfg_attr(not(feature = "download"), allow(dead_code))]
+fn unique_temp_path(target: &Path) -> PathBuf {
+    let suffix = format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        crate::ids::new_ulid().to_ascii_lowercase()
+    );
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    target.with_file_name(name)
+}
+
+#[cfg_attr(not(feature = "download"), allow(dead_code))]
+async fn set_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|err| {
-                Error::transport(format!("failed to chmod {}: {err}", temp.display()))
+                Error::transport(format!("failed to chmod {}: {err}", path.display()))
             })?;
     }
-    tokio::fs::rename(&temp, target).await.map_err(|err| {
-        Error::transport(format!(
-            "failed to install {} -> {}: {err}",
-            temp.display(),
-            target.display()
-        ))
-    })?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Adds the owner execute bit to an existing file when it is missing.
+async fn ensure_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|err| Error::transport(format!("failed to stat {}: {err}", path.display())))?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0o111 {
+            return Ok(());
+        }
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o755))
+            .await
+            .map_err(|err| {
+                Error::transport(format!("failed to chmod {}: {err}", path.display()))
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -321,6 +381,55 @@ mod tests {
         assert!(
             err.message().contains("SHA-256 checksum is required"),
             "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_verified_cache_entry_is_made_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = WithoutEnvOverrides::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cached = dir.path().join("makai");
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        tokio::fs::write(&cached, bytes).await.expect("write");
+        tokio::fs::set_permissions(&cached, std::fs::Permissions::from_mode(0o644))
+            .await
+            .expect("chmod");
+
+        let resolver = BinaryResolver {
+            binary_url: Some("https://example.invalid/makai".to_owned()),
+            checksum_sha256: Some(sha256_hex(bytes)),
+            cache_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let resolved = resolver.resolve().await.expect("cache hit resolves");
+        assert_eq!(resolved, cached);
+
+        let mode = tokio::fs::metadata(&cached)
+            .await
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "resolved binary must be executable");
+    }
+
+    #[test]
+    fn concurrent_downloads_do_not_share_a_temporary_path() {
+        let target = Path::new("/tmp/cache/makai");
+        let first = unique_temp_path(target);
+        let second = unique_temp_path(target);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), target.parent());
+        assert_ne!(first, target.to_path_buf());
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("makai.tmp.")),
+            "{first:?}"
         );
     }
 

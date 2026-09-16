@@ -228,7 +228,7 @@ impl AuthApi {
         let mut guard = LoginGuard {
             transport: Arc::clone(&self.transport),
             flow_id: flow_id.clone(),
-            sequence: 2,
+            sequence,
             settled: false,
         };
 
@@ -243,6 +243,7 @@ impl AuthApi {
                 guard.settled = true;
                 to_auth_error(err)
             })?;
+        guard.sequence = sequence;
 
         let mut last_error: Option<(Option<String>, String)> = None;
         let mut cancelled_for_missing_handler = false;
@@ -253,10 +254,7 @@ impl AuthApi {
                 .await
             {
                 Ok(frame) => frame,
-                Err(err) => {
-                    guard.sequence = sequence;
-                    return Err(to_auth_error(err));
-                }
+                Err(err) => return Err(to_auth_error(err)),
             };
 
             match frame.kind.as_str() {
@@ -313,6 +311,7 @@ impl AuthApi {
                                             guard.settled = true;
                                             to_auth_error(err)
                                         })?;
+                                    guard.sequence = sequence;
                                 }
                                 Err(reason) => {
                                     self.cancel(&flow_id, next(&mut sequence));
@@ -377,6 +376,10 @@ impl AuthApi {
 }
 
 /// Cancels an abandoned login flow when the future driving it is dropped.
+///
+/// `sequence` tracks the flow's next outbound value and is advanced after
+/// every send. A stale value would be rejected as a duplicate sequence, and
+/// the runtime would leave the flow and its OAuth listener running.
 struct LoginGuard {
     transport: Arc<Transport>,
     flow_id: String,

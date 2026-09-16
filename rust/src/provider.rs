@@ -103,7 +103,7 @@ impl ProviderApi {
                 }
                 "result" | "complete_response" => {
                     guard.settle();
-                    return Ok(CompletionResponse::parse(frame.payload()));
+                    return Ok(CompletionResponse::parse(frame.payload_object()?));
                 }
                 other => {
                     guard.settle();

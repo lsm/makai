@@ -274,7 +274,7 @@ impl AgentApi {
                 }
                 FrameAction::ProviderResult => {
                     session.mark_message_settled();
-                    let response = CompletionResponse::parse(frame.payload());
+                    let response = CompletionResponse::parse(frame.payload_object()?);
                     session.teardown("completed").await;
                     return response_or_auth_error(
                         response,
@@ -486,8 +486,12 @@ impl AgentApi {
                             provider_id,
                         } = &mut event
                         {
-                            // Spec §3.5: aggregate usage sums the turns.
-                            if usage.is_none() {
+                            // Spec §3.5: aggregate usage sums the turns. The
+                            // terminal payload commonly carries the final
+                            // turn's usage, so the accumulated total wins
+                            // whenever there is one; the payload's value is
+                            // only used for a run that produced no message_end.
+                            if aggregate_usage.is_some() {
                                 *usage = aggregate_usage;
                             }
                             if stop_reason.as_deref() == Some("error")
@@ -515,15 +519,23 @@ impl AgentApi {
                             }
                         }
 
-                        let terminal = event.is_terminal();
                         if !event.is_replayable() {
                             yielded_content = true;
                         }
-                        yield event;
-                        if terminal {
+                        if event.is_terminal() {
+                            // Teardown has to happen before the yield: a
+                            // consumer that breaks on the terminal event drops
+                            // the generator at this suspension point, and the
+                            // drop guard only sends a fire-and-forget
+                            // agent_stop with reason "client aborted" and
+                            // never drains the tail. A promptly reused session
+                            // id would then pick up the trailing frame as its
+                            // own first event.
                             session.teardown("completed").await;
+                            yield event;
                             return;
                         }
+                        yield event;
                     }
                 }
             }

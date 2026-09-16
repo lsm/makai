@@ -172,6 +172,23 @@ impl Frame {
         }
     }
 
+    /// The `payload` object for a frame whose payload must be one.
+    ///
+    /// Keeps `payload`'s fallback to the envelope for the flatter shapes that
+    /// omit `payload` altogether, but rejects a `payload` that is present and
+    /// is not an object: falling back there parses the envelope instead and
+    /// turns a malformed response into a valid-looking empty value.
+    pub(crate) fn payload_object(&self) -> Result<&Value> {
+        match self.raw.get("payload") {
+            Some(payload) if payload.is_object() => Ok(payload),
+            None | Some(Value::Null) => Ok(&self.raw),
+            Some(_) => Err(Error::protocol(
+                format!("{} carried a payload that is not an object", self.kind),
+                Some("malformed_response"),
+            )),
+        }
+    }
+
     /// Deserializes the payload into a pinned shape.
     pub(crate) fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_value(self.payload().clone()).map_err(|err| {
@@ -241,6 +258,7 @@ pub(crate) fn object_or_empty(value: &Value) -> Map<String, Value> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -267,6 +285,41 @@ mod tests {
     fn payload_falls_back_when_payload_is_not_an_object() {
         let frame = Frame::parse(r#"{"type":"x","payload":42,"delta":"hi"}"#).expect("parses");
         assert_eq!(frame.payload_str("delta"), Some("hi"));
+    }
+
+    #[test]
+    fn payload_object_falls_back_only_when_payload_is_absent() {
+        let flat = Frame::parse(r#"{"type":"result","stop_reason":"end_turn"}"#).expect("parses");
+        assert_eq!(
+            flat.payload_object().expect("flat shape is accepted")["stop_reason"],
+            Value::String("end_turn".to_owned())
+        );
+
+        let nested = Frame::parse(r#"{"type":"result","payload":{"stop_reason":"max_tokens"}}"#)
+            .expect("parses");
+        assert_eq!(
+            nested.payload_object().expect("nested shape is accepted")["stop_reason"],
+            Value::String("max_tokens".to_owned())
+        );
+
+        let null = Frame::parse(r#"{"type":"result","payload":null,"stop_reason":"end_turn"}"#)
+            .expect("parses");
+        assert!(null.payload_object().is_ok());
+    }
+
+    #[test]
+    fn payload_object_rejects_a_payload_that_is_not_an_object() {
+        for line in [
+            r#"{"type":"result","payload":"a string"}"#,
+            r#"{"type":"result","payload":42}"#,
+            r#"{"type":"result","payload":[{"stop_reason":"end_turn"}]}"#,
+        ] {
+            let frame = Frame::parse(line).expect("parses");
+            let err = frame
+                .payload_object()
+                .expect_err("a non-object payload must not fall back to the envelope");
+            assert!(err.to_string().contains("not an object"), "{err}");
+        }
     }
 
     #[test]
