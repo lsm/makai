@@ -31,6 +31,9 @@ zig/zig-pkg/
 *.dll
 *.exe
 
+# Rust build artifacts (rust/ SDK)
+rust/target/
+
 # Temporary files
 tmp/
 

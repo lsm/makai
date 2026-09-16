@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
+Makai is a Zig-first streaming AI runtime plus a TypeScript SDK and a Rust SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames. The Rust SDK (`rust/`, crate `makai`) mirrors that surface on tokio; it is built and tested only by cargo, never by `zig build`.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -101,6 +101,22 @@ npm run demo:start                # builds then runs dist/demo/server.js
 `resolveMakaiBinary` picks the binary in this order: `MAKAI_BINARY_PATH` or an explicit `binaryPath`; `MAKAI_BINARY_URL`/`binaryUrl` (checksum required); the platform package `@makai/cli-<platform>-<arch>`; `./zig-out/bin/makai`; `./zig/zig-out/bin/makai`; then `PATH`. **The platform package outranks both local build paths**, so if an optional `@makai/cli-*` package is installed, `zig build` alone does not make the SDK tests exercise your fresh binary. Set `MAKAI_BINARY_PATH` to be sure which one runs (CI builds with `zig build install --prefix /tmp/makai-smoke` and points `MAKAI_BINARY_PATH` at it).
 
 That variable is also what gates real-binary coverage. Every test in `typescript/test/makai_binary_smoke.test.ts` calls `t.skip("MAKAI_BINARY_PATH is not set")` when it is unset, so `npm run test:sdk` passes green with **zero** end-to-end binary coverage, and a binary found through `zig-out` or the platform package does not switch those tests on. Export `MAKAI_BINARY_PATH` explicitly when you mean to exercise the real runtime.
+
+### Rust SDK
+
+```bash
+cd rust
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test                                            # fake-server suite; needs no binary and no keys
+MAKAI_BINARY_PATH=/tmp/makai-rs/bin/makai cargo test  # adds the real-runtime suite
+```
+
+`rust/` (crate `makai`) mirrors the TypeScript SDK over the same stdio protocol. It is **not wired into the Zig build** — `zig build` neither builds nor tests it; the `rust-sdk` job in `.github/workflows/ci.yml` is its only CI entry point. The zero-comments policy does not apply: Rust doc comments are expected.
+
+Integration tests drive `src/bin/protocol_fake.rs` (`makai-protocol-fake`), a scriptable `makai --stdio` stand-in selected with `MAKAI_FAKE_SCENARIO` and able to log the frames it received to `MAKAI_FAKE_REQUEST_LOG`. Tests reach it through `ClientBuilder::command`, which bypasses binary resolution — `binary_path` would lose to an ambient `MAKAI_BINARY_PATH`, exactly as in TypeScript. `tests/real_binary.rs` skips without `MAKAI_BINARY_PATH`, like the TS smoke tests.
+
+**On macOS two of those real-binary tests skip by default.** Anything that makes the runtime *persist* credentials goes through `saveToPreferredStorage` -> the login Keychain, and creating that item from an unsigned local build blocks in `AuthorizationCopyRights` on a UI prompt no test runner can answer. The test harness also sets `MAKAI_KEYCHAIN_SERVICE` to a service holding no item, which makes *reads* miss immediately instead of blocking — without it, `models.list` and every auth-aware call hang on a Mac. `MAKAI_RUST_SDK_ALLOW_KEYCHAIN=1` runs the skipped two anyway.
 
 ### TUI PTY Harness and Benchmarks
 

@@ -427,6 +427,10 @@ async function run(): Promise<void> {
 void run();
 ```
 
+## Rust SDK
+
+A Rust SDK for the same stdio protocol lives under [`rust/`](rust/README.md) (crate `makai`). It exposes the same four namespaces — `auth`, `models`, `provider`, `agent` — on tokio, with streams as `futures_core::Stream`s and tools executing in the caller's process. See [`rust/README.md`](rust/README.md) for install and quick-start.
+
 ## Zig core library
 
 The Zig core lives under `zig/src/` and is consumed directly as a path dependency (see `build.zig.zon`). Streaming APIs hand out borrowed string slices by design, so memory ownership follows explicit rules: event strings are borrowed from provider buffers by default (owned-event streams — `stream.owns_events == true`, e.g. OpenAI Completions — flip that: you free each polled event with `deinitAssistantMessageEvent`), `wait()` returning `null` is the completion signal (not a `done` event), and the final result is taken with `cloneResult()` as a caller-owned deep copy.

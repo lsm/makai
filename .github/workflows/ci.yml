@@ -138,6 +138,62 @@ jobs:
         run: npm run check:declarations
 
   # =============================================================================
+  # Rust SDK (rust/) — lint, format, unit tests, and E2E against a real
+  # `makai --stdio` build. No API keys: the fake-server tests drive the crate's
+  # own `makai-protocol-fake` binary, and the binary-backed tests exercise the
+  # unauthenticated failure paths plus the runtime's `test-fixture` auth
+  # provider. The crate is NOT wired into the Zig build; this job is its only
+  # entry point.
+  # =============================================================================
+  rust-sdk:
+    name: Rust SDK
+    needs: [unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build makai binary for Rust SDK E2E
+        working-directory: .
+        run: zig build install --prefix /tmp/makai-rs
+
+      - name: Run Rust SDK unit + E2E tests
+        env:
+          MAKAI_BINARY_PATH: /tmp/makai-rs/bin/makai
+        run: cargo test --all-features
+
+  # =============================================================================
   # TUI PTY Harness (deterministic, fixture provider — no API keys)
   #
   # Drives `makai --tui` through a pseudo-terminal with the canned-reply
