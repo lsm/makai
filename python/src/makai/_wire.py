@@ -12,6 +12,7 @@ always carry sequence 1, while an agent session counts ``agent_start`` = 1,
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Dict, Mapping, Optional
 
@@ -140,10 +141,15 @@ def optional_str(value: Any) -> Optional[str]:
 
 
 def number_or(value: Any, fallback: int) -> int:
+    """Read a JSON number, falling back when it is not a usable one.
+
+    ``NaN`` and ``Infinity`` are floats that Python's JSON decoder accepts, so
+    an isinstance check alone lets them reach an ``int()`` that raises.
+    """
     if isinstance(value, bool):
         return fallback
     if isinstance(value, int):
         return value
-    if isinstance(value, float):
+    if isinstance(value, float) and math.isfinite(value):
         return int(value)
     return fallback

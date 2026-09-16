@@ -252,3 +252,32 @@ def test_a_non_finite_cache_age_falls_back_to_the_default() -> None:
         {"payload": {"models": [], "fetched_at_ms": 1, "cache_max_age_ms": float("inf")}}
     )
     assert response.cache_max_age_ms == DEFAULT_CACHE_MAX_AGE_MS
+
+
+def test_non_finite_descriptor_limits_are_dropped_not_crashes() -> None:
+    """context_window / max_output_tokens reach int() the same way."""
+    for value in (float("nan"), float("inf"), float("-inf")):
+        response = _parse_models_response(
+            {
+                "payload": {
+                    "fetched_at_ms": 1,
+                    "models": [
+                        {
+                            "model_ref": "anthropic/anthropic-messages@m",
+                            "model_id": "m",
+                            "display_name": "M",
+                            "provider_id": "anthropic",
+                            "api": "anthropic-messages",
+                            "auth_status": "authenticated",
+                            "lifecycle": "stable",
+                            "capabilities": ["chat"],
+                            "source": "dynamic",
+                            "context_window": value,
+                            "max_output_tokens": value,
+                        }
+                    ],
+                }
+            }
+        )
+        assert response.models[0].context_window is None
+        assert response.models[0].max_output_tokens is None

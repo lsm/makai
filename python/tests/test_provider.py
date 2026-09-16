@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+from makai._wire import number_or
 from conftest import FakeServerFactory, read_log
 from makai.errors import MakaiAuthRequiredError, MakaiProtocolError, MakaiStreamError
 from makai.types import (
@@ -459,3 +460,13 @@ async def test_opaque_model_ref_is_passed_through(fake: FakeServerFactory) -> No
     assert payload["model_ref"] == "opaque-handle"
     assert payload["model"]["id"] == "opaque-handle"
     assert payload["model"]["provider"] == ""
+
+
+def test_non_finite_content_index_falls_back() -> None:
+    """number_or feeds int() too; NaN/Infinity must take the fallback."""
+    for value in (float("nan"), float("inf"), float("-inf")):
+        assert number_or(value, 7) == 7
+    assert number_or(3, 7) == 3
+    assert number_or(3.9, 7) == 3
+    assert number_or(True, 7) == 7
+    assert number_or("3", 7) == 7

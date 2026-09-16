@@ -319,8 +319,8 @@ def _parse_descriptor(raw: Any, index: int) -> ModelDescriptor:
             raw.get("source"), f"models[{index}].source", _KNOWN_SOURCES
         ),
         base_url=_optional_nonempty_str(raw.get("base_url")),
-        context_window=_optional_int(raw.get("context_window")),
-        max_output_tokens=_optional_int(raw.get("max_output_tokens")),
+        context_window=_finite_int(raw.get("context_window")),
+        max_output_tokens=_finite_int(raw.get("max_output_tokens")),
         reasoning_default=reasoning_default,
         metadata=metadata,
     )
@@ -342,8 +342,3 @@ def _require_known(value: Any, field_name: str, known: Set[str]) -> str:
 def _optional_nonempty_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
-
-def _optional_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return int(value)
