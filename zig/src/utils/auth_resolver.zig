@@ -52,11 +52,9 @@ pub fn resolveApiKey(
     return error.AuthRequired;
 }
 
-const max_custom_provider_config_bytes = 1024 * 1024;
-
 fn customProviderEnvKey(allocator: std.mem.Allocator, provider_id: []const u8) std.mem.Allocator.Error!?[]u8 {
     if (builtin.is_test) return null;
-    const providers = custom_providers.load(allocator, max_custom_provider_config_bytes) catch |err| switch (err) {
+    const providers = custom_providers.load(allocator, custom_providers.max_config_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };

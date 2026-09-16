@@ -818,12 +818,10 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
-    const max_custom_provider_config_bytes = 1024 * 1024;
-
     fn warnOnUnreadableCustomProviders(self: *App) void {
         const path = custom_providers.configPath(self.allocator) catch return;
         defer self.allocator.free(path);
-        const data = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, max_custom_provider_config_bytes) catch return;
+        const data = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, custom_providers.max_config_bytes) catch return;
         defer self.allocator.free(data);
         const providers = custom_providers.parse(self.allocator, data) catch |err| {
             const msg = std.fmt.allocPrint(
@@ -839,7 +837,7 @@ pub const App = struct {
     }
 
     fn isDeclaredCustomProvider(self: *App, provider_id: []const u8) bool {
-        const providers = custom_providers.load(self.allocator, max_custom_provider_config_bytes) catch return false;
+        const providers = custom_providers.load(self.allocator, custom_providers.max_config_bytes) catch return false;
         defer custom_providers.deinitProviders(self.allocator, providers);
         for (providers) |provider| {
             if (std.mem.eql(u8, provider.id, provider_id)) return true;

@@ -111,7 +111,7 @@ fn loadCustomModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthS
     const providers = if (builtin.is_test)
         try custom_providers.parse(allocator, test_custom_providers_config orelse return emptyModels(allocator))
     else
-        custom_providers.load(allocator, max_catalog_bytes) catch |err| switch (err) {
+        custom_providers.load(allocator, custom_providers.max_config_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return emptyModels(allocator),
         };

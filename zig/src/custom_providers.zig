@@ -4,6 +4,7 @@ const compat_mod = @import("compat");
 const provider_base_url = @import("provider_base_url");
 
 pub const config_file_name = "providers.json";
+pub const max_config_bytes = 2 * 1024 * 1024;
 
 pub const supported_apis = [_][]const u8{
     "openai-completions",

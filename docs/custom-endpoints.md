@@ -135,6 +135,16 @@ name already exists is skipped rather than duplicated, so an `Authorization` or
 `anthropic-version` in configuration cannot shadow the credential the runtime
 resolved or the API version it requires.
 
+## The Anthropic wire format and vendor credentials
+
+The provider protocol refuses to use a vendor OAuth credential for a provider it
+was not issued to, which is why an Anthropic subscription token cannot be pointed
+at a third-party endpoint. A custom provider on `anthropic-messages` is not that
+case: it authenticates with its own key, resolved from the keychain under its id
+or from its declared environment variable, and the vendor token is never
+consulted. A provider with no credential at all still reaches the endpoint
+unauthenticated, which is what a keyless local server needs.
+
 ## Limits
 
 - Custom providers reach the TUI and the CLI. The TypeScript SDK's `models.list`
