@@ -293,7 +293,7 @@ def kinds(frames):
 # `unknown_envelope` error and keep processing (see the unit test "stdio mode
 # emits unknown_envelope error and continues processing" in makai.zig).
 
-def survives(ctx, name, frame_or_bytes, spec):
+def survives(ctx, name, frame_or_bytes, spec, answered=True):
     """Send one frame and require the host process to survive it.
 
     A frame that is rejected before it reaches real work answers the follow-up
@@ -301,6 +301,13 @@ def survives(ctx, name, frame_or_bytes, spec):
     unsigned macOS build, reading the login Keychain pops an invisible ACL
     prompt), so an alive-but-silent host is reported rather than failed; only a
     host that actually died fails the check.
+
+    Surviving is necessary but not sufficient: the frame must also have been
+    *answered*, with an error frame if it was rejected or a normal reply if it
+    was accepted. A host that silently drops a frame stays alive and answers
+    the follow-up ping, which would otherwise pass this check while regressing
+    the contract it exists to protect. A frame carrying no usable message_id
+    cannot be correlated to any reply, so pass ``answered=False`` for those.
     """
     host = ctx.host()
     host.next_frame(timeout=3.0)
@@ -334,6 +341,13 @@ def survives(ctx, name, frame_or_bytes, spec):
             "host answers and keeps serving",
             "host stayed alive but did not answer the follow-up ping "
             "(exit=%s); on macOS an unsigned build blocks on the Keychain ACL prompt" % code)
+    if answered and not replies:
+        return Result(
+            name, "envelope", "fail", spec,
+            "host answers the frame and keeps serving",
+            "host survived but answered nothing: replies=[], exit=%s" % code,
+            {"stderr": host.stderr_lines[:4]},
+        )
     return Result(name, "envelope", "pass", spec,
                   "host answers and keeps serving",
                   "alive, replies=%s, exit=%s" % (kinds(replies), code))
@@ -385,8 +399,8 @@ def group_envelope(ctx):
         ("provider: type is a number", prov(type=123), spec_host),
         ("provider: payload is absent", without(prov(), "payload"), spec_host),
         ("provider: payload is an array", prov(payload=[]), spec_host),
-        ("provider: message_id is absent", without(prov(), "message_id"), spec_agent),
-        ("provider: message_id is a number", prov(message_id=5), spec_agent),
+        ("provider: message_id is absent", without(prov(), "message_id"), spec_agent, False),
+        ("provider: message_id is a number", prov(message_id=5), spec_agent, False),
         ("provider: timestamp is absent", without(prov(), "timestamp"), spec_agent),
         ("provider: timestamp is a string", prov(timestamp="x"), spec_agent),
         ("provider: in_reply_to is a number", prov(in_reply_to=123), spec_agent),
@@ -432,8 +446,10 @@ def group_envelope(ctx):
     ]
 
     results = []
-    for name, frame, spec in cases:
-        results.append(survives(ctx, name, frame, spec))
+    for case in cases:
+        name, frame, spec = case[0], case[1], case[2]
+        answered = case[3] if len(case) > 3 else True
+        results.append(survives(ctx, name, frame, spec, answered))
     for name, blob in raw_cases:
         results.append(survives(ctx, name, blob, spec_host))
 

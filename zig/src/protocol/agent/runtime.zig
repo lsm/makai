@@ -2,6 +2,8 @@ const std = @import("std");
 const agent_server = @import("agent_server");
 const agent_client = @import("agent_client");
 const agent_envelope = @import("agent_envelope");
+const agent_types = @import("agent_types");
+const compat = @import("compat");
 const in_process = @import("transports/in_process");
 
 const AgentProtocolServer = agent_server.AgentProtocolServer;
@@ -15,12 +17,51 @@ pub const AgentProtocolRuntime = struct {
 
     const Self = @This();
 
+    fn sendErrorForUndecodableInput(self: *Self, raw_json: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+
+        const session_value = obj.get("session_id") orelse return;
+        if (session_value != .string) return;
+        const session_id = agent_types.parseSessionId(session_value.string) orelse return;
+
+        const message_value = obj.get("message_id") orelse return;
+        if (message_value != .string) return;
+        const message_id = agent_types.parseUlid(message_value.string) orelse return;
+
+        var env = agent_types.Envelope{
+            .session_id = session_id,
+            .message_id = agent_types.generateUlid(),
+            .sequence = 0,
+            .in_reply_to = message_id,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{
+                .code = .invalid_request,
+                .message = try self.allocator.dupe(u8, "envelope could not be decoded"),
+            } },
+        };
+        defer env.deinit(self.allocator);
+
+        const json = try agent_envelope.serializeEnvelope(env, self.allocator);
+        defer self.allocator.free(json);
+
+        var sender = self.pipe.serverSender();
+        try sender.write(json);
+        try sender.flush();
+    }
+
     pub fn pumpClientMessages(self: *Self) !void {
         var recv = self.pipe.serverReceiver();
         while (try recv.readLine(self.allocator)) |line| {
             defer self.allocator.free(line);
 
-            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch continue;
+            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch {
+                self.sendErrorForUndecodableInput(line) catch {};
+                continue;
+            };
             defer env.deinit(self.allocator);
 
             if (try self.server.handleEnvelope(env)) |response| {

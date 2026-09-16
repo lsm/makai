@@ -2074,7 +2074,7 @@ fn validatedAgentStopSessionFromLine(line: []const u8, allocator: std.mem.Alloca
     if (AgentProtocolTypes.parseUlid(message_id) == null) return null;
     if (!hasIntegerField(root, "sequence")) return null;
     if (!hasIntegerField(root, "timestamp")) return null;
-    if (!hasIntegerField(root, "version")) return null;
+    if (!hasOptionalIntegerField(root, "version")) return null;
 
     const payload = root.get("payload") orelse return null;
     if (payload != .object) return null;
@@ -2099,7 +2099,7 @@ fn hasValidAgentEnvelopeShape(line: []const u8, allocator: std.mem.Allocator) bo
     if (AgentProtocolTypes.parseUlid(message_id) == null) return false;
     if (!hasIntegerField(root, "sequence")) return false;
     if (!hasIntegerField(root, "timestamp")) return false;
-    if (!hasIntegerField(root, "version")) return false;
+    if (!hasOptionalIntegerField(root, "version")) return false;
 
     const payload = root.get("payload") orelse return false;
     if (payload != .object) return false;
@@ -2132,6 +2132,11 @@ fn hasValidAgentPayloadShape(ty: []const u8, payload: std.json.ObjectMap) bool {
 
 fn hasIntegerField(obj: std.json.ObjectMap, key: []const u8) bool {
     const value = obj.get(key) orelse return false;
+    return value == .integer;
+}
+
+fn hasOptionalIntegerField(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return true;
     return value == .integer;
 }
 

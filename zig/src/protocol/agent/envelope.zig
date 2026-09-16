@@ -280,9 +280,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "agent_message")) {
         const msg = try allocator.dupe(u8, try jf.requireString(payload, "message_json"));
         var req = agent_types.AgentMessageRequest{
-            .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")),
+            .session_id = undefined,
             .message_json = msg,
         };
+        errdefer {
+            allocator.free(msg);
+            req.options_json.deinit(allocator);
+        }
+        req.session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id"));
         if (try jf.optionalString(payload, "options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_message = req };
     }
@@ -310,55 +315,91 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .agent_stopped = stopped };
     }
     if (std.mem.eql(u8, type_str, "agent_error")) {
-        return .{ .agent_error = .{
-            .code = std.meta.stringToEnum(agent_types.AgentErrorCode, try jf.requireString(payload, "code")) orelse .internal_error,
-            .message = try allocator.dupe(u8, try jf.requireString(payload, "message")),
-        } };
+        const code = std.meta.stringToEnum(agent_types.AgentErrorCode, try jf.requireString(payload, "code")) orelse .internal_error;
+        const message = try allocator.dupe(u8, try jf.requireString(payload, "message"));
+        return .{ .agent_error = .{ .code = code, .message = message } };
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
+        const session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id"));
+        const status = std.meta.stringToEnum(agent_types.AgentStatus, try jf.requireString(payload, "status")) orelse .@"error";
+        const model = try allocator.dupe(u8, try jf.requireString(payload, "model"));
+        errdefer allocator.free(model);
+        const message_count = try jf.requireUnsigned(u32, payload, "message_count");
+        const created_at = try jf.requireInteger(payload, "created_at");
+        const updated_at = try jf.requireInteger(payload, "updated_at");
         return .{ .session_info = .{
-            .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")),
-            .status = std.meta.stringToEnum(agent_types.AgentStatus, try jf.requireString(payload, "status")) orelse .@"error",
-            .model = try allocator.dupe(u8, try jf.requireString(payload, "model")),
-            .message_count = try jf.requireUnsigned(u32, payload, "message_count"),
-            .created_at = try jf.requireInteger(payload, "created_at"),
-            .updated_at = try jf.requireInteger(payload, "updated_at"),
+            .session_id = session_id,
+            .status = status,
+            .model = model,
+            .message_count = message_count,
+            .created_at = created_at,
+            .updated_at = updated_at,
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
         const tools_arr = try jf.requireArray(payload, "tools");
         const tools = try allocator.alloc(agent_types.ToolDefinition, tools_arr.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (tools[0..filled]) |tool| {
+                allocator.free(tool.name);
+                allocator.free(tool.description);
+                allocator.free(tool.parameters_schema_json);
+            }
+            allocator.free(tools);
+        }
         for (tools_arr.items, 0..) |t, i| {
+            const entry = try jf.elementAsObject(t);
+            const name = try allocator.dupe(u8, try jf.requireString(entry, "name"));
+            errdefer allocator.free(name);
+            const description = try allocator.dupe(u8, try jf.requireString(entry, "description"));
+            errdefer allocator.free(description);
+            const schema = try allocator.dupe(u8, try jf.requireString(entry, "parameters_schema_json"));
             tools[i] = .{
-                .name = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "name")),
-                .description = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "description")),
-                .parameters_schema_json = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "parameters_schema_json")),
+                .name = name,
+                .description = description,
+                .parameters_schema_json = schema,
             };
+            filled = i + 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name"));
+        errdefer allocator.free(tool_name);
+        const args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json"));
+        errdefer allocator.free(args_json);
         var req = agent_types.ToolExecuteRequest{
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
-            .args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json")),
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
+            .args_json = args_json,
         };
         if (try jf.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json"));
+        errdefer allocator.free(result_json);
+        const is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false;
         var res = agent_types.ToolExecuteResponse{
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json")),
-            .is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false,
+            .tool_call_id = tool_call_id,
+            .result_json = result_json,
+            .is_error = is_error,
         };
         if (try jf.optionalString(payload, "details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_result = res };
     }
     if (std.mem.eql(u8, type_str, "tool_streaming")) {
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const partial_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_json"));
         return .{ .tool_streaming = .{
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .partial_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_json")),
+            .tool_call_id = tool_call_id,
+            .partial_json = partial_json,
         } };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
@@ -373,7 +414,8 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "nack")) {
         const rejected_id = try parseUlidRequired(try jf.requireString(payload, "rejected_id"));
-        const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "reason")));
+        var reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "reason")));
+        errdefer reason.deinit(allocator);
         const error_code = if (try jf.optionalString(payload, "error_code")) |v|
             std.meta.stringToEnum(agent_types.ErrorCode, v)
         else

@@ -63,8 +63,7 @@ fn serializePayload(
     try w.beginObject();
 
     switch (payload) {
-        .ping => {
-        },
+        .ping => {},
         .pong => |pong| {
             try w.writeStringField("ping_id", pong.ping_id.slice());
         },
@@ -1435,18 +1434,28 @@ fn deserializeContext(
     };
 
     const messages = try allocator.alloc(ai_types.Message, messages_arr.items.len);
-    errdefer allocator.free(messages);
+    var messages_filled: usize = 0;
+    errdefer {
+        for (messages[0..messages_filled]) |*message| message.deinit(allocator);
+        allocator.free(messages);
+    }
 
     for (messages_arr.items, 0..) |item, i| {
         messages[i] = try deserializeMessage(try jf.elementAsObject(item), allocator);
+        messages_filled = i + 1;
     }
 
     var tools: ?[]ai_types.Tool = null;
-    if (try jf.optionalArray(obj, "tools")) |tools_val| {
-        const tools_arr = tools_val;
+    var tools_filled: usize = 0;
+    errdefer if (tools) |owned| {
+        for (owned[0..tools_filled]) |*tool| tool.deinit(allocator);
+        allocator.free(owned);
+    };
+    if (try jf.optionalArray(obj, "tools")) |tools_arr| {
         tools = try allocator.alloc(ai_types.Tool, tools_arr.items.len);
         for (tools_arr.items, 0..) |item, i| {
             tools.?[i] = try deserializeTool(try jf.elementAsObject(item), allocator);
+            tools_filled = i + 1;
         }
     }
 
@@ -2478,7 +2487,6 @@ test "deserializeEnvelope with stream_request frees all memory" {
     try std.testing.expectEqualStrings("GPT-4o", envelope.payload.stream_request.model.name);
     try std.testing.expect(envelope.payload.stream_request.model.is_owned);
     try std.testing.expect(envelope.payload.stream_request.context.is_owned);
-
 }
 
 test "deserializeEnvelope with complete_request frees all memory" {

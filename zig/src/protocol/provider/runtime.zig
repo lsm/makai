@@ -218,10 +218,16 @@ pub const ProviderProtocolRuntime = struct {
         if (message_id_str != .string) return;
         const message_id = protocol_types.parseUlid(message_id_str.string) orelse return;
 
+        const sequence: u64 = blk: {
+            const raw = obj.get("sequence") orelse break :blk 0;
+            if (raw != .integer or raw.integer <= 0) break :blk 0;
+            break :blk std.math.cast(u64, raw.integer) orelse 0;
+        };
+
         const dummy_envelope = protocol_types.Envelope{
             .stream_id = stream_id,
             .message_id = message_id,
-            .sequence = 0,
+            .sequence = sequence,
             .timestamp = compat.time.nowMillis(),
             .payload = .ping,
         };

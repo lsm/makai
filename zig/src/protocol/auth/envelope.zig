@@ -228,10 +228,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "auth_prompt_response")) {
+        const flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id"));
+        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "prompt_id")));
+        errdefer prompt_id.deinit(allocator);
+        const answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "answer")));
         return .{ .auth_prompt_response = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id")),
-            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "prompt_id"))),
-            .answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "answer"))),
+            .flow_id = flow_id,
+            .prompt_id = prompt_id,
+            .answer = answer,
         } };
     }
 
@@ -303,10 +307,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "auth_login_result")) {
+        const flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "provider_id")));
+        errdefer provider_id.deinit(allocator);
+        const status = std.meta.stringToEnum(auth_types.AuthLoginStatus, try jf.requireString(payload, "status")) orelse .failed;
         return .{ .auth_login_result = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id")),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "provider_id"))),
-            .status = std.meta.stringToEnum(auth_types.AuthLoginStatus, try jf.requireString(payload, "status")) orelse .failed,
+            .flow_id = flow_id,
+            .provider_id = provider_id,
+            .status = status,
         } };
     }
 
@@ -333,12 +341,17 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
 fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocator) !auth_types.AuthEvent {
     if (try jf.optionalObject(payload, "auth_url")) |auth_url| {
+        const flow_id = try parseUlidRequired(try jf.requireString(auth_url, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "provider_id")));
+        errdefer provider_id.deinit(allocator);
+        const url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "url")));
 
         var result: auth_types.AuthEvent = .{ .auth_url = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(auth_url, "flow_id")),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "provider_id"))),
-            .url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "url"))),
+            .flow_id = flow_id,
+            .provider_id = provider_id,
+            .url = url,
         } };
+        errdefer result.deinit(allocator);
 
         if (try jf.optionalString(auth_url, "instructions")) |instructions| {
             result.auth_url.instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, instructions));
@@ -348,20 +361,32 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
     }
 
     if (try jf.optionalObject(payload, "prompt")) |prompt| {
+        const flow_id = try parseUlidRequired(try jf.requireString(prompt, "flow_id"));
+        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "prompt_id")));
+        errdefer prompt_id.deinit(allocator);
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "provider_id")));
+        errdefer provider_id.deinit(allocator);
+        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "message")));
+        errdefer message.deinit(allocator);
+        const allow_empty = if (try jf.optionalBool(prompt, "allow_empty")) |value| value else false;
         return .{ .prompt = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(prompt, "flow_id")),
-            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "prompt_id"))),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "provider_id"))),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "message"))),
-            .allow_empty = if (try jf.optionalBool(prompt, "allow_empty")) |allow_empty| allow_empty else false,
+            .flow_id = flow_id,
+            .prompt_id = prompt_id,
+            .provider_id = provider_id,
+            .message = message,
+            .allow_empty = allow_empty,
         } };
     }
 
     if (try jf.optionalObject(payload, "progress")) |progress| {
+        const flow_id = try parseUlidRequired(try jf.requireString(progress, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "provider_id")));
+        errdefer provider_id.deinit(allocator);
+        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "message")));
         return .{ .progress = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(progress, "flow_id")),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "provider_id"))),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "message"))),
+            .flow_id = flow_id,
+            .provider_id = provider_id,
+            .message = message,
         } };
     }
 
@@ -373,12 +398,17 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
     }
 
     if (try jf.optionalObject(payload, "error")) |event_error| {
+        const flow_id = try parseUlidRequired(try jf.requireString(event_error, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "provider_id")));
+        errdefer provider_id.deinit(allocator);
+        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "message")));
 
         var result: auth_types.AuthEvent = .{ .@"error" = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(event_error, "flow_id")),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "provider_id"))),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "message"))),
+            .flow_id = flow_id,
+            .provider_id = provider_id,
+            .message = message,
         } };
+        errdefer result.deinit(allocator);
 
         if (try jf.optionalString(event_error, "code")) |code| {
             result.@"error".code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, code));

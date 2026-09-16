@@ -695,7 +695,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_server", .module = protocol_agent_server_mod },
             .{ .name = "agent_client", .module = protocol_agent_client_mod },
             .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
+            .{ .name = "agent_types", .module = protocol_agent_types_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -745,7 +747,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "auth_server", .module = protocol_auth_server_mod },
             .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
+            .{ .name = "auth_types", .module = protocol_auth_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 

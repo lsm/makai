@@ -397,8 +397,23 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
         const tools_arr = try jf.requireArray(payload, "tools");
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (tools[0..filled]) |tool| {
+                allocator.free(tool.name);
+                allocator.free(tool.description);
+                allocator.free(tool.parameters_schema_json);
+                allocator.free(tool.version);
+                if (tool.required_permissions) |perms| {
+                    for (perms) |p| allocator.free(p);
+                    allocator.free(perms);
+                }
+            }
+            allocator.free(tools);
+        }
         for (tools_arr.items, 0..) |t, i| {
             tools[i] = try deserializeToolMetadata(try jf.elementAsObject(t), allocator);
+            filled = i + 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
@@ -407,37 +422,57 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         errdefer allocator.free(args_json);
         try validateJson(args_json, allocator);
 
+        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name"));
+        errdefer allocator.free(tool_name);
+
         var req = tool_types.ToolExecuteRequest{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
             .args_json = args_json,
         };
+        errdefer req.stream_callback_url.deinit(allocator);
         if (try jf.optionalUnsigned(u32, payload, "timeout_ms")) |v| req.timeout_ms = v;
         if (try jf.optionalString(payload, "stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_stream")) {
+        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const partial_result_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_result_json"));
+        errdefer allocator.free(partial_result_json);
+
         var update = tool_types.ToolStreamUpdate{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .partial_result_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_result_json")),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id,
+            .partial_result_json = partial_result_json,
         };
+        errdefer update.status.deinit(allocator);
         if (try jf.optionalUnsigned(u8, payload, "progress")) |v| update.progress = v;
         if (try jf.optionalString(payload, "status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_stream = update };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
+        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
+        const result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json"));
+        errdefer allocator.free(result_json);
+        const is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false;
+        const duration_ms = try jf.requireUnsigned(u32, payload, "duration_ms");
+
         var result = tool_types.ToolExecuteResult{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
-            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
-            .result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json")),
-            .is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false,
-            .duration_ms = try jf.requireUnsigned(u32, payload, "duration_ms"),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id,
+            .result_json = result_json,
+            .is_error = is_error,
+            .duration_ms = duration_ms,
         };
         errdefer {
-            allocator.free(result.tool_call_id);
-            allocator.free(result.result_json);
             result.error_message.deinit(allocator);
             result.details_json.deinit(allocator);
             result.artifacts.deinit(allocator);
@@ -460,10 +495,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_error")) {
+        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
+        const code = std.meta.stringToEnum(tool_types.ToolErrorCode, try jf.requireString(payload, "code")) orelse return error.InvalidPayloadType;
+        const message = try allocator.dupe(u8, try jf.requireString(payload, "message"));
         return .{ .tool_error = .{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
-            .code = std.meta.stringToEnum(tool_types.ToolErrorCode, try jf.requireString(payload, "code")) orelse return error.InvalidPayloadType,
-            .message = try allocator.dupe(u8, try jf.requireString(payload, "message")),
+            .execution_id = execution_id,
+            .code = code,
+            .message = message,
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status")) {
@@ -626,23 +664,43 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
     var required_permissions: ?[]const []const u8 = null;
-    if (try jf.optionalArray(obj, "required_permissions")) |permissions_value| {
-        const permissions_arr = permissions_value;
+    var permissions_filled: usize = 0;
+    errdefer if (required_permissions) |permissions| {
+        for (permissions[0..permissions_filled]) |permission| allocator.free(permission);
+        allocator.free(permissions);
+    };
+    if (try jf.optionalArray(obj, "required_permissions")) |permissions_arr| {
         const permissions = try allocator.alloc([]const u8, permissions_arr.items.len);
+        required_permissions = permissions;
         for (permissions_arr.items, 0..) |permission, i| {
             permissions[i] = try allocator.dupe(u8, try jf.elementAsString(permission));
+            permissions_filled = i + 1;
         }
-        required_permissions = permissions;
     }
 
+    const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, try jf.requireString(obj, "description"));
+    errdefer allocator.free(description);
+    const parameters_schema_json = try allocator.dupe(u8, try jf.requireString(obj, "parameters_schema_json"));
+    errdefer allocator.free(parameters_schema_json);
+    const version = if (try jf.optionalString(obj, "version")) |v|
+        try allocator.dupe(u8, v)
+    else
+        try allocator.dupe(u8, "1.0.0");
+    errdefer allocator.free(version);
+    const supports_streaming = if (try jf.optionalBool(obj, "supports_streaming")) |v| v else false;
+    const estimated_duration_ms = try jf.optionalUnsigned(u32, obj, "estimated_duration_ms");
+    const is_destructive = try jf.boolOr(obj, "is_destructive", false);
+
     return .{
-        .name = try allocator.dupe(u8, try jf.requireString(obj, "name")),
-        .description = try allocator.dupe(u8, try jf.requireString(obj, "description")),
-        .parameters_schema_json = try allocator.dupe(u8, try jf.requireString(obj, "parameters_schema_json")),
-        .version = if (try jf.optionalString(obj, "version")) |v| try allocator.dupe(u8, v) else try allocator.dupe(u8, "1.0.0"),
-        .supports_streaming = if (try jf.optionalBool(obj, "supports_streaming")) |v| v else false,
-        .estimated_duration_ms = try jf.optionalUnsigned(u32, obj, "estimated_duration_ms"),
-        .is_destructive = try jf.boolOr(obj, "is_destructive", false),
+        .name = name,
+        .description = description,
+        .parameters_schema_json = parameters_schema_json,
+        .version = version,
+        .supports_streaming = supports_streaming,
+        .estimated_duration_ms = estimated_duration_ms,
+        .is_destructive = is_destructive,
         .required_permissions = required_permissions,
     };
 }
