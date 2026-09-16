@@ -1480,7 +1480,13 @@ fn runThread(ctx: *ThreadCtx) void {
                                     stream.completeWithError("oom text");
                                     return;
                                 };
-                                content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
+                                content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
+                                    allocator.free(text_copy);
+                                    ctx.deinit();
+                                    stream.markThreadDone();
+                                    stream.completeWithError("oom text");
+                                    return;
+                                };
 
                                 _ = stream.pushBlocking(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } });
                             },
@@ -1499,13 +1505,27 @@ fn runThread(ctx: *ThreadCtx) void {
                                 content_blocks.append(allocator, .{ .thinking = .{
                                     .thinking = thinking_copy,
                                     .thinking_signature = sig_copy,
-                                } }) catch {};
+                                } }) catch {
+                                    allocator.free(thinking_copy);
+                                    if (sig_copy) |sig| allocator.free(sig);
+                                    ctx.deinit();
+                                    stream.markThreadDone();
+                                    stream.completeWithError("oom thinking");
+                                    return;
+                                };
 
                                 _ = stream.pushBlocking(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } });
                             },
                             .tool_use => {
                                 if (tc_tracker.completeCall(cbs.index, allocator)) |tool_call| {
-                                    content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {};
+                                    content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {
+                                        var orphan = tool_call;
+                                        ai_types.deinitToolCall(allocator, &orphan);
+                                        ctx.deinit();
+                                        stream.markThreadDone();
+                                        stream.completeWithError("oom tool call");
+                                        return;
+                                    };
 
                                     const event_tc = ai_types.ToolCall{
                                         .id = allocator.dupe(u8, tool_call.id) catch tool_call.id,
@@ -1573,7 +1593,13 @@ fn runThread(ctx: *ThreadCtx) void {
             stream.completeWithError("oom text");
             return;
         };
-        content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
+        content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
+            allocator.free(text_copy);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom text");
+            return;
+        };
     }
 
     if (content_blocks.items.len == 0) {
