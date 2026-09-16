@@ -223,18 +223,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const type_str = root.get("type").?.string;
-    const session_id = parseSessionIdOrError(root.get("session_id").?.string) orelse return error.InvalidSessionId;
-    const message_id = try parseUlidRequired(root.get("message_id").?.string);
-    const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
-    const timestamp = root.get("timestamp").?.integer;
-    const version = @as(u8, @intCast(root.get("version").?.integer));
+    const root = try asObject(parsed.value);
+    const type_str = try requiredString(root, "type");
+    const session_id = try parseSessionIdRequired(try requiredString(root, "session_id"));
+    const message_id = try parseUlidRequired(try requiredString(root, "message_id"));
+    const sequence = try requiredBoundedInteger(u64, root, "sequence");
+    const timestamp = try requiredInteger(root, "timestamp");
+    const version: u8 = if (root.get("version")) |v| try asBoundedInteger(u8, v) else 1;
 
     var in_reply_to: ?agent_types.Ulid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
+    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(try asString(v));
 
-    const payload_obj = root.get("payload").?.object;
+    const payload_obj = try requiredObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -248,6 +248,83 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     };
 }
 
+const FieldError = error{ MissingField, InvalidField };
+
+fn asString(value: std.json.Value) FieldError![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidField,
+    };
+}
+
+fn asBool(value: std.json.Value) FieldError!bool {
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidField,
+    };
+}
+
+fn asInteger(value: std.json.Value) FieldError!i64 {
+    return switch (value) {
+        .integer => |n| n,
+        else => error.InvalidField,
+    };
+}
+
+fn asBoundedInteger(comptime T: type, value: std.json.Value) FieldError!T {
+    return std.math.cast(T, try asInteger(value)) orelse error.InvalidField;
+}
+
+fn asArray(value: std.json.Value) FieldError!std.json.Array {
+    return switch (value) {
+        .array => |a| a,
+        else => error.InvalidField,
+    };
+}
+
+fn asObject(value: std.json.Value) FieldError!std.json.ObjectMap {
+    return switch (value) {
+        .object => |o| o,
+        else => error.InvalidField,
+    };
+}
+
+fn requiredField(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Value {
+    return obj.get(key) orelse error.MissingField;
+}
+
+fn requiredString(obj: std.json.ObjectMap, key: []const u8) FieldError![]const u8 {
+    return asString(try requiredField(obj, key));
+}
+
+fn requiredInteger(obj: std.json.ObjectMap, key: []const u8) FieldError!i64 {
+    return asInteger(try requiredField(obj, key));
+}
+
+fn requiredBoundedInteger(comptime T: type, obj: std.json.ObjectMap, key: []const u8) FieldError!T {
+    return asBoundedInteger(T, try requiredField(obj, key));
+}
+
+fn requiredArray(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Array {
+    return asArray(try requiredField(obj, key));
+}
+
+fn requiredObject(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.ObjectMap {
+    return asObject(try requiredField(obj, key));
+}
+
+fn optionalString(obj: std.json.ObjectMap, key: []const u8) FieldError!?[]const u8 {
+    return if (obj.get(key)) |v| try asString(v) else null;
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8, fallback: bool) FieldError!bool {
+    return if (obj.get(key)) |v| try asBool(v) else fallback;
+}
+
+fn optionalBoundedInteger(comptime T: type, obj: std.json.ObjectMap, key: []const u8) FieldError!?T {
+    return if (obj.get(key)) |v| try asBoundedInteger(T, v) else null;
+}
+
 fn parseUlidRequired(str: []const u8) !agent_types.Ulid {
     return agent_types.parseUlid(str) orelse error.InvalidUlid;
 }
@@ -256,126 +333,203 @@ fn parseSessionIdRequired(str: []const u8) !agent_types.SessionId {
     return agent_types.parseSessionId(str) orelse error.InvalidSessionId;
 }
 
-fn parseSessionIdOrError(str: []const u8) ?agent_types.SessionId {
-    return agent_types.parseSessionId(str);
-}
-
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
     if (std.mem.eql(u8, type_str, "agent_start")) {
-        const config = try allocator.dupe(u8, payload.get("config_json").?.string);
-        var result = agent_types.AgentStartRequest{ .config_json = config };
-        if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("session_id")) |v| {
-            result.session_id = try parseSessionIdRequired(v.string);
-        } else if (payload.get("resume_session_id")) |v| {
-            result.session_id = try parseSessionIdRequired(v.string);
-        }
+        const config_json = try requiredString(payload, "config_json");
+        const system_prompt = try optionalString(payload, "system_prompt");
+        const session_id: ?agent_types.SessionId = if (payload.get("session_id")) |v|
+            try parseSessionIdRequired(try asString(v))
+        else if (payload.get("resume_session_id")) |v|
+            try parseSessionIdRequired(try asString(v))
+        else
+            null;
+
+        const config = try allocator.dupe(u8, config_json);
+        errdefer allocator.free(config);
+
+        var result = agent_types.AgentStartRequest{ .config_json = config, .session_id = session_id };
+        if (system_prompt) |value| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
-        const msg = try allocator.dupe(u8, payload.get("message_json").?.string);
+        const session_id = try parseSessionIdRequired(try requiredString(payload, "session_id"));
+        const message_json = try requiredString(payload, "message_json");
+        const options_json = try optionalString(payload, "options_json");
+
+        const msg = try allocator.dupe(u8, message_json);
+        errdefer allocator.free(msg);
+
         var req = agent_types.AgentMessageRequest{
-            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
+            .session_id = session_id,
             .message_json = msg,
         };
-        if (payload.get("options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (options_json) |value| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .agent_message = req };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
-        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
-        if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        const session_id = try parseSessionIdRequired(try requiredString(payload, "session_id"));
+        const reason = try optionalString(payload, "reason");
+
+        var req = agent_types.AgentStopRequest{ .session_id = session_id };
+        if (reason) |value| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .agent_stop = req };
     }
     if (std.mem.eql(u8, type_str, "agent_status")) {
-        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(try requiredString(payload, "session_id")) } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
+        const prefix = try optionalString(payload, "prefix");
         var req = agent_types.ToolListRequest{};
-        if (payload.get("prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (prefix) |value| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "agent_started")) {
-        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(try requiredString(payload, "session_id")) } };
     }
-    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, payload.get("event_json").?.string) };
-    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, payload.get("result_json").?.string) };
+    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, try requiredString(payload, "event_json")) };
+    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, try requiredString(payload, "result_json")) };
     if (std.mem.eql(u8, type_str, "agent_stopped")) {
-        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
-        if (payload.get("reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        const session_id = try parseSessionIdRequired(try requiredString(payload, "session_id"));
+        const reason = try optionalString(payload, "reason");
+
+        var stopped = agent_types.AgentStopped{ .session_id = session_id };
+        if (reason) |value| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .agent_stopped = stopped };
     }
     if (std.mem.eql(u8, type_str, "agent_error")) {
+        const code = try requiredString(payload, "code");
+        const message = try requiredString(payload, "message");
         return .{ .agent_error = .{
-            .code = std.meta.stringToEnum(agent_types.AgentErrorCode, payload.get("code").?.string) orelse .internal_error,
-            .message = try allocator.dupe(u8, payload.get("message").?.string),
+            .code = std.meta.stringToEnum(agent_types.AgentErrorCode, code) orelse .internal_error,
+            .message = try allocator.dupe(u8, message),
         } };
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
+        const session_id = try parseSessionIdRequired(try requiredString(payload, "session_id"));
+        const status = try requiredString(payload, "status");
+        const model = try requiredString(payload, "model");
+        const message_count = try requiredBoundedInteger(u32, payload, "message_count");
+        const created_at = try requiredInteger(payload, "created_at");
+        const updated_at = try requiredInteger(payload, "updated_at");
+
         return .{ .session_info = .{
-            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
-            .status = std.meta.stringToEnum(agent_types.AgentStatus, payload.get("status").?.string) orelse .@"error",
-            .model = try allocator.dupe(u8, payload.get("model").?.string),
-            .message_count = @as(u32, @intCast(payload.get("message_count").?.integer)),
-            .created_at = payload.get("created_at").?.integer,
-            .updated_at = payload.get("updated_at").?.integer,
+            .session_id = session_id,
+            .status = std.meta.stringToEnum(agent_types.AgentStatus, status) orelse .@"error",
+            .model = try allocator.dupe(u8, model),
+            .message_count = message_count,
+            .created_at = created_at,
+            .updated_at = updated_at,
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = payload.get("tools").?.array;
+        const tools_arr = try requiredArray(payload, "tools");
         const tools = try allocator.alloc(agent_types.ToolDefinition, tools_arr.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tools[0..initialized]) |tool| {
+                allocator.free(tool.name);
+                allocator.free(tool.description);
+                allocator.free(tool.parameters_schema_json);
+            }
+            allocator.free(tools);
+        }
+
         for (tools_arr.items, 0..) |t, i| {
+            const tool_obj = try asObject(t);
+            const name = try requiredString(tool_obj, "name");
+            const description = try requiredString(tool_obj, "description");
+            const parameters_schema_json = try requiredString(tool_obj, "parameters_schema_json");
+
+            const name_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_copy);
+            const description_copy = try allocator.dupe(u8, description);
+            errdefer allocator.free(description_copy);
+
             tools[i] = .{
-                .name = try allocator.dupe(u8, t.object.get("name").?.string),
-                .description = try allocator.dupe(u8, t.object.get("description").?.string),
-                .parameters_schema_json = try allocator.dupe(u8, t.object.get("parameters_schema_json").?.string),
+                .name = name_copy,
+                .description = description_copy,
+                .parameters_schema_json = try allocator.dupe(u8, parameters_schema_json),
             };
+            initialized += 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const tool_name = try requiredString(payload, "tool_name");
+        const args_json = try requiredString(payload, "args_json");
+        const callback_url = try optionalString(payload, "callback_url");
+
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+        const tool_name_copy = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(tool_name_copy);
+        const args_json_copy = try allocator.dupe(u8, args_json);
+        errdefer allocator.free(args_json_copy);
+
         var req = agent_types.ToolExecuteRequest{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
-            .args_json = try allocator.dupe(u8, payload.get("args_json").?.string),
+            .tool_call_id = tool_call_id_copy,
+            .tool_name = tool_name_copy,
+            .args_json = args_json_copy,
         };
-        if (payload.get("callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (callback_url) |value| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const result_json = try requiredString(payload, "result_json");
+        const is_error = try optionalBool(payload, "is_error", false);
+        const details_json = try optionalString(payload, "details_json");
+
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+        const result_json_copy = try allocator.dupe(u8, result_json);
+        errdefer allocator.free(result_json_copy);
+
         var res = agent_types.ToolExecuteResponse{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .result_json = try allocator.dupe(u8, payload.get("result_json").?.string),
-            .is_error = if (payload.get("is_error")) |v| v.bool else false,
+            .tool_call_id = tool_call_id_copy,
+            .result_json = result_json_copy,
+            .is_error = is_error,
         };
-        if (payload.get("details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (details_json) |value| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_result = res };
     }
     if (std.mem.eql(u8, type_str, "tool_streaming")) {
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const partial_json = try requiredString(payload, "partial_json");
+
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+
         return .{ .tool_streaming = .{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .partial_json = try allocator.dupe(u8, payload.get("partial_json").?.string),
+            .tool_call_id = tool_call_id_copy,
+            .partial_json = try allocator.dupe(u8, partial_json),
         } };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
-    if (std.mem.eql(u8, type_str, "pong")) return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("ping_id").?.string)) } };
+    if (std.mem.eql(u8, type_str, "pong")) {
+        const ping_id = try requiredString(payload, "ping_id");
+        return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, ping_id)) } };
+    }
     if (std.mem.eql(u8, type_str, "goodbye")) {
+        const reason = try optionalString(payload, "reason");
         var g = agent_types.Goodbye{};
-        if (payload.get("reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (reason) |value| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .goodbye = g };
     }
     if (std.mem.eql(u8, type_str, "ack")) {
-        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(payload.get("acknowledged_id").?.string) } };
+        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(try requiredString(payload, "acknowledged_id")) } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
-        const rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string);
-        const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
-        const error_code = if (payload.get("error_code")) |v|
-            std.meta.stringToEnum(agent_types.ErrorCode, v.string)
+        const rejected_id = try parseUlidRequired(try requiredString(payload, "rejected_id"));
+        const reason_str = try requiredString(payload, "reason");
+        const error_code: ?agent_types.ErrorCode = if (payload.get("error_code")) |v|
+            std.meta.stringToEnum(agent_types.ErrorCode, try asString(v))
         else
             null;
         return .{ .nack = .{
             .rejected_id = rejected_id,
-            .reason = reason,
+            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, reason_str)),
             .error_code = error_code,
         } };
     }
@@ -393,8 +547,14 @@ fn deserializeModelsRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsRequest {
-    const provider_id = if (obj.get("provider_id")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const provider_id_str = try optionalString(obj, "provider_id");
+    const api_str = try optionalString(obj, "api");
+    const model_id_str = try optionalString(obj, "model_id");
+    const include_deprecated = try optionalBool(obj, "include_deprecated", false);
+    const include_login_required = try optionalBool(obj, "include_login_required", true);
+
+    const provider_id = if (provider_id_str) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -402,8 +562,8 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const api = if (obj.get("api")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const api = if (api_str) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -411,17 +571,14 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const model_id = if (obj.get("model_id")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const model_id = if (model_id_str) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
-
-    const include_deprecated = if (obj.get("include_deprecated")) |value| value.bool else false;
-    const include_login_required = if (obj.get("include_login_required")) |value| value.bool else true;
 
     return .{
         .provider_id = provider_id,
@@ -436,9 +593,9 @@ fn deserializeModelsResponse(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsResponse {
-    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
-    const cache_max_age_ms: u64 = @intCast(obj.get("cache_max_age_ms").?.integer);
-    const models_array = obj.get("models").?.array;
+    const fetched_at_ms = try requiredInteger(obj, "fetched_at_ms");
+    const cache_max_age_ms = try requiredBoundedInteger(u64, obj, "cache_max_age_ms");
+    const models_array = try requiredArray(obj, "models");
 
     const descriptors = try allocator.alloc(model_catalog_types.ModelDescriptor, models_array.items.len);
     var allocated_count: usize = 0;
@@ -448,7 +605,7 @@ fn deserializeModelsResponse(
     }
 
     for (models_array.items, 0..) |item, idx| {
-        descriptors[idx] = try deserializeModelDescriptor(item.object, allocator);
+        descriptors[idx] = try deserializeModelDescriptor(try asObject(item), allocator);
         allocated_count += 1;
     }
 
@@ -463,38 +620,55 @@ fn deserializeModelDescriptor(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !model_catalog_types.ModelDescriptor {
-    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    const model_ref_str = try requiredString(obj, "model_ref");
+    const model_id_str = try requiredString(obj, "model_id");
+    const display_name_str = try requiredString(obj, "display_name");
+    const provider_id_str = try requiredString(obj, "provider_id");
+    const api_str = try requiredString(obj, "api");
+    const base_url_str = try optionalString(obj, "base_url");
+    const auth_status = parseAuthStatus(try requiredString(obj, "auth_status"));
+    const lifecycle = try parseModelLifecycle(try requiredString(obj, "lifecycle"));
+    const source = try parseModelSource(try requiredString(obj, "source"));
+    const context_window = try optionalBoundedInteger(u32, obj, "context_window");
+    const max_output_tokens = try optionalBoundedInteger(u32, obj, "max_output_tokens");
+    const reasoning_default: ?model_catalog_types.ReasoningLevel = if (obj.get("reasoning_default")) |value|
+        try parseReasoningLevel(try asString(value))
+    else
+        null;
+    const capabilities_array = try requiredArray(obj, "capabilities");
+
+    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model_ref_str));
     errdefer {
         var mutable = model_ref;
         mutable.deinit(allocator);
     }
 
-    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model_id_str));
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, display_name_str));
     errdefer {
         var mutable = display_name;
         mutable.deinit(allocator);
     }
 
-    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id_str));
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, api_str));
     errdefer {
         var mutable = api;
         mutable.deinit(allocator);
     }
 
-    const base_url = if (obj.get("base_url")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const base_url = if (base_url_str) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -502,16 +676,15 @@ fn deserializeModelDescriptor(
         mutable.deinit(allocator);
     }
 
-    const capabilities_array = obj.get("capabilities").?.array;
     const capabilities = try allocator.alloc(model_catalog_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = try parseModelCapability(item.string);
+        capabilities[idx] = try parseModelCapability(try asString(item));
     }
 
     var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
     if (obj.get("metadata")) |metadata_value| {
-        const metadata_obj = metadata_value.object;
+        const metadata_obj = try asObject(metadata_value);
         const metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
         var metadata_count: usize = 0;
         errdefer {
@@ -521,9 +694,15 @@ fn deserializeModelDescriptor(
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
+            const entry_value = try asString(entry.value_ptr.*);
+            const key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*));
+            errdefer {
+                var mutable = key;
+                mutable.deinit(allocator);
+            }
             metadata_items[metadata_count] = .{
-                .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+                .key = key,
+                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry_value)),
             };
             metadata_count += 1;
         }
@@ -538,13 +717,13 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
-        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
+        .auth_status = auth_status,
+        .lifecycle = lifecycle,
         .capabilities = OwnedSlice(model_catalog_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(obj.get("source").?.string),
-        .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
-        .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
-        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
+        .source = source,
+        .context_window = context_window,
+        .max_output_tokens = max_output_tokens,
+        .reasoning_default = reasoning_default,
         .metadata = metadata,
     };
 }
@@ -862,4 +1041,317 @@ test "agent envelope roundtrip for ack and nack" {
         parsed_nack.payload.nack.reason.slice(),
     );
     try std.testing.expectEqual(agent_types.ErrorCode.not_implemented, parsed_nack.payload.nack.error_code.?);
+}
+
+test "deserializeEnvelope rejects a non-object root" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope("[1,2,3]", allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope("42", allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope("\"frame\"", allocator));
+}
+
+test "deserializeEnvelope rejects a frame with no envelope fields instead of panicking" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingField, deserializeEnvelope("{\"type\":\"agent_event\"}", allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope("{}", allocator));
+}
+
+test "deserializeEnvelope rejects a missing or non-string type" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(missing);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing, allocator));
+
+    const wrong_type = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":7,\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(wrong_type);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(wrong_type, allocator));
+}
+
+test "deserializeEnvelope rejects a missing or non-string session_id" {
+    const allocator = std.testing.allocator;
+    const mid = "00000000000000000000000002";
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{mid},
+    );
+    defer allocator.free(missing);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing, allocator));
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":123,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{mid},
+    );
+    defer allocator.free(non_string);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string, allocator));
+
+    const null_valued = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":null,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{mid},
+    );
+    defer allocator.free(null_valued);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(null_valued, allocator));
+
+    const too_short = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"short\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{mid},
+    );
+    defer allocator.free(too_short);
+    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(too_short, allocator));
+}
+
+test "deserializeEnvelope rejects a missing or non-string message_id" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{sid},
+    );
+    defer allocator.free(missing);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing, allocator));
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":[],\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{sid},
+    );
+    defer allocator.free(non_string);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string, allocator));
+}
+
+test "deserializeEnvelope rejects a missing, non-integer or out-of-range sequence" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(missing);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing, allocator));
+
+    const non_integer = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":\"1\",\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(non_integer);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_integer, allocator));
+
+    const fractional = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1.5,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(fractional);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(fractional, allocator));
+
+    const negative = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":-1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(negative);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative, allocator));
+}
+
+test "deserializeEnvelope rejects a missing timestamp and an out-of-range version" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const missing_timestamp = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(missing_timestamp);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_timestamp, allocator));
+
+    const oversized_version = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":999,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(oversized_version);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(oversized_version, allocator));
+}
+
+test "deserializeEnvelope defaults version to 1 when the field is absent" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), parsed.version);
+}
+
+test "deserializeEnvelope rejects a missing or non-object payload" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(missing);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing, allocator));
+
+    const non_object = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":\"{{}}\"}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(non_object);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_object, allocator));
+}
+
+test "deserializeEnvelope rejects a non-string in_reply_to" {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"in_reply_to\":false,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(json);
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(json, allocator));
+}
+
+fn expectPayloadDecodeError(expected: anyerror, type_str: []const u8, payload_json: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"{s}\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{s}}}",
+        .{ type_str, sid, mid, payload_json },
+    );
+    defer allocator.free(json);
+    try std.testing.expectError(expected, deserializeEnvelope(json, allocator));
+}
+
+test "deserializePayload rejects missing required payload fields" {
+    try expectPayloadDecodeError(error.MissingField, "agent_start", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_message", "{\"session_id\":\"000000000000000000000\"}");
+    try expectPayloadDecodeError(error.MissingField, "agent_event", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_result", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_stop", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_status", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_started", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_stopped", "{}");
+    try expectPayloadDecodeError(error.MissingField, "agent_error", "{\"code\":\"internal_error\"}");
+    try expectPayloadDecodeError(error.MissingField, "tool_list_response", "{}");
+    try expectPayloadDecodeError(error.MissingField, "tool_execute", "{\"tool_call_id\":\"call-1\"}");
+    try expectPayloadDecodeError(error.MissingField, "tool_result", "{\"tool_call_id\":\"call-1\"}");
+    try expectPayloadDecodeError(error.MissingField, "tool_streaming", "{\"tool_call_id\":\"call-1\"}");
+    try expectPayloadDecodeError(error.MissingField, "pong", "{}");
+    try expectPayloadDecodeError(error.MissingField, "ack", "{}");
+    try expectPayloadDecodeError(error.MissingField, "nack", "{\"rejected_id\":\"00000000000000000000000002\"}");
+    try expectPayloadDecodeError(error.MissingField, "session_info", "{\"session_id\":\"000000000000000000000\",\"status\":\"ready\",\"model\":\"m\"}");
+    try expectPayloadDecodeError(error.MissingField, "models_response", "{}");
+}
+
+test "deserializePayload rejects wrongly typed payload fields" {
+    try expectPayloadDecodeError(error.InvalidField, "agent_start", "{\"config_json\":{}}");
+    try expectPayloadDecodeError(error.InvalidField, "agent_start", "{\"config_json\":\"{}\",\"system_prompt\":5}");
+    try expectPayloadDecodeError(error.InvalidField, "agent_start", "{\"config_json\":\"{}\",\"session_id\":5}");
+    try expectPayloadDecodeError(error.InvalidField, "agent_event", "{\"event_json\":[]}");
+    try expectPayloadDecodeError(error.InvalidField, "agent_message", "{\"session_id\":\"000000000000000000000\",\"message_json\":12}");
+    try expectPayloadDecodeError(error.InvalidField, "tool_result", "{\"tool_call_id\":\"call-1\",\"result_json\":\"{}\",\"is_error\":\"yes\"}");
+    try expectPayloadDecodeError(error.InvalidField, "tool_list_response", "{\"tools\":{}}");
+    try expectPayloadDecodeError(error.InvalidField, "tool_list_response", "{\"tools\":[\"not-an-object\"]}");
+    try expectPayloadDecodeError(
+        error.InvalidField,
+        "session_info",
+        "{\"session_id\":\"000000000000000000000\",\"status\":\"ready\",\"model\":\"m\",\"message_count\":-1,\"created_at\":1,\"updated_at\":2}",
+    );
+    try expectPayloadDecodeError(error.InvalidField, "models_request", "{\"provider_id\":9}");
+    try expectPayloadDecodeError(error.InvalidField, "models_request", "{\"include_deprecated\":\"true\"}");
+    try expectPayloadDecodeError(error.InvalidField, "models_response", "{\"fetched_at_ms\":1,\"cache_max_age_ms\":1,\"models\":\"none\"}");
+}
+
+const valid_descriptor_json =
+    \\{"model_ref":"p/a@m","model_id":"m","display_name":"M","provider_id":"p","api":"a","auth_status":"authenticated","lifecycle":"stable","source":"dynamic","capabilities":["chat"]}
+;
+
+fn expectModelsResponseDecodeError(expected: anyerror, models_json: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fetched_at_ms\":1,\"cache_max_age_ms\":1,\"models\":{s}}}",
+        .{models_json},
+    );
+    defer allocator.free(payload_json);
+    try expectPayloadDecodeError(expected, "models_response", payload_json);
+}
+
+test "deserializePayload frees earlier allocations when a later tool entry is malformed" {
+    try expectPayloadDecodeError(
+        error.MissingField,
+        "tool_list_response",
+        "{\"tools\":[{\"name\":\"a\",\"description\":\"d\",\"parameters_schema_json\":\"{}\"},{\"name\":\"b\",\"description\":\"d\"}]}",
+    );
+}
+
+test "deserializePayload frees earlier descriptors when a later model is malformed" {
+    const allocator = std.testing.allocator;
+    const models_json = try std.fmt.allocPrint(
+        allocator,
+        "[{s},{{\"model_ref\":\"p/a@n\"}}]",
+        .{valid_descriptor_json},
+    );
+    defer allocator.free(models_json);
+    try expectModelsResponseDecodeError(error.MissingField, models_json);
+}
+
+test "deserializeModelDescriptor frees owned fields when capabilities or metadata are malformed" {
+    try expectModelsResponseDecodeError(
+        error.InvalidField,
+        "[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"M\",\"provider_id\":\"p\",\"api\":\"a\",\"base_url\":\"https://x\",\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"capabilities\":[7]}]",
+    );
+    try expectModelsResponseDecodeError(
+        error.InvalidField,
+        "[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"M\",\"provider_id\":\"p\",\"api\":\"a\",\"base_url\":\"https://x\",\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"capabilities\":[\"chat\"],\"metadata\":{\"a\":\"1\",\"b\":2}}]",
+    );
+    try expectModelsResponseDecodeError(
+        error.MissingField,
+        "[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"M\",\"provider_id\":\"p\",\"api\":\"a\",\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\"}]",
+    );
+    try expectModelsResponseDecodeError(
+        error.InvalidEnumValue,
+        "[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"M\",\"provider_id\":\"p\",\"api\":\"a\",\"auth_status\":\"authenticated\",\"lifecycle\":\"experimental\",\"source\":\"dynamic\",\"capabilities\":[\"chat\"]}]",
+    );
 }
