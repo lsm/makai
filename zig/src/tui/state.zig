@@ -636,15 +636,15 @@ pub const AppState = struct {
                         const detail_source = if (payload.details_json.slice().len > 0) payload.details_json.slice() else payload.text.slice();
                         try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
                         terminalizeToolOccurrence(tool, status, .result);
+                        const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, detail_source, payload.is_error, 0, 0, 0, 0);
+                        defer self.allocator.free(summary);
+                        try self.writeToolSummaryRow(summary, tool.id);
                         if (payload.is_error) {
                             const unwrapped = try toolErrorMessage(self.allocator, detail_source);
                             defer if (unwrapped) |message| self.allocator.free(message);
                             tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, detail_source);
                             try self.emitToolErrorCard(tool, if (unwrapped) |message| message else detail_source);
                         }
-                        const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, detail_source, payload.is_error, 0, 0, 0, 0);
-                        defer self.allocator.free(summary);
-                        try self.writeToolSummaryRow(summary, tool.id);
                     } else if (tool.terminal_evidence == .execution) {
                         tool.terminal_evidence = .both;
                     }
