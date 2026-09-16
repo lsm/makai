@@ -1308,6 +1308,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
     defer {
         ai_types.deinitAssistantContent(allocator, content_blocks.items);
+        content_blocks = .empty;
         content_blocks.deinit(allocator);
     }
     var current_text = std.ArrayList(u8).empty;
