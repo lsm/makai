@@ -31,7 +31,7 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
-ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|\.Random[[:space:]]*[.;]'
+ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random[[:space:]]*\.[[:space:]]*int\b|\.[[:space:]]*random[[:space:]]*[;(]|\.[[:space:]]*Random[[:space:]]*[.;]'
 secure_entropy_pattern='\b(fillSecureBytes|secureBytes|secureIntRangeLessThan|randomSecure)\b'
 
 strip_noncode() {
@@ -46,6 +46,17 @@ strip_noncode() {
       d = substr(line, i + 1, 1)
       if (c == "/" && d == "/") break
       if (c == "\\" && d == "\\") break
+      if (c == "@" && d == "\"") {
+        i += 2
+        while (i <= n) {
+          ch = substr(line, i, 1)
+          if (ch == "\\") { out = out substr(line, i, 2); i += 2; continue }
+          i++
+          if (ch == "\"") break
+          out = out ch
+        }
+        continue
+      }
       if (c == "\"" || c == "'"'"'") {
         quote = c
         i++
@@ -126,6 +137,10 @@ zig/src/utils/tool_utils.zig|    return generateMistralToolCallIdWithRandom(allo
 SITES
 )"
 
+expected_sensitive_noncode_matches="$(cat <<'NONCODE'
+NONCODE
+)"
+
 echo "[patterns] checking security-sensitive entropy call sites..."
 for file in "${secure_random_files[@]}"; do
   if [[ ! -f "$file" ]]; then
@@ -133,11 +148,19 @@ for file in "${secure_random_files[@]}"; do
     echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
     exit 1
   fi
-  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" || true)"
+  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" \
+    | sed "s|^[0-9]*:|$file\||" || true)"
+  if [[ -n "$secure_file_matches" ]]; then
+    secure_file_matches="$(comm -13 \
+      <(printf "%s\n" "$expected_sensitive_noncode_matches" | grep -v '^$' | sort) \
+      <(printf "%s\n" "$secure_file_matches" | grep -v '^$' | sort))"
+  fi
   if [[ -n "$secure_file_matches" ]]; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
     echo "$secure_file_matches" >&2
     echo "[patterns] use compat.random secure helpers / io.randomSecure for OAuth, WebSocket, and protocol IDs" >&2
+    echo "[patterns] this check matches raw text on purpose, so a scanner bug cannot unprotect these files;" >&2
+    echo "[patterns] if the match is genuinely non-code, declare it in expected_sensitive_noncode_matches" >&2
     exit 1
   fi
 done
@@ -197,7 +220,7 @@ zig/src/protocol/provider/types.zig|    return generateUlidWithRandom(compat.ran
 zig/src/transports/websocket.zig|        compat.random.fillSecureBytes(&mask);
 zig/src/transports/websocket.zig|    compat.random.fillSecureBytes(&nonce);
 zig/src/tui/app.zig|    compat.random.fillSecureBytes(&random_bytes);
-zig/src/utils/oauth/openai_codex.zig|    compat.random.fillSecureBytes(&random_bytes);
+zig/src/utils/oauth/openai_codex.zig|    return generateStateWithRandom(allocator, compat.random.fillSecureBytes);
 zig/src/utils/oauth/pkce.zig|    return generateWithRandom(allocator, compat.random.fillSecureBytes);
 SECURE
 )"
