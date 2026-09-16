@@ -46,7 +46,8 @@ fn anthropicIsAuthFailure(err_msg: []const u8) bool {
         std.ascii.indexOfIgnoreCase(err_msg, "invalid api key") != null;
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
+fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, provider_id, "anthropic")) return null;
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
     return null;
@@ -1682,7 +1683,7 @@ pub fn streamAnthropicMessages(
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const env = envApiKey(allocator);
+        const env = envApiKeyForProvider(allocator, model.provider);
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
     };
@@ -2186,6 +2187,15 @@ test "anthropic model headers are forwarded and never shadow a built-in" {
     }
     try std.testing.expectEqualStrings("acme", tenant.?);
     try std.testing.expectEqual(@as(usize, 1), version_count);
+}
+
+test "the anthropic env key never resolves for another provider id" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expect(envApiKeyForProvider(allocator, "gateway") == null);
+    try std.testing.expect(envApiKeyForProvider(allocator, "openai-codex") == null);
+    try std.testing.expect(envApiKeyForProvider(allocator, "") == null);
+    try std.testing.expect(envApiKeyForProvider(allocator, "anthropic-gateway") == null);
 }
 
 test "anthropic_api_key_headers_are_forwarded_exactly" {

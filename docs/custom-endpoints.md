@@ -152,8 +152,14 @@ was not issued to, which is why an Anthropic subscription token cannot be pointe
 at a third-party endpoint. A custom provider on `anthropic-messages` is not that
 case: it authenticates with its own key, resolved from the keychain under its id
 or from its declared environment variable, and the vendor token is never
-consulted. A provider with no credential at all still reaches the endpoint
-unauthenticated, which is what a keyless local server needs.
+consulted.
+
+A provider with no credential at all is **not** supported on these wire formats.
+Both the OpenAI and the Anthropic provider return `MissingApiKey` when neither
+the request nor their own environment variable supplies a key, so a keyless
+local server needs an `env_key` naming a variable (its value may be a dummy the
+server ignores) or a key stored by `/login <id>`. Letting a declared endpoint be
+genuinely keyless is a follow-up, not something this feature does today.
 
 Two rules keep those apart, because `base_url` arrives from the request and the
 server does not police where a model points. When a request names a vendor wire
@@ -165,6 +171,16 @@ api-key-only rule that skips OAuth entries entirely. A custom provider's
 credential is always a stored API key or an environment variable, so the rule
 costs it nothing, and no OAuth access token can leave through this path whatever
 id the request claims.
+
+Each provider's own environment fallback is scoped the same way. When the server
+resolves nothing it still calls the provider without a key, and the provider then
+looks at its own variables; the Anthropic provider used to read
+`ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` without checking which provider
+the model belonged to, so a custom endpoint could be handed the vendor key that
+happened to be in the environment. It now reads them only when
+`model.provider` is `anthropic`, matching what the OpenAI providers already did,
+and a custom provider that resolves no key of its own fails with `MissingApiKey`
+instead of borrowing one.
 
 ## Limits
 
