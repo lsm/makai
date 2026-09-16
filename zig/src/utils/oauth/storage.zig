@@ -314,6 +314,10 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     const errSecSuccess: OSStatus = 0;
     const errSecDuplicateItem: OSStatus = -25299;
     const errSecItemNotFound: OSStatus = -25300;
+    const errSecInteractionNotAllowed: OSStatus = -25308;
+    const errSecInteractionRequired: OSStatus = -25315;
+
+    extern "c" fn SecKeychainSetUserInteractionAllowed(state: u8) OSStatus;
 
     extern "c" fn SecKeychainFindGenericPassword(
         keychainOrArray: ?*const anyopaque,
@@ -388,6 +392,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         const kc = defaultKeychain();
         defer if (kc) |ref| CFRelease(ref);
 
+        _ = SecKeychainSetUserInteractionAllowed(0);
         const status = SecKeychainFindGenericPassword(
             kc,
             try asUInt32(service.len),
@@ -398,9 +403,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
             &password_data,
             &item,
         );
+        _ = SecKeychainSetUserInteractionAllowed(1);
         defer if (item) |value| CFRelease(@ptrCast(value));
 
         if (status == errSecItemNotFound) return null;
+        if (status == errSecInteractionNotAllowed or status == errSecInteractionRequired) {
+            return error.KeychainNeedsInteraction;
+        }
         if (status != errSecSuccess) return error.KeychainUnavailable;
         const data = password_data orelse return error.KeychainUnavailable;
         defer _ = SecKeychainItemFreeContent(null, data);
@@ -409,7 +418,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return try allocator.dupe(u8, bytes[0..password_len]);
     }
 
-    const KeychainError = error{KeychainUnavailable};
+    const KeychainError = error{ KeychainUnavailable, KeychainNeedsInteraction };
 
     fn writeServiceAccount(service: []const u8, account: []const u8, data: []const u8) KeychainError!void {
         var password_len: UInt32 = 0;
