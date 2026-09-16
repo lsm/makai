@@ -1320,44 +1320,15 @@ pub const Server = struct {
     }
 
     pub fn buildCapabilities(self: *Self) !oap_types.CapabilitiesResponse {
-        const endpoint_id = try self.allocator.dupe(u8, ENDPOINT_ID);
-        errdefer self.allocator.free(endpoint_id);
-        const endpoint_name = try self.allocator.dupe(u8, ENDPOINT_NAME);
-        errdefer self.allocator.free(endpoint_name);
-        const endpoint_version = try self.allocator.dupe(u8, self.endpoint_version);
-        errdefer self.allocator.free(endpoint_version);
-
-        var result = oap_types.CapabilitiesResponse{ .endpoint = .{
-            .id = endpoint_id,
-            .name = endpoint_name,
-            .version = endpoint_version,
-        } };
+        var result = oap_types.CapabilitiesResponse{ .endpoint = try self.buildEndpoint() };
         errdefer result.deinit(self.allocator);
 
         const versions = [_][]const u8{oap_types.VERSION};
         const profiles = [_][]const u8{oap_types.PROFILE};
         result.protocol_versions = try oap_types.dupeStringList(self.allocator, &versions);
         result.profiles = try oap_types.dupeStringList(self.allocator, &profiles);
-
-        const bindings = try self.allocator.alloc(oap_types.Binding, 1);
-        result.bindings = bindings[0..0];
-        const kind = try self.allocator.dupe(u8, "stdio");
-        errdefer self.allocator.free(kind);
-        const serialization = try self.allocator.dupe(u8, "jsonl");
-        bindings[0] = .{ .kind = kind, .serialization = serialization };
-        result.bindings = bindings;
-
-        const features = try self.allocator.alloc(oap_types.Feature, advertised_features.len);
-        result.features = features[0..0];
-        for (advertised_features, 0..) |source, index| {
-            const key = try self.allocator.dupe(u8, source.key);
-            errdefer self.allocator.free(key);
-            const mode = if (source.mode) |value| try self.allocator.dupe(u8, value) else null;
-            errdefer if (mode) |value| self.allocator.free(value);
-            const reason = if (source.reason) |value| try self.allocator.dupe(u8, value) else null;
-            features[index] = .{ .key = key, .level = source.level, .mode = mode, .reason = reason };
-            result.features = features[0 .. index + 1];
-        }
+        result.bindings = try self.buildBindings();
+        result.features = try self.buildFeatures();
 
         const requested = try self.allocator.alloc(oap_types.RequestedDelivery, 1);
         requested[0] = .auto;
@@ -1366,8 +1337,66 @@ pub const Server = struct {
         effective[0] = .start;
         result.effective_delivery_modes = effective;
 
+        result.degradation = try self.buildDegradation();
+
+        return result;
+    }
+
+    fn buildEndpoint(self: *Self) !oap_types.Endpoint {
+        const id = try self.allocator.dupe(u8, ENDPOINT_ID);
+        errdefer self.allocator.free(id);
+        const name = try self.allocator.dupe(u8, ENDPOINT_NAME);
+        errdefer self.allocator.free(name);
+        const version = try self.allocator.dupe(u8, self.endpoint_version);
+        return .{ .id = id, .name = name, .version = version };
+    }
+
+    fn buildBindings(self: *Self) ![]oap_types.Binding {
+        const bindings = try self.allocator.alloc(oap_types.Binding, 1);
+        var filled: usize = 0;
+        errdefer {
+            for (bindings[0..filled]) |*binding| binding.deinit(self.allocator);
+            self.allocator.free(bindings);
+        }
+
+        const kind = try self.allocator.dupe(u8, "stdio");
+        errdefer self.allocator.free(kind);
+        const serialization = try self.allocator.dupe(u8, "jsonl");
+        bindings[0] = .{ .kind = kind, .serialization = serialization };
+        filled = 1;
+
+        return bindings;
+    }
+
+    fn buildFeatures(self: *Self) ![]oap_types.Feature {
+        const features = try self.allocator.alloc(oap_types.Feature, advertised_features.len);
+        var filled: usize = 0;
+        errdefer {
+            for (features[0..filled]) |*entry| entry.deinit(self.allocator);
+            self.allocator.free(features);
+        }
+
+        for (advertised_features, 0..) |source, index| {
+            const key = try self.allocator.dupe(u8, source.key);
+            errdefer self.allocator.free(key);
+            const mode = if (source.mode) |value| try self.allocator.dupe(u8, value) else null;
+            errdefer if (mode) |value| self.allocator.free(value);
+            const reason = if (source.reason) |value| try self.allocator.dupe(u8, value) else null;
+            features[index] = .{ .key = key, .level = source.level, .mode = mode, .reason = reason };
+            filled = index + 1;
+        }
+
+        return features;
+    }
+
+    fn buildDegradation(self: *Self) ![]oap_types.Degradation {
         const degradation = try self.allocator.alloc(oap_types.Degradation, advertised_degradation.len);
-        result.degradation = degradation[0..0];
+        var filled: usize = 0;
+        errdefer {
+            for (degradation[0..filled]) |*record| record.deinit(self.allocator);
+            self.allocator.free(degradation);
+        }
+
         for (advertised_degradation, 0..) |source, index| {
             const feature = try self.allocator.dupe(u8, source.feature);
             errdefer self.allocator.free(feature);
@@ -1378,10 +1407,10 @@ pub const Server = struct {
                 .to = source.to,
                 .reason = reason,
             };
-            result.degradation = degradation[0 .. index + 1];
+            filled = index + 1;
         }
 
-        return result;
+        return degradation;
     }
 };
 
@@ -2138,6 +2167,18 @@ test "an advertised run control admits and is reported on the run" {
         "anthropic/anthropic-messages@session-default",
         state_event.payload.session_state_updated.current_model_id.?,
     );
+}
+
+fn buildCapabilitiesProbe(allocator: std.mem.Allocator) !void {
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+    defer server.deinit();
+
+    var capabilities = try server.buildCapabilities();
+    capabilities.deinit(allocator);
+}
+
+test "buildCapabilities survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildCapabilitiesProbe, .{});
 }
 
 test "a syntactically invalid model selection is refused before admission" {
