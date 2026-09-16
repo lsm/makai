@@ -650,45 +650,42 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
-    const type_str = obj.get("type").?.string;
+    const obj = try jf.asObject(parsed.value);
+    const type_str = try jf.requireString(obj, "type");
 
     if (std.mem.eql(u8, type_str, "result")) {
         return .{ .result = try parseAssistantMessage(obj, allocator) };
     }
     if (std.mem.eql(u8, type_str, "stream_error")) {
-        const msg = obj.get("message").?.string;
+        const msg = try jf.requireString(obj, "message");
         return .{ .stream_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, msg)) };
     }
 
     if (std.mem.eql(u8, type_str, "ack")) {
-        const acknowledged_id = if (obj.get("acknowledged_id")) |id|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
-        else
-            return error.MissingField;
+        const acknowledged_id = OwnedSlice(u8).initOwned(
+            try allocator.dupe(u8, try jf.requireString(obj, "acknowledged_id")),
+        );
         return .{ .control = .{ .ack = .{ .acknowledged_id = acknowledged_id } } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
-        const rejected_id = if (obj.get("rejected_id")) |id|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
-        else
-            return error.MissingField;
+        const rejected_id = OwnedSlice(u8).initOwned(
+            try allocator.dupe(u8, try jf.requireString(obj, "rejected_id")),
+        );
         errdefer {
             var mutable = rejected_id;
             mutable.deinit(allocator);
         }
 
-        const reason = if (obj.get("reason")) |r|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
-        else
-            return error.MissingField;
+        const reason = OwnedSlice(u8).initOwned(
+            try allocator.dupe(u8, try jf.requireString(obj, "reason")),
+        );
         errdefer {
             var mutable = reason;
             mutable.deinit(allocator);
         }
 
-        const error_code = if (obj.get("error_code")) |ec|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, ec.string))
+        const error_code = if (try jf.optionalString(obj, "error_code")) |ec|
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, ec))
         else
             OwnedSlice(u8).initBorrowed("");
 
@@ -705,8 +702,8 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
         return .{ .control = .pong };
     }
     if (std.mem.eql(u8, type_str, "goodbye")) {
-        const reason = if (obj.get("reason")) |r|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
+        const reason = if (try jf.optionalString(obj, "reason")) |r|
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, r))
         else
             OwnedSlice(u8).initBorrowed("");
         return .{ .control = .{ .goodbye = reason } };
@@ -715,22 +712,18 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
         return .{ .control = .sync_request };
     }
     if (std.mem.eql(u8, type_str, "sync")) {
-        const stream_id = if (obj.get("stream_id")) |id|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
-        else
-            return error.MissingField;
+        const stream_id = OwnedSlice(u8).initOwned(
+            try allocator.dupe(u8, try jf.requireString(obj, "stream_id")),
+        );
         errdefer {
             var mutable = stream_id;
             mutable.deinit(allocator);
         }
 
-        const sequence: u64 = if (obj.get("sequence")) |seq|
-            @intCast(seq.integer)
-        else
-            return error.MissingField;
+        const sequence: u64 = try jf.requireUnsigned(u64, obj, "sequence");
 
-        const partial = if (obj.get("partial")) |p|
-            OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.string))
+        const partial = if (try jf.optionalString(obj, "partial")) |p|
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, p))
         else
             OwnedSlice(u8).initBorrowed("");
 
@@ -753,8 +746,8 @@ fn parsePartialFromEvent(
 
     const obj = partial_obj.?.object;
 
-    if (obj.get("current_text")) |ct| {
-        const text = try allocator.dupe(u8, ct.string);
+    if (try jf.optionalString(obj, "current_text")) |ct| {
+        const text = try allocator.dupe(u8, ct);
         errdefer allocator.free(text);
 
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
@@ -774,8 +767,8 @@ fn parsePartialFromEvent(
         };
     }
 
-    if (obj.get("current_thinking")) |ct| {
-        const thinking = try allocator.dupe(u8, ct.string);
+    if (try jf.optionalString(obj, "current_thinking")) |ct| {
+        const thinking = try allocator.dupe(u8, ct);
         errdefer allocator.free(thinking);
 
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
@@ -795,8 +788,8 @@ fn parsePartialFromEvent(
         };
     }
 
-    if (obj.get("current_arguments_json")) |ca| {
-        const args_json = try allocator.dupe(u8, ca.string);
+    if (try jf.optionalString(obj, "current_arguments_json")) |ca| {
+        const args_json = try allocator.dupe(u8, ca);
         errdefer allocator.free(args_json);
 
         const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
@@ -969,8 +962,8 @@ pub fn parseAssistantMessageEvent(
     }
     if (std.mem.eql(u8, type_str, "toolcall_end")) {
         const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
-        const thought_signature = if (obj.get("thought_signature")) |sig_val|
-            try allocator.dupe(u8, sig_val.string)
+        const thought_signature = if (try jf.optionalString(obj, "thought_signature")) |sig_val|
+            try allocator.dupe(u8, sig_val)
         else
             null;
         errdefer if (thought_signature) |sig| allocator.free(sig);
@@ -1010,8 +1003,8 @@ pub fn parseAssistantMessageEvent(
         var err_msg = empty_partial;
         err_msg.is_owned = true;
 
-        if (obj.get("error_message")) |em| {
-            err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
+        if (try jf.optionalString(obj, "error_message")) |em| {
+            err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em));
         }
 
         if (obj.get("usage")) |usage_obj| {
@@ -1101,12 +1094,11 @@ pub fn parseAssistantMessage(
     result.provider = try allocator.dupe(u8, try jf.requireString(obj, "provider"));
     errdefer allocator.free(result.provider);
 
-    if (obj.get("error_message")) |em| {
-        if (em == .string and em.string.len > 0) {
-            result.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
-        } else {
-            result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
-        }
+    if (try jf.optionalString(obj, "error_message")) |em| {
+        result.error_message = if (em.len > 0)
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
     } else {
         result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
     }
@@ -1148,8 +1140,8 @@ fn parseAssistantContent(
     const type_str = try jf.requireString(obj, "type");
 
     if (std.mem.eql(u8, type_str, "text")) {
-        const text_signature = if (obj.get("text_signature")) |sig_val|
-            try allocator.dupe(u8, sig_val.string)
+        const text_signature = if (try jf.optionalString(obj, "text_signature")) |sig_val|
+            try allocator.dupe(u8, sig_val)
         else
             null;
         return .{ .text = .{
@@ -1158,8 +1150,8 @@ fn parseAssistantContent(
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_call")) {
-        const thought_signature = if (obj.get("thought_signature")) |sig_val|
-            try allocator.dupe(u8, sig_val.string)
+        const thought_signature = if (try jf.optionalString(obj, "thought_signature")) |sig_val|
+            try allocator.dupe(u8, sig_val)
         else
             null;
         return .{ .tool_call = .{
@@ -1170,8 +1162,8 @@ fn parseAssistantContent(
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking")) {
-        const thinking_signature = if (obj.get("thinking_signature")) |sig_val|
-            try allocator.dupe(u8, sig_val.string)
+        const thinking_signature = if (try jf.optionalString(obj, "thinking_signature")) |sig_val|
+            try allocator.dupe(u8, sig_val)
         else
             null;
         return .{ .thinking = .{
@@ -2079,4 +2071,65 @@ test "parseAssistantMessage without error_message keeps it unset" {
     var round = msg.result;
     defer round.deinit(allocator);
     try std.testing.expect(round.getErrorMessage() == null);
+}
+
+test "deserialize rejects malformed control frames instead of panicking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "5",
+        "[1,2,3]",
+        "{}",
+        \\{"type":5}
+        ,
+        \\{"type":"stream_error","message":5}
+        ,
+        \\{"type":"ack","acknowledged_id":5}
+        ,
+        \\{"type":"nack","rejected_id":"a","reason":5}
+        ,
+        \\{"type":"nack","rejected_id":"a","reason":"b","error_code":5}
+        ,
+        \\{"type":"goodbye","reason":5}
+        ,
+        \\{"type":"sync","stream_id":5,"sequence":1}
+        ,
+        \\{"type":"sync","stream_id":"a","sequence":"soon"}
+        ,
+        \\{"type":"sync","stream_id":"a","sequence":-1}
+        ,
+        \\{"type":"sync","stream_id":"a","partial":5}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserialize(json, allocator)));
+    }
+}
+
+test "deserialize rejects malformed event payloads instead of panicking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"toolcall_end","content_index":0,"thought_signature":5}
+        ,
+        \\{"type":"error","reason":"error","error_message":5}
+        ,
+        \\{"type":"text_delta","content_index":0,"delta":"hi","partial":{"current_text":5}}
+        ,
+        \\{"type":"thinking_delta","content_index":0,"delta":"hi","partial":{"current_thinking":5}}
+        ,
+        \\{"type":"toolcall_delta","content_index":0,"delta":"{","partial":{"current_arguments_json":5}}
+        ,
+        \\{"type":"result","content":[{"type":"text","text":"hi","text_signature":5}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
+        ,
+        \\{"type":"result","content":[{"type":"thinking","thinking":"hm","thinking_signature":5}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
+        ,
+        \\{"type":"result","content":[{"type":"tool_call","id":"c","name":"t","arguments_json":"{}","thought_signature":5}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
+        ,
+        \\{"type":"result","error_message":5,"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserialize(json, allocator)));
+    }
 }
