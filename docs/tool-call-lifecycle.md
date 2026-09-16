@@ -223,8 +223,8 @@ erasing richer state the other half already recovered** — the field-level exte
 | Arrival × field | `output` | artifacts | byte telemetry |
 |---|---|---|---|
 | execution half into an occurrence with previews (normal end) | append the final payload after the accumulated previews, skipping when the retained output already equals it (idempotence) | set from the payload | replace per field only when the incoming value is non-zero |
-| result half, merge path (live occurrence, `none`-evidence reconcile, or allocate-from-result) | merge the detail source through the same idempotent append — the guard is equality, never emptiness (r4021914112) | count = max(retained, `artifacts_json` length) (r4021914118) | none on this wire; retained values unchanged |
-| execution half, merge path (reverse replay: end after result) | append `result_json` through the same idempotent append (dedupes the re-delivered payload) | count = max(retained, payload count); a zero never clobbers (r4021914125) | replace per field only when non-zero — legacy/incomplete ends carry zeros that mean absent (r4021914125) |
+| result half, merge path (live occurrence, `none`-evidence reconcile, or allocate-from-result) | merge the detail source through the same idempotent append — the guard is equality, never emptiness (r4021914112) | count = max(retained, `artifacts_json` length) (r4021914118); refs stay absent on this wire; the derived `truncated` flag recomputes after any artifact recovery | none on this wire; retained values unchanged |
+| execution half, merge path (reverse replay: end after result) | append `result_json` through the same idempotent append (dedupes the re-delivered payload) | count = max(retained, payload count); a zero never clobbers (r4021914125); refs replace on a count increase and are adopted when the counts tie and the result half left them empty (the tie case is the only refs source for a reversed replay) | replace per field only when non-zero — legacy/incomplete ends carry zeros that mean absent (r4021914125) |
 | result half, render-link (evidence `execution` → `both`) | no merge | no merge | no merge — the row is display-only; in forward order the execution half is authoritative |
 
 Previews append with a newline separator while the occurrence is live (unchanged). The
@@ -279,8 +279,12 @@ above its occurrence's summary row and is covered transitively. Consequences:
 - Linked-row scans (`replaceLinkedSummaryRow`, `insertBeforeLinkedResultRow`,
   `removeLinkedResultRows`, the error-card refresh scan) stop at the floor (§5,
   r4019270180). The advance itself walks forward only past rows it proves unowned —
-  amortized linear over the session, with the owner check bounded by the unfrozen
-  registry suffix. It runs where ownership changes: after each terminal half, after
+  amortized linear over the session — and proves ownership with an occurrence-key
+  membership set over the unfrozen suffix (`unfrozen_occurrence_ids`, keys borrowed
+  from the registry entries), maintained at exactly the three points frozen-ness
+  changes: allocation inserts, the `both`-evidence transition (terminalize and the
+  render-link flip) removes, retirement removes. One O(1) set lookup per row visited;
+  no registry rescan. It runs where ownership changes: after each terminal half, after
   `finalizeInterruptedTools`, and after retirement. Allocation and append sites do not
   call it: appended rows land at or above the floor, and a floor already at
   `items.len` correctly points at the first row the new occurrence appends. The flush

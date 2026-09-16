@@ -469,6 +469,7 @@ pub const AppState = struct {
     active_tool_result_entry: ?usize = null,
     active_tool_summary_entry: ?usize = null,
     tool_families: std.StringHashMapUnmanaged(usize) = .empty,
+    unfrozen_occurrence_ids: std.StringHashMapUnmanaged(void) = .empty,
     finalized_tool_count: usize = 0,
     summary_scan_floor: usize = 0,
     summary_floor_tool: usize = 0,
@@ -489,6 +490,7 @@ pub const AppState = struct {
         self.transcript.deinit(self.allocator);
         for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
         self.registered_tools.deinit(self.allocator);
+        self.unfrozen_occurrence_ids.deinit(self.allocator);
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.deinit(self.allocator);
         self.clearToolFamilies();
@@ -551,6 +553,7 @@ pub const AppState = struct {
     }
 
     pub fn clearTools(self: *AppState) void {
+        self.unfrozen_occurrence_ids.clearRetainingCapacity();
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.clearRetainingCapacity();
         self.clearToolFamilies();
@@ -730,11 +733,12 @@ pub const AppState = struct {
                     if (resolution.merge_state or upgrade_failure) {
                         const detail_source = if (payload.details_json.slice().len > 0) payload.details_json.slice() else payload.text.slice();
                         try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
-                        terminalizeToolOccurrence(tool, status, .result);
+                        self.terminalizeToolOccurrence(tool, status, .result);
                         if (resolution.merge_state) {
                             try self.mergeTerminalOutput(tool, detail_source);
                             const artifact_count = countArtifactsJson(self.allocator, payload.artifacts_json.slice());
                             if (artifact_count > tool.artifact_count) tool.artifact_count = artifact_count;
+                            refreshTruncated(tool);
                         }
                         const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, detail_source, payload.is_error, tool.raw_total_bytes, tool.returned_total_bytes, tool.estimated_returned_tokens, tool.artifact_count);
                         defer self.allocator.free(summary);
@@ -747,6 +751,7 @@ pub const AppState = struct {
                         }
                     } else if (tool.terminal_evidence == .execution) {
                         tool.terminal_evidence = .both;
+                        _ = self.unfrozen_occurrence_ids.remove(tool.id);
                     }
                     const suppress_text = tool.status == .@"error" and tool.error_detail_readable;
                     try self.finishToolResultEntry(if (suppress_text) "" else payload.text.slice(), tool.id);
@@ -780,7 +785,7 @@ pub const AppState = struct {
                 if (tool.args_json.len == 0) try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
                 try self.mergeTerminalOutput(tool, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                terminalizeToolOccurrence(tool, status, .execution);
+                self.terminalizeToolOccurrence(tool, status, .execution);
                 const effective_is_error = tool.status == .@"error";
                 const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), effective_is_error, tool.raw_total_bytes, tool.returned_total_bytes, tool.estimated_returned_tokens, tool.artifact_count);
                 defer self.allocator.free(summary);
@@ -1141,13 +1146,13 @@ pub const AppState = struct {
         if (raw_total_bytes > 0) tool.raw_total_bytes = raw_total_bytes;
         if (returned_total_bytes > 0) tool.returned_total_bytes = returned_total_bytes;
         if (estimated_returned_tokens > 0) tool.estimated_returned_tokens = estimated_returned_tokens;
-        if (artifact_count > tool.artifact_count) {
-            tool.artifact_count = artifact_count;
+        if (artifact_count > tool.artifact_count or (artifact_count == tool.artifact_count and artifact_refs.len > 0 and tool.artifact_refs.len == 0)) {
+            tool.artifact_count = @max(tool.artifact_count, artifact_count);
             const owned_refs = try self.allocator.dupe(u8, artifact_refs);
             if (tool.artifact_refs.len > 0) self.allocator.free(tool.artifact_refs);
             tool.artifact_refs = owned_refs;
         }
-        tool.truncated = tool.raw_total_bytes > tool.returned_total_bytes or tool.artifact_count > 0;
+        refreshTruncated(tool);
     }
 
     fn mergeTerminalOutput(self: *AppState, tool: *ToolEntry, payload: []const u8) !void {
@@ -1182,6 +1187,8 @@ pub const AppState = struct {
         var entry = try ToolEntry.init(self.allocator, key, name, label, args_json, status);
         entry.occurrence = occurrence;
         errdefer entry.deinit(self.allocator);
+        try self.unfrozen_occurrence_ids.put(self.allocator, entry.id, {});
+        errdefer _ = self.unfrozen_occurrence_ids.remove(entry.id);
         if (self.tool_families.getPtr(provider_id)) |latest| {
             try self.tools.append(self.allocator, entry);
             latest.* = self.tools.items.len - 1;
@@ -1218,7 +1225,10 @@ pub const AppState = struct {
         var i = self.retired_scan_index;
         while (i < self.tools.items.len) : (i += 1) {
             const tool = &self.tools.items[i];
-            if (isTerminalToolStatus(tool.status)) tool.retired = true;
+            if (isTerminalToolStatus(tool.status)) {
+                tool.retired = true;
+                _ = self.unfrozen_occurrence_ids.remove(tool.id);
+            }
         }
         while (self.retired_scan_index < self.tools.items.len and isTerminalToolStatus(self.tools.items[self.retired_scan_index].status)) self.retired_scan_index += 1;
         self.advanceSummaryScanFloor();
@@ -1234,13 +1244,9 @@ pub const AppState = struct {
         while (i < self.transcript.items.len) : (i += 1) {
             const entry = &self.transcript.items[i];
             if (entry.kind != .tool or entry.tool_call_id.len == 0) continue;
-            var t = self.summary_floor_tool;
-            while (t < self.tools.items.len) : (t += 1) {
-                const tool = &self.tools.items[t];
-                if (!tool.isFrozen() and std.mem.eql(u8, tool.id, entry.tool_call_id)) {
-                    self.summary_scan_floor = i;
-                    return;
-                }
+            if (self.unfrozen_occurrence_ids.contains(entry.tool_call_id)) {
+                self.summary_scan_floor = i;
+                return;
             }
         }
         self.summary_scan_floor = self.transcript.items.len;
@@ -1277,7 +1283,7 @@ pub const AppState = struct {
         }
     }
 
-    fn terminalizeToolOccurrence(tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) void {
+    fn terminalizeToolOccurrence(self: *AppState, tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) void {
         if (tool.terminal_evidence == .none) {
             tool.status = status;
             tool.terminal_evidence = half;
@@ -1285,6 +1291,7 @@ pub const AppState = struct {
             tool.terminal_evidence = .both;
             if (status == .@"error") tool.status = .@"error";
         }
+        if (tool.isFrozen()) _ = self.unfrozen_occurrence_ids.remove(tool.id);
     }
 
     fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8, readable: bool) !void {
@@ -1549,6 +1556,10 @@ fn countArtifactsJson(allocator: std.mem.Allocator, artifacts_json: []const u8) 
     defer parsed.deinit();
     if (parsed.value != .array) return 0;
     return @intCast(parsed.value.array.items.len);
+}
+
+fn refreshTruncated(tool: *ToolEntry) void {
+    tool.truncated = tool.raw_total_bytes > tool.returned_total_bytes or tool.artifact_count > 0;
 }
 
 fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
@@ -3068,6 +3079,7 @@ test "AppState keeps result-recovered artifacts against a legacy telemetry-less 
 
     try std.testing.expectEqualStrings("{\"ok\":true,\"artifact\":\"out.txt\"}", state.tools.items[0].output.items);
     try std.testing.expectEqual(@as(u32, 2), state.tools.items[0].artifact_count);
+    try std.testing.expect(state.tools.items[0].truncated);
     var summary_text: ?[]const u8 = null;
     for (state.transcript.items) |*entry| {
         if (entry.kind == .tool and entry.tool_summary and std.mem.eql(u8, entry.tool_call_id, "call-o")) summary_text = entry.text.items;
@@ -3119,6 +3131,7 @@ test "AppState merges end telemetry into result-recovered state" {
     try std.testing.expectEqual(@as(u64, 80), state.tools.items[0].returned_total_bytes);
     try std.testing.expectEqual(@as(u64, 9), state.tools.items[0].estimated_returned_tokens);
     try std.testing.expectEqual(@as(u32, 1), state.tools.items[0].artifact_count);
+    try std.testing.expectEqualStrings("artifact://one", state.tools.items[0].artifact_refs);
     try std.testing.expectEqual(TerminalEvidence.both, state.tools.items[0].terminal_evidence);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "raw=120B returned=80B") != null);
 }
