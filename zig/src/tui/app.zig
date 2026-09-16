@@ -2632,11 +2632,11 @@ test "App inline flush stop follows the reconciliation floor" {
     var resolution = try app.state.resolveToolOccurrenceForTest("call-h", "shell_execute", "{\"command\":\"pwd\"}", .live_intent, .running);
     try app.state.appendToolSummaryTranscript("running now", resolution.tool.id);
     try app.state.appendTranscript(.assistant, "later text");
-    try app.state.advanceSummaryScanFloor();
+    app.state.advanceSummaryScanFloor();
     try std.testing.expectEqual(@as(usize, 0), TuiModel.inlineFlushStop(&app));
 
     resolution.tool.terminal_evidence = .both;
-    try app.state.advanceSummaryScanFloor();
+    app.state.advanceSummaryScanFloor();
     try std.testing.expectEqual(@as(usize, 2), TuiModel.inlineFlushStop(&app));
 }
 
