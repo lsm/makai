@@ -89,6 +89,48 @@ jobs:
           OUT_ROOT="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}"
           zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$OUT_ROOT"
 
+      # Zig leaves an ad-hoc linker signature on macOS binaries, which carries no
+      # team identifier: Gatekeeper refuses a quarantined download and keychain
+      # access lists bind to the code hash, so every release re-prompts for the
+      # login password. Re-sign with Developer ID. See docs/macos-code-signing.md.
+      - name: Sign macOS binary
+        if: matrix.os_name == 'macos'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          BINARY="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}"
+          if [ -z "${MACOS_CERTIFICATE_P12:-}" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::MACOS_CERTIFICATE_P12 is not configured; refusing to publish an unsigned macOS release binary (docs/macos-code-signing.md)"
+              exit 1
+            fi
+            echo "::warning::No signing certificate configured; keeping the ad-hoc linker signature. This build is not distributable."
+            echo "MACOS_SIGNED=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ./scripts/sign-macos.sh "$BINARY"
+          echo "MACOS_SIGNED=1" >> "$GITHUB_ENV"
+
+      - name: Notarize macOS binary
+        if: matrix.os_name == 'macos' && env.MACOS_SIGNED == '1' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          BINARY="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}"
+          if [ -z "${MACOS_NOTARY_KEY:-}" ]; then
+            echo "::error::MACOS_NOTARY_KEY is not configured; a signed but un-notarized binary is refused by Gatekeeper when downloaded (docs/macos-code-signing.md)"
+            exit 1
+          fi
+          ./scripts/notarize-macos.sh "$BINARY"
+
       - name: Package tar.gz
         if: matrix.archive == 'tar.gz'
         shell: bash

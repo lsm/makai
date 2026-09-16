@@ -174,7 +174,10 @@ code paths; add a transcript row instead.
   by its code hash and every new build is a new application to securityd (a
   `partition_id` entry it adds for non-Apple-signed apps enforces this even when the
   ACL lists no applications). Expect one login-password prompt per new dev binary;
-  identical rebuilds do not re-prompt. `MAKAI_KEYCHAIN_SERVICE` overrides the service
+  identical rebuilds do not re-prompt. `make sign` signs a local build with a
+  Developer ID certificate and ends the per-rebuild prompt;
+  [macos-code-signing.md](macos-code-signing.md) covers that and the release pipeline.
+  `MAKAI_KEYCHAIN_SERVICE` overrides the service
   name so tests can use an isolated item; the 0600 `~/.makai/auth.json` file remains
   the fallback only when the keychain is unavailable.
 - `/login` shows each provider's state: `✓ logged in` (OAuth), `✓ api key` (stored key),

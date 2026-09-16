@@ -2,11 +2,12 @@ ZIG ?= zig
 ARGS ?=
 ZIG_GLOBAL_CACHE := $(shell $(ZIG) env 2>/dev/null | sed -n 's/.*global_cache_dir[" ]*[:=] *"\([^"]*\)".*/\1/p')
 
-.PHONY: help build tui test test-tui check clean clean-all
+.PHONY: help build tui sign test test-tui check clean clean-all
 
 help:
 	@echo "make build      build the makai CLI into zig-out/bin"
 	@echo "make tui        build, then start the TUI (extra flags: make tui ARGS='--model ...')"
+	@echo "make sign       macOS: code sign zig-out/bin/makai so the keychain stops re-prompting"
 	@echo "make test       run every unit test group"
 	@echo "make test-tui   run the TUI unit tests"
 	@echo "make check      run the no-comments and Zig pattern guardrails"
@@ -18,6 +19,10 @@ build:
 
 tui: build
 	./zig-out/bin/makai --tui $(ARGS)
+
+sign: build
+	@if [ "$$(uname -s)" != "Darwin" ]; then echo "make sign only applies to macOS"; exit 1; fi
+	./scripts/sign-macos.sh ./zig-out/bin/makai
 
 test:
 	$(ZIG) build test
