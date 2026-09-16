@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const compat = @import("compat");
 const zz = @import("zigzag");
@@ -33,6 +32,7 @@ const Driver = struct {
     tmp: std.testing.TmpDir,
     saved_home: ?[]u8,
     init_cmd: zz.Cmd(TuiModel.Msg),
+    history: std.ArrayList(u8),
 
     fn init(gpa: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions, view_opts: DriverOptions) !*Driver {
         const self = try gpa.create(Driver);
@@ -56,13 +56,16 @@ const Driver = struct {
         self.ctx.width = view_opts.width;
         self.ctx.height = view_opts.height;
 
-        self.model = .{ .options = options };
+        self.history = .empty;
+        self.model = .{ .options = options, .render_mode = .inline_history };
         self.init_cmd = self.model.init(&self.ctx);
         return self;
     }
 
     fn deinit(self: *Driver) void {
         self.model.deinit();
+        self.ctx.deinit();
+        self.history.deinit(self.gpa);
         self.restoreHome();
         self.arena.deinit();
         self.tmp.cleanup();
@@ -112,7 +115,11 @@ const Driver = struct {
 
     fn frame(self: *Driver) []const u8 {
         _ = self.arena.reset(.retain_capacity);
-        return self.model.view(&self.ctx);
+        const above = self.ctx.takeAbove(self.gpa) catch return "";
+        defer self.gpa.free(above);
+        self.history.appendSlice(self.gpa, above) catch return "";
+        const live = self.model.view(&self.ctx);
+        return std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{ self.history.items, live }) catch "";
     }
 
     fn frameContains(self: *Driver, needle: []const u8) bool {
@@ -167,8 +174,8 @@ test "e2e: /help renders all command names into the transcript" {
 
     const screen = d.frame();
     const expected = [_][]const u8{
-        "/help",   "/model",    "/provider",    "/status",
-        "/resume", "/login",    "/permissions", "/abort",
+        "/help",   "/model", "/provider",    "/status",
+        "/resume", "/login", "/permissions", "/abort",
         "/clear",  "/quit",
     };
     for (expected) |needle| {

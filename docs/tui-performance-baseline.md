@@ -58,8 +58,9 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   failure), Shift+Enter (kitty
   `CSI 13;2u` encoding) composer newline (asserted positively: the submitted
   draft must echo as two separate transcript rows), Up/Down history recall,
-  PgUp/PgDn, Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
-  Ctrl+C exit.
+  PgUp/PgDn (PgUp must put the `SCROLL` indicator on screen and PgDn must clear
+  it), Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
+  Ctrl+C (clears a pending draft first; on an empty idle composer it exits).
 - `steer-abort` — a `hold` fixture step keeps the stream open so Enter mid-turn
   steers (queue indicator) and `/abort` cancels; a follow-up tool step
   (`shell_execute` running `sleep`) holds the next turn open long enough to
@@ -76,6 +77,13 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   the second lists it via `/resume` and replays the saved transcript; each half
   dumps its own artifacts under `session-roundtrip/save/` and
   `session-roundtrip/resume/`.
+- `tool-loss-reconcile` — seeds a session file whose first tool call lost its
+  `tool_execution_end` (only the retained `tool_result` arrives) and whose
+  second call delivers its failing result before its end event, then `/resume`s
+  it. It judges the screen: exactly one `✓` summary row for the reconciled
+  call with its retained result text beneath it, exactly one `✗ failed` row for
+  the reversed call, exactly one error card carrying the `Boom` detail, and no
+  `interrupted` placeholder anywhere in the stream.
 
 These scenarios use the fixture step encoding, which extends the plain
 canned-reply value: `|`-separated steps `text:<body>`, `tool:<name>` or
@@ -153,3 +161,18 @@ was 457 ms — roughly 370 ms of that was the mode-2027 and primary-device-
 attributes queries timing out against a non-responsive master, not
 application work. Raw numbers for every run are in the `TUI PTY Harness` job
 summary and artifacts (`tui-pty-harness`).
+
+## Rendering model
+
+The inline live-region renderer the harness drives is documented in
+[tui-rendering-model.md](tui-rendering-model.md). The renderer rewrites only the rows
+that changed since the previous paint, so the byte stream is not a sequence of full
+screens; the harness therefore feeds every chunk into its `VtScreen` model and judges
+tool rows, steer echoes and approval prompts by the rows on screen (`screen_text()`,
+`visible_text()`). Stream-based `wait_for` is still used for *new* output, with
+`since=` when two markers land in one paint. The Shift+Enter check looks for a
+`\r\n` row break between the two draft lines in the raw stream (user blocks are only
+as wide as their text, so byte distance no longer implies a row break), and the
+tool-summary checks count the `✓`/`✗` status glyphs on screen instead of the old
+`Label ok` / `Label failed` text. The status bar's whole-segment cut marker is
+optional at 100 columns because the bar is compact enough to fit.

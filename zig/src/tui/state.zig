@@ -24,6 +24,7 @@ pub const TranscriptKind = enum {
     thinking,
     tool,
     system,
+    welcome,
     @"error",
 };
 
@@ -184,6 +185,7 @@ pub const ApprovalState = struct {
 pub const TelemetryState = struct {
     estimated_tokens: u64 = 0,
     context_window: u64 = 0,
+    input_cost_per_million: f64 = 0,
 };
 
 pub const QueueState = tui_runtime.QueuedCounts;
@@ -196,6 +198,8 @@ pub const StatusState = struct {
     context_limit: usize = 0,
     turn_count: usize = 0,
     streaming: bool = false,
+    streaming_since_ms: i64 = 0,
+    streaming_elapsed_ms: u64 = 0,
     last_error: []u8 = &.{},
 
     pub fn deinit(self: *StatusState, allocator: std.mem.Allocator) void {
@@ -331,7 +335,82 @@ pub const ComposerState = struct {
     pub fn moveCursorEnd(self: *ComposerState) void {
         self.cursor = self.buffer.items.len;
     }
+
+    pub fn moveCursorWordPrev(self: *ComposerState) void {
+        self.normalizeCursor();
+        self.cursor = wordStartBefore(self.buffer.items, self.cursor);
+    }
+
+    pub fn moveCursorWordNext(self: *ComposerState) void {
+        self.normalizeCursor();
+        self.cursor = wordEndAfter(self.buffer.items, self.cursor);
+    }
+
+    pub fn deleteWordBeforeCursor(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor == 0) return false;
+        const start = wordStartBefore(self.buffer.items, self.cursor);
+        self.removeRange(start, self.cursor);
+        return true;
+    }
+
+    pub fn deleteToLineEnd(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor >= self.buffer.items.len) return false;
+        const end = std.mem.indexOfScalarPos(u8, self.buffer.items, self.cursor, '\n') orelse self.buffer.items.len;
+        if (end == self.cursor) {
+            self.removeRange(self.cursor, self.cursor + 1);
+            return true;
+        }
+        self.removeRange(self.cursor, end);
+        return true;
+    }
+
+    pub fn deleteToLineStart(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor == 0) return false;
+        const start = if (std.mem.lastIndexOfScalar(u8, self.buffer.items[0..self.cursor], '\n')) |nl| nl + 1 else 0;
+        if (start == self.cursor) {
+            self.removeRange(self.cursor - 1, self.cursor);
+            return true;
+        }
+        self.removeRange(start, self.cursor);
+        return true;
+    }
+
+    pub fn deleteAtCursor(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor >= self.buffer.items.len) return false;
+        const end = nextCodepointEnd(self.buffer.items, self.cursor);
+        self.removeRange(self.cursor, end);
+        return true;
+    }
+
+    fn removeRange(self: *ComposerState, start: usize, end: usize) void {
+        const removed = end - start;
+        std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[end..]);
+        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
+        self.cursor = start;
+    }
 };
+
+fn isWordByte(c: u8) bool {
+    return !(c == ' ' or c == '\t' or c == '\n' or c == '/' or c == '.' or c == ',' or c == ';' or c == ':' or c == '-' or c == '_' or c == '(' or c == ')' or c == '"' or c == '\'');
+}
+
+fn wordStartBefore(text: []const u8, cursor: usize) usize {
+    var idx = @min(cursor, text.len);
+    while (idx > 0 and !isWordByte(text[idx - 1])) idx -= 1;
+    while (idx > 0 and isWordByte(text[idx - 1])) idx -= 1;
+    return idx;
+}
+
+fn wordEndAfter(text: []const u8, cursor: usize) usize {
+    var idx = @min(cursor, text.len);
+    while (idx < text.len and !isWordByte(text[idx])) idx += 1;
+    while (idx < text.len and isWordByte(text[idx])) idx += 1;
+    return idx;
+}
 
 fn previousCodepointStart(text: []const u8, cursor: usize) usize {
     if (cursor == 0) return 0;
@@ -381,6 +460,7 @@ pub const AppState = struct {
     picker_kind: PickerKind = .model,
     active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
+    active_thinking_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
     active_tool_summary_entry: ?usize = null,
     tool_families: std.StringHashMapUnmanaged(usize) = .empty,
@@ -602,9 +682,11 @@ pub const AppState = struct {
         switch (event) {
             .agent_start => {
                 self.status.streaming = true;
+                self.markStreamingStarted();
             },
             .turn_start => {
                 self.status.streaming = true;
+                self.markStreamingStarted();
                 self.status.turn_count += 1;
                 self.cleanupActiveTranscriptEntries();
             },
@@ -614,11 +696,12 @@ pub const AppState = struct {
                 .tool_result => self.active_tool_result_entry = try self.appendEmptyTranscript(.tool),
             },
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
-            .thinking_delta => |payload| try self.appendDelta(.thinking, payload.delta.slice()),
+            .thinking_delta => |payload| try self.appendThinkingDelta(payload.delta.slice()),
             .tool_call_delta => {},
             .provider_event => {},
             .message_end => |payload| switch (payload.role) {
                 .assistant => {
+                    self.active_thinking_entry = null;
                     try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry);
                     try self.rememberToolCalls(payload.tool_calls_json.slice());
                 },
@@ -703,11 +786,13 @@ pub const AppState = struct {
             },
             .turn_end => {
                 self.status.streaming = false;
+                self.markStreamingStopped();
                 self.stream_aborted = false;
                 try self.finalizeInterruptedTools();
             },
             .agent_end => |payload| {
                 self.status.streaming = false;
+                self.markStreamingStopped();
                 self.stream_aborted = false;
                 try self.finalizeInterruptedTools();
                 switch (payload.reason) {
@@ -723,6 +808,7 @@ pub const AppState = struct {
             },
             .@"error" => |payload| {
                 self.cleanupActiveTranscriptEntries();
+                self.markStreamingStopped();
                 self.stream_aborted = false;
                 try self.status.setError(self.allocator, payload.message.slice());
                 try self.appendTranscript(.@"error", payload.message.slice());
@@ -779,6 +865,51 @@ pub const AppState = struct {
             }
         }
         try self.preview.set(self.allocator, out.items);
+    }
+
+    fn markStreamingStarted(self: *AppState) void {
+        if (self.status.streaming_since_ms == 0) self.status.streaming_since_ms = compat.time.nowMillis();
+    }
+
+    fn markStreamingStopped(self: *AppState) void {
+        self.status.streaming_since_ms = 0;
+        self.status.streaming_elapsed_ms = 0;
+    }
+
+    pub fn refreshStreamingElapsed(self: *AppState, now_ms: i64) void {
+        if (self.status.streaming_since_ms == 0 or now_ms < self.status.streaming_since_ms) {
+            self.status.streaming_elapsed_ms = 0;
+            return;
+        }
+        self.status.streaming_elapsed_ms = @intCast(now_ms - self.status.streaming_since_ms);
+    }
+
+    fn appendThinkingDelta(self: *AppState, delta: []const u8) !void {
+        const index = try self.thinkingEntryIndex();
+        try self.transcript.items[index].text.appendSlice(self.allocator, delta);
+    }
+
+    fn thinkingEntryIndex(self: *AppState) !usize {
+        if (self.active_thinking_entry) |index| {
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == .thinking) return index;
+            self.active_thinking_entry = null;
+        }
+        const len = self.transcript.items.len;
+        if (len > 0 and self.transcript.items[len - 1].kind == .thinking) {
+            self.active_thinking_entry = len - 1;
+            return len - 1;
+        }
+        if (self.active_assistant_entry) |index| {
+            if (index + 1 == len and self.transcript.items[index].kind == .assistant and self.transcript.items[index].text.items.len == 0) {
+                try self.transcript.insert(self.allocator, index, try TranscriptEntry.init(self.allocator, .thinking, ""));
+                self.active_assistant_entry = index + 1;
+                self.active_thinking_entry = index;
+                return index;
+            }
+        }
+        const index = try self.appendEmptyTranscript(.thinking);
+        self.active_thinking_entry = index;
+        return index;
     }
 
     fn ensureTrailingEntry(self: *AppState, kind: TranscriptKind) !usize {
@@ -846,6 +977,7 @@ pub const AppState = struct {
     fn clearActiveTranscriptEntries(self: *AppState) void {
         self.active_user_entry = null;
         self.active_assistant_entry = null;
+        self.active_thinking_entry = null;
         self.active_tool_result_entry = null;
         self.active_tool_summary_entry = null;
     }
@@ -853,6 +985,7 @@ pub const AppState = struct {
     fn cleanupActiveTranscriptEntries(self: *AppState) void {
         self.removeEmptyActiveTranscriptEntry(&self.active_user_entry, .user);
         self.removeEmptyActiveTranscriptEntry(&self.active_assistant_entry, .assistant);
+        self.removeEmptyActiveTranscriptEntry(&self.active_thinking_entry, .thinking);
         self.removeEmptyActiveTranscriptEntry(&self.active_tool_result_entry, .tool);
         self.removeEmptyActiveTranscriptEntry(&self.active_tool_summary_entry, .tool);
         self.clearActiveTranscriptEntries();
@@ -951,6 +1084,7 @@ pub const AppState = struct {
         entry.deinit(self.allocator);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_thinking_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_summary_entry, index);
     }
@@ -1760,10 +1894,12 @@ test "AppState finalizes active assistant after reasoning and tool deltas" {
     try state.applyEvent(assistant_end);
 
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
-    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
-    try std.testing.expectEqualStrings("final", state.transcript.items[0].text.items);
-    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[1].kind);
-    try std.testing.expectEqualStrings("plan", state.transcript.items[1].text.items);
+    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("plan", state.transcript.items[0].text.items);
+    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("final", state.transcript.items[1].text.items);
+    try std.testing.expect(state.active_thinking_entry == null);
+    try std.testing.expect(state.active_assistant_entry == null);
 }
 
 test "AppState keeps identical inline assistant message_end turns" {

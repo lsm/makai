@@ -57,6 +57,8 @@ fn isOAuthToken(key: []const u8) bool {
 }
 
 fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, suffix)) return allocator.dupe(u8, trimmed);
     var sb = StringBuilder{};
     sb.count(base_url);
     sb.count(suffix);
@@ -293,10 +295,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     const emits_thinking = options.thinking_enabled and model.reasoning and
         (supportsAdaptiveThinking(model.id) or requested_max > 1024);
     if (options.temperature) |t| {
-        if (emits_thinking and t != 1) {
-        } else {
-        try w.writeKey("temperature");
-        try w.writeFloat(t);
+        if (emits_thinking and t != 1) {} else {
+            try w.writeKey("temperature");
+            try w.writeFloat(t);
         }
     }
 
@@ -1269,9 +1270,16 @@ fn runThread(ctx: *ThreadCtx) void {
     if (response.head.status != .ok) {
         const status_code = @intFromEnum(response.head.status);
         if (last_error) |e| allocator.free(e);
-        last_error = std.fmt.allocPrint(allocator, "anthropic request failed: HTTP {d}{s}", .{
+        var error_transfer_buf: [4096]u8 = undefined;
+        const error_reader = compat.http.responseReader(&response, &error_transfer_buf);
+        const error_body = compat.http.allocRemainingResponse(allocator, error_reader, 8192) catch null;
+        defer if (error_body) |body| allocator.free(body);
+        const detail = if (error_body) |body| anthropicErrorDetail(allocator, body) catch null else null;
+        defer if (detail) |text| allocator.free(text);
+        last_error = std.fmt.allocPrint(allocator, "anthropic request failed: HTTP {d}{s}{s}", .{
             status_code,
             if (status_code == 401) " (check ANTHROPIC_API_KEY is valid)" else "",
+            detail orelse "",
         }) catch null;
 
         ctx.deinit();
@@ -1762,6 +1770,41 @@ pub fn streamSimpleAnthropicMessages(
         .thinking_budget_tokens = thinking_budget_tokens,
         .thinking_effort = if (thinking_effort) |eff| ai_types.OwnedSlice(u8).initBorrowed(eff) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
+}
+
+fn anthropicErrorDetail(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const err_value = parsed.value.object.get("error") orelse return null;
+    if (err_value != .object) return null;
+    const message = err_value.object.get("message") orelse return null;
+    if (message != .string or message.string.len == 0) return null;
+    const kind = err_value.object.get("type");
+    if (kind != null and kind.? == .string and kind.?.string.len > 0) {
+        return try std.fmt.allocPrint(allocator, " ({s}: {s})", .{ kind.?.string, message.string });
+    }
+    return try std.fmt.allocPrint(allocator, " ({s})", .{message.string});
+}
+
+test "buildUrlWithSuffix does not double a suffix already present" {
+    const doubled = try buildUrlWithSuffix(std.testing.allocator, "https://api.anthropic.com/v1/messages", "/v1/messages");
+    defer std.testing.allocator.free(doubled);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", doubled);
+    const plain = try buildUrlWithSuffix(std.testing.allocator, "https://api.anthropic.com/", "/v1/messages");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("https://api.anthropic.com//v1/messages", plain);
+    const bare = try buildUrlWithSuffix(std.testing.allocator, "https://api.anthropic.com", "/v1/messages");
+    defer std.testing.allocator.free(bare);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", bare);
+}
+
+test "anthropicErrorDetail surfaces the API error type and message" {
+    const detail = (try anthropicErrorDetail(std.testing.allocator, "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-sonnet-5\"}}")).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expectEqualStrings(" (not_found_error: model: claude-sonnet-5)", detail);
+    try std.testing.expect((try anthropicErrorDetail(std.testing.allocator, "<html>oops</html>")) == null);
+    try std.testing.expect((try anthropicErrorDetail(std.testing.allocator, "{\"error\":\"plain\"}")) == null);
 }
 
 pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry) !void {
