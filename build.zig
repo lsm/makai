@@ -1490,6 +1490,15 @@ pub fn build(b: *std.Build) void {
     const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
     const tools_mcp_bridge_test = b.addTest(.{ .root_module = tools_mcp_bridge_mod });
     const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
+    const tools_common_test_run = b.addRunArtifact(tools_common_test);
+    const tools_artifact_test_run = b.addRunArtifact(tools_artifact_test);
+    const tools_shell_test_run = b.addRunArtifact(tools_shell_test);
+    const tools_search_test_run = b.addRunArtifact(tools_search_test);
+    const tools_file_test_run = b.addRunArtifact(tools_file_test);
+    tools_artifact_test_run.step.dependOn(&tools_common_test_run.step);
+    tools_shell_test_run.step.dependOn(&tools_artifact_test_run.step);
+    tools_search_test_run.step.dependOn(&tools_shell_test_run.step);
+    tools_file_test_run.step.dependOn(&tools_search_test_run.step);
     agent_provider_protocol_bridge_test.use_llvm = true;
 
     const agent_test = b.addTest(.{
@@ -1659,11 +1668,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
     test_step.dependOn(&b.addRunArtifact(api_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(stream_test).step);
+    test_step.dependOn(&b.addRunArtifact(sse_parser_test).step);
     test_step.dependOn(&b.addRunArtifact(transport_test).step);
     test_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(in_process_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(transport_retry_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
     test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
@@ -1697,13 +1708,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_step.dependOn(&tools_common_test_run.step);
+    test_step.dependOn(&tools_artifact_test_run.step);
+    test_step.dependOn(&tools_file_test_run.step);
     test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_step.dependOn(&tools_shell_test_run.step);
+    test_step.dependOn(&tools_search_test_run.step);
     test_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
@@ -1829,19 +1840,23 @@ pub fn build(b: *std.Build) void {
     test_unit_makai_cli_step.dependOn(&auth_cli_test_run.step);
     test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
 
+    const test_unit_tools_step = b.step("test-unit-tools", "Run agent tool unit tests");
+    test_unit_tools_step.dependOn(&tools_common_test_run.step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
+    test_unit_tools_step.dependOn(&tools_artifact_test_run.step);
+    test_unit_tools_step.dependOn(&tools_shell_test_run.step);
+    test_unit_tools_step.dependOn(&tools_file_test_run.step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
+    test_unit_tools_step.dependOn(&tools_search_test_run.step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
+    test_unit_tools_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
+
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
     test_unit_agent_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
+    test_unit_agent_step.dependOn(test_unit_tools_step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
@@ -1849,16 +1864,6 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_config_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
@@ -1903,16 +1908,6 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_e2e_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_common_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_file_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_search_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
