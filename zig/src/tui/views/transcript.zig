@@ -744,10 +744,12 @@ fn renderToolSummaryRow(allocator: std.mem.Allocator, entry: *const DisplayEntry
     const status = try renderToolStatus(allocator, summary, entry.anim_tick, entry.awaiting_approval);
     const status_width = tui_text.visibleWidth(status);
     const glyph = try tui_theme.toolRole(tool_name).render(allocator, tui_theme.glyph.tool);
-    const label = try tui_theme.toolRole(tool_name).render(allocator, label_text);
-    const label_width = tui_text.visibleWidth(label_text);
-
     const gutter = gutterFor(width);
+    const label_budget = width -| (gutter + 2 + 2 + status_width);
+    const fitted_label = if (tui_text.visibleWidth(label_text) > label_budget) try tui_text.truncateLineToWidth(allocator, label_text, label_budget) else label_text;
+    const label = try tui_theme.toolRole(tool_name).render(allocator, fitted_label);
+    const label_width = tui_text.visibleWidth(fitted_label);
+
     const available = width -| (gutter + 2 + label_width + 2 + status_width + 2);
     var arg_text: []const u8 = "";
     if (summary.arg.len > 0 and available >= 4) {
@@ -1595,6 +1597,20 @@ test "single line system entries render as one muted row" {
     try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(rendered));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "System") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "model switched") != null);
+}
+
+test "tool rows keep their status visible on narrow terminals" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    _ = try state.resolveToolOccurrenceForTest("call-narrow", "mcp__very_long_server_name__some_extremely_long_tool_identifier", "{\"path\":\"/tmp/x\"}", .running);
+    try state.appendToolSummaryTranscript("◈ Some Extremely Long Tool Identifier From An MCP Server \"/tmp/x\" running", "call-narrow");
+    const entry = &state.transcript.items[0];
+    const rendered = try renderTranscriptEntry(std.testing.allocator, entry, 30);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(rendered));
+    try std.testing.expect(tui_text.visibleWidth(rendered) <= 30);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "…") != null);
 }
 
 test "system entries wrap long URLs across rows and hyperlink every fragment" {

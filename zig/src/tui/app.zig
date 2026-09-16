@@ -153,6 +153,32 @@ test "App loginStatusFor reports stored, environment and expired credentials" {
     try std.testing.expect(App.loginBadge(.none) == null);
 }
 
+test "App welcome banner neutralises control bytes in the working directory" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    std.testing.allocator.free(app.working_dir);
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/evil\x1b[2J\x1b]0;pwned\x07dir");
+    try app.appendWelcome();
+    const entry = app.state.transcript.items[app.state.transcript.items.len - 1];
+    try std.testing.expectEqual(tui_state.TranscriptKind.welcome, entry.kind);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "/tmp/evil?[2J?]0;pwned?dir") != null);
+}
+
+test "Context requestClearScreen discards history queued before the request" {
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try tctx.ctx.printAbove("stale row");
+    tctx.ctx.requestClearScreen();
+    try std.testing.expect(!tctx.ctx.hasPendingAbove());
+    try tctx.ctx.printAbove("transcript cleared");
+    const above = try tctx.ctx.takeAbove(std.testing.allocator);
+    defer std.testing.allocator.free(above);
+    try std.testing.expectEqualStrings("transcript cleared\n", above);
+}
+
 test "TuiModel login picker shows which providers are logged in" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
     defer model.deinit();
@@ -592,7 +618,7 @@ pub const App = struct {
     }
 
     const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
-    const login_env_keys = [_]?[]const u8{ "ANTHROPIC_API_KEY", null, null, "KIMI_API_KEY" };
+    const login_env_keys = [_][]const []const u8{ &.{ "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY" }, &.{}, &.{}, &.{} };
 
     pub const LoginStatus = enum { none, api_key, env_key, oauth, expired };
 
@@ -621,9 +647,9 @@ pub const App = struct {
         defer storage.deinit();
         for (login_providers, 0..) |provider, i| {
             var env_present = false;
-            if (login_env_keys[i]) |name| {
+            for (login_env_keys[i]) |name| {
                 if (compat.getEnvVarOwned(self.allocator, name)) |value| {
-                    env_present = value.len > 0;
+                    env_present = env_present or value.len > 0;
                     self.allocator.free(value);
                 } else |_| {}
             }
@@ -1353,9 +1379,12 @@ pub const App = struct {
     }
 
     pub fn appendWelcome(self: *App) !void {
-        const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
-        const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
-        const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
+        const model = try tui_text.sanitizeTerminalText(self.allocator, if (self.state.status.model.len > 0) self.state.status.model else "no-model");
+        defer self.allocator.free(model);
+        const provider = try tui_text.sanitizeTerminalText(self.allocator, if (self.state.status.provider.len > 0) self.state.status.provider else "local");
+        defer self.allocator.free(provider);
+        const cwd = try tui_text.sanitizeTerminalText(self.allocator, if (self.working_dir.len > 0) self.working_dir else ".");
+        defer self.allocator.free(cwd);
         const k = tui_theme.key;
         if (self.state.sessions.items.len == 0) {
             const welcome = try std.fmt.allocPrint(self.allocator,

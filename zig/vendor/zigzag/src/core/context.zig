@@ -53,6 +53,7 @@ pub const Context = struct {
 
     pub fn requestClearScreen(self: *Context) void {
         self.clear_screen_requested = true;
+        self.above_buffer.clearRetainingCapacity();
     }
 
     pub fn log(self: *const Context, comptime fmt: []const u8, args: anytype) void {

@@ -22,7 +22,7 @@ const anthropic_provider_id = "anthropic";
 const anthropic_api_name = "anthropic-messages";
 const anthropic_base_url = "https://api.anthropic.com";
 const anthropic_models_url = "https://api.anthropic.com/v1/models?limit=100";
-const anthropic_api_key_env = "ANTHROPIC_API_KEY";
+const anthropic_env_keys = [_][]const u8{ "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY" };
 const max_catalog_bytes = 2 * 1024 * 1024;
 const default_codex_client_version = "0.0.0";
 const default_max_output_tokens: u32 = 16_384;
@@ -264,10 +264,12 @@ fn anthropicCredential(allocator: std.mem.Allocator, storage: ?*oauth_storage.Au
             if (stored.getApiKey(anthropic_provider_id, anthropicOAuthProvider()) catch null) |token| return token;
         }
     }
-    if (compat.getEnvVarOwned(allocator, anthropic_api_key_env)) |key| {
-        if (key.len > 0) return key;
-        allocator.free(key);
-    } else |_| {}
+    for (anthropic_env_keys) |name| {
+        if (compat.getEnvVarOwned(allocator, name)) |key| {
+            if (key.len > 0) return key;
+            allocator.free(key);
+        } else |_| {}
+    }
     return null;
 }
 
