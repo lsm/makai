@@ -35,7 +35,7 @@ ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)
 secure_entropy_pattern='\b(fillSecureBytes|secureBytes|secureIntRangeLessThan|randomSecure)\b'
 
 strip_noncode() {
-  sed 's/\\"//g; s/"[^"]*"//g; s|//.*||'
+  sed -E 's/"([^"\]|\\.)*"//g; s/\\\\.*//; s|//.*||'
 }
 
 code_matches_only() {
