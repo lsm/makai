@@ -93,10 +93,20 @@ file. Listing them in the picker is not implemented yet.
 
 ## Model discovery
 
-On first use makai fetches `<base_url>/v1/models` and caches the response under
-`~/.makai/model_catalog/custom-<id>.json` for 24 hours. `/model` forces a fresh
-fetch. When the fetch fails it falls back to the cached copy however old, and
-then to the declared `models` list.
+Startup never touches the network. Loading the catalog reads
+`~/.makai/model_catalog/custom-<id>.json`, preferring a copy younger than 24
+hours and still using an older one rather than nothing, and falls through to the
+declared `models` list when there is no cache at all. This matters because
+`compat.http` sets no connect or read timeout: a declared endpoint that is down,
+or that accepts the connection and then stalls, would otherwise hold up
+`makai --tui` and print-mode model resolution for as long as the peer cared to
+wait, and again every day once the cache went stale.
+
+The fetch happens off that path. A successful `/login <id>` refreshes every
+catalog, which is what populates the cache the first time, and a refresh
+requests `<base_url>/v1/models`, writes the cache, and falls back to the cached
+copy however old when it fails. A keyless endpoint has no login step, so it
+serves its declared `models` list until some other login triggers a refresh.
 
 The declared list is a fallback **only** when discovery produced nothing at all.
 When discovery succeeds, its result is filtered by the list and that is what you
@@ -144,6 +154,17 @@ case: it authenticates with its own key, resolved from the keychain under its id
 or from its declared environment variable, and the vendor token is never
 consulted. A provider with no credential at all still reaches the endpoint
 unauthenticated, which is what a keyless local server needs.
+
+Two rules keep those apart, because `base_url` arrives from the request and the
+server does not police where a model points. When a request names a vendor wire
+format (`anthropic-messages`, `openai-codex-responses`) but a different
+`provider`, the server refuses outright if that `provider` is itself a vendor id,
+so claiming `provider: "openai-codex"` on `anthropic-messages` cannot pull the
+stored Codex token. Otherwise it resolves the credential for that id under an
+api-key-only rule that skips OAuth entries entirely. A custom provider's
+credential is always a stored API key or an environment variable, so the rule
+costs it nothing, and no OAuth access token can leave through this path whatever
+id the request claims.
 
 ## Limits
 

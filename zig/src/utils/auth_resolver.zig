@@ -20,11 +20,26 @@ pub const ResolvedKey = struct {
     }
 };
 
+pub const CredentialKind = enum {
+    any,
+    api_key_only,
+};
+
 pub fn resolveApiKey(
     allocator: std.mem.Allocator,
     auth_storage: ?*AuthStorage,
     provider_id: []const u8,
     provided_api_key: ?[]const u8,
+) AuthResolveError!ResolvedKey {
+    return resolveApiKeyOfKind(allocator, auth_storage, provider_id, provided_api_key, .any);
+}
+
+pub fn resolveApiKeyOfKind(
+    allocator: std.mem.Allocator,
+    auth_storage: ?*AuthStorage,
+    provider_id: []const u8,
+    provided_api_key: ?[]const u8,
+    kind: CredentialKind,
 ) AuthResolveError!ResolvedKey {
     if (provided_api_key) |k| {
         if (k.len > 0) {
@@ -41,8 +56,10 @@ pub fn resolveApiKey(
                     return .{ .api_key = dup };
                 },
                 .oauth => |creds| {
-                    const dup = try allocator.dupe(u8, creds.access);
-                    return .{ .api_key = dup };
+                    if (kind == .any) {
+                        const dup = try allocator.dupe(u8, creds.access);
+                        return .{ .api_key = dup };
+                    }
                 },
             }
         }
@@ -148,6 +165,42 @@ test "resolveApiKey - loads oauth access token from storage by provider_id" {
     defer resolved.deinit(testing.allocator);
 
     try testing.expectEqualStrings("oauth-access", resolved.api_key);
+}
+
+test "resolveApiKeyOfKind - api_key_only refuses a stored oauth token" {
+    var storage = makeStorage(testing.allocator);
+    defer storage.deinit();
+
+    const provider_id = try testing.allocator.dupe(u8, "openai-codex");
+    const refresh = try testing.allocator.dupe(u8, "refresh-token");
+    const access = try testing.allocator.dupe(u8, "oauth-access");
+    try storage.providers.put(provider_id, .{ .oauth = .{
+        .refresh = refresh,
+        .access = access,
+        .expires = compat.time.nowMillis() + 3_600_000,
+    } });
+
+    try testing.expectError(
+        error.AuthRequired,
+        resolveApiKeyOfKind(testing.allocator, &storage, "openai-codex", null, .api_key_only),
+    );
+
+    var any = try resolveApiKeyOfKind(testing.allocator, &storage, "openai-codex", null, .any);
+    defer any.deinit(testing.allocator);
+    try testing.expectEqualStrings("oauth-access", any.api_key);
+}
+
+test "resolveApiKeyOfKind - api_key_only still returns a stored api key" {
+    var storage = makeStorage(testing.allocator);
+    defer storage.deinit();
+
+    const provider_id = try testing.allocator.dupe(u8, "gateway");
+    const stored = try testing.allocator.dupe(u8, "gateway-key");
+    try storage.providers.put(provider_id, .{ .api_key = stored });
+
+    var resolved = try resolveApiKeyOfKind(testing.allocator, &storage, "gateway", null, .api_key_only);
+    defer resolved.deinit(testing.allocator);
+    try testing.expectEqualStrings("gateway-key", resolved.api_key);
 }
 
 test "resolveApiKey - missing storage and no key returns AuthRequired" {

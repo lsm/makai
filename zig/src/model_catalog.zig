@@ -257,6 +257,7 @@ fn discoverCustomModelIds(
 
     if (mode == .allow_cache) {
         if (try loadCachedModelIds(allocator, name, anthropic_catalog_max_age_ms)) |ids| return ids;
+        return loadCachedModelIds(allocator, name, null);
     }
 
     const token = customCredential(allocator, provider, storage);
