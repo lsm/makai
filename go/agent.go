@@ -183,7 +183,6 @@ func (s *AgentStream) Next() bool {
 				if s.run.aggregateUsage != nil {
 					value.Usage = s.run.aggregateUsage
 				}
-				s.run.finished = true
 				s.done = true
 				if value.StopReason == "error" && isAuthFailureMessage(value.ErrorMessage, value.API) {
 					s.fail(newAuthRequiredError(firstNonEmpty(value.ProviderID, s.run.fallbackProvider), value.ErrorMessage))
@@ -216,7 +215,6 @@ func (s *AgentStream) Next() bool {
 		if s.run.result != nil {
 			// The run settled through a result frame rather than an
 			// agent_end event; project it as the terminal event.
-			s.run.finished = true
 			s.pending = append(s.pending, agentEndFromResponse(s.run.result))
 			s.run.result = nil
 			continue
@@ -295,7 +293,6 @@ type agentRun struct {
 	startReplyObserved bool
 	foreignSession     bool
 	stopped            bool
-	finished           bool
 
 	aggregateUsage *Usage
 	result         *CompletionResponse
@@ -365,13 +362,11 @@ func (r *agentRun) pump() ([]AgentEvent, error) {
 				return nil, err
 			}
 			r.result = parseAgentRunResponse(payload)
-			r.finished = true
 			return nil, nil
 
 		case "result", "complete_response":
 			r.unresolvedMessageSequence = 0
 			r.result = parseCompletionResponse(f.payload())
-			r.finished = true
 			return nil, nil
 		}
 
