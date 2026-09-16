@@ -125,6 +125,30 @@ test "compat random range helpers respect upper bound" {
     }
 }
 
+test "compat random range helpers vary across draws" {
+    var secure_seen = [_]bool{false} ** 62;
+    var ordinary_seen = [_]bool{false} ** 62;
+    var secure_distinct: usize = 0;
+    var ordinary_distinct: usize = 0;
+
+    for (0..256) |_| {
+        const secure_value = secureIntRangeLessThan(usize, 62);
+        if (!secure_seen[secure_value]) {
+            secure_seen[secure_value] = true;
+            secure_distinct += 1;
+        }
+
+        const ordinary_value = randomIntRangeLessThan(usize, 62);
+        if (!ordinary_seen[ordinary_value]) {
+            ordinary_seen[ordinary_value] = true;
+            ordinary_distinct += 1;
+        }
+    }
+
+    try std.testing.expect(secure_distinct > 8);
+    try std.testing.expect(ordinary_distinct > 8);
+}
+
 test "compat random range helpers accept a single value range" {
     try std.testing.expectEqual(@as(usize, 0), secureIntRangeLessThan(usize, 1));
     try std.testing.expectEqual(@as(usize, 0), randomIntRangeLessThan(usize, 1));
