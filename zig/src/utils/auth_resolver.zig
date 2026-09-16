@@ -1,7 +1,8 @@
-
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
 const storage_mod = @import("oauth/storage");
+const custom_providers = @import("custom_providers");
 
 pub const AuthStorage = storage_mod.AuthStorage;
 pub const ProviderAuth = storage_mod.ProviderAuth;
@@ -32,19 +33,53 @@ pub fn resolveApiKey(
         }
     }
 
-    const storage = auth_storage orelse return error.AuthRequired;
-    const auth = storage.providers.get(provider_id) orelse return error.AuthRequired;
-
-    switch (auth) {
-        .api_key => |key| {
-            const dup = try allocator.dupe(u8, key);
-            return .{ .api_key = dup };
-        },
-        .oauth => |creds| {
-            const dup = try allocator.dupe(u8, creds.access);
-            return .{ .api_key = dup };
-        },
+    if (auth_storage) |storage| {
+        if (storage.providers.get(provider_id)) |auth| {
+            switch (auth) {
+                .api_key => |key| {
+                    const dup = try allocator.dupe(u8, key);
+                    return .{ .api_key = dup };
+                },
+                .oauth => |creds| {
+                    const dup = try allocator.dupe(u8, creds.access);
+                    return .{ .api_key = dup };
+                },
+            }
+        }
     }
+
+    if (try customProviderEnvKey(allocator, provider_id)) |key| return .{ .api_key = key };
+    return error.AuthRequired;
+}
+
+const max_custom_provider_config_bytes = 1024 * 1024;
+
+fn customProviderEnvKey(allocator: std.mem.Allocator, provider_id: []const u8) std.mem.Allocator.Error!?[]u8 {
+    if (builtin.is_test) return null;
+    const providers = custom_providers.load(allocator, max_custom_provider_config_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer custom_providers.deinitProviders(allocator, providers);
+    return envKeyForProvider(allocator, providers, provider_id);
+}
+
+pub fn envKeyForProvider(
+    allocator: std.mem.Allocator,
+    providers: []const custom_providers.CustomProvider,
+    provider_id: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    for (providers) |provider| {
+        if (!std.mem.eql(u8, provider.id, provider_id)) continue;
+        const env_name = provider.env_key orelse return null;
+        const value = compat.getEnvVarOwned(allocator, env_name) catch return null;
+        if (value.len == 0) {
+            allocator.free(value);
+            return null;
+        }
+        return value;
+    }
+    return null;
 }
 
 const testing = std.testing;
@@ -153,4 +188,17 @@ test "resolveApiKey - empty key with no storage returns AuthRequired" {
         error.AuthRequired,
         resolveApiKey(testing.allocator, null, "anthropic", ""),
     );
+}
+
+test "envKeyForProvider reads the declared variable and ignores other providers" {
+    const providers = [_]custom_providers.CustomProvider{
+        .{ .id = "gateway", .name = "Gateway", .api = "openai-completions", .base_url = "https://gw.test", .env_key = "MAKAI_TEST_GATEWAY_KEY" },
+        .{ .id = "keyless", .name = "Keyless", .api = "openai-completions", .base_url = "http://localhost:8000" },
+    };
+
+    try testing.expect(try envKeyForProvider(testing.allocator, &providers, "absent") == null);
+    try testing.expect(try envKeyForProvider(testing.allocator, &providers, "keyless") == null);
+
+    const unset = try envKeyForProvider(testing.allocator, &providers, "gateway");
+    if (unset) |value| testing.allocator.free(value);
 }

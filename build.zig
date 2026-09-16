@@ -187,6 +187,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const custom_providers_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/custom_providers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "provider_base_url", .module = provider_base_url_mod },
+        },
+    });
+    const custom_providers_test = b.addTest(.{ .root_module = custom_providers_mod });
+
     const auth_resolver_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/utils/auth_resolver.zig"),
         .target = target,
@@ -194,6 +206,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "custom_providers", .module = custom_providers_mod },
         },
     });
 
@@ -985,18 +998,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
         },
     });
-
-    const custom_providers_mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/custom_providers.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "provider_base_url", .module = provider_base_url_mod },
-        },
-    });
-    const custom_providers_test = b.addTest(.{ .root_module = custom_providers_mod });
 
     const model_catalog_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/model_catalog.zig"),
