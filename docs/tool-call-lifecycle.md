@@ -155,6 +155,10 @@ One design, two PRs (~100 production lines each, per methodology):
    retirement (scans stay eager; §5's transcript bound is unimplemented until then),
    and the retained-payload merge matrix (output/artifact retention on reconciled
    entries), both as design-first follow-ups with the review findings as inputs.
+3. **Payload merge + scan/flush mechanics** (#295 / task #410): the §6 merge matrix and
+   the §7 reconciliation floor with the inline-flush cursor contract, including the
+   retirement boundaries and the end-of-session flush release. Specified in the
+   addendum below from the seven #295 findings; implemented after #288 landed.
 
 ## Non-goals
 
@@ -193,3 +197,138 @@ One design, two PRs (~100 production lines each, per methodology):
   reversed order assert the reconciled scrollback text.
 - Guard: `tui_loc` delta reported against #266 (identity layer is plumbing; expected
   net near-flat against the deleted exact-match helpers).
+
+## Addendum (#295): retained-payload merge + scan/flush mechanics
+
+Date: 2026-09-16. Design-first deliverable for the two layers the coordinator pre-ruled
+out of PR #288 (cycle 5). Baseline: `main` @ `85be234`. Inputs: the seven findings listed
+on #295 — four from the cycle-5 payload/retirement layer and three from earlier PR #288
+rounds. This addendum extends §3–§5; it changes no §2 resolution semantics.
+
+### 6. Retained-payload merge matrix
+
+An occurrence's retained payload is what later renders read after the half that carried
+it is gone: `output` (final content bytes), `artifact_count`/`artifact_refs`, and the byte
+telemetry (`raw_total_bytes`, `returned_total_bytes`, `estimated_returned_tokens`, derived
+`truncated`). Three sources feed them: preview fragments
+(`tool_execution_update.partial_result_json`, live occurrences only), the execution half
+(`tool_execution_end`: `result_json` + telemetry + artifact count/refs), and the result
+half (`message_end.tool_result`: detail source = `details_json` else `text`, plus
+`artifacts_json`). Status/error merging stays exactly as #288 landed it.
+
+One principle covers every cell: **a terminal half merges its payload per field without
+erasing richer state the other half already recovered** — the field-level extension of
+§1's "the second half merges missing fields".
+
+| Arrival × field | `output` | artifacts | byte telemetry |
+|---|---|---|---|
+| execution half into an occurrence with previews (normal end) | append the final payload after the accumulated previews, skipping when the retained output already equals it (idempotence) | set from the payload | replace per field only when the incoming value is non-zero |
+| result half, merge path (live occurrence, `none`-evidence reconcile, or allocate-from-result) | merge the detail source through the same idempotent append — the guard is equality, never emptiness (r4021914112) | count = max(retained, `artifacts_json` length) (r4021914118) | none on this wire; retained values unchanged |
+| execution half, merge path (reverse replay: end after result) | append `result_json` through the same idempotent append (dedupes the re-delivered payload) | count = max(retained, payload count); a zero never clobbers (r4021914125) | replace per field only when non-zero — legacy/incomplete ends carry zeros that mean absent (r4021914125) |
+| result half, render-link (evidence `execution` → `both`) | no merge | no merge | no merge — the row is display-only; in forward order the execution half is authoritative |
+
+Previews append with a newline separator while the occurrence is live (unchanged). The
+idempotent-append primitive is shared by both terminal paths, so a reversed replay of the
+same run does not double the payload, and a final result over a preview-accumulated
+occurrence still lands (the r4021914112 defect was guarding on emptiness).
+
+**Rendering rule (r4021914118):** terminal summary rows render *after* the merge, from
+merged entry state — byte telemetry and artifact count read the entry, the status/error
+preview reads the half's own payload. A summary written before a field was recovered is
+rewritten by the later half through the §4 primitive, so the stored row never omits
+artifact indicators the entry knows about.
+
+### 7. The reconciliation floor and the inline-flush cursor
+
+Slice 2 left linked-row scans eager because §5's bound needed two things the review loop
+showed were under-specified: when an occurrence stops being rewritable, and what the
+inline renderer may flush. Both are contracts, not implementation details.
+
+**Frozen.** An occurrence is *frozen* when its terminal evidence is `both` or it is
+*retired*. Frozen occurrences are immutable: resolution never attaches to a retired
+occurrence (a later half of the family allocates the next occurrence, as #288 already
+does for `both`-evidence families), so no rewrite, insert, or removal ever targets a
+frozen occurrence's rows again.
+
+**Retirement boundaries.** Retirement marks terminal occurrences retired at the points
+after which no further half can legally arrive: `turn_start` (a new turn's calls are new
+invocations) and `agent_end` — the r4021914129 fix; a session whose last turn ends
+without a next turn must still release its rows — plus the post-replay finalization on
+resume (a crashed session replays without an `agent_end` record; after the replay drain,
+the same boundary holds). `turn_end` never retires: the agent loop emits tool-result
+`message_end`s after `turn_end` (§3 loss mode 1), so the reconcile window spans the turn
+boundary. A retired occurrence's late half arrives as a **corrected row**: a fresh
+occurrence with fresh rows, never a rewrite of scrollback.
+
+**The floor.** `summary_scan_floor` is one watermark: the index of the earliest
+transcript row *owned* by an unfrozen occurrence (a `.tool` row whose `tool_call_id`
+names one), or `transcript.items.len` when there is none. Error cards need no separate
+ownership: §4 orders the write primitive before card emission, so a card always sits
+above its occurrence's summary row and is covered transitively. Consequences:
+
+- Every rewrite, insert, and removal of *owned* rows targets rows ≥ the floor, because
+  targets belong to the occurrence being handled, which is unfrozen at handling time,
+  and the floor is the minimum over all unfrozen occurrences. The one exception is the
+  pending tool-result placeholder: an unowned row that can sit below the floor. A
+  summary insert before it clamps the floor down to the insert index, and its removal
+  decrements the floor — two mechanical index adjustments at those two sites; every
+  other insert/remove site performs **no** floor maintenance (the c3/c4 finding
+  family), and `advanceSummaryScanFloor` is the floor's only other writer. Without the
+  insert clamp, a later half's rewrite would miss the summary row below the floor and
+  duplicate it.
+- Linked-row scans (`replaceLinkedSummaryRow`, `insertBeforeLinkedResultRow`,
+  `removeLinkedResultRows`, the error-card refresh scan) stop at the floor (§5,
+  r4019270180). The advance itself walks forward only past rows it proves unowned —
+  amortized linear over the session, with the owner check bounded by the unfrozen
+  registry suffix. It runs where ownership changes: after each terminal half, after
+  `finalizeInterruptedTools`, and after retirement. Allocation and append sites do not
+  call it: appended rows land at or above the floor, and a floor already at
+  `items.len` correctly points at the first row the new occurrence appends. The flush
+  tick also runs it before reading the stop — rows can append with no tool event at
+  all (welcome banner, plain-chat turns), and the walk is amortized O(1) (it stops at
+  the first owned row and re-walks nothing), so the stop stays a read of a maintained
+  watermark rather than a per-row lookup (PR #288 c2 P2).
+
+**The inline-flush cursor contract.** The inline renderer flushes transcript rows into
+immutable scrollback sequentially from `inline_history_flushed`; a rewrite of a row the
+cursor has passed would be invisible (PR #288 c1 P1). The contract:
+
+1. The flush stop is `min(earliest active entry, summary_scan_floor)` — one O(1) read of
+   the watermark, no per-row registry lookups during flush ticks (PR #288 c2 P2).
+2. Held rows stay visible: the live region renders the whole unflushed range from
+   `inline_history_flushed`, tail-clipped to the live window, so withholding a row from
+   scrollback never withholds it from the screen.
+3. Release is the floor advancing: a frozen or retired occurrence's rows flush on the
+   next tick once the cursor may pass them. `agent_end` retires everything, so a session
+   that ends without a next turn still flushes its full rewritable prefix (the
+   end-of-session flush release, asserted by PTY).
+4. The final flush at quit bypasses the stop — exit always dumps the transcript.
+5. Rows below the cursor are immutable by construction (stop ≤ floor); the corrected-row
+   rule above is the only post-release path, and it appends rather than rewrites.
+
+### Addendum traceability
+
+| #295 finding | Resolved by |
+|---|---|
+| r4021914112 retained output dropped behind previews | §6 idempotent append (equality guard) |
+| r4021914118 summary omits result-recovered artifacts | §6 artifact max-merge + rendering rule |
+| r4021914125 legacy-end telemetry zeros clobber | §6 non-zero per-field replace + max-retain |
+| r4021914129 rows held forever at session end | §7 agent_end/retirement boundary + release |
+| PR #288 c1 P1 rewrites of flushed rows invisible | §7 flush stop + held-row rendering |
+| PR #288 c2 P2 per-row lookups in flush ticks | §7 stop = O(1) watermark read |
+| PR #288 c3/c4 floor under insert/remove | §7 single-writer floor, no per-site maintenance |
+
+### Addendum tests
+
+- `state.zig`: matrix cells — final result over preview-accumulated output; result
+  artifact recovery rendering into the stored row; legacy-zero end after result-recovered
+  telemetry/artifacts; reversed-replay payload dedupe. Retirement — turn_start and
+  agent_end retire; results after retirement allocate; the floor advances over frozen
+  families, stays put below interleaved unfrozen ones, and releases to `items.len` at
+  agent_end.
+- `app.zig`: the flush stop reads the floor and releases when the occurrence freezes;
+  held rows render above the active entries.
+- PTY: a resumed session whose final turn drops the tool-result half (execution-evidence
+  occurrence at `agent_end`) with enough trailing rows for flush pressure asserts the
+  end-of-session release — the early rows land in scrollback instead of being clipped
+  out of the held window.

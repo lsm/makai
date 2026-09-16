@@ -665,6 +665,7 @@ pub const App = struct {
             try self.applyRuntimeEvent(event.*);
         }
         try self.state.finalizeInterruptedTools();
+        self.state.retireToolOccurrences();
         if (self.session) |*session| session.clearQueuedMessages();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
@@ -2143,6 +2144,7 @@ pub const TuiModel = struct {
         if (!self.inlineMode(ctx)) return;
         const entries = app.state.transcript.items;
         if (app.inline_history_flushed >= entries.len) return;
+        app.state.advanceSummaryScanFloor();
 
         const width: usize = @max(ctx.width, 20);
         const stop = if (include_active) entries.len else inlineFlushStop(app);
@@ -2211,7 +2213,7 @@ pub const TuiModel = struct {
         if (app.state.active_thinking_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_summary_entry) |idx| stop = @min(stop, idx);
-        return stop;
+        return @min(stop, app.state.summary_scan_floor);
     }
 
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
@@ -2622,6 +2624,20 @@ test "TuiModel inline flush keeps scrollback and window contiguous" {
         try std.testing.expectEqualStrings(std.mem.trimEnd(u8, row, " "), std.mem.trimEnd(u8, got, " "));
     }
     try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, actual.next() orelse return error.TestUnexpectedResult, " "));
+}
+
+test "App inline flush stop follows the reconciliation floor" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var resolution = try app.state.resolveToolOccurrenceForTest("call-h", "shell_execute", "{\"command\":\"pwd\"}", .live_intent, .running);
+    try app.state.appendToolSummaryTranscript("running now", resolution.tool.id);
+    try app.state.appendTranscript(.assistant, "later text");
+    try app.state.advanceSummaryScanFloor();
+    try std.testing.expectEqual(@as(usize, 0), TuiModel.inlineFlushStop(&app));
+
+    resolution.tool.terminal_evidence = .both;
+    try app.state.advanceSummaryScanFloor();
+    try std.testing.expectEqual(@as(usize, 2), TuiModel.inlineFlushStop(&app));
 }
 
 test "TuiModel inline frame keeps the composer on the bottom row across a picker" {
