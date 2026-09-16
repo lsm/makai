@@ -100,7 +100,14 @@ declared `models` list when there is no cache at all. This matters because
 `compat.http` sets no connect or read timeout: a declared endpoint that is down,
 or that accepts the connection and then stalls, would otherwise hold up
 `makai --tui` and print-mode model resolution for as long as the peer cared to
-wait, and again every day once the cache went stale.
+wait, and again every day once the cache went stale. Nor can it simply set one.
+`std.http.Client.ConnectTcpOptions` in Zig 0.16.0 declares a `timeout` field,
+but that is the only mention of it anywhere under `std/http/`, and
+`connectTcpOptions` never reads it, so it is inert. Bounding a request means
+either driving the connection setup below `Client.request` or running the fetch
+on a thread with a timed wait, which is why no request in this tree is bounded
+today and why keeping the fetch off the startup path is the fix that was
+available here.
 
 The fetch happens off that path. A successful `/login <id>` refreshes every
 catalog, which is what populates the cache the first time, and a refresh
