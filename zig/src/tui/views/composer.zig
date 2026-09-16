@@ -1,4 +1,5 @@
 const std = @import("std");
+const zz = @import("zigzag");
 const tui_state = @import("tui_state");
 const tui_theme = @import("tui_theme");
 const tui_text = @import("tui_text");
@@ -6,20 +7,51 @@ const tui_render = @import("tui_render");
 
 pub const Options = struct {
     width: usize = 80,
+    anim_tick: u64 = 0,
 };
 
 const cursor_blank = " ";
 const cursor_cell_width = 1;
+const max_draft_rows = 6;
+const placeholder_text = "Ask Makai…";
 
 pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
     defer allocator.free(input);
-    const hint = try renderHint(allocator, state, inner_width);
-    defer allocator.free(hint);
-    const body = try tui_render.joinVertical(allocator, &.{ input, hint });
-    defer allocator.free(body);
-    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+    const border = borderColor(state, options.anim_tick);
+    return tui_theme.panelWith(border).width(@intCast(@min(inner_width, std.math.maxInt(u16)))).render(allocator, input);
+}
+
+pub fn borderColor(state: *const tui_state.AppState, anim_tick: u64) zz.Color {
+    if (state.mode == .approval) return tui_theme.palette.warning;
+    if (state.mode == .login_input) return tui_theme.palette.thinking;
+    if (state.status.streaming) return tui_theme.pulseColor(anim_tick);
+    if (state.composer.text().len > 0) return tui_theme.palette.accent;
+    return tui_theme.palette.panel_border;
+}
+
+pub fn hintText(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]u8 {
+    const text = state.composer.text();
+    const k = tui_theme.key;
+    switch (state.mode) {
+        .approval => return allocator.dupe(u8, "y allow · a always · n deny · esc abort"),
+        .login_input => return std.fmt.allocPrint(allocator, "{s} submit · esc cancel", .{k.enter}),
+        .picker, .session_picker => return std.fmt.allocPrint(allocator, "{s} move · {s} select · esc close", .{ k.up_down, k.enter }),
+        .normal => {},
+    }
+    if (state.status.streaming) {
+        const queued = state.queue.total();
+        if (queued > 0) return std.fmt.allocPrint(allocator, "{s} steer · queued {d} · esc abort", .{ k.enter, queued });
+        return std.fmt.allocPrint(allocator, "{s} steer · esc abort", .{k.enter});
+    }
+    if (std.mem.startsWith(u8, text, "!")) return std.fmt.allocPrint(allocator, "shell mode · {s} runs the command through the agent", .{k.enter});
+    if (std.mem.startsWith(u8, text, "@")) return allocator.dupe(u8, "file picker · type a path or query");
+    if (std.mem.startsWith(u8, text, "/")) return std.fmt.allocPrint(allocator, "{s} complete · {s} run · esc clear", .{ k.tab, k.enter });
+    if (state.composer.history.items.len > 0) {
+        return std.fmt.allocPrint(allocator, "{s} history · {s}{s} newline · / commands", .{ k.up_down, k.shift, k.enter });
+    }
+    return std.fmt.allocPrint(allocator, "{s} send · {s}{s} newline · / commands · {s}C quit", .{ k.enter, k.shift, k.enter, k.ctrl });
 }
 
 fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]u8 {
@@ -36,7 +68,7 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     }
     if (state.composer.text().len == 0) {
         const draft_width = content_width -| cursor_cell_width;
-        const placeholder = try tui_text.truncateLineToWidth(allocator, "Ask Makai…", draft_width);
+        const placeholder = try tui_text.truncateLineToWidth(allocator, placeholderFor(state), draft_width);
         defer allocator.free(placeholder);
         const styled_placeholder = try tui_theme.composerPlaceholder().render(allocator, placeholder);
         defer allocator.free(styled_placeholder);
@@ -49,6 +81,13 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     const draft = try renderDraftWithCursor(allocator, state.composer.text(), state.composer.cursor, content_width);
     defer allocator.free(draft);
     return prefixFirstLine(allocator, prompt, draft);
+}
+
+fn placeholderFor(state: *const tui_state.AppState) []const u8 {
+    if (state.mode == .login_input) return if (state.login_input_secret) "paste the secret and press Enter" else "type your answer and press Enter";
+    if (state.mode == .approval) return "y / a / n to decide, or type /abort";
+    if (state.status.streaming) return "type to steer the running turn…";
+    return placeholder_text;
 }
 
 fn maskedSecretInput(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -65,7 +104,7 @@ fn renderDraftWithCursor(allocator: std.mem.Allocator, text: []const u8, cursor:
     const after = text[normalized_cursor..];
     const plain = try appendCursorBlock(allocator, before, after);
     defer allocator.free(plain);
-    if (tui_text.lineCount(plain) <= 4 and tui_text.visibleWidth(plain) <= width) return allocator.dupe(u8, plain);
+    if (tui_text.lineCount(plain) <= max_draft_rows and maxLineWidth(plain) <= width) return allocator.dupe(u8, plain);
 
     const visible_after_budget = @min(width / 3, width -| cursor_cell_width);
     const after_preview = try takeLeadingWidth(allocator, after, visible_after_budget);
@@ -75,15 +114,23 @@ fn renderDraftWithCursor(allocator: std.mem.Allocator, text: []const u8, cursor:
     defer allocator.free(before_preview);
     const windowed = try appendCursorBlock(allocator, before_preview, after_preview);
     defer allocator.free(windowed);
-    return tui_text.truncateLinesToWidth(allocator, windowed, width, 4);
+    return tui_text.truncateLinesToWidth(allocator, windowed, width, max_draft_rows);
+}
+
+fn maxLineWidth(text: []const u8) usize {
+    var widest: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| widest = @max(widest, tui_text.visibleWidth(line));
+    return widest;
 }
 
 fn appendCursorBlock(allocator: std.mem.Allocator, before: []const u8, after: []const u8) ![]u8 {
     const cell_end = if (after.len == 0) 0 else nextCodepointEnd(after, 0);
-    const cursor_cell = if (cell_end == 0) cursor_blank else after[0..cell_end];
+    const cursor_cell = if (cell_end == 0 or after[0] == '\n') cursor_blank else after[0..cell_end];
     const cursor = try renderCursorCell(allocator, cursor_cell);
     defer allocator.free(cursor);
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ before, cursor, after[cell_end..] });
+    const rest = if (cell_end == 0 or after[0] == '\n') after else after[cell_end..];
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ before, cursor, rest });
 }
 
 fn renderCursorCell(allocator: std.mem.Allocator, cell: []const u8) ![]const u8 {
@@ -97,12 +144,13 @@ fn takeLeadingWidth(allocator: std.mem.Allocator, text: []const u8, width: usize
 
 fn takeTrailingWidth(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
     if (width == 0 or text.len == 0) return allocator.dupe(u8, "");
-    if (tui_text.visibleWidth(text) <= width) return allocator.dupe(u8, text);
+    if (tui_text.visibleWidth(text) <= width and std.mem.indexOfScalar(u8, text, '\n') == null) return allocator.dupe(u8, text);
     var start = text.len;
     var visible: usize = 0;
     while (start > 0 and visible < width -| 1) {
         const cp_start = previousCodepointStart(text, start);
         const cp = text[cp_start..start];
+        if (cp.len == 1 and cp[0] == '\n') break;
         visible += tui_text.visibleWidth(cp);
         if (visible > width -| 1) break;
         start = cp_start;
@@ -128,42 +176,6 @@ fn utf8BoundaryAtOrBefore(text: []const u8, index: usize) usize {
     var idx = @min(index, text.len);
     while (idx > 0 and idx < text.len and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
     return idx;
-}
-
-fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, max_width: usize) ![]const u8 {
-    const text = state.composer.text();
-    if (state.status.streaming) {
-        const queued = state.queue.total();
-        const hint = if (queued > 0)
-            try std.fmt.allocPrint(allocator, "Enter steer • queued {d}", .{queued})
-        else
-            try allocator.dupe(u8, "Enter steer");
-        defer allocator.free(hint);
-        const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
-        defer allocator.free(truncated);
-        return tui_theme.muted().render(allocator, truncated);
-    }
-    if (std.mem.startsWith(u8, text, "!")) {
-        const truncated = try tui_text.truncateToWidth(allocator, "shell mode • Enter runs command through agent", max_width);
-        defer allocator.free(truncated);
-        return tui_theme.muted().render(allocator, truncated);
-    }
-    if (std.mem.startsWith(u8, text, "@")) {
-        const truncated = try tui_text.truncateToWidth(allocator, "file picker • type path or query", max_width);
-        defer allocator.free(truncated);
-        return tui_theme.muted().render(allocator, truncated);
-    }
-    if (state.composer.history.items.len > 0) {
-        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Shift+Tab thinking level", .{state.composer.history.items.len});
-        defer allocator.free(hint);
-        const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
-        defer allocator.free(truncated);
-        return tui_theme.muted().render(allocator, truncated);
-    }
-    const base_hint = "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit";
-    const truncated = try tui_text.truncateToWidth(allocator, base_hint, max_width);
-    defer allocator.free(truncated);
-    return tui_theme.muted().render(allocator, truncated);
 }
 
 fn promptFor(state: *const tui_state.AppState) []const u8 {
@@ -195,13 +207,12 @@ test "composer renders placeholder and text" {
     const placeholder = try render(std.testing.allocator, &state, .{ .width = 80 });
     defer std.testing.allocator.free(placeholder);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Ask Makai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Shift+Tab") != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Ctrl+R") == null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, cursor_blank) != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "|") == null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "\u{2588}") == null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "╭") != null);
     try std.testing.expect((std.mem.indexOf(u8, placeholder, "\x1b[7m") orelse return error.MissingCursor) < (std.mem.indexOf(u8, placeholder, "Ask Makai") orelse return error.MissingPlaceholder));
+    var lines = std.mem.splitScalar(u8, placeholder, '\n');
+    while (lines.next()) |line| try std.testing.expectEqual(@as(usize, 80), tui_text.visibleWidth(line));
 
     try state.composer.buffer.appendSlice(std.testing.allocator, "hello world");
     state.composer.cursor = state.composer.buffer.items.len;
@@ -210,6 +221,67 @@ test "composer renders placeholder and text" {
     try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{2588}") == null);
+}
+
+test "composer hint follows the interaction state" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const idle = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(idle);
+    try std.testing.expect(std.mem.indexOf(u8, idle, "send") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle, "newline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle, "commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle, "Ctrl+R") == null);
+
+    try state.recordComposerHistory("earlier");
+    const recall = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(recall);
+    try std.testing.expect(std.mem.indexOf(u8, recall, "history") != null);
+
+    state.status.streaming = true;
+    state.queue.steering = 2;
+    const streaming = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(streaming);
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "steer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "queued 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "Alt+Enter") == null);
+    state.status.streaming = false;
+    state.queue.steering = 0;
+
+    try state.replaceComposerBuffer("!ls");
+    const shell = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(shell);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "shell mode") != null);
+
+    try state.replaceComposerBuffer("@src");
+    const file = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(file);
+    try std.testing.expect(std.mem.indexOf(u8, file, "file picker") != null);
+
+    try state.replaceComposerBuffer("/mo");
+    const slash = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(slash);
+    try std.testing.expect(std.mem.indexOf(u8, slash, "complete") != null);
+
+    state.mode = .approval;
+    const approval = try hintText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(approval);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "deny") != null);
+}
+
+test "composer border reflects mode and streaming state" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expect(std.meta.eql(borderColor(&state, 0), tui_theme.palette.panel_border));
+    try state.replaceComposerBuffer("draft");
+    try std.testing.expect(std.meta.eql(borderColor(&state, 0), tui_theme.palette.accent));
+    state.mode = .approval;
+    try std.testing.expect(std.meta.eql(borderColor(&state, 0), tui_theme.palette.warning));
+    state.mode = .normal;
+    state.status.streaming = true;
+    try std.testing.expect(std.meta.eql(borderColor(&state, 0), tui_theme.pulseColor(0)));
 }
 
 test "composer renders multiline draft content" {
@@ -223,6 +295,20 @@ test "composer renders multiline draft content" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expectEqual(@as(usize, 40), tui_text.visibleWidth(line));
+}
+
+test "composer keeps a block cursor on a newline boundary" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.composer.buffer.appendSlice(std.testing.allocator, "first\nsecond");
+    state.composer.cursor = 5;
+
+    const input = try renderInput(std.testing.allocator, &state, 30);
+    defer std.testing.allocator.free(input);
+    try std.testing.expect(std.mem.indexOf(u8, input, "first\x1b[7m \x1b[27m\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input, "second") != null);
 }
 
 test "composer masks secret login input" {
@@ -238,34 +324,6 @@ test "composer masks secret login input" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "sk-secret-value") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "***************") != null);
-}
-
-test "composer renders queued hint while streaming" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    state.status.streaming = true;
-    state.queue.steering = 2;
-
-    const text = try render(std.testing.allocator, &state, .{ .width = 80 });
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Enter steer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") == null);
-}
-
-test "composer renders shell and file hints" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    try state.composer.buffer.appendSlice(std.testing.allocator, "!ls");
-    const shell = try render(std.testing.allocator, &state, .{ .width = 50 });
-    defer std.testing.allocator.free(shell);
-    try std.testing.expect(std.mem.indexOf(u8, shell, "shell mode") != null);
-
-    state.composer.buffer.clearRetainingCapacity();
-    try state.composer.buffer.appendSlice(std.testing.allocator, "@src");
-    const file = try render(std.testing.allocator, &state, .{ .width = 50 });
-    defer std.testing.allocator.free(file);
-    try std.testing.expect(std.mem.indexOf(u8, file, "file picker") != null);
 }
 
 test "composer accounts for prompt width when truncating text" {
@@ -292,8 +350,6 @@ test "composer renders block cursor at current position" {
     const input = try renderInput(std.testing.allocator, &state, 20);
     defer std.testing.allocator.free(input);
 
-    try std.testing.expect(std.mem.indexOf(u8, input, "a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, input, "b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, input, "c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input, "a\x1b[7mb\x1b[27mc") != null);
     try std.testing.expect(std.mem.indexOf(u8, input, "\u{2588}") == null);
 }

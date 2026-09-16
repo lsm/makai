@@ -15,6 +15,10 @@ zig build test                    # Run all unit tests
 zig build run                     # Run the demo application
 ```
 
+A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, then start
+`makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
+(project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
+
 ### Grouped Test Steps
 
 Unit tests are split into groups for parallel CI:
@@ -168,6 +172,10 @@ Ownership and auth boundary:
 **`providers/`** - Each provider implements streaming via SSE parsing over HTTP, building request JSON with `json/writer.zig`, and pushing events into an `AssistantMessageStream`. Providers support cancellation tokens and payload callbacks.
 
 **`api_registry.zig`** - Provider registry with `registerApiProvider()` for registering streaming API implementations by name (e.g., "anthropic-messages", "openai-responses").
+
+### TUI (`zig/src/tui/`)
+
+`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS; unsigned dev builds get one keychain prompt per new binary because access lists bind to the code hash (signed releases are keyed by team ID). Never move credentials to a plain file. `MAKAI_KEYCHAIN_SERVICE` isolates keychain items in local runs. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
 
 ### Adding a New Provider
 

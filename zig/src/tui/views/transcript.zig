@@ -11,6 +11,13 @@ const TranscriptEntry = tui_state.TranscriptEntry;
 pub const Options = struct {
     width: usize = 80,
     height: usize = 20,
+    anim_tick: u64 = 0,
+};
+
+pub const EntryOptions = struct {
+    live: bool = false,
+    anim_tick: u64 = 0,
+    awaiting_approval: bool = false,
 };
 
 const DisplayEntry = struct {
@@ -19,7 +26,19 @@ const DisplayEntry = struct {
     timestamp_ms: i64,
     tool_name: []const u8 = "",
     title: []const u8 = "",
+    tool_summary: bool = false,
+    live: bool = false,
+    anim_tick: u64 = 0,
+    awaiting_approval: bool = false,
 };
+
+const gutter_left: usize = 1;
+const body_indent: usize = 3;
+const chat_max_column: usize = 108;
+const max_result_rows: usize = 8;
+const max_thinking_rows: usize = 10;
+const max_live_thinking_rows: usize = 6;
+const summary_prefix = "\u{25c8} ";
 
 pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Options) ![]const u8 {
     if (options.height == 0) return allocator.dupe(u8, "");
@@ -44,9 +63,11 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
     var current_line: usize = 0;
     for (visible_entries.items, 0..) |*entry, i| {
         if (i > 0) {
-            try all_writer.writeAll("\n\n");
-            current_line += 1;
+            const attached = displayEntriesAttached(&visible_entries.items[i - 1], entry);
+            try all_writer.writeAll(if (attached) "\n" else "\n\n");
+            if (!attached) current_line += 1;
         }
+        entry.anim_tick = options.anim_tick;
         const row = try renderEntry(allocator, entry, options.width);
         defer allocator.free(row);
         try all_writer.writeAll(row);
@@ -81,14 +102,45 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
 }
 
 pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
+    return renderTranscriptEntryWith(allocator, entry, width, .{});
+}
+
+pub fn renderTranscriptEntryWith(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize, options: EntryOptions) ![]u8 {
     var display = DisplayEntry{
         .kind = entry.kind,
         .text = entry.text.items,
         .timestamp_ms = entry.timestamp_ms,
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
+        .tool_summary = entry.tool_summary or parseToolSummary(entry.text.items) != null,
+        .live = options.live,
+        .anim_tick = options.anim_tick,
+        .awaiting_approval = options.awaiting_approval,
     };
     return renderEntry(allocator, &display, width);
+}
+
+pub fn entriesAttached(previous: *const TranscriptEntry, next: *const TranscriptEntry) bool {
+    return previous.kind == .tool and next.kind == .tool;
+}
+
+pub fn renderWaitingLine(allocator: std.mem.Allocator, model: []const u8, anim_tick: u64, elapsed_ms: u64) ![]u8 {
+    const glyph = try tui_theme.role(.assistant).render(allocator, tui_theme.glyph.assistant ++ " Makai");
+    defer allocator.free(glyph);
+    const spinner = try tui_theme.runningText().render(allocator, tui_theme.spinnerFrame(anim_tick));
+    defer allocator.free(spinner);
+    const label = if (elapsed_ms >= 1000)
+        try std.fmt.allocPrint(allocator, "waiting for {s} · {d}s", .{ if (model.len > 0) model else "the model", elapsed_ms / 1000 })
+    else
+        try std.fmt.allocPrint(allocator, "waiting for {s}…", .{if (model.len > 0) model else "the model"});
+    defer allocator.free(label);
+    const styled_label = try tui_theme.muted().render(allocator, label);
+    defer allocator.free(styled_label);
+    return std.fmt.allocPrint(allocator, " {s} {s} {s}", .{ glyph, spinner, styled_label });
+}
+
+fn displayEntriesAttached(previous: *const DisplayEntry, next: *const DisplayEntry) bool {
+    return previous.kind == .tool and next.kind == .tool;
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
@@ -146,6 +198,7 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
         .timestamp_ms = entry.timestamp_ms,
         .tool_name = if (entry.kind == .tool) (if (tool) |found| found.name else inferredToolName(entry.text.items)) else "",
         .title = if (entry.kind == .tool) (if (tool) |found| found.label else inferredToolTitle(entry.text.items)) else "",
+        .tool_summary = entry.tool_summary or (entry.kind == .tool and parseToolSummary(entry.text.items) != null),
     });
 }
 
@@ -156,34 +209,29 @@ fn appendToolSummary(
     tool: tui_state.ToolEntry,
 ) !void {
     const intent = try invocationDescription(arena, tool.args_json);
-    const status = switch (tool.status) {
-        .pending => "pending",
-        .running => "running",
-        .done => "ok",
-        .@"error" => "failed",
-        .interrupted => "interrupted",
+    const status: []const u8 = switch (tool.status) {
+        .pending, .running => "",
+        .done => " ok",
+        .@"error" => " failed",
+        .interrupted => " interrupted",
     };
 
     var out: std.Io.Writer.Allocating = .init(arena);
     const writer = &out.writer;
-    try writer.writeAll("\u{25b8}");
-    if (intent) |value| if (value.len > 0) try writer.print(" {s}", .{value});
-    try writer.print(" [{s}", .{status});
-    if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
-        try writer.print(", {d}B", .{tool.returned_total_bytes});
-    } else if (tool.output.items.len > 0) {
-        try writer.print(", {d}B", .{tool.output.items.len});
-    }
-    if (tool.estimated_returned_tokens > 0) try writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
-    if (tool.artifact_count > 0) {
-        if (tool.raw_total_bytes > 0) {
-            try writer.print(", {d}KB artifact", .{(tool.raw_total_bytes + 1023) / 1024});
-        } else {
-            try writer.print(", {d} artifact{s}", .{ tool.artifact_count, if (tool.artifact_count == 1) "" else "s" });
+    try writer.writeAll(summary_prefix);
+    try writer.writeAll(tool.label);
+    if (intent) |value| if (value.len > 0) try writer.print(" \"{s}\"", .{value});
+    try writer.writeAll(status);
+    if (tool.status == .done or tool.status == .@"error") {
+        if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
+            try writer.print(" raw={d}B returned={d}B", .{ tool.raw_total_bytes, tool.returned_total_bytes });
+        } else if (tool.output.items.len > 0) {
+            try writer.print(" output={d}B", .{tool.output.items.len});
         }
-        try writer.writeAll(", filter via artifact_retrieve");
+        if (tool.estimated_returned_tokens > 0) try writer.print(" ~{d} tok", .{tool.estimated_returned_tokens});
+        if (tool.artifact_count > 0) try writer.print(" artifacts={d} on disk", .{tool.artifact_count});
+        if (tool.raw_total_bytes > tool.returned_total_bytes or tool.artifact_count > 0) try writer.writeAll(" preview-capped");
     }
-    try writer.writeByte(']');
 
     try entries.append(allocator, .{
         .kind = .tool,
@@ -191,6 +239,7 @@ fn appendToolSummary(
         .timestamp_ms = 0,
         .tool_name = tool.name,
         .title = tool.label,
+        .tool_summary = true,
     });
 }
 
@@ -266,91 +315,514 @@ fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
     return clamped * 100 / max_scroll;
 }
 
-const user_bg = zz.Color.color256(111);
-const user_fg = zz.Color.color256(235);
-const assistant_bg = zz.Color.fromRgb(42, 44, 52);
-const assistant_fg = zz.Color.fromRgb(238, 241, 247);
+fn bodyWidth(width: usize) usize {
+    if (width <= 24) return width;
+    return @min(width -| (body_indent + 1), chat_max_column);
+}
 
-const chat_max_column: usize = 108;
+fn bodyIndent(width: usize) usize {
+    return if (width <= 24) 0 else body_indent;
+}
 
-const EntryLayout = struct {
-    left: usize,
-    width: usize,
-};
+fn gutterFor(width: usize) usize {
+    return if (width <= 24) 0 else gutter_left;
+}
 
 fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const align_right = entry.kind == .user;
-    const header_layout = entryHeaderLayout(entry.kind, width);
-    const body_layout = entryBodyLayout(entry.kind, width);
-    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width);
-    const header = try indentBlock(arena, header_inner, header_layout.left);
+    const body_w = bodyWidth(width);
+    const indent = bodyIndent(width);
 
-    const body_inner: []const u8 = switch (entry.kind) {
-        .user => blk: {
-            const budget = @max(body_layout.width -| 2, 8);
-            const wrapped = try tui_text.wrapTextWithAnsi(arena, entry.text, budget);
-            const open = try openSgr(arena, user_fg, user_bg);
-            break :blk try renderBubble(arena, wrapped, open, true, body_layout.width);
-        },
-        .assistant => blk: {
-            const budget = @max(body_layout.width -| 2, 8);
-            const rendered = try renderAssistantPlain(arena, entry.text, budget);
-            const open = try openSgr(arena, assistant_fg, assistant_bg);
-            break :blk try renderBubble(arena, rendered, open, false, body_layout.width);
-        },
-        .tool => try renderToolRow(arena, entry.tool_name, entry.text, body_layout.width),
-        else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, body_layout.width),
+    const rendered: []const u8 = switch (entry.kind) {
+        .welcome => try renderWelcome(arena, entry.text, width),
+        .tool => if (entry.tool_summary)
+            try renderToolSummaryRow(arena, entry, width)
+        else
+            try indentBlock(arena, try renderToolResult(arena, entry.text, body_w), indent),
+        .system => if (std.mem.indexOfScalar(u8, entry.text, '\n') == null and tui_text.visibleWidth(entry.text) <= systemLineBudget(width))
+            try renderSystemLine(arena, entry.text, width)
+        else
+            try renderHeaderedBody(arena, entry, width, try renderSystemBody(arena, entry.text, body_w)),
+        .@"error" => try renderHeaderedBody(arena, entry, width, try renderWrappedLines(arena, tui_theme.errorBody(), entry.text, body_w)),
+        .thinking => try renderHeaderedBody(arena, entry, width, try renderThinkingBody(arena, entry, body_w)),
+        .user => try renderHeaderedBody(arena, entry, width, try renderUserBlock(arena, entry.text, body_w)),
+        .assistant => try renderHeaderedBody(arena, entry, width, try renderAssistantBody(arena, entry, body_w)),
     };
-    const body = try indentBlock(arena, body_inner, body_layout.left);
+    return allocator.dupe(u8, rendered);
+}
 
+fn renderHeaderedBody(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, body_inner: []const u8) ![]u8 {
+    const header = try renderHeader(allocator, entry, width);
+    const body = try indentBlock(allocator, body_inner, bodyIndent(width));
+    if (body.len == 0) return header;
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
+}
+
+fn renderHeader(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
+    const name = roleName(entry.kind);
+    const label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(entry.kind), name });
+    const styled_label = try tui_theme.role(entry.kind).render(allocator, label);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.writeAll(header);
-    if (body.len > 0) {
-        try writer.writeByte('\n');
-        try writer.writeAll(body);
+    for (0..gutterFor(width)) |_| try writer.writeByte(' ');
+    try writer.writeAll(styled_label);
+    if (entry.live and (entry.kind == .assistant or entry.kind == .thinking)) {
+        const spinner = try tui_theme.runningText().render(allocator, tui_theme.spinnerFrame(entry.anim_tick));
+        try writer.writeByte(' ');
+        try writer.writeAll(spinner);
+        return out.toOwnedSlice();
+    }
+    const clock = try formatTimestamp(allocator, entry.timestamp_ms);
+    if (clock.len > 0) {
+        const time = try std.fmt.allocPrint(allocator, " {s} {s}", .{ tui_theme.glyph.dot, clock });
+        const styled_time = try tui_theme.dim().render(allocator, time);
+        try writer.writeAll(styled_time);
     }
     return out.toOwnedSlice();
 }
 
-fn entryHeaderLayout(kind: TranscriptKind, width: usize) EntryLayout {
-    if (width <= 24) return .{ .left = 0, .width = width };
-
-    const gutter: usize = 1;
-    const available = width -| (gutter * 2);
-    const left = if (kind == .user) width -| gutter -| available else gutter;
-    return .{ .left = left, .width = available };
+fn systemLineBudget(width: usize) usize {
+    return width -| (gutterFor(width) + 2);
 }
 
-fn entryBodyLayout(kind: TranscriptKind, width: usize) EntryLayout {
-    if (width <= 24) return .{ .left = 0, .width = width };
-
-    const user_gutter: usize = if (width >= 100) 4 else 2;
-    const label_text_left: usize = 3;
-    const left_edge_right_gutter: usize = 1;
-    const user_available = width -| (user_gutter * 2);
-    const left_available = width -| label_text_left -| left_edge_right_gutter;
-    const column = switch (kind) {
-        .user => @min(user_available, chat_max_column),
-        .assistant => @min(left_available, chat_max_column),
-        else => left_available,
-    };
-    const left = switch (kind) {
-        .user => width -| user_gutter -| column,
-        .@"error" => label_text_left -| 2,
-        else => label_text_left,
-    };
-    const adjusted_column = if (kind == .@"error") column + (label_text_left -| left) else column;
-    return .{ .left = left, .width = adjusted_column };
+fn renderSystemLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const clipped = try tui_text.truncateLineToWidth(allocator, text, systemLineBudget(width));
+    const glyph = try tui_theme.dim().render(allocator, tui_theme.glyph.system);
+    const styled = try tui_theme.systemText().render(allocator, clipped);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (0..gutterFor(width)) |_| try out.writer.writeByte(' ');
+    try out.writer.writeAll(glyph);
+    try out.writer.writeByte(' ');
+    try out.writer.writeAll(styled);
+    return out.toOwnedSlice();
 }
 
-fn indentBlock(allocator: std.mem.Allocator, text: []const u8, spaces: usize) ![]const u8 {
-    if (spaces == 0) return allocator.dupe(u8, text);
+fn renderSystemBody(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const max_width = @max(width, 8);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var first = true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!first) try out.writer.writeByte('\n');
+        first = false;
+        try writeWrappedSystemLine(allocator, &out.writer, line, max_width);
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeWrappedSystemLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, max_width: usize) !void {
+    var row_width: usize = 0;
+    var words = std.mem.tokenizeAny(u8, line, " \t\r");
+    while (words.next()) |word| {
+        const url: ?[]const u8 = if (isUrl(word)) word else null;
+        var remaining = word;
+        while (remaining.len > 0) {
+            const sep: usize = if (row_width > 0) 1 else 0;
+            var available = max_width -| (row_width + sep);
+            if (row_width > 0 and tui_text.visibleWidth(remaining) > available) {
+                try writer.writeByte('\n');
+                row_width = 0;
+                available = max_width;
+            }
+            const take = prefixByWidth(remaining, available);
+            const chunk = remaining[0..take];
+            if (row_width > 0) {
+                try writer.writeByte(' ');
+                row_width += 1;
+            }
+            try writeSystemSegment(allocator, writer, chunk, url);
+            row_width += tui_text.visibleWidth(chunk);
+            remaining = remaining[take..];
+        }
+    }
+}
+
+fn writeSystemSegment(allocator: std.mem.Allocator, writer: *std.Io.Writer, chunk: []const u8, url: ?[]const u8) !void {
+    if (url) |target| {
+        const styled = try tui_theme.link().render(allocator, chunk);
+        defer allocator.free(styled);
+        try writer.print("\x1b]8;id=makai-{x};{s}\x1b\\{s}\x1b]8;;\x1b\\", .{ std.hash.Wyhash.hash(0, target), target, styled });
+        return;
+    }
+    const styled = try tui_theme.systemText().render(allocator, chunk);
+    defer allocator.free(styled);
+    try writer.writeAll(styled);
+}
+
+fn isUrl(word: []const u8) bool {
+    inline for (.{ "https://", "http://" }) |scheme| {
+        if (word.len > scheme.len and std.ascii.startsWithIgnoreCase(word, scheme)) return true;
+    }
+    return false;
+}
+
+fn prefixByWidth(text: []const u8, max_width: usize) usize {
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const end = @min(text.len, i + len);
+        const codepoint: u21 = std.unicode.utf8Decode(text[i..end]) catch text[i];
+        const cell_width = zz.measure.charWidth(@intCast(codepoint));
+        if (i > 0 and used + cell_width > max_width) break;
+        used += cell_width;
+        i = end;
+    }
+    return i;
+}
+
+fn renderWrappedLines(allocator: std.mem.Allocator, style: zz.Style, text: []const u8, width: usize) ![]u8 {
+    const plain = try renderAssistantPlain(allocator, text, @max(width, 8));
+    return styleEachLine(allocator, style, plain);
+}
+
+fn renderUserBlock(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const budget = @max(width -| 2, 8);
+    const wrapped = try renderAssistantPlain(allocator, text, budget);
+    if (wrapped.len == 0) return allocator.dupe(u8, "");
+    var block_w: usize = 0;
+    {
+        var lines = std.mem.splitScalar(u8, wrapped, '\n');
+        while (lines.next()) |line| block_w = @max(block_w, tui_text.visibleWidth(line));
+    }
+    block_w = @min(block_w, budget);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, wrapped, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        const padded = try std.fmt.allocPrint(allocator, " {s}{s} ", .{ line, try spaces(allocator, block_w -| tui_text.visibleWidth(line)) });
+        const styled = try tui_theme.userBlock().render(allocator, padded);
+        try writer.writeAll(styled);
+    }
+    return out.toOwnedSlice();
+}
+
+fn spaces(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    const buf = try allocator.alloc(u8, count);
+    @memset(buf, ' ');
+    return buf;
+}
+
+fn renderThinkingBody(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
+    const plain = try renderAssistantPlain(allocator, entry.text, @max(width, 8));
+    const cap: usize = if (entry.live) max_live_thinking_rows else max_thinking_rows;
+    const clipped = if (entry.live) try tailRows(allocator, plain, cap) else try headRows(allocator, plain, cap);
+    return styleEachLine(allocator, tui_theme.bodyStyle(.thinking), clipped);
+}
+
+fn renderAssistantBody(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
+    const body = try renderAssistantStyled(allocator, entry.text, @max(width, 8));
+    if (!entry.live) return body;
+    const caret = try tui_theme.caret().render(allocator, tui_theme.glyph.caret);
+    if (body.len == 0) return allocator.dupe(u8, caret);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ body, caret });
+}
+
+fn tailRows(allocator: std.mem.Allocator, text: []const u8, max_rows: usize) ![]u8 {
+    const total = tui_text.lineCount(text);
+    if (total <= max_rows) return allocator.dupe(u8, text);
+    var skip = total - max_rows;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const marker = try std.fmt.allocPrint(allocator, "… {d} earlier lines", .{skip});
+    try out.writer.writeAll(marker);
+    while (lines.next()) |line| {
+        if (skip > 0) {
+            skip -= 1;
+            continue;
+        }
+        try out.writer.writeByte('\n');
+        try out.writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
+}
+
+fn headRows(allocator: std.mem.Allocator, text: []const u8, max_rows: usize) ![]u8 {
+    const total = tui_text.lineCount(text);
+    if (total <= max_rows) return allocator.dupe(u8, text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var written: usize = 0;
+    while (lines.next()) |line| {
+        if (written >= max_rows) break;
+        if (written > 0) try out.writer.writeByte('\n');
+        try out.writer.writeAll(line);
+        written += 1;
+    }
+    const marker = try std.fmt.allocPrint(allocator, "\n… +{d} more lines", .{total - max_rows});
+    try out.writer.writeAll(marker);
+    return out.toOwnedSlice();
+}
+
+fn renderToolResult(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const content_width = @max(width -| 2, 8);
+    const capped = try headRows(allocator, text, max_result_rows);
+    const truncated = try tui_text.truncateLinesToWidth(allocator, capped, content_width, std.math.maxInt(usize));
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, truncated, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        const prefix = if (first) tui_theme.glyph.result ++ " " else "  ";
+        first = false;
+        const styled_prefix = try tui_theme.faint().render(allocator, prefix);
+        try writer.writeAll(styled_prefix);
+        if (line.len == 0) continue;
+        const styled = try tui_theme.muted().render(allocator, line);
+        try writer.writeAll(styled);
+    }
+    return out.toOwnedSlice();
+}
+
+const ToolRowStatus = enum { running, ok, failed, interrupted };
+
+const ToolSummary = struct {
+    label: []const u8,
+    arg: []const u8,
+    status: ToolRowStatus,
+    stats: []const u8,
+};
+
+fn parseToolSummary(text: []const u8) ?ToolSummary {
+    if (!std.mem.startsWith(u8, text, summary_prefix)) return null;
+    const rest = text[summary_prefix.len..];
+    if (rest.len == 0) return null;
+    const words = [_]struct { word: []const u8, status: ToolRowStatus }{
+        .{ .word = "ok", .status = .ok },
+        .{ .word = "failed", .status = .failed },
+        .{ .word = "interrupted", .status = .interrupted },
+    };
+    var best: ?usize = null;
+    var best_status: ToolRowStatus = .running;
+    var best_len: usize = 0;
+    for (words) |candidate| {
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, rest, search, candidate.word)) |pos| {
+            search = pos + 1;
+            if (pos == 0 or rest[pos - 1] != ' ') continue;
+            const end = pos + candidate.word.len;
+            if (end < rest.len and rest[end] != ' ') continue;
+            const head = rest[0 .. pos - 1];
+            const quoted = std.mem.indexOfScalar(u8, head, '"') != null;
+            if (quoted and (head.len == 0 or head[head.len - 1] != '"')) continue;
+            if (best == null or pos < best.?) {
+                best = pos;
+                best_status = candidate.status;
+                best_len = candidate.word.len;
+            }
+            break;
+        }
+    }
+    var summary = ToolSummary{ .label = rest, .arg = "", .status = .running, .stats = "" };
+    var head = rest;
+    if (best) |pos| {
+        head = rest[0 .. pos - 1];
+        summary.status = best_status;
+        summary.stats = std.mem.trim(u8, rest[pos + best_len ..], " ");
+    }
+    if (std.mem.indexOf(u8, head, " \"")) |quote| {
+        summary.label = head[0..quote];
+        var arg = head[quote + 2 ..];
+        if (arg.len > 0 and arg[arg.len - 1] == '"') arg = arg[0 .. arg.len - 1];
+        summary.arg = arg;
+    } else {
+        summary.label = std.mem.trim(u8, head, " ");
+    }
+    return summary;
+}
+
+const ToolStats = struct {
+    bytes: ?u64 = null,
+    tokens: ?u64 = null,
+    artifacts: ?u64 = null,
+    capped: bool = false,
+    detail: []const u8 = "",
+};
+
+fn parseToolStats(stats: []const u8) ToolStats {
+    var parsed = ToolStats{};
+    if (stats.len == 0) return parsed;
+    if (numberAfter(stats, "returned=")) |n| {
+        parsed.bytes = n;
+    } else if (numberAfter(stats, "output=")) |n| {
+        parsed.bytes = n;
+    }
+    parsed.tokens = numberAfter(stats, "~");
+    parsed.artifacts = numberAfter(stats, "artifacts=");
+    parsed.capped = std.mem.indexOf(u8, stats, "preview-capped") != null;
+    if (std.mem.indexOfScalar(u8, stats, '"')) |open| {
+        var detail = stats[open + 1 ..];
+        if (detail.len > 0 and detail[detail.len - 1] == '"') detail = detail[0 .. detail.len - 1];
+        parsed.detail = detail;
+    }
+    return parsed;
+}
+
+fn numberAfter(text: []const u8, marker: []const u8) ?u64 {
+    const pos = std.mem.indexOf(u8, text, marker) orelse return null;
+    var i = pos + marker.len;
+    var value: u64 = 0;
+    var digits: usize = 0;
+    while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {
+        value = value *% 10 +% (text[i] - '0');
+        digits += 1;
+    }
+    return if (digits == 0) null else value;
+}
+
+fn formatBytes(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
+    if (bytes >= 1024 * 1024) return std.fmt.allocPrint(allocator, "{d}.{d}MB", .{ bytes / (1024 * 1024), (bytes % (1024 * 1024)) * 10 / (1024 * 1024) });
+    if (bytes >= 1024) return std.fmt.allocPrint(allocator, "{d}.{d}KB", .{ bytes / 1024, (bytes % 1024) * 10 / 1024 });
+    return std.fmt.allocPrint(allocator, "{d}B", .{bytes});
+}
+
+fn renderToolStatus(allocator: std.mem.Allocator, summary: ToolSummary, anim_tick: u64, awaiting_approval: bool) ![]const u8 {
+    if (awaiting_approval and summary.status == .running) {
+        return tui_theme.warningText().render(allocator, tui_theme.glyph.pending ++ " awaiting approval");
+    }
+    const stats = parseToolStats(summary.stats);
+    var plain: std.Io.Writer.Allocating = .init(allocator);
+    const pw = &plain.writer;
+    const glyph: []const u8 = switch (summary.status) {
+        .running => tui_theme.spinnerFrame(anim_tick),
+        .ok => tui_theme.glyph.check,
+        .failed => tui_theme.glyph.cross,
+        .interrupted => tui_theme.glyph.stop,
+    };
+    try pw.writeAll(glyph);
+    switch (summary.status) {
+        .running => try pw.writeAll(" running"),
+        .ok => {},
+        .failed => try pw.writeAll(" failed"),
+        .interrupted => try pw.writeAll(" interrupted"),
+    }
+    var parts: usize = 0;
+    if (stats.bytes) |bytes| {
+        const formatted = try formatBytes(allocator, bytes);
+        try pw.print(" {s}", .{formatted});
+        parts += 1;
+    }
+    if (stats.tokens) |tokens| {
+        try pw.print("{s}~{d} tok", .{ if (parts > 0) " " ++ tui_theme.glyph.dot ++ " " else " ", tokens });
+        parts += 1;
+    }
+    if (stats.artifacts) |count| {
+        try pw.print("{s}{d} artifact{s}", .{ if (parts > 0) " " ++ tui_theme.glyph.dot ++ " " else " ", count, if (count == 1) "" else "s" });
+        parts += 1;
+    } else if (stats.capped) {
+        try pw.print("{s}capped", .{if (parts > 0) " " ++ tui_theme.glyph.dot ++ " " else " "});
+        parts += 1;
+    }
+    const style = switch (summary.status) {
+        .running => tui_theme.runningText(),
+        .ok => tui_theme.successText(),
+        .failed => tui_theme.errorText(),
+        .interrupted => tui_theme.warningText(),
+    };
+    return style.render(allocator, plain.written());
+}
+
+fn renderToolSummaryRow(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
+    const summary = parseToolSummary(entry.text) orelse ToolSummary{ .label = entry.text, .arg = "", .status = .running, .stats = "" };
+    const tool_name = if (entry.tool_name.len > 0) entry.tool_name else summary.label;
+    const label_text = if (entry.title.len > 0) entry.title else summary.label;
+
+    const status = try renderToolStatus(allocator, summary, entry.anim_tick, entry.awaiting_approval);
+    const status_width = tui_text.visibleWidth(status);
+    const glyph = try tui_theme.toolRole(tool_name).render(allocator, tui_theme.glyph.tool);
+    const label = try tui_theme.toolRole(tool_name).render(allocator, label_text);
+    const label_width = tui_text.visibleWidth(label_text);
+
+    const gutter = gutterFor(width);
+    const available = width -| (gutter + 2 + label_width + 2 + status_width + 2);
+    var arg_text: []const u8 = "";
+    if (summary.arg.len > 0 and available >= 4) {
+        arg_text = try tui_text.truncateLineToWidth(allocator, summary.arg, available);
+    }
+    const styled_arg = try tui_theme.soft().render(allocator, arg_text);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    for (0..gutter) |_| try writer.writeByte(' ');
+    try writer.writeAll(glyph);
+    try writer.writeByte(' ');
+    try writer.writeAll(label);
+    var used = gutter + 2 + label_width;
+    if (arg_text.len > 0) {
+        try writer.writeAll("  ");
+        try writer.writeAll(styled_arg);
+        used += 2 + tui_text.visibleWidth(arg_text);
+    }
+    if (used + 2 + status_width <= width) {
+        const pad = width - used - status_width - 1;
+        for (0..pad) |_| try writer.writeByte(' ');
+        try writer.writeAll(status);
+    } else {
+        try writer.writeAll("  ");
+        try writer.writeAll(status);
+    }
+    return out.toOwnedSlice();
+}
+
+fn renderWelcome(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    const box_width = @min(width -| gutter_left, chat_max_column + 4);
+    const inner_width = box_width -| 4;
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    const writer = &body.writer;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    var title_seen = false;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, " \r");
+        if (line.len == 0) continue;
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        if (!title_seen) {
+            title_seen = true;
+            const title = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.glyph.welcome, line });
+            try writer.writeAll(try tui_theme.accentStrong().render(allocator, title));
+            continue;
+        }
+        if (std.mem.indexOf(u8, line, ": ")) |colon| {
+            const key = line[0..colon];
+            const value = std.mem.trim(u8, line[colon + 2 ..], " ");
+            if (std.mem.eql(u8, key, "tips")) {
+                try writer.writeByte('\n');
+                const clipped = try tui_text.truncateLineToWidth(allocator, value, inner_width);
+                try writer.writeAll(try tui_theme.keyHint().render(allocator, clipped));
+                continue;
+            }
+            const padded_key = try std.fmt.allocPrint(allocator, "{s: <7}", .{key});
+            const clipped = try tui_text.truncateLineToWidth(allocator, value, inner_width -| 8);
+            try writer.writeAll(try tui_theme.dim().render(allocator, padded_key));
+            try writer.writeByte(' ');
+            try writer.writeAll(try tui_theme.soft().render(allocator, clipped));
+            continue;
+        }
+        const clipped = try tui_text.truncateLineToWidth(allocator, line, inner_width);
+        try writer.writeAll(try tui_theme.soft().render(allocator, clipped));
+    }
+    const boxed = try tui_theme.titledPanel(allocator, body.written(), .{ .width = box_width, .border = tui_theme.palette.accent_dim });
+    return indentBlock(allocator, boxed, gutter_left);
+}
+
+fn indentBlock(allocator: std.mem.Allocator, text: []const u8, count: usize) ![]u8 {
+    if (count == 0 or text.len == 0) return allocator.dupe(u8, text);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -360,20 +832,56 @@ fn indentBlock(allocator: std.mem.Allocator, text: []const u8, spaces: usize) ![
     while (lines.next()) |line| {
         if (!first) try writer.writeByte('\n');
         first = false;
-        try writeSpaces(writer, spaces);
+        if (line.len == 0) continue;
+        try writeSpaces(writer, count);
         try writer.writeAll(line);
     }
     return out.toOwnedSlice();
 }
 
-fn renderToolRow(allocator: std.mem.Allocator, tool_name: []const u8, text: []const u8, width: usize) ![]const u8 {
-    const content_width = @max(width, 8);
-    const truncated = try tui_text.truncateLinesToWidth(allocator, text, content_width, std.math.maxInt(usize));
-    const styled = try styleEachLine(allocator, tui_theme.toolBody(tool_name), truncated);
-    return styled;
+pub fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    return renderAssistantText(allocator, text, width, false);
 }
 
-fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+fn renderAssistantStyled(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    return renderAssistantText(allocator, text, width, true);
+}
+
+const BlockKind = enum { plain, heading, bullet, numbered, quote };
+
+const BlockPrefix = struct {
+    kind: BlockKind = .plain,
+    content_start: usize = 0,
+    marker: []const u8 = "",
+    indent: usize = 0,
+};
+
+fn detectBlock(line: []const u8) BlockPrefix {
+    const ind = lineIndent(line);
+    if (ind.width > 3) return .{};
+    const rest = line[ind.start..];
+    if (rest.len >= 2 and rest[0] == '#') {
+        var hashes: usize = 0;
+        while (hashes < rest.len and rest[hashes] == '#') hashes += 1;
+        if (hashes <= 6 and hashes < rest.len and rest[hashes] == ' ') {
+            return .{ .kind = .heading, .content_start = ind.start + hashes + 1, .indent = ind.width };
+        }
+    }
+    if (rest.len >= 2 and (rest[0] == '-' or rest[0] == '*' or rest[0] == '+') and rest[1] == ' ') {
+        return .{ .kind = .bullet, .content_start = ind.start + 2, .marker = tui_theme.glyph.bullet, .indent = ind.width };
+    }
+    if (rest.len >= 2 and rest[0] == '>' and (rest[1] == ' ' or rest.len == 1)) {
+        return .{ .kind = .quote, .content_start = ind.start + 2, .marker = tui_theme.glyph.quote_bar, .indent = ind.width };
+    }
+    var digits: usize = 0;
+    while (digits < rest.len and digits < 4 and std.ascii.isDigit(rest[digits])) digits += 1;
+    if (digits > 0 and digits + 1 < rest.len and (rest[digits] == '.' or rest[digits] == ')') and rest[digits + 1] == ' ') {
+        return .{ .kind = .numbered, .content_start = ind.start + digits + 2, .marker = rest[0 .. digits + 1], .indent = ind.width };
+    }
+    return .{};
+}
+
+fn renderAssistantText(allocator: std.mem.Allocator, text: []const u8, width: usize, styled: bool) ![]u8 {
     const code_width = width -| 2;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -389,6 +897,11 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
                 in_fence = true;
                 fence_char = marker.char;
                 fence_len = marker.len;
+                if (styled and marker.info.len > 0) {
+                    if (!first_line) try writer.writeByte('\n');
+                    first_line = false;
+                    try writeCodeTag(allocator, writer, marker.info, code_width);
+                }
                 continue;
             }
         } else if (isFenceClose(line, fence_char, fence_len)) {
@@ -398,7 +911,11 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
         if (!first_line) try writer.writeByte('\n');
         first_line = false;
         if (!in_fence) {
-            try wrapPlainLine(allocator, writer, line, width);
+            if (styled) {
+                try writeStyledProseLine(allocator, writer, line, width);
+            } else {
+                try wrapPlainLine(allocator, writer, line, width);
+            }
             continue;
         }
         const cleaned = try stripControls(allocator, line);
@@ -407,16 +924,165 @@ fn renderAssistantPlain(allocator: std.mem.Allocator, text: []const u8, width: u
         defer allocator.free(expanded);
         const clipped = try tui_text.truncateLineToWidth(allocator, expanded, code_width);
         defer allocator.free(clipped);
-        if (clipped.len == 0) continue;
+        if (!styled) {
+            if (clipped.len == 0) continue;
+            try writer.writeAll("  ");
+            const dimmed = try tui_theme.dim().render(allocator, clipped);
+            defer allocator.free(dimmed);
+            try writer.writeAll(dimmed);
+            continue;
+        }
         try writer.writeAll("  ");
-        const styled = try tui_theme.dim().render(allocator, clipped);
-        defer allocator.free(styled);
-        try writer.writeAll(styled);
+        const padded = try std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped, try spaces(allocator, code_width -| tui_text.visibleWidth(clipped)) });
+        defer allocator.free(padded);
+        const block = try tui_theme.codeBlock().render(allocator, padded);
+        defer allocator.free(block);
+        try writer.writeAll(block);
     }
     return out.toOwnedSlice();
 }
 
-const FenceMarker = struct { char: u8, len: usize };
+fn writeCodeTag(allocator: std.mem.Allocator, writer: *std.Io.Writer, info: []const u8, code_width: usize) !void {
+    const clipped = try tui_text.truncateLineToWidth(allocator, info, code_width -| 2);
+    defer allocator.free(clipped);
+    const padded = try std.fmt.allocPrint(allocator, " {s}{s} ", .{ clipped, try spaces(allocator, code_width -| (tui_text.visibleWidth(clipped) + 2)) });
+    defer allocator.free(padded);
+    const tag = try tui_theme.codeTag().render(allocator, padded);
+    defer allocator.free(tag);
+    try writer.writeAll("  ");
+    try writer.writeAll(tag);
+}
+
+fn writeStyledProseLine(allocator: std.mem.Allocator, writer: *std.Io.Writer, line: []const u8, width: usize) !void {
+    const block = detectBlock(line);
+    const content = line[block.content_start..];
+    const marker_width = if (block.marker.len > 0) tui_text.visibleWidth(block.marker) + 1 else 0;
+    const hang = block.indent + marker_width;
+    const wrap_width = @max(width -| hang, 8);
+
+    var wrapped: std.Io.Writer.Allocating = .init(allocator);
+    defer wrapped.deinit();
+    try wrapPlainLine(allocator, &wrapped.writer, content, wrap_width);
+
+    const row_style = switch (block.kind) {
+        .heading => tui_theme.heading(),
+        .quote => tui_theme.quote(),
+        else => tui_theme.base(),
+    };
+    var rows = std.mem.splitScalar(u8, wrapped.written(), '\n');
+    var first = true;
+    while (rows.next()) |row| {
+        if (!first) try writer.writeByte('\n');
+        if (block.indent > 0) try writeSpaces(writer, block.indent);
+        if (block.marker.len > 0) {
+            if (first) {
+                const marker_style = if (block.kind == .quote) tui_theme.dim() else tui_theme.accentText();
+                const marker = try marker_style.render(allocator, block.marker);
+                defer allocator.free(marker);
+                try writer.writeAll(marker);
+                try writer.writeByte(' ');
+            } else {
+                try writeSpaces(writer, marker_width);
+            }
+        }
+        first = false;
+        try writeInlineStyled(allocator, writer, row, row_style);
+    }
+}
+
+fn writeInlineStyled(allocator: std.mem.Allocator, writer: *std.Io.Writer, row: []const u8, base_style: zz.Style) !void {
+    var literal_start: usize = 0;
+    var i: usize = 0;
+    while (i < row.len) {
+        if (row[i] == '`') {
+            var run: usize = 0;
+            while (i + run < row.len and row[i + run] == '`') run += 1;
+            if (findCodeClose(row, i + run, run)) |close| {
+                try flushLiteral(allocator, writer, row[literal_start..i], base_style);
+                const inner = std.mem.trim(u8, row[i + run .. close], " ");
+                if (inner.len > 0) {
+                    const styled = try tui_theme.inlineCode().render(allocator, inner);
+                    defer allocator.free(styled);
+                    try writer.writeAll(styled);
+                }
+                i = close + run;
+                literal_start = i;
+                continue;
+            }
+            i += run;
+            continue;
+        }
+        if (matchEmphasis(row, i)) |span| {
+            try flushLiteral(allocator, writer, row[literal_start..i], base_style);
+            const inner = row[i + span.marker_len .. span.close];
+            const style = if (span.strong) base_style.bold(true) else base_style.italic(true);
+            var inner_out: std.Io.Writer.Allocating = .init(allocator);
+            defer inner_out.deinit();
+            try writeInlineStyled(allocator, &inner_out.writer, inner, style);
+            try writer.writeAll(inner_out.written());
+            i = span.close + span.marker_len;
+            literal_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    try flushLiteral(allocator, writer, row[literal_start..], base_style);
+}
+
+fn flushLiteral(allocator: std.mem.Allocator, writer: *std.Io.Writer, text: []const u8, style: zz.Style) !void {
+    if (text.len == 0) return;
+    const styled = try style.render(allocator, text);
+    defer allocator.free(styled);
+    try writer.writeAll(styled);
+}
+
+fn findCodeClose(row: []const u8, from: usize, run: usize) ?usize {
+    var i = from;
+    while (i < row.len) {
+        if (row[i] != '`') {
+            i += 1;
+            continue;
+        }
+        var count: usize = 0;
+        while (i + count < row.len and row[i + count] == '`') count += 1;
+        if (count == run) return i;
+        i += count;
+    }
+    return null;
+}
+
+const EmphasisSpan = struct {
+    marker_len: usize,
+    close: usize,
+    strong: bool,
+};
+
+fn matchEmphasis(row: []const u8, i: usize) ?EmphasisSpan {
+    const c = row[i];
+    if (c != '*' and c != '_') return null;
+    const strong = i + 1 < row.len and row[i + 1] == c;
+    const marker_len: usize = if (strong) 2 else 1;
+    const content_start = i + marker_len;
+    if (content_start >= row.len or row[content_start] == ' ' or row[content_start] == c) return null;
+    if (i > 0 and isWordChar(row[i - 1])) return null;
+    var j = content_start;
+    while (j < row.len) : (j += 1) {
+        if (row[j] != c) continue;
+        if (strong and (j + 1 >= row.len or row[j + 1] != c)) continue;
+        if (row[j - 1] == ' ') continue;
+        const after = j + marker_len;
+        if (after < row.len and isWordChar(row[after])) continue;
+        if (j == content_start) return null;
+        return .{ .marker_len = marker_len, .close = j, .strong = strong };
+    }
+    return null;
+}
+
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c >= 0x80;
+}
+
+const FenceMarker = struct { char: u8, len: usize, info: []const u8 = "" };
 
 const LineIndent = struct { width: usize, start: usize };
 
@@ -445,7 +1111,7 @@ fn fenceMarker(line: []const u8) ?FenceMarker {
     while (n < rest.len and rest[n] == rest[0]) n += 1;
     if (n < 3) return null;
     if (rest[0] == '`' and std.mem.indexOfScalar(u8, rest[n..], '`') != null) return null;
-    return .{ .char = rest[0], .len = n };
+    return .{ .char = rest[0], .len = n, .info = std.mem.trim(u8, rest[n..], " \t\r") };
 }
 
 fn isFenceClose(line: []const u8, open_char: u8, open_len: usize) bool {
@@ -685,80 +1351,7 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
     }
 }
 
-fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
-    const name = if (kind == .tool and title.len > 0) title else roleName(kind);
-    const raw_label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(kind), name });
-    const role_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolRole(tool_name) else tui_theme.role(kind);
-    const styled_label = try role_style.render(allocator, raw_label);
-    const clock = try formatTimestamp(allocator, ts_ms);
-
-    var time_raw: []const u8 = "";
-    var styled_time: []const u8 = "";
-    if (clock.len > 0) {
-        time_raw = try std.fmt.allocPrint(allocator, " \u{00b7} {s}", .{clock});
-        styled_time = try tui_theme.muted().render(allocator, time_raw);
-    }
-
-    const visible = tui_text.visibleWidth(raw_label) + tui_text.visibleWidth(time_raw);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    if (align_right) try writeSpaces(writer, width -| visible);
-    try writer.writeAll(styled_label);
-    try writer.writeAll(styled_time);
-    return out.toOwnedSlice();
-}
-
-fn renderBubble(allocator: std.mem.Allocator, content: []const u8, open: []const u8, align_right: bool, width: usize) ![]u8 {
-    if (content.len == 0) return allocator.dupe(u8, "");
-
-    const needle = "\x1b[0m";
-    const repl = try std.fmt.allocPrint(allocator, "{s}{s}", .{ needle, open });
-    const reasserted = try std.mem.replaceOwned(u8, allocator, content, needle, repl);
-
-    const max_content = width -| 2;
-    var content_w: usize = 0;
-    {
-        var lines = std.mem.splitScalar(u8, reasserted, '\n');
-        while (lines.next()) |line| content_w = @max(content_w, tui_text.visibleWidth(line));
-    }
-    content_w = @min(content_w, max_content);
-    const left_margin = if (align_right) width -| (content_w + 2) else 0;
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    var lines = std.mem.splitScalar(u8, reasserted, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        if (!first) try writer.writeByte('\n');
-        first = false;
-        try writeSpaces(writer, left_margin);
-        try writer.writeAll(open);
-        try writer.writeByte(' ');
-        try writer.writeAll(line);
-        try writer.writeAll(open);
-        const pad = content_w -| tui_text.visibleWidth(line);
-        try writeSpaces(writer, pad);
-        try writer.writeByte(' ');
-        try writer.writeAll(zz.ansi.reset);
-    }
-    return out.toOwnedSlice();
-}
-
-fn renderCard(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, text: []const u8, width: usize) ![]const u8 {
-    const content_width = @max(width -| 4, 8);
-    const truncated = try tui_text.truncateLinesToWidth(allocator, text, content_width, std.math.maxInt(usize));
-    const body_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolBody(tool_name) else tui_theme.bodyStyle(kind);
-    const styled = try styleEachLine(allocator, body_style, truncated);
-    const card = tui_theme.panel()
-        .borderForeground(roleColor(kind, tool_name))
-        .width(@intCast(@min(content_width, std.math.maxInt(u16))));
-    return card.render(allocator, styled);
-}
-
-fn styleEachLine(allocator: std.mem.Allocator, style: zz.Style, text: []const u8) ![]const u8 {
+fn styleEachLine(allocator: std.mem.Allocator, style: zz.Style, text: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
@@ -772,14 +1365,6 @@ fn styleEachLine(allocator: std.mem.Allocator, style: zz.Style, text: []const u8
         defer allocator.free(styled);
         try writer.writeAll(styled);
     }
-    return out.toOwnedSlice();
-}
-
-fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try fg.writeFg(&out.writer);
-    try bg.writeBg(&out.writer);
     return out.toOwnedSlice();
 }
 
@@ -800,34 +1385,18 @@ fn roleName(kind: TranscriptKind) []const u8 {
         .thinking => "Thinking",
         .tool => "Tool",
         .system => "System",
+        .welcome => "Makai",
         .@"error" => "Error",
     };
 }
 
-fn roleColor(kind: TranscriptKind, tool_name: []const u8) zz.Color {
-    return switch (kind) {
-        .user => tui_theme.palette.user,
-        .assistant => tui_theme.palette.assistant,
-        .thinking => tui_theme.palette.thinking,
-        .tool => if (tool_name.len > 0) tui_theme.toolColorForName(tool_name) else tui_theme.palette.tool,
-        .system => tui_theme.palette.panel_border,
-        .@"error" => tui_theme.palette.danger,
-    };
-}
-
 fn inferredToolName(text: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, text, "◈ ")) return firstToolNameToken(text["◈ ".len..]);
+    if (parseToolSummary(text)) |summary| return firstToolNameToken(summary.label);
     return firstToolNameToken(text);
 }
 
 fn inferredToolTitle(text: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, text, "◈ ")) {
-        const rest = text["◈ ".len..];
-        const quote = std.mem.indexOfScalar(u8, rest, '"') orelse rest.len;
-        const status = std.mem.indexOf(u8, rest, " ok ") orelse std.mem.indexOf(u8, rest, " failed ") orelse std.mem.indexOf(u8, rest, " interrupted") orelse quote;
-        const end = @min(quote, status);
-        return std.mem.trim(u8, rest[0..end], " \t\r\n");
-    }
+    if (parseToolSummary(text)) |summary| return std.mem.trim(u8, summary.label, " \t\r\n");
     return "";
 }
 
@@ -883,6 +1452,236 @@ fn colorFg(allocator: std.mem.Allocator, color: zz.Color) ![]u8 {
     return out.toOwnedSlice();
 }
 
+test "tool summary parser splits label argument status and stats" {
+    const running = parseToolSummary("◈ Shell Execute \"ls -la\"").?;
+    try std.testing.expectEqualStrings("Shell Execute", running.label);
+    try std.testing.expectEqualStrings("ls -la", running.arg);
+    try std.testing.expectEqual(ToolRowStatus.running, running.status);
+
+    const done = parseToolSummary("◈ Shell Execute \"echo \"ok\" now\" ok raw=342B returned=342B ~87 tok").?;
+    try std.testing.expectEqualStrings("Shell Execute", done.label);
+    try std.testing.expectEqualStrings("echo \"ok\" now", done.arg);
+    try std.testing.expectEqual(ToolRowStatus.ok, done.status);
+    const stats = parseToolStats(done.stats);
+    try std.testing.expectEqual(@as(?u64, 342), stats.bytes);
+    try std.testing.expectEqual(@as(?u64, 87), stats.tokens);
+
+    const failed = parseToolSummary("◈ workspace_list failed output=17B \"FileNotFound\"").?;
+    try std.testing.expectEqualStrings("workspace_list", failed.label);
+    try std.testing.expectEqualStrings("", failed.arg);
+    try std.testing.expectEqual(ToolRowStatus.failed, failed.status);
+    try std.testing.expectEqualStrings("FileNotFound", parseToolStats(failed.stats).detail);
+
+    const interrupted = parseToolSummary("◈ Shell Execute \"Inspect pwd now\" interrupted").?;
+    try std.testing.expectEqual(ToolRowStatus.interrupted, interrupted.status);
+    try std.testing.expect(parseToolSummary("plain output row") == null);
+}
+
+test "tool summary row keeps status right-aligned within the width" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .tool, "◈ Shell Execute \"Run the whole build and every unit test group twice\" ok output=4096B ~120 tok");
+    defer entry.deinit(std.testing.allocator);
+    entry.tool_summary = true;
+
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 60);
+    defer std.testing.allocator.free(rendered);
+
+    var lines = std.mem.splitScalar(u8, rendered, '\n');
+    const row = lines.next().?;
+    try std.testing.expect(tui_text.visibleWidth(row) <= 60);
+    try std.testing.expect(std.mem.indexOf(u8, row, "Shell Execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, tui_theme.glyph.check) != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "4.0KB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "…") != null);
+}
+
+test "failed tool summary row stays on one line and marks the failure" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .tool, "◈ workspace_list \"src\" failed output=17B \"FileNotFound\"");
+    defer entry.deinit(std.testing.allocator);
+    entry.tool_summary = true;
+
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 80);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(rendered));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, tui_theme.glyph.cross ++ " failed") != null);
+
+    const awaiting = try renderTranscriptEntryWith(std.testing.allocator, &entry, 80, .{ .awaiting_approval = true });
+    defer std.testing.allocator.free(awaiting);
+    try std.testing.expect(std.mem.indexOf(u8, awaiting, "awaiting approval") == null);
+
+    var pending = try TranscriptEntry.init(std.testing.allocator, .tool, "◈ Shell Execute \"pwd\"");
+    defer pending.deinit(std.testing.allocator);
+    const waiting = try renderTranscriptEntryWith(std.testing.allocator, &pending, 80, .{ .awaiting_approval = true });
+    defer std.testing.allocator.free(waiting);
+    try std.testing.expect(std.mem.indexOf(u8, waiting, "awaiting approval") != null);
+}
+
+test "live assistant entry shows spinner header and caret" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .assistant, "partial answer");
+    defer entry.deinit(std.testing.allocator);
+    entry.timestamp_ms = 1779978720 * 1000;
+
+    const live = try renderTranscriptEntryWith(std.testing.allocator, &entry, 80, .{ .live = true, .anim_tick = 3 });
+    defer std.testing.allocator.free(live);
+    try std.testing.expect(std.mem.indexOf(u8, live, tui_theme.spinnerFrame(3)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, tui_theme.glyph.caret) != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "14:32") == null);
+
+    const settled = try renderTranscriptEntry(std.testing.allocator, &entry, 80);
+    defer std.testing.allocator.free(settled);
+    try std.testing.expect(std.mem.indexOf(u8, settled, tui_theme.glyph.caret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, settled, "14:32") != null);
+}
+
+test "inline emphasis and code spans are styled without their markers" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeStyledProseLine(std.testing.allocator, &out.writer, "use `zig build` with **care** and *speed* but a*b stays", 80);
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zig build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[3m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "a*b") != null);
+}
+
+test "unbalanced emphasis markers render literally" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeStyledProseLine(std.testing.allocator, &out.writer, "2 * 3 = 6 and **open", 80);
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "2 * 3 = 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "**open") != null);
+}
+
+test "bullets numbered lists and headings get block styling with hanging indent" {
+    const styled = try renderAssistantStyled(std.testing.allocator, "# Title\n- alpha beta gamma delta\n2. second\n> quoted", 16);
+    defer std.testing.allocator.free(styled);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "# Title") == null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, tui_theme.glyph.bullet) != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "- alpha") == null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "2.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, tui_theme.glyph.quote_bar) != null);
+    var lines = std.mem.splitScalar(u8, styled, '\n');
+    var saw_hanging = false;
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 16);
+        if (std.mem.startsWith(u8, line, "  ") and std.mem.indexOf(u8, line, "gamma") != null) saw_hanging = true;
+    }
+    try std.testing.expect(saw_hanging);
+}
+
+test "welcome entry renders as a banner with the marker and key hints" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .welcome, "Makai TUI\nmodel: anthropic/claude\ncwd: /tmp/work\ntips: Enter send");
+    defer entry.deinit(std.testing.allocator);
+
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 60);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Makai TUI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "anthropic/claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "/tmp/work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Enter send") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\u{256d}") != null);
+    var lines = std.mem.splitScalar(u8, rendered, '\n');
+    while (lines.next()) |line| try std.testing.expect(tui_text.visibleWidth(line) <= 60);
+}
+
+test "single line system entries render as one muted row" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .system, "model switched to claude (anthropic)");
+    defer entry.deinit(std.testing.allocator);
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 80);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(rendered));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "System") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "model switched") != null);
+}
+
+test "system entries wrap long URLs across rows and hyperlink every fragment" {
+    const url = "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile";
+    const text = "open this URL to authorize:\n" ++ url ++ "\nPaste the code from the URL after '#code=' below:";
+    var entry = try TranscriptEntry.init(std.testing.allocator, .system, text);
+    defer entry.deinit(std.testing.allocator);
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 60);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "…") == null);
+    var joined = std.ArrayList(u8).empty;
+    defer joined.deinit(std.testing.allocator);
+    var fragments: usize = 0;
+    var rows = std.mem.splitScalar(u8, rendered, '\n');
+    while (rows.next()) |row| {
+        try std.testing.expect(tui_text.visibleWidth(row) <= 60);
+        const plain = try stripEscapesForTest(std.testing.allocator, row);
+        defer std.testing.allocator.free(plain);
+        for (plain) |c| if (c != ' ') try joined.append(std.testing.allocator, c);
+        fragments += std.mem.count(u8, row, "\x1b]8;id=makai-");
+    }
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, url) != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "Pastethecode") != null);
+    try std.testing.expect(fragments >= 3);
+    try std.testing.expectEqual(fragments, std.mem.count(u8, rendered, ";" ++ url ++ "\x1b\\"));
+    try std.testing.expectEqual(fragments, std.mem.count(u8, rendered, "\x1b]8;;\x1b\\"));
+}
+
+test "single line system entries wider than the screen wrap instead of truncating" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .system, "the session was restored from disk and every pending steer was reconciled against the runtime");
+    defer entry.deinit(std.testing.allocator);
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 40);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(tui_text.lineCount(rendered) > 2);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "…") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "System") != null);
+    var rows = std.mem.splitScalar(u8, rendered, '\n');
+    while (rows.next()) |row| try std.testing.expect(tui_text.visibleWidth(row) <= 40);
+}
+
+fn stripEscapesForTest(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] != 0x1b) {
+            try out.append(allocator, text[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= text.len) break;
+        if (text[i] == '[') {
+            i += 1;
+            while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
+            i += 1;
+        } else if (text[i] == ']') {
+            i += 1;
+            while (i < text.len and text[i] != 0x07 and !(text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '\\')) i += 1;
+            i += if (i < text.len and text[i] == 0x07) 1 else 2;
+        } else {
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "tool result rows are capped with a remainder marker" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .tool, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11");
+    defer entry.deinit(std.testing.allocator);
+    const rendered = try renderTranscriptEntry(std.testing.allocator, &entry, 80);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, tui_theme.glyph.result) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "l8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "l9") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "+3 more lines") != null);
+}
+
+test "waiting line names the model and spins" {
+    const line = try renderWaitingLine(std.testing.allocator, "claude", 2, 3500);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "waiting for claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "3s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, tui_theme.spinnerFrame(2)) != null);
+}
+
 test "transcript renders labels" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -909,18 +1708,20 @@ test "transcript renders chat-style alignment and cards" {
     const text = try render(std.testing.allocator, &state, .{ .width = 48, .height = 14 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "System") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "system notice") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Makai") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "You") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "01:02") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") == null);
 
     const assistant_line = renderedLineContaining(text, "assistant reply").?;
     try std.testing.expect(std.mem.startsWith(u8, assistant_line, "   "));
 
     const user_line = renderedLineContaining(text, "user reply").?;
-    try std.testing.expect(std.mem.startsWith(u8, user_line, "          "));
-    try std.testing.expectEqual(@as(usize, 46), tui_text.visibleWidth(user_line));
+    try std.testing.expect(std.mem.startsWith(u8, user_line, "   "));
+    try std.testing.expect(tui_text.visibleWidth(user_line) <= 48);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expect(tui_text.visibleWidth(line) <= 48);
 }
 
 test "transcript aligns error card content with role label text" {
@@ -1014,7 +1815,10 @@ test "transcript collapses tool events into intent row without card" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "Shell Execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Tool") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Run pwd to show current working directory [ok, 342B, ~87 tok]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Run pwd to show current working directory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.check) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "342B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "~87 tok") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "{\"command\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "not-a-summary") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ok stdout=43 stderr=0") == null);
@@ -1055,9 +1859,14 @@ test "transcript renders reused tool call ids as distinct occurrences" {
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} List files [ok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Read config [failed") != null);
+    const first_row = std.mem.indexOf(u8, text, "List files") orelse return error.TestUnexpectedResult;
+    const second_row = std.mem.indexOf(u8, text, "Read config") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first_row < second_row);
+    try std.testing.expect(std.mem.indexOf(u8, text[first_row..second_row], tui_theme.glyph.check) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[second_row..], tui_theme.glyph.cross) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[second_row..], "failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Tool execution rejected by user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8}") == null);
 }
 
 test "transcript balanced mode sanitizes tool descriptions" {
@@ -1187,7 +1996,8 @@ test "transcript renders interrupted balanced summaries from linked tools" {
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "Inspect pwd now [interrupted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Inspect pwd now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.stop ++ " interrupted") != null);
 }
 
 test "transcript renders unlinked tool rows as original text" {
@@ -1208,7 +2018,8 @@ test "transcript renders unlinked tool rows as original text" {
     const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 20 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "\u{25b8} Run pwd now [ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Run pwd now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.check) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "orphan output row") != null);
 }
 
@@ -1231,7 +2042,7 @@ test "transcript colors tool cards by inferred operation" {
     try std.testing.expect(!std.mem.eql(u8, shell_open, read_open));
 }
 
-test "transcript renders assistant markdown syntax literally" {
+test "transcript styles assistant headings and bullets" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "# Heading\n- item");
@@ -1239,8 +2050,11 @@ test "transcript renders assistant markdown syntax literally" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "- item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- item") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.bullet) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "item") != null);
 }
 
 test "transcript keeps assistant code indentation" {
@@ -1332,7 +2146,8 @@ test "transcript wraps assistant list text plainly" {
     const text = try render(std.testing.allocator, &state, .{ .width = 15, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "- first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- first") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "third") != null);
 
@@ -1342,7 +2157,7 @@ test "transcript wraps assistant list text plainly" {
     }
 }
 
-test "transcript renders inline code markers literally" {
+test "transcript styles inline code spans without backticks" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.appendTranscript(.assistant, "use `code` here");
@@ -1350,7 +2165,11 @@ test "transcript renders inline code markers literally" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "`code`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`code`") == null);
+    const probe = try tui_theme.inlineCode().render(std.testing.allocator, "code");
+    defer std.testing.allocator.free(probe);
+    try std.testing.expect(std.mem.indexOf(u8, text, probe) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "here") != null);
 }
 
 test "transcript dims and indents fenced code block" {
@@ -1366,10 +2185,10 @@ test "transcript dims and indents fenced code block" {
     try std.testing.expect(std.mem.indexOf(u8, text, "```") == null);
     try std.testing.expect(std.mem.indexOf(u8, code_line, "const x = 1;") != null);
 
-    const dim_probe = try tui_theme.dim().render(std.testing.allocator, "x");
-    defer std.testing.allocator.free(dim_probe);
-    const x_index = std.mem.indexOf(u8, dim_probe, "x").?;
-    try std.testing.expect(std.mem.indexOf(u8, code_line, dim_probe[0..x_index]) != null);
+    const code_probe = try tui_theme.codeBlock().render(std.testing.allocator, "x");
+    defer std.testing.allocator.free(code_probe);
+    const x_index = std.mem.indexOf(u8, code_probe, "x").?;
+    try std.testing.expect(std.mem.indexOf(u8, code_line, code_probe[0..x_index]) != null);
 }
 
 test "transcript wraps assistant text within viewport width" {
@@ -1526,7 +2345,9 @@ test "transcript does not open a fence from inline code spans" {
     const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 10 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "```code```") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "then text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "plain") != null);
 }
 
 test "transcript caps fence opener indent at three spaces" {

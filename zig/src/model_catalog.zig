@@ -4,6 +4,7 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const oauth_storage = @import("oauth/storage");
 const codex_oauth = @import("oauth/openai_codex");
+const anthropic_oauth = @import("oauth/anthropic");
 
 const openai_codex_provider_id = "openai-codex";
 const openai_codex_api_id = "openai-codex-responses";
@@ -16,6 +17,12 @@ const kimi_global_base_url = "https://api.moonshot.ai";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
+const makai_anthropic_catalog_name = "anthropic.json";
+const anthropic_provider_id = "anthropic";
+const anthropic_api_name = "anthropic-messages";
+const anthropic_base_url = "https://api.anthropic.com";
+const anthropic_models_url = "https://api.anthropic.com/v1/models?limit=100";
+const anthropic_api_key_env = "ANTHROPIC_API_KEY";
 const max_catalog_bytes = 2 * 1024 * 1024;
 const default_codex_client_version = "0.0.0";
 const default_max_output_tokens: u32 = 16_384;
@@ -48,58 +55,59 @@ pub fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void
 }
 
 pub fn loadProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    var codex_models = try loadOpenAICodexModels(allocator, .allow_cache);
-    errdefer deinitModels(allocator, codex_models);
-
-    const kimi_models = try loadKimiModels(allocator);
-    defer allocator.free(kimi_models);
-    errdefer for (kimi_models) |*model| model.deinit(allocator);
-
-    if (kimi_models.len == 0) return codex_models;
-
-    var models = try allocator.alloc(ai_types.Model, codex_models.len + kimi_models.len);
-    @memcpy(models[0..codex_models.len], codex_models);
-    @memcpy(models[codex_models.len..], kimi_models);
-    allocator.free(codex_models);
-    codex_models = &.{};
-    return models;
+    return loadProductionModelsWithMode(allocator, .allow_cache);
 }
 
 pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadProductionModelsWithMode(allocator, .force_fetch);
+}
+
+fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadMode) ![]ai_types.Model {
+    var loaded_storage: ?oauth_storage.AuthStorage = if (builtin.is_test) null else oauth_storage.AuthStorage.loadDefault(allocator) catch null;
+    defer if (loaded_storage) |*storage| storage.deinit();
+    const storage: ?*oauth_storage.AuthStorage = if (loaded_storage) |*storage| storage else null;
+
     var codex_refresh_error: ?anyerror = null;
-    var codex_models = loadOpenAICodexModels(allocator, .force_fetch) catch |err| blk: {
+    var codex_models = loadOpenAICodexModels(allocator, mode, storage) catch |err| blk: {
+        if (mode == .allow_cache) return err;
         codex_refresh_error = err;
         break :blk try emptyModels(allocator);
     };
-    errdefer deinitModels(allocator, codex_models);
+    defer deinitModels(allocator, codex_models);
 
-    const kimi_models = try loadKimiModels(allocator);
-    defer allocator.free(kimi_models);
-    errdefer for (kimi_models) |*model| model.deinit(allocator);
+    var kimi_models = try loadKimiModels(allocator, storage);
+    defer deinitModels(allocator, kimi_models);
 
-    if (kimi_models.len == 0) {
+    var anthropic_models = try loadAnthropicModels(allocator, storage, mode);
+    defer deinitModels(allocator, anthropic_models);
+
+    if (kimi_models.len == 0 and anthropic_models.len == 0) {
         if (codex_refresh_error) |err| return err;
-        return codex_models;
     }
 
-    var models = try allocator.alloc(ai_types.Model, codex_models.len + kimi_models.len);
-    @memcpy(models[0..codex_models.len], codex_models);
-    @memcpy(models[codex_models.len..], kimi_models);
-    allocator.free(codex_models);
-    codex_models = &.{};
+    const lists = [_]*[]ai_types.Model{ &codex_models, &kimi_models, &anthropic_models };
+    var total: usize = 0;
+    for (lists) |list| total += list.len;
+    const models = try allocator.alloc(ai_types.Model, total);
+    var offset: usize = 0;
+    for (lists) |list| {
+        @memcpy(models[offset .. offset + list.len], list.*);
+        offset += list.len;
+        allocator.free(list.*);
+        list.* = &.{};
+    }
     return models;
 }
 
-fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+fn loadKimiModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage) ![]ai_types.Model {
     var region: []const u8 = "china";
     if (builtin.is_test) {
         if (!test_force_kimi_model) return emptyModels(allocator);
     } else {
-        var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return emptyModels(allocator);
-        defer storage.deinit();
-        if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
+        const stored = storage orelse return emptyModels(allocator);
+        if (!stored.providers.contains(kimi_provider_id)) return emptyModels(allocator);
 
-        if (storage.providers.get(kimi_provider_id)) |auth| {
+        if (stored.providers.get(kimi_provider_id)) |auth| {
             if (auth == .oauth) {
                 if (auth.oauth.provider_data) |provider_data| region = kimiRegionFromProviderData(provider_data);
             }
@@ -118,6 +126,235 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 
 var test_force_kimi_model: bool = false;
 var test_force_codex_refresh_error: bool = false;
+var test_force_anthropic_models: bool = false;
+
+const AnthropicSpec = struct {
+    prefix: []const u8,
+    cost: ai_types.Cost,
+    max_tokens: u32,
+};
+
+const anthropic_known_models = [_]AnthropicSpec{
+    .{ .prefix = "claude-opus-4-1", .cost = .{ .input = 15.0, .output = 75.0, .cache_read = 1.50, .cache_write = 18.75 }, .max_tokens = 32_000 },
+    .{ .prefix = "claude-opus-4", .cost = .{ .input = 15.0, .output = 75.0, .cache_read = 1.50, .cache_write = 18.75 }, .max_tokens = 32_000 },
+    .{ .prefix = "claude-sonnet-4-5", .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 }, .max_tokens = 64_000 },
+    .{ .prefix = "claude-sonnet-4", .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 }, .max_tokens = 64_000 },
+    .{ .prefix = "claude-haiku-4-5", .cost = .{ .input = 1.0, .output = 5.0, .cache_read = 0.10, .cache_write = 1.25 }, .max_tokens = 64_000 },
+    .{ .prefix = "claude-3-7-sonnet", .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 }, .max_tokens = 64_000 },
+    .{ .prefix = "claude-3-5-sonnet", .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 }, .max_tokens = 8_192 },
+    .{ .prefix = "claude-3-5-haiku", .cost = .{ .input = 0.80, .output = 4.0, .cache_read = 0.08, .cache_write = 1.0 }, .max_tokens = 8_192 },
+};
+
+const AnthropicStatic = struct { id: []const u8, name: []const u8 };
+
+const anthropic_static_models = [_]AnthropicStatic{
+    .{ .id = "claude-fable-5-1", .name = "Claude Fable 5.1" },
+    .{ .id = "claude-opus-5", .name = "Claude Opus 5" },
+    .{ .id = "claude-sonnet-5", .name = "Claude Sonnet 5" },
+    .{ .id = "claude-sonnet-4-5", .name = "Claude Sonnet 4.5" },
+    .{ .id = "claude-haiku-4-5-20251001", .name = "Claude Haiku 4.5" },
+    .{ .id = "claude-opus-4-1", .name = "Claude Opus 4.1" },
+};
+
+fn anthropicSpec(id: []const u8) ?AnthropicSpec {
+    for (anthropic_known_models) |spec| {
+        if (std.mem.startsWith(u8, id, spec.prefix)) return spec;
+    }
+    return null;
+}
+
+fn anthropicModel(allocator: std.mem.Allocator, id_text: []const u8, name_text: []const u8) !ai_types.Model {
+    const id = try allocator.dupe(u8, id_text);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, name_text);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, anthropic_api_name);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, anthropic_provider_id);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, anthropic_base_url);
+    errdefer allocator.free(base_url);
+    const input = try allocator.alloc([]const u8, 2);
+    errdefer allocator.free(input);
+    input[0] = try allocator.dupe(u8, "text");
+    errdefer allocator.free(input[0]);
+    input[1] = try allocator.dupe(u8, "image");
+    errdefer allocator.free(input[1]);
+
+    const spec = anthropicSpec(id_text);
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = true,
+        .input = input,
+        .cost = if (spec) |known| known.cost else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200_000,
+        .max_tokens = if (spec) |known| known.max_tokens else 32_000,
+        .is_owned = true,
+    };
+}
+
+fn anthropicStaticModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    var models = std.ArrayList(ai_types.Model).empty;
+    errdefer {
+        for (models.items) |*model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+    for (anthropic_static_models) |entry| {
+        try models.append(allocator, try anthropicModel(allocator, entry.id, entry.name));
+    }
+    return models.toOwnedSlice(allocator);
+}
+
+fn parseAnthropicModels(allocator: std.mem.Allocator, data: []const u8) ![]ai_types.Model {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidModelCatalog;
+    const list = parsed.value.object.get("data") orelse return error.InvalidModelCatalog;
+    if (list != .array) return error.InvalidModelCatalog;
+
+    var models = std.ArrayList(ai_types.Model).empty;
+    errdefer {
+        for (models.items) |*model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+    for (list.array.items) |item| {
+        if (item != .object) continue;
+        const obj = &item.object;
+        const id = objectString(obj, "id") orelse continue;
+        if (id.len == 0 or !std.mem.startsWith(u8, id, "claude")) continue;
+        const name = objectString(obj, "display_name") orelse id;
+        try models.append(allocator, try anthropicModel(allocator, id, name));
+    }
+    return models.toOwnedSlice(allocator);
+}
+
+fn refreshAnthropicCredentials(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !oauth_storage.Credentials {
+    const refreshed = try anthropic_oauth.refreshToken(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+    return .{ .refresh = refreshed.refresh, .access = refreshed.access, .expires = refreshed.expires };
+}
+
+fn getAnthropicApiKey(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) ![]const u8 {
+    return try anthropic_oauth.getApiKey(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+}
+
+fn anthropicOAuthProvider() oauth_storage.OAuthProvider {
+    return .{
+        .id = anthropic_provider_id,
+        .name = "Anthropic",
+        .refresh_fn = refreshAnthropicCredentials,
+        .get_api_key_fn = getAnthropicApiKey,
+    };
+}
+
+fn anthropicCredential(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage) !?[]const u8 {
+    if (storage) |stored| {
+        if (stored.providers.contains(anthropic_provider_id)) {
+            if (stored.getApiKey(anthropic_provider_id, anthropicOAuthProvider()) catch null) |token| return token;
+        }
+    }
+    if (compat.getEnvVarOwned(allocator, anthropic_api_key_env)) |key| {
+        if (key.len > 0) return key;
+        allocator.free(key);
+    } else |_| {}
+    return null;
+}
+
+fn isAnthropicOAuthToken(token: []const u8) bool {
+    return std.mem.indexOf(u8, token, "sk-ant-oat") != null;
+}
+
+fn loadAnthropicModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage, mode: CatalogLoadMode) ![]ai_types.Model {
+    if (builtin.is_test) return if (test_force_anthropic_models) anthropicStaticModels(allocator) else emptyModels(allocator);
+
+    const token = (try anthropicCredential(allocator, storage)) orelse return emptyModels(allocator);
+    defer secureFree(allocator, token);
+
+    if (mode == .allow_cache) {
+        if (try loadCachedAnthropicModels(allocator)) |models| return models;
+    }
+    if (fetchAnthropicModelsCatalog(allocator, token)) |body| {
+        defer allocator.free(body);
+        if (parseAnthropicModels(allocator, body)) |models| {
+            if (models.len > 0) {
+                saveMakaiCatalog(allocator, makai_anthropic_catalog_name, body) catch {};
+                return models;
+            }
+            allocator.free(models);
+        } else |_| {}
+    } else |_| {}
+    if (try loadCachedAnthropicModels(allocator)) |models| return models;
+    return anthropicStaticModels(allocator);
+}
+
+fn loadCachedAnthropicModels(allocator: std.mem.Allocator) !?[]ai_types.Model {
+    const path = makaiCatalogPath(allocator, makai_anthropic_catalog_name) catch return null;
+    defer allocator.free(path);
+    const data = compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), path, max_catalog_bytes) catch return null;
+    defer allocator.free(data);
+    const models = parseAnthropicModels(allocator, data) catch return null;
+    if (models.len > 0) return models;
+    allocator.free(models);
+    return null;
+}
+
+fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    const uri = try std.Uri.parse(anthropic_models_url);
+
+    var client = compat.http.HttpClient.init(allocator);
+    defer client.deinit();
+
+    var environ_map = compat.createEnvMap(allocator) catch null;
+    defer if (environ_map) |*map| map.deinit();
+    if (environ_map) |*map| {
+        client.initDefaultProxies(allocator, map) catch {};
+    }
+
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    defer secureFree(allocator, bearer);
+
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
+    try headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" });
+    if (isAnthropicOAuthToken(token)) {
+        try headers.append(allocator, .{ .name = "authorization", .value = bearer });
+        try headers.append(allocator, .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" });
+    } else {
+        try headers.append(allocator, .{ .name = "x-api-key", .value = token });
+    }
+
+    var req = try client.openRequest(.GET, uri, .{
+        .extra_headers = headers.items,
+        .accept_encoding = "identity",
+    });
+    defer req.deinit();
+    req.headers.accept_encoding = .omit;
+
+    try compat.http.sendBodilessRequest(&req);
+
+    var head_buf: [4096]u8 = undefined;
+    var response = try compat.http.receiveResponse(&req, &head_buf);
+
+    var transfer_buf: [4096]u8 = undefined;
+    const reader = compat.http.responseReader(&response, &transfer_buf);
+    const body = try compat.http.allocRemainingResponse(allocator, reader, max_catalog_bytes);
+    errdefer allocator.free(body);
+
+    if (response.head.status != .ok) return error.ModelCatalogFetchFailed;
+    return body;
+}
 
 fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -222,16 +459,14 @@ fn codexOAuthProvider() oauth_storage.OAuthProvider {
     };
 }
 
-fn loadOpenAICodexModels(allocator: std.mem.Allocator, mode: CatalogLoadMode) ![]ai_types.Model {
+fn loadOpenAICodexModels(allocator: std.mem.Allocator, mode: CatalogLoadMode, storage_opt: ?*oauth_storage.AuthStorage) ![]ai_types.Model {
     if (builtin.is_test and mode == .force_fetch and test_force_codex_refresh_error) return error.ModelCatalogFetchFailed;
     if (builtin.is_test) return emptyModels(allocator);
 
-    var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
-    defer storage.deinit();
-
+    const storage = storage_opt orelse return emptyModels(allocator);
     if (!storage.providers.contains(openai_codex_provider_id)) return emptyModels(allocator);
 
-    const account_id = try codexAccountIdFromStorage(allocator, &storage);
+    const account_id = try codexAccountIdFromStorage(allocator, storage);
     defer if (account_id) |id| allocator.free(id);
 
     if (mode == .allow_cache) {
@@ -309,9 +544,13 @@ fn codexModelsCachePath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn makaiCodexCatalogPath(allocator: std.mem.Allocator) ![]u8 {
+    return makaiCatalogPath(allocator, makai_codex_catalog_name);
+}
+
+fn makaiCatalogPath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     const home = try compat.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".makai", makai_catalog_dir_name, makai_codex_catalog_name });
+    return try std.fs.path.join(allocator, &.{ home, ".makai", makai_catalog_dir_name, name });
 }
 
 fn makaiCatalogDirPath(allocator: std.mem.Allocator) ![]u8 {
@@ -321,11 +560,15 @@ fn makaiCatalogDirPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn saveMakaiCodexCatalog(allocator: std.mem.Allocator, data: []const u8) !void {
+    return saveMakaiCatalog(allocator, makai_codex_catalog_name, data);
+}
+
+fn saveMakaiCatalog(allocator: std.mem.Allocator, name: []const u8, data: []const u8) !void {
     const dir_path = try makaiCatalogDirPath(allocator);
     defer allocator.free(dir_path);
     try compat.fs.createDir(compat.fs.getCwd(), dir_path);
 
-    const path = try makaiCodexCatalogPath(allocator);
+    const path = try makaiCatalogPath(allocator, name);
     defer allocator.free(path);
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}.{x}", .{ path, compat.time.nowMillis(), compat.random.int(u64) });
@@ -655,6 +898,48 @@ fn objectU32(obj: *const std.json.ObjectMap, key: []const u8) ?u32 {
         },
         else => return null,
     };
+}
+
+test "parseAnthropicModels maps the models endpoint into owned Anthropic models" {
+    const body =
+        \\{"data":[{"type":"model","id":"claude-sonnet-4-5-20250929","display_name":"Claude Sonnet 4.5","created_at":"2025-09-29T00:00:00Z"},{"type":"model","id":"claude-opus-4-1-20250805","display_name":"Claude Opus 4.1"},{"type":"model","id":"claude-future-9","display_name":"Claude Future"},{"type":"model","id":"not-a-claude"}],"has_more":false}
+    ;
+    const models = try parseAnthropicModels(std.testing.allocator, body);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5-20250929", models[0].id);
+    try std.testing.expectEqualStrings("Claude Sonnet 4.5", models[0].name);
+    try std.testing.expectEqualStrings(anthropic_provider_id, models[0].provider);
+    try std.testing.expectEqualStrings(anthropic_api_name, models[0].api);
+    try std.testing.expectEqualStrings("https://api.anthropic.com", models[0].base_url);
+    try std.testing.expectEqual(@as(f64, 3.0), models[0].cost.input);
+    try std.testing.expectEqual(@as(u32, 64_000), models[0].max_tokens);
+    try std.testing.expectEqual(@as(f64, 15.0), models[1].cost.input);
+    try std.testing.expectEqual(@as(u32, 32_000), models[1].max_tokens);
+    try std.testing.expectEqual(@as(f64, 0), models[2].cost.input);
+    try std.testing.expect(models[2].reasoning);
+}
+
+test "loadProductionModels includes the Anthropic static list when forced" {
+    test_force_anthropic_models = true;
+    defer test_force_anthropic_models = false;
+    const models = try loadProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(anthropic_static_models.len, models.len);
+    for (models) |model| try std.testing.expectEqualStrings(anthropic_provider_id, model.provider);
+    try std.testing.expectEqualStrings("claude-fable-5-1", models[0].id);
+}
+
+test "refreshProductionModels keeps Anthropic models when Codex refresh fails" {
+    test_force_anthropic_models = true;
+    test_force_codex_refresh_error = true;
+    defer {
+        test_force_anthropic_models = false;
+        test_force_codex_refresh_error = false;
+    }
+    const models = try refreshProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(anthropic_static_models.len, models.len);
 }
 
 test "parseCodexModelsCache maps visible supported Codex models" {

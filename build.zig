@@ -995,6 +995,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
     });
 
@@ -1958,7 +1959,6 @@ pub fn build(b: *std.Build) void {
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
     test_e2e_protocol_step.dependOn(&e2e_provider_base_url_test_run.step);
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
-
 
     const test_e2e_distributed_fullstack_step = b.step("test-e2e-distributed-fullstack", "Run distributed fullstack E2E tests (mock-based)");
     test_e2e_distributed_fullstack_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
