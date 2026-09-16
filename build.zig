@@ -1041,6 +1041,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
             .{ .name = "tui_login", .module = tui_login_mod },
+            .{ .name = "custom_providers", .module = custom_providers_mod },
             .{ .name = "model_catalog", .module = model_catalog_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
             .{ .name = "tui_theme", .module = tui_theme_mod },

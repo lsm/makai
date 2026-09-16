@@ -1,0 +1,136 @@
+# Custom OpenAI- and Anthropic-compatible endpoints
+
+`~/.makai/providers.json` declares endpoints the runtime does not ship knowledge
+of: a self-hosted vLLM or llama.cpp server, an aggregator such as OpenRouter, a
+corporate gateway that speaks the Anthropic wire format, or any vendor with an
+OpenAI-compatible API.
+
+Declared providers appear in `/model`, the status bar and print mode alongside
+the built-in ones.
+
+```json
+{
+  "providers": [
+    {
+      "id": "groq",
+      "name": "Groq",
+      "api": "openai-completions",
+      "base_url": "https://api.groq.com/openai/v1",
+      "auth": { "env": "GROQ_API_KEY" },
+      "models": ["llama-3.3-70b-versatile"]
+    },
+    {
+      "id": "gateway",
+      "name": "Internal Gateway",
+      "api": "anthropic-messages",
+      "base_url": "https://gw.internal/anthropic",
+      "headers": { "X-Tenant": "acme" },
+      "capabilities": { "cache_ttl": true }
+    },
+    {
+      "id": "local",
+      "api": "openai-completions",
+      "base_url": "http://localhost:8000/v1"
+    }
+  ]
+}
+```
+
+## Fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `id` | yes | Provider id. Letters, digits, `-`, `_`, `.`. Becomes the provider half of a model ref and the keychain account, so it must not collide with a built-in id. |
+| `base_url` | yes | Endpoint origin. A trailing `/v1` is stripped; see Base URLs below. |
+| `api` | no | `openai-completions` (default), `openai-responses` or `anthropic-messages`. |
+| `name` | no | Display name; defaults to the id. |
+| `auth.env` | no | Environment variable to read the key from. |
+| `headers` | no | Extra request headers, as a flat object of strings. |
+| `models` | no | Allowlist and fallback list; strings, or objects with `id`, `name`, `context_window`, `max_tokens`. |
+| `capabilities` | no | Overrides for what the endpoint supports; see below. |
+| `reasoning` | no | Whether models expose reasoning. Default `false`. |
+| `context_window`, `max_tokens` | no | Defaults for models that do not state their own. Default 128000 and 8192. |
+
+A malformed entry fails the whole file rather than being skipped, so a typo is
+visible instead of silently dropping a provider. Reserved ids, unparseable base
+URLs, unsupported `api` values and duplicate ids are all rejected by name.
+
+## Base URLs
+
+Paste whichever form the vendor documents. A trailing `/v1` is stripped when the
+file is read, because the providers append their own versioned path. Both of
+these reach `https://api.groq.com/openai/v1/chat/completions`:
+
+```
+"base_url": "https://api.groq.com/openai/v1"
+"base_url": "https://api.groq.com/openai"
+```
+
+Without that normalisation the first form would produce `/v1/v1/chat/completions`
+and a 404, since the OpenAI request builder concatenates without checking.
+
+## Credentials
+
+**Keys are never read from this file.** There are two supported sources:
+
+- **Keychain**, which is preferred. `/login <id>` prompts for the key and stores
+  it under that provider id, the same path Kimi uses. The input is masked.
+- **Environment**, by naming a variable in `auth.env`. The name is not a secret;
+  the value never enters the file.
+
+The keychain is checked first. A provider with neither still lists its models,
+because a local llama.cpp or vLLM usually needs no key at all; a request to an
+endpoint that does need one then fails with the endpoint's own auth error.
+
+`/login` with no argument shows the built-in providers. Custom providers are
+reached by naming them, `/login gateway`, and only if they are declared in the
+file. Listing them in the picker is not implemented yet.
+
+## Model discovery
+
+On first use makai fetches `<base_url>/v1/models` and caches the response under
+`~/.makai/model_catalog/custom-<id>.json` for 24 hours. `/model` forces a fresh
+fetch. When the fetch fails it falls back to the cached copy however old, and
+then to the declared `models` list.
+
+A declared `models` list acts as an **allowlist** over whatever discovery
+returns. This is what keeps an aggregator usable: OpenRouter lists hundreds of
+models, and naming three keeps `/model` readable. Omit the list entirely and
+every model the endpoint advertises is offered, which is what you want for a
+server hosting one.
+
+## Capabilities
+
+Capability detection is otherwise a hostname guess, which cannot work for an
+endpoint on your own domain. Anything you declare wins; anything you leave out
+falls back to that guess, so existing providers are unaffected.
+
+| Key | Effect |
+| --- | --- |
+| `cache_ttl` | Endpoint honours long Anthropic prompt-cache TTL. This is the one that matters for an Anthropic-compatible gateway, which otherwise silently loses long cache TTL because `isAnthropicHost` matches on hostname. |
+| `reasoning_effort` | Accepts a reasoning-effort parameter. |
+| `developer_role` | Accepts the `developer` role. |
+| `store` | Supports the `store` parameter. |
+| `strict_mode` | Supports strict tool schemas. |
+| `thinking_as_text` | Requires thinking to be sent as plain text. |
+| `usage_in_streaming` | Reports usage in streaming responses. |
+| `max_tokens_field` | `max_tokens` or `max_completion_tokens`. |
+| `thinking_format` | `openai`, `zai` or `qwen`. |
+
+## Headers
+
+`headers` entries are sent on every request to that provider. A header whose
+name already exists is skipped rather than duplicated, so an `Authorization` or
+`anthropic-version` in configuration cannot shadow the credential the runtime
+resolved or the API version it requires.
+
+## Limits
+
+- Custom providers reach the TUI and the CLI. The TypeScript SDK's `models.list`
+  is served by a separate catalog and does not show them. SDK consumers are not
+  blocked: the provider server already accepts a client-supplied `base_url`, so
+  they can stream against any endpoint by passing it explicitly.
+- Only the three wire formats above are accepted. Google, Bedrock and Azure
+  shapes are not expressible here.
+- Pricing is not declared, so the status bar hides cost for custom models rather
+  than guessing a rate.

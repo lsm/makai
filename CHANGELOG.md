@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Custom OpenAI- and Anthropic-compatible endpoints can be declared in `~/.makai/providers.json` and appear in `/model`, the status bar and print mode ([`docs/custom-endpoints.md`](docs/custom-endpoints.md)). An entry carries an id, a wire format, a base URL, and optional headers, model list and capability overrides. Models are discovered from the endpoint's `/v1/models` and cached for a day, with a declared list acting as an allowlist over the result so an aggregator serving hundreds stays usable, and as the fallback when discovery fails. Keys never live in the file: `/login <id>` stores one in the keychain under the provider id, or an entry names an environment variable to read; an endpoint needing no key at all still lists its models. A `capabilities` block populates `Model.compat`, which is what finally lets an Anthropic-compatible gateway on a private domain keep long prompt-cache TTL — capability detection is otherwise a hostname match that such a host can never satisfy. Base URLs are normalised to the origin, so pasting a vendor's documented URL ending in `/v1` no longer produces `/v1/v1/chat/completions` and a 404.
+
 ### Fixed
 
 - Stopped the TypeScript SDK from orphaning a runtime process when the stdio handshake fails. `MakaiStdioClient.connect()` rejected on a handshake timeout, a protocol `version_mismatch`, or an `error` handshake frame while leaving the spawned `makai --stdio` child running and `this.child` set; `createMakaiClient()` and `createMakaiAuthClient()` call `connect()` internally and reject before returning a handle, so the caller had no way to reach `close()` and every failed attempt leaked one process (three failed `createMakaiClient()` calls left three live children, and the leftover pipes kept the parent's event loop alive). `connect()` now terminates the child, closes the line reader, and clears the handle on any handshake failure.

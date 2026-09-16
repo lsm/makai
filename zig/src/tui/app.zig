@@ -10,6 +10,7 @@ const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
+const custom_providers = @import("custom_providers");
 const model_catalog = @import("model_catalog");
 const tui_config = @import("tui_config");
 const tui_theme = @import("tui_theme");
@@ -817,8 +818,37 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
+    const max_custom_provider_config_bytes = 1024 * 1024;
+
+    fn isDeclaredCustomProvider(self: *App, provider_id: []const u8) bool {
+        const providers = custom_providers.load(self.allocator, max_custom_provider_config_bytes) catch return false;
+        defer custom_providers.deinitProviders(self.allocator, providers);
+        for (providers) |provider| {
+            if (std.mem.eql(u8, provider.id, provider_id)) return true;
+        }
+        return false;
+    }
+
+    fn startCustomLogin(self: *App, provider_id: []const u8) !void {
+        self.state.mode = .normal;
+        if (self.login != null) {
+            try self.state.appendTranscript(.system, "a login is already in progress");
+            return;
+        }
+        self.login = tui_login.LoginSession.startApiKey(self.allocator, provider_id) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator, "could not start login for {s}: {s}", .{ provider_id, @errorName(err) });
+            defer self.allocator.free(msg);
+            try self.state.appendTranscript(.@"error", msg);
+            return;
+        };
+        const msg = try std.fmt.allocPrint(self.allocator, "starting login for {s}…", .{provider_id});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
     fn startLoginProviderName(self: *App, provider_id: []const u8) !void {
         const idx = loginProviderIndex(provider_id) orelse {
+            if (self.isDeclaredCustomProvider(provider_id)) return self.startCustomLogin(provider_id);
             const msg = try std.fmt.allocPrint(self.allocator, "unknown login provider: {s}", .{provider_id});
             defer self.allocator.free(msg);
             try self.state.status.setError(self.allocator, msg);
@@ -866,7 +896,7 @@ pub const App = struct {
             },
             .done => |creds| {
                 const provider_id = session.provider_id;
-                const save_err = self.saveLoginCredentials(provider_id, creds);
+                const save_err = self.saveLoginCredentials(provider_id, creds, session.storesApiKey());
                 creds.deinit(self.allocator);
                 self.finishLogin();
                 if (save_err) |_| {
@@ -905,14 +935,14 @@ pub const App = struct {
         if (self.state.mode == .login_input) self.state.mode = .normal;
     }
 
-    fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
+    fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials, stores_api_key: bool) !void {
         var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
         defer storage.deinit();
 
         const key = try self.allocator.dupe(u8, provider_id);
         var owned = false;
         errdefer if (!owned) self.allocator.free(key);
-        if (std.mem.eql(u8, provider_id, "kimi")) {
+        if (stores_api_key) {
             const api_key = try self.allocator.dupe(u8, creds.access);
             errdefer if (!owned) self.allocator.free(api_key);
 
@@ -2521,6 +2551,84 @@ test "App refreshes runtime models after login" {
     try std.testing.expectEqualStrings(defaultModel().id, runtime.currentModel().?.id);
 }
 
+const TempHome = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    previous: ?[]u8,
+
+    fn init(sub: []const u8) !TempHome {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, sub });
+        errdefer std.testing.allocator.free(home);
+        try compat.fs.createDir(compat.fs.getCwd(), home);
+        const previous = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "HOME") catch null;
+        const home_z = try std.testing.allocator.dupeZ(u8, home);
+        defer std.testing.allocator.free(home_z);
+        _ = setenv("HOME", home_z.ptr, 1);
+        return .{ .tmp = tmp, .home = home, .previous = previous };
+    }
+
+    fn deinit(self: *TempHome) void {
+        if (self.previous) |value| {
+            if (std.testing.allocator.dupeZ(u8, value) catch null) |home_z| {
+                defer std.testing.allocator.free(home_z);
+                _ = setenv("HOME", home_z.ptr, 1);
+            }
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv("HOME");
+        }
+        std.testing.allocator.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+test "App stores a custom provider key under its own id" {
+    var env = try TempHome.init("home-custom-key");
+    defer env.deinit();
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const creds = oauth_storage.Credentials{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "gateway-secret"),
+        .expires = std.math.maxInt(i64),
+    };
+    defer creds.deinit(std.testing.allocator);
+
+    try app.saveLoginCredentials("gateway", creds, true);
+
+    var storage = try oauth_storage.AuthStorage.loadFromFile(std.testing.allocator);
+    defer storage.deinit();
+    const auth = storage.providers.get("gateway") orelse return error.MissingCustomAuth;
+    switch (auth) {
+        .api_key => |key| try std.testing.expectEqualStrings("gateway-secret", key),
+        else => return error.UnexpectedAuthKind,
+    }
+}
+
+test "App only offers an api-key login for a declared custom provider" {
+    var env = try TempHome.init("home-custom-login");
+    defer env.deinit();
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try std.testing.expect(!app.isDeclaredCustomProvider("gateway"));
+
+    const makai_dir = try std.fs.path.join(std.testing.allocator, &.{ env.home, ".makai" });
+    defer std.testing.allocator.free(makai_dir);
+    try compat.fs.createDir(compat.fs.getCwd(), makai_dir);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ makai_dir, "providers.json" });
+    defer std.testing.allocator.free(config_path);
+    try compat.fs.writeFile(compat.fs.getCwd(), config_path,
+        \\{"providers":[{"id":"gateway","base_url":"https://gw.test"}]}
+    );
+
+    try std.testing.expect(app.isDeclaredCustomProvider("gateway"));
+    try std.testing.expect(!app.isDeclaredCustomProvider("not-declared"));
+}
+
 test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
@@ -2989,7 +3097,7 @@ test "App saves Kimi login credentials as api key" {
     };
     defer creds.deinit(std.testing.allocator);
 
-    try app.saveLoginCredentials("kimi", creds);
+    try app.saveLoginCredentials("kimi", creds, true);
 
     var storage = try oauth_storage.AuthStorage.loadFromFile(std.testing.allocator);
     defer storage.deinit();
