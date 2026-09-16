@@ -1445,8 +1445,13 @@ fn freeDetails(allocator: std.mem.Allocator, details: []const oap_types.DetailEn
 fn cloneDetails(allocator: std.mem.Allocator, details: []const oap_types.DetailEntry) ![]const oap_types.DetailEntry {
     const out = try allocator.alloc(oap_types.DetailEntry, details.len);
     var filled: usize = 0;
-    errdefer freeDetails(allocator, out[0..filled]);
-    errdefer allocator.free(out);
+    errdefer {
+        for (out[0..filled]) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        allocator.free(out);
+    }
     for (details, 0..) |entry, index| {
         const key = try allocator.dupe(u8, entry.key);
         errdefer allocator.free(key);
@@ -2179,6 +2184,19 @@ fn buildCapabilitiesProbe(allocator: std.mem.Allocator) !void {
 
 test "buildCapabilities survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, buildCapabilitiesProbe, .{});
+}
+
+fn cloneDetailsProbe(allocator: std.mem.Allocator) !void {
+    const entries = [_]oap_types.DetailEntry{
+        .{ .key = "reason", .value = "stale_capabilities" },
+        .{ .key = "control", .value = "unadvertised" },
+    };
+    const cloned = try cloneDetails(allocator, &entries);
+    freeDetails(allocator, cloned);
+}
+
+test "cloneDetails survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneDetailsProbe, .{});
 }
 
 test "a syntactically invalid model selection is refused before admission" {
