@@ -3,6 +3,7 @@ const compat = @import("compat");
 const tool_types = @import("tool_types");
 const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const jf = @import("json_field");
 
 pub const protocol_types = tool_types;
 
@@ -249,18 +250,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const type_str = root.get("type").?.string;
-    const server_id = try parseUlidRequired(root.get("server_id").?.string);
-    const message_id = try parseUlidRequired(root.get("message_id").?.string);
-    const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
-    const timestamp = root.get("timestamp").?.integer;
-    const version = @as(u8, @intCast(root.get("version").?.integer));
+    const root = try jf.asObject(parsed.value);
+    const type_str = try jf.requireString(root, "type");
+    const server_id = try parseUlidRequired(try jf.requireString(root, "server_id"));
+    const message_id = try parseUlidRequired(try jf.requireString(root, "message_id"));
+    const sequence = try jf.requireUnsigned(u64, root, "sequence");
+    const timestamp = try jf.requireInteger(root, "timestamp");
+    const version = try jf.unsignedOr(u8, root, "version", 1);
 
     var in_reply_to: ?tool_types.Ulid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
+    if (try jf.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
 
-    const payload_obj = root.get("payload").?.object;
+    const payload_obj = try jf.requireObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -366,73 +367,73 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
     if (std.mem.eql(u8, type_str, "tool_register")) {
-        const tool = try deserializeToolMetadata(payload.get("tool").?.object, allocator);
+        const tool = try deserializeToolMetadata(try jf.requireObject(payload, "tool"), allocator);
         var req = tool_types.ToolRegisterRequest{ .tool = tool };
-        if (payload.get("callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_register = req };
     }
     if (std.mem.eql(u8, type_str, "tool_registered")) {
         return .{ .tool_registered = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
-            .registered_at = payload.get("registered_at").?.integer,
+            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
+            .registered_at = try jf.requireInteger(payload, "registered_at"),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregister")) {
         return .{ .tool_unregister = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
+            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregistered")) {
         return .{ .tool_unregistered = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
+            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = tool_types.ToolListRequest{};
-        if (payload.get("prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("supports_streaming")) |v| req.supports_streaming = v.bool;
+        if (try jf.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try jf.optionalBool(payload, "supports_streaming")) |v| req.supports_streaming = v;
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = payload.get("tools").?.array;
+        const tools_arr = try jf.requireArray(payload, "tools");
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
         for (tools_arr.items, 0..) |t, i| {
-            tools[i] = try deserializeToolMetadata(t.object, allocator);
+            tools[i] = try deserializeToolMetadata(try jf.elementAsObject(t), allocator);
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
-        const args_json = try allocator.dupe(u8, payload.get("args_json").?.string);
+        const args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json"));
         errdefer allocator.free(args_json);
         try validateJson(args_json, allocator);
 
         var req = tool_types.ToolExecuteRequest{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
             .args_json = args_json,
         };
-        if (payload.get("timeout_ms")) |v| req.timeout_ms = @as(u32, @intCast(v.integer));
-        if (payload.get("stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalInteger(payload, "timeout_ms")) |v| req.timeout_ms = @as(u32, @intCast(v));
+        if (try jf.optionalString(payload, "stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_stream")) {
         var update = tool_types.ToolStreamUpdate{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .partial_result_json = try allocator.dupe(u8, payload.get("partial_result_json").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .partial_result_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_result_json")),
         };
-        if (payload.get("progress")) |v| update.progress = @as(u8, @intCast(v.integer));
-        if (payload.get("status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalInteger(payload, "progress")) |v| update.progress = @as(u8, @intCast(v));
+        if (try jf.optionalString(payload, "status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_stream = update };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
         var result = tool_types.ToolExecuteResult{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .result_json = try allocator.dupe(u8, payload.get("result_json").?.string),
-            .is_error = if (payload.get("is_error")) |v| v.bool else false,
-            .duration_ms = @as(u32, @intCast(payload.get("duration_ms").?.integer)),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json")),
+            .is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false,
+            .duration_ms = try jf.requireUnsigned(u32, payload, "duration_ms"),
         };
         errdefer {
             allocator.free(result.tool_call_id);
@@ -441,42 +442,42 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             result.details_json.deinit(allocator);
             result.artifacts.deinit(allocator);
         }
-        if (payload.get("error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try jf.optionalString(payload, "details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try parseJsonArray(v), allocator));
         return .{ .tool_result = result };
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
         var req = tool_types.ToolCancelRequest{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
         };
-        if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_cancel = req };
     }
     if (std.mem.eql(u8, type_str, "tool_cancelled")) {
         return .{ .tool_cancelled = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_error")) {
         return .{ .tool_error = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .code = std.meta.stringToEnum(tool_types.ToolErrorCode, payload.get("code").?.string) orelse return error.InvalidPayloadType,
-            .message = try allocator.dupe(u8, payload.get("message").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .code = std.meta.stringToEnum(tool_types.ToolErrorCode, try jf.requireString(payload, "code")) orelse return error.InvalidPayloadType,
+            .message = try allocator.dupe(u8, try jf.requireString(payload, "message")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status")) {
         return .{ .tool_status = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status_response")) {
         return .{ .tool_status_response = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
-            .status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, payload.get("status").?.string) orelse return error.InvalidPayloadType,
-            .started_at = payload.get("started_at").?.integer,
-            .completed_at = if (payload.get("completed_at")) |v| v.integer else null,
+            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
+            .status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, try jf.requireString(payload, "status")) orelse return error.InvalidPayloadType,
+            .started_at = try jf.requireInteger(payload, "started_at"),
+            .completed_at = if (try jf.optionalInteger(payload, "completed_at")) |v| v else null,
         } };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieve")) {
@@ -611,12 +612,12 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
     if (std.mem.eql(u8, type_str, "pong")) {
         return .{ .pong = .{
-            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("ping_id").?.string)),
+            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "ping_id"))),
         } };
     }
     if (std.mem.eql(u8, type_str, "goodbye")) {
         var goodbye = tool_types.Goodbye{};
-        if (payload.get("reason")) |v| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "reason")) |v| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .goodbye = goodbye };
     }
 
@@ -625,23 +626,23 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
     var required_permissions: ?[]const []const u8 = null;
-    if (obj.get("required_permissions")) |permissions_value| {
-        const permissions_arr = permissions_value.array;
+    if (try jf.optionalArray(obj, "required_permissions")) |permissions_value| {
+        const permissions_arr = permissions_value;
         const permissions = try allocator.alloc([]const u8, permissions_arr.items.len);
         for (permissions_arr.items, 0..) |permission, i| {
-            permissions[i] = try allocator.dupe(u8, permission.string);
+            permissions[i] = try allocator.dupe(u8, try jf.elementAsString(permission));
         }
         required_permissions = permissions;
     }
 
     return .{
-        .name = try allocator.dupe(u8, obj.get("name").?.string),
-        .description = try allocator.dupe(u8, obj.get("description").?.string),
-        .parameters_schema_json = try allocator.dupe(u8, obj.get("parameters_schema_json").?.string),
-        .version = if (obj.get("version")) |v| try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "1.0.0"),
-        .supports_streaming = if (obj.get("supports_streaming")) |v| v.bool else false,
-        .estimated_duration_ms = if (obj.get("estimated_duration_ms")) |v| @as(u32, @intCast(v.integer)) else null,
-        .is_destructive = if (obj.get("is_destructive")) |v| v.bool else false,
+        .name = try allocator.dupe(u8, try jf.requireString(obj, "name")),
+        .description = try allocator.dupe(u8, try jf.requireString(obj, "description")),
+        .parameters_schema_json = try allocator.dupe(u8, try jf.requireString(obj, "parameters_schema_json")),
+        .version = if (try jf.optionalString(obj, "version")) |v| try allocator.dupe(u8, v) else try allocator.dupe(u8, "1.0.0"),
+        .supports_streaming = if (try jf.optionalBool(obj, "supports_streaming")) |v| v else false,
+        .estimated_duration_ms = if (try jf.optionalInteger(obj, "estimated_duration_ms")) |v| @as(u32, @intCast(v)) else null,
+        .is_destructive = try jf.boolOr(obj, "is_destructive", false),
         .required_permissions = required_permissions,
     };
 }

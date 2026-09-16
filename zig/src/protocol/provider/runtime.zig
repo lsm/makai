@@ -5,6 +5,17 @@ const protocol_client = @import("protocol_client");
 const envelope = @import("protocol_envelope");
 const in_process = @import("transports/in_process");
 
+fn undecodableReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InputTooLong => "input field exceeds maximum allowed length",
+        error.MissingField => "envelope is missing a required field",
+        error.InvalidFieldType => "envelope field has the wrong JSON type",
+        error.FieldOutOfRange => "envelope field is outside its allowed range",
+        error.InvalidUlid => "envelope id is not a valid ULID",
+        else => "envelope could not be decoded",
+    };
+}
+
 const ProtocolServer = protocol_server.ProtocolServer;
 const ProtocolClient = protocol_client.ProtocolClient;
 const protocol_types = envelope.protocol_types;
@@ -173,9 +184,7 @@ pub const ProviderProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                if (err == error.InputTooLong) {
-                    self.sendNackForOversizedInput(line) catch {};
-                }
+                self.sendNackForUndecodableInput(line, undecodableReason(err)) catch {};
                 continue;
             };
             defer env.deinit(self.allocator);
@@ -194,10 +203,11 @@ pub const ProviderProtocolRuntime = struct {
         }
     }
 
-    fn sendNackForOversizedInput(self: *Self, raw_json: []const u8) !void {
+    fn sendNackForUndecodableInput(self: *Self, raw_json: []const u8, reason: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
         defer parsed.deinit();
 
+        if (parsed.value != .object) return;
         const obj = parsed.value.object;
 
         const stream_id_str = obj.get("stream_id") orelse return;
@@ -218,7 +228,7 @@ pub const ProviderProtocolRuntime = struct {
 
         const nack = try envelope.createNack(
             dummy_envelope,
-            "input field exceeds maximum allowed length",
+            reason,
             .invalid_request,
             self.allocator,
         );

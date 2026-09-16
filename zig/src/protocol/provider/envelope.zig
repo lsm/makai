@@ -4,6 +4,7 @@ pub const protocol_types = @import("protocol_types");
 const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
 const transport = @import("transport");
+const jf = @import("json_field");
 
 const OpenAICompatMaxTokensField = @TypeOf((ai_types.OpenAICompatOptions{}).max_tokens_field);
 const OpenAICompatThinkingFormat = @TypeOf((ai_types.OpenAICompatOptions{}).thinking_format);
@@ -515,7 +516,7 @@ fn serializeEventPayload(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, event_json, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try jf.asObject(parsed.value);
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "type")) continue;
@@ -535,7 +536,7 @@ fn serializeResultPayload(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try jf.asObject(parsed.value);
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         try w.writeKey(entry.key_ptr.*);
@@ -633,31 +634,28 @@ pub fn deserializeEnvelope(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = try jf.asObject(parsed.value);
 
-    const version: u8 = if (obj.get("version")) |v|
-        @intCast(v.integer)
-    else
-        1;
+    const version: u8 = try jf.unsignedOr(u8, obj, "version", 1);
 
-    const stream_id_str = obj.get("stream_id").?.string;
+    const stream_id_str = try jf.requireString(obj, "stream_id");
     const stream_id = protocol_types.parseUlid(stream_id_str) orelse return error.InvalidUlid;
 
-    const message_id_str = obj.get("message_id").?.string;
+    const message_id_str = try jf.requireString(obj, "message_id");
     const message_id = protocol_types.parseUlid(message_id_str) orelse return error.InvalidUlid;
 
-    const sequence: u64 = @intCast(obj.get("sequence").?.integer);
+    const sequence: u64 = try jf.requireUnsigned(u64, obj, "sequence");
 
-    const timestamp: i64 = obj.get("timestamp").?.integer;
+    const timestamp: i64 = try jf.requireInteger(obj, "timestamp");
 
     var in_reply_to: ?protocol_types.Ulid = null;
-    if (obj.get("in_reply_to")) |reply_val| {
-        in_reply_to = protocol_types.parseUlid(reply_val.string) orelse return error.InvalidUlid;
+    if (try jf.optionalString(obj, "in_reply_to")) |reply_val| {
+        in_reply_to = protocol_types.parseUlid(reply_val) orelse return error.InvalidUlid;
     }
 
-    const type_str = obj.get("type").?.string;
+    const type_str = try jf.requireString(obj, "type");
 
-    const payload_obj = obj.get("payload").?.object;
+    const payload_obj = try jf.requireObject(obj, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return protocol_types.Envelope{
@@ -783,19 +781,19 @@ fn deserializeModel(
         .api = api,
         .provider = provider,
         .base_url = base_url,
-        .reasoning = if (obj.get("reasoning")) |value| try valueAsBool(value) else false,
+        .reasoning = try jf.boolOr(obj, "reasoning", false),
         .input = input,
-        .cost = if (obj.get("cost")) |value| blk: {
-            if (value != .object) return error.InvalidUserContent;
-            break :blk try deserializeCost(value.object);
-        } else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .cost = if (try userObjectField(obj, "cost")) |value|
+            try deserializeCost(value)
+        else
+            .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = try optionalU32(obj, "context_window", 0),
         .max_tokens = try optionalU32(obj, "max_tokens", 0),
         .headers = headers,
-        .compat = if (obj.get("compat")) |value| blk: {
-            if (value != .object) return error.InvalidUserContent;
-            break :blk try deserializeOpenAICompatOptions(value.object);
-        } else null,
+        .compat = if (try userObjectField(obj, "compat")) |value|
+            try deserializeOpenAICompatOptions(value)
+        else
+            null,
         .is_owned = true,
     };
 }
@@ -806,7 +804,7 @@ fn dupeValidatedString(
     field: []const u8,
     max_len: usize,
 ) ![]u8 {
-    const value = obj.get(field).?.string;
+    const value = try jf.requireString(obj, field);
     try validateLength(value, max_len);
     return try allocator.dupe(u8, value);
 }
@@ -827,8 +825,8 @@ fn deserializeInputModalities(
 
     for (input_arr.items, 0..) |item, idx| {
         if (item != .string) return error.InvalidUserContent;
-        try validateLength(item.string, MAX_IDENTIFIER_LENGTH);
-        input[idx] = try allocator.dupe(u8, item.string);
+        try validateLength(try jf.elementAsString(item), MAX_IDENTIFIER_LENGTH);
+        input[idx] = try allocator.dupe(u8, try jf.elementAsString(item));
         initialized += 1;
     }
 
@@ -853,7 +851,7 @@ fn deserializeHeaderPairs(
 
     for (array.items, 0..) |item, idx| {
         if (item != .object) return error.InvalidUserContent;
-        const header_obj = item.object;
+        const header_obj = try jf.elementAsObject(item);
         const name_field = header_obj.get("name") orelse return error.InvalidUserContent;
         if (name_field != .string) return error.InvalidUserContent;
         const name_value = name_field.string;
@@ -920,6 +918,10 @@ fn valueAsU64(value: std.json.Value) !u64 {
     };
 }
 
+fn userObjectField(obj: std.json.ObjectMap, field: []const u8) error{InvalidUserContent}!?std.json.ObjectMap {
+    return jf.optionalObject(obj, field) catch error.InvalidUserContent;
+}
+
 fn valueAsBool(value: std.json.Value) !bool {
     return switch (value) {
         .bool => |b| b,
@@ -948,17 +950,15 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
         .supports_developer_role = try optionalBool(obj, "supports_developer_role"),
         .supports_reasoning_effort = try optionalBool(obj, "supports_reasoning_effort"),
         .supports_usage_in_streaming = try optionalBool(obj, "supports_usage_in_streaming"),
-        .max_tokens_field = if (obj.get("max_tokens_field")) |value| blk: {
-            if (value != .string) return error.InvalidUserContent;
-            break :blk try parseMaxTokensField(value.string);
+        .max_tokens_field = if (try jf.optionalString(obj, "max_tokens_field")) |value| blk: {
+            break :blk try parseMaxTokensField(value);
         } else .max_completion_tokens,
         .requires_tool_result_name = try optionalBool(obj, "requires_tool_result_name"),
         .requires_assistant_after_tool_result = try optionalBool(obj, "requires_assistant_after_tool_result"),
         .requires_thinking_as_text = try optionalBool(obj, "requires_thinking_as_text"),
         .requires_mistral_tool_ids = try optionalBool(obj, "requires_mistral_tool_ids"),
-        .thinking_format = if (obj.get("thinking_format")) |value| blk: {
-            if (value != .string) return error.InvalidUserContent;
-            break :blk try parseThinkingFormat(value.string);
+        .thinking_format = if (try jf.optionalString(obj, "thinking_format")) |value| blk: {
+            break :blk try parseThinkingFormat(value);
         } else .openai,
         .supports_strict_mode = try optionalBool(obj, "supports_strict_mode"),
         .supports_anthropic_cache_ttl = try optionalBool(obj, "supports_anthropic_cache_ttl"),
@@ -982,15 +982,15 @@ fn deserializeStreamRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamRequest {
-    const model_obj = obj.get("model").?.object;
+    const model_obj = try jf.requireObject(obj, "model");
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
         var mutable_model = model;
         mutable_model.deinit(allocator);
     }
 
-    const context = if (obj.get("context")) |ctx_val|
-        try deserializeContext(ctx_val.object, allocator)
+    const context = if (try jf.optionalObject(obj, "context")) |ctx_val|
+        try deserializeContext(ctx_val, allocator)
     else
         ai_types.Context{ .messages = &.{} };
     errdefer {
@@ -998,13 +998,13 @@ fn deserializeStreamRequest(
         mutable_context.deinit(allocator);
     }
 
-    const include_partial = if (obj.get("include_partial")) |ip|
-        ip.bool
+    const include_partial = if (try jf.optionalBool(obj, "include_partial")) |ip|
+        ip
     else
         false;
 
-    const options = if (obj.get("options")) |opts_val|
-        try deserializeStreamOptions(opts_val.object, allocator)
+    const options = if (try jf.optionalObject(obj, "options")) |opts_val|
+        try deserializeStreamOptions(opts_val, allocator)
     else
         null;
     errdefer if (options) |opts| {
@@ -1024,15 +1024,15 @@ fn deserializeCompleteRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.CompleteRequest {
-    const model_obj = obj.get("model").?.object;
+    const model_obj = try jf.requireObject(obj, "model");
     const model = try deserializeModel(model_obj, allocator);
     errdefer {
         var mutable_model = model;
         mutable_model.deinit(allocator);
     }
 
-    const context = if (obj.get("context")) |ctx_val|
-        try deserializeContext(ctx_val.object, allocator)
+    const context = if (try jf.optionalObject(obj, "context")) |ctx_val|
+        try deserializeContext(ctx_val, allocator)
     else
         ai_types.Context{ .messages = &.{} };
     errdefer {
@@ -1040,8 +1040,8 @@ fn deserializeCompleteRequest(
         mutable_context.deinit(allocator);
     }
 
-    const options = if (obj.get("options")) |opts_val|
-        try deserializeStreamOptions(opts_val.object, allocator)
+    const options = if (try jf.optionalObject(obj, "options")) |opts_val|
+        try deserializeStreamOptions(opts_val, allocator)
     else
         null;
     errdefer if (options) |opts| {
@@ -1060,11 +1060,11 @@ fn deserializeAbortRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.AbortRequest {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try jf.requireString(obj, "target_stream_id");
     const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
-    const reason = if (obj.get("reason")) |r|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
+    const reason = if (try jf.optionalString(obj, "reason")) |r|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1078,17 +1078,17 @@ fn deserializeModelsRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsRequest {
-    const provider_id = if (obj.get("provider_id")) |value| blk: {
-        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
-        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+    const provider_id = if (try jf.optionalString(obj, "provider_id")) |value| blk: {
+        try validateLength(value, MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
     } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = if (obj.get("api")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const api = if (try jf.optionalString(obj, "api")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -1096,23 +1096,20 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const model_id = if (obj.get("model_id")) |value| blk: {
-        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
-        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+    const model_id = if (try jf.optionalString(obj, "model_id")) |value| blk: {
+        try validateLength(value, MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
     } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const include_deprecated = if (obj.get("include_deprecated")) |value|
-        value.bool
+    const include_deprecated = if (try jf.optionalBool(obj, "include_deprecated")) |value|
+        value
     else
         false;
-    const include_login_required = if (obj.get("include_login_required")) |value|
-        value.bool
-    else
-        true;
+    const include_login_required = try jf.boolOr(obj, "include_login_required", true);
 
     return .{
         .provider_id = provider_id,
@@ -1127,9 +1124,9 @@ fn deserializeModelsResponse(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsResponse {
-    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
+    const fetched_at_ms = try jf.requireInteger(obj, "fetched_at_ms");
     const cache_max_age_ms = try valueAsU64(obj.get("cache_max_age_ms").?);
-    const models_array = obj.get("models").?.array;
+    const models_array = try jf.requireArray(obj, "models");
 
     const models = try allocator.alloc(protocol_types.ModelDescriptor, models_array.items.len);
     var allocated_count: usize = 0;
@@ -1139,7 +1136,7 @@ fn deserializeModelsResponse(
     }
 
     for (models_array.items, 0..) |item, idx| {
-        models[idx] = try deserializeModelDescriptor(item.object, allocator);
+        models[idx] = try deserializeModelDescriptor(try jf.elementAsObject(item), allocator);
         allocated_count += 1;
     }
 
@@ -1154,38 +1151,38 @@ fn deserializeModelDescriptor(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelDescriptor {
-    const model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    const model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_ref")));
     errdefer {
         var mutable = model_ref;
         mutable.deinit(allocator);
     }
 
-    const model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    const model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_id")));
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    const display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "display_name")));
     errdefer {
         var mutable = display_name;
         mutable.deinit(allocator);
     }
 
-    const provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    const provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "provider_id")));
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    const api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "api")));
     errdefer {
         var mutable = api;
         mutable.deinit(allocator);
     }
 
-    const base_url = if (obj.get("base_url")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const base_url = if (try jf.optionalString(obj, "base_url")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -1193,16 +1190,16 @@ fn deserializeModelDescriptor(
         mutable.deinit(allocator);
     }
 
-    const capabilities_array = obj.get("capabilities").?.array;
+    const capabilities_array = try jf.requireArray(obj, "capabilities");
     const capabilities = try allocator.alloc(protocol_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = try parseModelCapability(item.string);
+        capabilities[idx] = try parseModelCapability(try jf.elementAsString(item));
     }
 
     var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
-    if (obj.get("metadata")) |metadata_value| {
-        const metadata_obj = metadata_value.object;
+    if (try jf.optionalObject(obj, "metadata")) |metadata_value| {
+        const metadata_obj = metadata_value;
         const metadata_items = try allocator.alloc(protocol_types.MetadataEntry, metadata_obj.count());
         var metadata_count: usize = 0;
         errdefer {
@@ -1214,7 +1211,7 @@ fn deserializeModelDescriptor(
         while (iter.next()) |entry| {
             metadata_items[metadata_count] = .{
                 .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.elementAsString(entry.value_ptr.*))),
             };
             metadata_count += 1;
         }
@@ -1229,19 +1226,19 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
-        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
+        .auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status")),
+        .lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle")),
         .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(obj.get("source").?.string),
-        .context_window = if (obj.get("context_window")) |value| try valueAsU32(value) else null,
-        .max_output_tokens = if (obj.get("max_output_tokens")) |value| try valueAsU32(value) else null,
-        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
+        .source = try parseModelSource(try jf.requireString(obj, "source")),
+        .context_window = try jf.optionalUnsigned(u32, obj, "context_window"),
+        .max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens"),
+        .reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null,
         .metadata = metadata,
     };
 }
 
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
-    const acknowledged_id_str = obj.get("acknowledged_id").?.string;
+    const acknowledged_id_str = try jf.requireString(obj, "acknowledged_id");
     const acknowledged_id = protocol_types.parseUlid(acknowledged_id_str) orelse return error.InvalidUlid;
 
     return .{
@@ -1253,23 +1250,23 @@ fn deserializeNack(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Nack {
-    const rejected_id_str = obj.get("rejected_id").?.string;
+    const rejected_id_str = try jf.requireString(obj, "rejected_id");
     const rejected_id = protocol_types.parseUlid(rejected_id_str) orelse return error.InvalidUlid;
 
-    const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("reason").?.string));
+    const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "reason")));
     errdefer {
         var mutable_reason = reason;
         mutable_reason.deinit(allocator);
     }
 
-    const error_code = if (obj.get("error_code")) |code_val|
-        parseErrorCode(code_val.string)
+    const error_code = if (try jf.optionalString(obj, "error_code")) |code_val|
+        parseErrorCode(code_val)
     else
         null;
 
     var supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initBorrowed(&.{});
-    if (obj.get("supported_versions")) |versions_val| {
-        const versions_arr = versions_val.array;
+    if (try jf.optionalArray(obj, "supported_versions")) |versions_val| {
+        const versions_arr = versions_val;
         const versions = try allocator.alloc(protocol_types.OwnedSlice(u8), versions_arr.items.len);
         var allocated_count: usize = 0;
         errdefer {
@@ -1277,7 +1274,7 @@ fn deserializeNack(
             allocator.free(versions);
         }
         for (versions_arr.items, 0..) |item, i| {
-            versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, item.string));
+            versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.elementAsString(item)));
             allocated_count += 1;
         }
         supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initOwned(versions);
@@ -1295,10 +1292,10 @@ fn deserializeStreamError(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamError {
-    const code_str = obj.get("code").?.string;
+    const code_str = try jf.requireString(obj, "code");
     const code = parseErrorCode(code_str);
 
-    const message = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("message").?.string));
+    const message = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "message")));
 
     return .{
         .code = code,
@@ -1310,7 +1307,7 @@ fn deserializePong(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Pong {
-    const ping_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("ping_id").?.string));
+    const ping_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "ping_id")));
     return .{ .ping_id = ping_id };
 }
 
@@ -1318,8 +1315,8 @@ fn deserializeGoodbye(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Goodbye {
-    const reason = if (obj.get("reason")) |r|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
+    const reason = if (try jf.optionalString(obj, "reason")) |r|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r))
     else
         protocol_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1327,7 +1324,7 @@ fn deserializeGoodbye(
 }
 
 fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try jf.requireString(obj, "target_stream_id");
     const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     return .{ .target_stream_id = target_id };
@@ -1337,11 +1334,11 @@ fn deserializeSync(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Sync {
-    const target_str = obj.get("target_stream_id").?.string;
+    const target_str = try jf.requireString(obj, "target_stream_id");
     const target_stream_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
-    const partial = if (obj.get("partial")) |p|
-        try transport.parseAssistantMessage(p.object, allocator)
+    const partial = if (try jf.optionalObject(obj, "partial")) |p|
+        try transport.parseAssistantMessage(p, allocator)
     else
         null;
 
@@ -1420,14 +1417,14 @@ fn deserializeContext(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Context {
-    var system_prompt = if (obj.get("system_prompt")) |sp|
-        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp.string))
+    var system_prompt = if (try jf.optionalString(obj, "system_prompt")) |sp|
+        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp))
     else
         ai_types.OwnedSlice(u8).initBorrowed("");
     errdefer system_prompt.deinit(allocator);
 
-    const messages_arr = if (obj.get("messages")) |msgs_val|
-        msgs_val.array
+    const messages_arr = if (try jf.optionalArray(obj, "messages")) |msgs_val|
+        msgs_val
     else {
         const empty_messages = try allocator.alloc(ai_types.Message, 0);
         return ai_types.Context{
@@ -1441,15 +1438,15 @@ fn deserializeContext(
     errdefer allocator.free(messages);
 
     for (messages_arr.items, 0..) |item, i| {
-        messages[i] = try deserializeMessage(item.object, allocator);
+        messages[i] = try deserializeMessage(try jf.elementAsObject(item), allocator);
     }
 
     var tools: ?[]ai_types.Tool = null;
-    if (obj.get("tools")) |tools_val| {
-        const tools_arr = tools_val.array;
+    if (try jf.optionalArray(obj, "tools")) |tools_val| {
+        const tools_arr = tools_val;
         tools = try allocator.alloc(ai_types.Tool, tools_arr.items.len);
         for (tools_arr.items, 0..) |item, i| {
-            tools.?[i] = try deserializeTool(item.object, allocator);
+            tools.?[i] = try deserializeTool(try jf.elementAsObject(item), allocator);
         }
     }
 
@@ -1465,10 +1462,10 @@ fn deserializeMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Message {
-    const role = obj.get("role").?.string;
+    const role = try jf.requireString(obj, "role");
 
     if (std.mem.eql(u8, role, "user")) {
-        const timestamp: i64 = if (obj.get("timestamp")) |ts| ts.integer else 0;
+        const timestamp: i64 = if (try jf.optionalInteger(obj, "timestamp")) |ts| ts else 0;
         const content = try deserializeUserContent(obj.get("content").?, allocator);
 
         return .{ .user = .{
@@ -1482,19 +1479,19 @@ fn deserializeMessage(
     }
 
     if (std.mem.eql(u8, role, "tool")) {
-        const tool_call_id = try allocator.dupe(u8, obj.get("tool_call_id").?.string);
-        const tool_name = try allocator.dupe(u8, obj.get("tool_name").?.string);
-        const timestamp: i64 = if (obj.get("timestamp")) |ts| ts.integer else 0;
-        const is_error = if (obj.get("is_error")) |ie| ie.bool else false;
+        const tool_call_id = try allocator.dupe(u8, try jf.requireString(obj, "tool_call_id"));
+        const tool_name = try allocator.dupe(u8, try jf.requireString(obj, "tool_name"));
+        const timestamp: i64 = if (try jf.optionalInteger(obj, "timestamp")) |ts| ts else 0;
+        const is_error = if (try jf.optionalBool(obj, "is_error")) |ie| ie else false;
 
-        const content_arr = if (obj.get("content")) |c| c.array else return error.MissingContent;
+        const content_arr = if (try jf.optionalArray(obj, "content")) |c| c else return error.MissingContent;
         const content = try allocator.alloc(ai_types.UserContentPart, content_arr.items.len);
         for (content_arr.items, 0..) |item, i| {
-            content[i] = try deserializeUserContentPart(item.object, allocator);
+            content[i] = try deserializeUserContentPart(try jf.elementAsObject(item), allocator);
         }
 
-        const details_json = if (obj.get("details_json")) |dj|
-            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj.string))
+        const details_json = if (try jf.optionalString(obj, "details_json")) |dj|
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj))
         else
             ai_types.OwnedSlice(u8).initBorrowed("");
 
@@ -1520,7 +1517,7 @@ fn deserializeUserContent(
         .array => |arr| {
             const parts = try allocator.alloc(ai_types.UserContentPart, arr.items.len);
             for (arr.items, 0..) |item, i| {
-                parts[i] = try deserializeUserContentPart(item.object, allocator);
+                parts[i] = try deserializeUserContentPart(try jf.elementAsObject(item), allocator);
             }
             return .{ .parts = parts };
         },
@@ -1532,20 +1529,20 @@ fn deserializeUserContentPart(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.UserContentPart {
-    const type_str = obj.get("type").?.string;
+    const type_str = try jf.requireString(obj, "type");
 
     if (std.mem.eql(u8, type_str, "text")) {
-        const text = try allocator.dupe(u8, obj.get("text").?.string);
-        const text_signature = if (obj.get("text_signature")) |sig|
-            try allocator.dupe(u8, sig.string)
+        const text = try allocator.dupe(u8, try jf.requireString(obj, "text"));
+        const text_signature = if (try jf.optionalString(obj, "text_signature")) |sig|
+            try allocator.dupe(u8, sig)
         else
             null;
         return .{ .text = .{ .text = text, .text_signature = text_signature } };
     }
 
     if (std.mem.eql(u8, type_str, "image")) {
-        const data = try allocator.dupe(u8, obj.get("data").?.string);
-        const mime_type = try allocator.dupe(u8, obj.get("mime_type").?.string);
+        const data = try allocator.dupe(u8, try jf.requireString(obj, "data"));
+        const mime_type = try allocator.dupe(u8, try jf.requireString(obj, "mime_type"));
         return .{ .image = .{ .data = data, .mime_type = mime_type } };
     }
 
@@ -1556,8 +1553,8 @@ fn deserializeTool(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Tool {
-    const name = try allocator.dupe(u8, obj.get("name").?.string);
-    const description = try allocator.dupe(u8, obj.get("description").?.string);
+    const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
+    const description = try allocator.dupe(u8, try jf.requireString(obj, "description"));
 
     const schema_json = if (obj.get("parameters_schema_json")) |schema| switch (schema) {
         .string => |s| try allocator.dupe(u8, s),
@@ -1584,8 +1581,8 @@ fn deserializeStreamOptions(
     var opts: ai_types.StreamOptions = .{};
     errdefer opts.deinit(allocator);
 
-    if (obj.get("api_key")) |key| {
-        opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key.string));
+    if (try jf.optionalString(obj, "api_key")) |key| {
+        opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key));
     }
     if (obj.get("temperature")) |temp| {
         opts.temperature = switch (temp) {
@@ -1597,46 +1594,46 @@ fn deserializeStreamOptions(
     if (obj.get("max_tokens")) |max| {
         opts.max_tokens = try valueAsU32(max);
     }
-    if (obj.get("cache_retention")) |ret| {
-        opts.cache_retention = parseCacheRetention(ret.string);
+    if (try jf.optionalString(obj, "cache_retention")) |ret| {
+        opts.cache_retention = parseCacheRetention(ret);
     }
-    if (obj.get("session_id")) |sid| {
-        opts.session_id = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sid.string));
+    if (try jf.optionalString(obj, "session_id")) |sid| {
+        opts.session_id = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sid));
     }
-    if (obj.get("thinking_enabled")) |te| {
-        opts.thinking_enabled = te.bool;
+    if (try jf.optionalBool(obj, "thinking_enabled")) |te| {
+        opts.thinking_enabled = te;
     }
     if (obj.get("thinking_budget_tokens")) |tbt| {
         opts.thinking_budget_tokens = try valueAsU32(tbt);
     }
-    if (obj.get("thinking_effort")) |effort| {
-        opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
+    if (try jf.optionalString(obj, "thinking_effort")) |effort| {
+        opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort));
     }
-    if (obj.get("reasoning_effort")) |effort| {
-        opts.reasoning_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
+    if (try jf.optionalString(obj, "reasoning_effort")) |effort| {
+        opts.reasoning_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort));
     }
-    if (obj.get("reasoning_summary")) |summary| {
-        opts.reasoning_summary = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, summary.string));
+    if (try jf.optionalString(obj, "reasoning_summary")) |summary| {
+        opts.reasoning_summary = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, summary));
     }
-    if (obj.get("include_reasoning_encrypted")) |ire| {
-        opts.include_reasoning_encrypted = ire.bool;
+    if (try jf.optionalBool(obj, "include_reasoning_encrypted")) |ire| {
+        opts.include_reasoning_encrypted = ire;
     }
-    if (obj.get("reasoning_enabled")) |re| {
-        opts.reasoning_enabled = re.bool;
+    if (try jf.optionalBool(obj, "reasoning_enabled")) |re| {
+        opts.reasoning_enabled = re;
     }
-    if (obj.get("service_tier")) |tier| {
-        opts.service_tier = parseServiceTier(tier.string);
+    if (try jf.optionalString(obj, "service_tier")) |tier| {
+        opts.service_tier = parseServiceTier(tier);
     }
-    if (obj.get("metadata")) |meta| {
+    if (try jf.optionalObject(obj, "metadata")) |meta| {
         opts.metadata = .{
-            .user_id = if (meta.object.get("user_id")) |uid|
-                ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, uid.string))
+            .user_id = if (try jf.optionalString(meta, "user_id")) |uid|
+                ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, uid))
             else
                 ai_types.OwnedSlice(u8).initBorrowed(""),
         };
     }
-    if (obj.get("tool_choice")) |choice| {
-        const choice_type = choice.object.get("type").?.string;
+    if (try jf.optionalObject(obj, "tool_choice")) |choice| {
+        const choice_type = try jf.requireString(choice, "type");
         if (std.mem.eql(u8, choice_type, "auto")) {
             opts.tool_choice = .auto;
         } else if (std.mem.eql(u8, choice_type, "none")) {
@@ -1644,7 +1641,7 @@ fn deserializeStreamOptions(
         } else if (std.mem.eql(u8, choice_type, "required")) {
             opts.tool_choice = .required;
         } else if (std.mem.eql(u8, choice_type, "function")) {
-            const function_name = try allocator.dupe(u8, choice.object.get("function").?.string);
+            const function_name = try allocator.dupe(u8, try jf.requireString(choice, "function"));
             opts.tool_choice = .{ .function = function_name };
             opts.owned_tool_choice_function = ai_types.OwnedSlice(u8).initOwned(function_name);
         }

@@ -4,6 +4,7 @@ const agent_types = @import("agent_types");
 const json_writer = @import("json_writer");
 const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const jf = @import("json_field");
 
 pub const protocol_types = agent_types;
 
@@ -223,18 +224,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const type_str = root.get("type").?.string;
-    const session_id = parseSessionIdOrError(root.get("session_id").?.string) orelse return error.InvalidSessionId;
-    const message_id = try parseUlidRequired(root.get("message_id").?.string);
-    const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
-    const timestamp = root.get("timestamp").?.integer;
-    const version = @as(u8, @intCast(root.get("version").?.integer));
+    const root = try jf.asObject(parsed.value);
+    const type_str = try jf.requireString(root, "type");
+    const session_id = parseSessionIdOrError(try jf.requireString(root, "session_id")) orelse return error.InvalidSessionId;
+    const message_id = try parseUlidRequired(try jf.requireString(root, "message_id"));
+    const sequence = try jf.requireUnsigned(u64, root, "sequence");
+    const timestamp = try jf.requireInteger(root, "timestamp");
+    const version = try jf.unsignedOr(u8, root, "version", 1);
 
     var in_reply_to: ?agent_types.Ulid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
+    if (try jf.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
 
-    const payload_obj = root.get("payload").?.object;
+    const payload_obj = try jf.requireObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -262,115 +263,115 @@ fn parseSessionIdOrError(str: []const u8) ?agent_types.SessionId {
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
     if (std.mem.eql(u8, type_str, "agent_start")) {
-        const config = try allocator.dupe(u8, payload.get("config_json").?.string);
+        const config = try allocator.dupe(u8, try jf.requireString(payload, "config_json"));
         var result = agent_types.AgentStartRequest{ .config_json = config };
-        if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("session_id")) |v| {
-            result.session_id = try parseSessionIdRequired(v.string);
-        } else if (payload.get("resume_session_id")) |v| {
-            result.session_id = try parseSessionIdRequired(v.string);
+        if (try jf.optionalString(payload, "system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try jf.optionalString(payload, "session_id")) |v| {
+            result.session_id = try parseSessionIdRequired(v);
+        } else if (try jf.optionalString(payload, "resume_session_id")) |v| {
+            result.session_id = try parseSessionIdRequired(v);
         }
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
-        const msg = try allocator.dupe(u8, payload.get("message_json").?.string);
+        const msg = try allocator.dupe(u8, try jf.requireString(payload, "message_json"));
         var req = agent_types.AgentMessageRequest{
-            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
+            .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")),
             .message_json = msg,
         };
-        if (payload.get("options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_message = req };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
-        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
-        if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) };
+        if (try jf.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_stop = req };
     }
     if (std.mem.eql(u8, type_str, "agent_status")) {
-        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = agent_types.ToolListRequest{};
-        if (payload.get("prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "agent_started")) {
-        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) } };
     }
-    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, payload.get("event_json").?.string) };
-    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, payload.get("result_json").?.string) };
+    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, try jf.requireString(payload, "event_json")) };
+    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, try jf.requireString(payload, "result_json")) };
     if (std.mem.eql(u8, type_str, "agent_stopped")) {
-        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
-        if (payload.get("reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) };
+        if (try jf.optionalString(payload, "reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_stopped = stopped };
     }
     if (std.mem.eql(u8, type_str, "agent_error")) {
         return .{ .agent_error = .{
-            .code = std.meta.stringToEnum(agent_types.AgentErrorCode, payload.get("code").?.string) orelse .internal_error,
-            .message = try allocator.dupe(u8, payload.get("message").?.string),
+            .code = std.meta.stringToEnum(agent_types.AgentErrorCode, try jf.requireString(payload, "code")) orelse .internal_error,
+            .message = try allocator.dupe(u8, try jf.requireString(payload, "message")),
         } };
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
         return .{ .session_info = .{
-            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
-            .status = std.meta.stringToEnum(agent_types.AgentStatus, payload.get("status").?.string) orelse .@"error",
-            .model = try allocator.dupe(u8, payload.get("model").?.string),
-            .message_count = @as(u32, @intCast(payload.get("message_count").?.integer)),
-            .created_at = payload.get("created_at").?.integer,
-            .updated_at = payload.get("updated_at").?.integer,
+            .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")),
+            .status = std.meta.stringToEnum(agent_types.AgentStatus, try jf.requireString(payload, "status")) orelse .@"error",
+            .model = try allocator.dupe(u8, try jf.requireString(payload, "model")),
+            .message_count = try jf.requireUnsigned(u32, payload, "message_count"),
+            .created_at = try jf.requireInteger(payload, "created_at"),
+            .updated_at = try jf.requireInteger(payload, "updated_at"),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = payload.get("tools").?.array;
+        const tools_arr = try jf.requireArray(payload, "tools");
         const tools = try allocator.alloc(agent_types.ToolDefinition, tools_arr.items.len);
         for (tools_arr.items, 0..) |t, i| {
             tools[i] = .{
-                .name = try allocator.dupe(u8, t.object.get("name").?.string),
-                .description = try allocator.dupe(u8, t.object.get("description").?.string),
-                .parameters_schema_json = try allocator.dupe(u8, t.object.get("parameters_schema_json").?.string),
+                .name = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "name")),
+                .description = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "description")),
+                .parameters_schema_json = try allocator.dupe(u8, try jf.requireString(try jf.elementAsObject(t), "parameters_schema_json")),
             };
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
         var req = agent_types.ToolExecuteRequest{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
-            .args_json = try allocator.dupe(u8, payload.get("args_json").?.string),
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
+            .args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json")),
         };
-        if (payload.get("callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
         var res = agent_types.ToolExecuteResponse{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .result_json = try allocator.dupe(u8, payload.get("result_json").?.string),
-            .is_error = if (payload.get("is_error")) |v| v.bool else false,
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json")),
+            .is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false,
         };
-        if (payload.get("details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_result = res };
     }
     if (std.mem.eql(u8, type_str, "tool_streaming")) {
         return .{ .tool_streaming = .{
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .partial_json = try allocator.dupe(u8, payload.get("partial_json").?.string),
+            .tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id")),
+            .partial_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_json")),
         } };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
-    if (std.mem.eql(u8, type_str, "pong")) return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("ping_id").?.string)) } };
+    if (std.mem.eql(u8, type_str, "pong")) return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "ping_id"))) } };
     if (std.mem.eql(u8, type_str, "goodbye")) {
         var g = agent_types.Goodbye{};
-        if (payload.get("reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (try jf.optionalString(payload, "reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .goodbye = g };
     }
     if (std.mem.eql(u8, type_str, "ack")) {
-        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(payload.get("acknowledged_id").?.string) } };
+        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(try jf.requireString(payload, "acknowledged_id")) } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
-        const rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string);
-        const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
-        const error_code = if (payload.get("error_code")) |v|
-            std.meta.stringToEnum(agent_types.ErrorCode, v.string)
+        const rejected_id = try parseUlidRequired(try jf.requireString(payload, "rejected_id"));
+        const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "reason")));
+        const error_code = if (try jf.optionalString(payload, "error_code")) |v|
+            std.meta.stringToEnum(agent_types.ErrorCode, v)
         else
             null;
         return .{ .nack = .{
@@ -393,8 +394,8 @@ fn deserializeModelsRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsRequest {
-    const provider_id = if (obj.get("provider_id")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const provider_id = if (try jf.optionalString(obj, "provider_id")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -402,8 +403,8 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const api = if (obj.get("api")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const api = if (try jf.optionalString(obj, "api")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -411,8 +412,8 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const model_id = if (obj.get("model_id")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const model_id = if (try jf.optionalString(obj, "model_id")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -420,8 +421,8 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const include_deprecated = if (obj.get("include_deprecated")) |value| value.bool else false;
-    const include_login_required = if (obj.get("include_login_required")) |value| value.bool else true;
+    const include_deprecated = if (try jf.optionalBool(obj, "include_deprecated")) |value| value else false;
+    const include_login_required = try jf.boolOr(obj, "include_login_required", true);
 
     return .{
         .provider_id = provider_id,
@@ -436,9 +437,9 @@ fn deserializeModelsResponse(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsResponse {
-    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
-    const cache_max_age_ms: u64 = @intCast(obj.get("cache_max_age_ms").?.integer);
-    const models_array = obj.get("models").?.array;
+    const fetched_at_ms = try jf.requireInteger(obj, "fetched_at_ms");
+    const cache_max_age_ms: u64 = try jf.requireUnsigned(u64, obj, "cache_max_age_ms");
+    const models_array = try jf.requireArray(obj, "models");
 
     const descriptors = try allocator.alloc(model_catalog_types.ModelDescriptor, models_array.items.len);
     var allocated_count: usize = 0;
@@ -448,7 +449,7 @@ fn deserializeModelsResponse(
     }
 
     for (models_array.items, 0..) |item, idx| {
-        descriptors[idx] = try deserializeModelDescriptor(item.object, allocator);
+        descriptors[idx] = try deserializeModelDescriptor(try jf.elementAsObject(item), allocator);
         allocated_count += 1;
     }
 
@@ -463,38 +464,38 @@ fn deserializeModelDescriptor(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !model_catalog_types.ModelDescriptor {
-    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_ref")));
     errdefer {
         var mutable = model_ref;
         mutable.deinit(allocator);
     }
 
-    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_id")));
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "display_name")));
     errdefer {
         var mutable = display_name;
         mutable.deinit(allocator);
     }
 
-    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "provider_id")));
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "api")));
     errdefer {
         var mutable = api;
         mutable.deinit(allocator);
     }
 
-    const base_url = if (obj.get("base_url")) |value|
-        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    const base_url = if (try jf.optionalString(obj, "base_url")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
     errdefer {
@@ -502,16 +503,16 @@ fn deserializeModelDescriptor(
         mutable.deinit(allocator);
     }
 
-    const capabilities_array = obj.get("capabilities").?.array;
+    const capabilities_array = try jf.requireArray(obj, "capabilities");
     const capabilities = try allocator.alloc(model_catalog_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = try parseModelCapability(item.string);
+        capabilities[idx] = try parseModelCapability(try jf.elementAsString(item));
     }
 
     var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
-    if (obj.get("metadata")) |metadata_value| {
-        const metadata_obj = metadata_value.object;
+    if (try jf.optionalObject(obj, "metadata")) |metadata_value| {
+        const metadata_obj = metadata_value;
         const metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
         var metadata_count: usize = 0;
         errdefer {
@@ -523,7 +524,7 @@ fn deserializeModelDescriptor(
         while (iter.next()) |entry| {
             metadata_items[metadata_count] = .{
                 .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.elementAsString(entry.value_ptr.*))),
             };
             metadata_count += 1;
         }
@@ -538,13 +539,13 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
-        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
+        .auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status")),
+        .lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle")),
         .capabilities = OwnedSlice(model_catalog_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(obj.get("source").?.string),
-        .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
-        .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
-        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
+        .source = try parseModelSource(try jf.requireString(obj, "source")),
+        .context_window = try jf.optionalUnsigned(u32, obj, "context_window"),
+        .max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens"),
+        .reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null,
         .metadata = metadata,
     };
 }
@@ -666,9 +667,9 @@ test "agent_start payload serializes the id under session_id plus the legacy ali
 
     var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed_json.deinit();
-    const payload = parsed_json.value.object.get("payload").?.object;
-    try std.testing.expectEqualStrings(&sid, payload.get("session_id").?.string);
-    try std.testing.expectEqualStrings(&sid, payload.get("resume_session_id").?.string);
+    const payload = try jf.requireObject(parsed_json.value.object, "payload");
+    try std.testing.expectEqualStrings(&sid, try jf.requireString(payload, "session_id"));
+    try std.testing.expectEqualStrings(&sid, try jf.requireString(payload, "resume_session_id"));
 
     var parsed = try deserializeEnvelope(json, allocator);
     defer parsed.deinit(allocator);

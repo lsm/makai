@@ -514,6 +514,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_json_field_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/protocol/json_field.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const content_partial_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/provider/content_partial.zig"),
         .target = target,
@@ -553,6 +559,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "json_field", .module = protocol_json_field_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "transport", .module = transport_mod },
@@ -647,6 +654,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "json_field", .module = protocol_json_field_mod },
             .{ .name = "agent_types", .module = protocol_agent_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
@@ -706,6 +714,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "json_field", .module = protocol_json_field_mod },
             .{ .name = "auth_types", .module = protocol_auth_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
@@ -755,6 +764,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "json_field", .module = protocol_json_field_mod },
             .{ .name = "tool_types", .module = protocol_tool_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
@@ -1418,6 +1428,7 @@ pub fn build(b: *std.Build) void {
 
     const protocol_model_ref_test = b.addTest(.{ .root_module = protocol_model_ref_mod });
     const protocol_model_catalog_types_test = b.addTest(.{ .root_module = protocol_model_catalog_types_mod });
+    const protocol_json_field_test = b.addTest(.{ .root_module = protocol_json_field_mod });
 
     const content_partial_test = b.addTest(.{ .root_module = content_partial_mod });
 
@@ -1669,6 +1680,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(transport_retry_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_json_field_test).step);
     test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
     test_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
@@ -1778,6 +1790,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(provider_base_url_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_json_field_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(content_partial_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
