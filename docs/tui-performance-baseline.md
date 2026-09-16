@@ -147,12 +147,13 @@ architectures measures the target difference, not a TUI change.
 
 ## Baseline
 
-The table below records the first CI-captured baseline of this harness. Each
+The table below records the CI-captured baselines of this harness. Each
 row names the exact source revision and host class it was measured on.
 
 | Revision | Host | Startup→first frame | Keypress median / p95 | Binary | tui/ LOC |
 | --- | --- | --- | --- | --- | --- |
 | `755325d` (PR #262, final harness semantics) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 51.1 ms | 13.2 / 13.5 ms | 21,262,152 B | 14,617 (22 files) |
+| `9189785` (main, post-reconciliation arc #300) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 2.1 ms | 13.0 / 13.3 ms | 22,147,856 B | 19,525 (22 files) |
 
 Same run, phase timings: submit→fixture-reply 46.7 ms, `/model` picker open
 13.4 ms, `/resume` picker open 13.3 ms, `/quit`→exit 13.0 ms. For comparison,
@@ -161,6 +162,16 @@ was 457 ms — roughly 370 ms of that was the mode-2027 and primary-device-
 attributes queries timing out against a non-responsive master, not
 application work. Raw numbers for every run are in the `TUI PTY Harness` job
 summary and artifacts (`tui-pty-harness`).
+
+`9189785` same run, phase timings: submit→fixture-reply 63.1 ms, `/model`
+picker open 12.7 ms, `/resume` picker open 13.5 ms, `/quit`→exit 13.4 ms.
+Startup→first frame dropped from the 51.1 ms recorded at `755325d` to ~2 ms
+on the same host class and is stable across the `cc5109f` / `04821ce` /
+`9189785` CI artifacts (1.7 / 2.0 / 2.1 ms), so the older row reflects an
+earlier startup path rather than a transient runner win; the shift landed
+somewhere in the 2026-09-15 → 2026-09-16 transcript-rewrite and
+reconciliation window, or in a runner-image update inside that window, and
+was not bisected further. Keypress latency is unchanged between the rows.
 
 ## Rendering model
 
