@@ -1219,8 +1219,8 @@ pub const AppState = struct {
         while (i < self.tools.items.len) : (i += 1) {
             const tool = &self.tools.items[i];
             if (isTerminalToolStatus(tool.status)) continue;
-            tool.status = .interrupted;
             try self.retire_candidates.append(self.allocator, i);
+            tool.status = .interrupted;
             const invocation = try toolInvocation(self.allocator, tool.label, tool.args_json);
             defer self.allocator.free(invocation);
             const message = try std.fmt.allocPrint(self.allocator, "{s} interrupted", .{invocation});
@@ -1295,7 +1295,7 @@ pub const AppState = struct {
     }
 
     fn terminalizeToolOccurrence(self: *AppState, tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) !void {
-        const was_terminal = isTerminalToolStatus(tool.status);
+        if (!isTerminalToolStatus(tool.status)) try self.retire_candidates.append(self.allocator, self.toolIndexOf(tool));
         if (tool.terminal_evidence == .none) {
             tool.status = status;
             tool.terminal_evidence = half;
@@ -1304,7 +1304,6 @@ pub const AppState = struct {
             if (status == .@"error") tool.status = .@"error";
         }
         if (tool.isFrozen()) _ = self.unfrozen_occurrence_ids.remove(tool.id);
-        if (!was_terminal and isTerminalToolStatus(tool.status)) try self.retire_candidates.append(self.allocator, self.toolIndexOf(tool));
     }
 
     fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8, readable: bool) !void {

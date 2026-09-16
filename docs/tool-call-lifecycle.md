@@ -262,7 +262,11 @@ occurrence with fresh rows, never a rewrite of scrollback. Retirement itself dra
 **retire-candidate list**: an occurrence appends its registry index exactly once, at
 the moment it becomes terminal — a terminal allocation (orphan results, id-reuse
 outcomes), the live→terminal terminalization, or the interruption inference — and
-retirement retires the drained set. Each occurrence is visited once, so a live gap (an
+retirement retires the drained set. The enqueue happens before the terminal state is
+committed (and the allocation enqueue before the registry append, with an error-path
+pop), so an allocation failure leaves the occurrence live and the transition retryable
+— a terminal-but-untracked occurrence, which nothing could re-enqueue, is
+unrepresentable. Each occurrence is visited once, so a live gap (an
 occurrence whose boundaries were evicted, blocking any monotone watermark) cannot make
 retirement rescan the suffix it already processed.
 
