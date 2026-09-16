@@ -318,6 +318,27 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     const errSecInteractionRequired: OSStatus = -25315;
 
     extern "c" fn SecKeychainSetUserInteractionAllowed(state: u8) OSStatus;
+    extern "c" fn SecKeychainGetUserInteractionAllowed(state: *u8) OSStatus;
+
+    var keychain_mutex: std.Io.Mutex = .init;
+
+    const KeychainScope = struct {
+        restore: ?u8,
+
+        fn begin(interaction: ?u8) KeychainScope {
+            keychain_mutex.lockUncancelable(defaultIo());
+            const override = interaction orelse return .{ .restore = null };
+            var previous: u8 = 1;
+            if (SecKeychainGetUserInteractionAllowed(&previous) != errSecSuccess) previous = 1;
+            _ = SecKeychainSetUserInteractionAllowed(override);
+            return .{ .restore = previous };
+        }
+
+        fn end(self: KeychainScope) void {
+            if (self.restore) |previous| _ = SecKeychainSetUserInteractionAllowed(previous);
+            keychain_mutex.unlock(defaultIo());
+        }
+    };
 
     extern "c" fn SecKeychainFindGenericPassword(
         keychainOrArray: ?*const anyopaque,
@@ -385,6 +406,12 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     }
 
     fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
+        const scope = KeychainScope.begin(0);
+        defer scope.end();
+        return findServiceAccount(allocator, service, account);
+    }
+
+    fn findServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
         var password_len: UInt32 = 0;
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
@@ -392,7 +419,6 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         const kc = defaultKeychain();
         defer if (kc) |ref| CFRelease(ref);
 
-        _ = SecKeychainSetUserInteractionAllowed(0);
         const status = SecKeychainFindGenericPassword(
             kc,
             try asUInt32(service.len),
@@ -403,7 +429,6 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
             &password_data,
             &item,
         );
-        _ = SecKeychainSetUserInteractionAllowed(1);
         defer if (item) |value| CFRelease(@ptrCast(value));
 
         if (status == errSecItemNotFound) return null;
@@ -513,8 +538,12 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     fn read(allocator: std.mem.Allocator) !?[]u8 {
         const service = try keychainServiceName(allocator);
         defer allocator.free(service);
-        if (try readServiceAccount(allocator, service, keychain_shared_account)) |content| return content;
-        const legacy = (try readServiceAccount(allocator, service, keychain_account)) orelse return null;
+
+        const scope = KeychainScope.begin(0);
+        defer scope.end();
+
+        if (try findServiceAccount(allocator, service, keychain_shared_account)) |content| return content;
+        const legacy = (try findServiceAccount(allocator, service, keychain_account)) orelse return null;
         writeServiceAccount(service, keychain_shared_account, legacy) catch return legacy;
         deleteServiceAccount(service, keychain_account) catch {};
         return legacy;
@@ -523,6 +552,10 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     fn write(allocator: std.mem.Allocator, data: []const u8) !void {
         const service = try keychainServiceName(allocator);
         defer allocator.free(service);
+
+        const scope = KeychainScope.begin(null);
+        defer scope.end();
+
         try writeServiceAccount(service, keychain_shared_account, data);
     }
 } else struct {
@@ -748,12 +781,11 @@ pub const AuthStorage = struct {
                     try maybeImportCodexCliCredentials(&loaded);
                     return loaded;
                 },
-                .not_found => {
+                .not_found, .unavailable => {
                     var storage = try loadFromFileWithSaveFn(allocator, keychain_save_fn);
                     try maybeImportCodexCliCredentials(&storage);
                     return storage;
                 },
-                .unavailable => {},
             }
         }
 
@@ -766,8 +798,7 @@ pub const AuthStorage = struct {
         if (shouldUseKeychain()) {
             switch (try loadFromKeychainWithCodexImport(allocator, false)) {
                 .found => |storage| return storage,
-                .not_found => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
-                .unavailable => {},
+                .not_found, .unavailable => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
             }
         }
 
