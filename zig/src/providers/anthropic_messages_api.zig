@@ -1530,18 +1530,44 @@ fn runThread(ctx: *ThreadCtx) void {
                                         return;
                                     };
 
-                                    const event_tc = ai_types.ToolCall{
-                                        .id = allocator.dupe(u8, tool_call.id) catch tool_call.id,
-                                        .name = allocator.dupe(u8, tool_call.name) catch tool_call.name,
-                                        .arguments_json = if (tool_call.arguments_json.len > 0) allocator.dupe(u8, tool_call.arguments_json) catch tool_call.arguments_json else "",
-                                        .thought_signature = if (tool_call.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
+                                    const event_tc: ?ai_types.ToolCall = blk: {
+                                        const id = allocator.dupe(u8, tool_call.id) catch break :blk null;
+                                        const name = allocator.dupe(u8, tool_call.name) catch {
+                                            allocator.free(id);
+                                            break :blk null;
+                                        };
+                                        const args = if (tool_call.arguments_json.len > 0)
+                                            allocator.dupe(u8, tool_call.arguments_json) catch {
+                                                allocator.free(id);
+                                                allocator.free(name);
+                                                break :blk null;
+                                            }
+                                        else
+                                            "";
+                                        const sig = if (tool_call.thought_signature) |s|
+                                            allocator.dupe(u8, s) catch {
+                                                allocator.free(id);
+                                                allocator.free(name);
+                                                if (args.len > 0) allocator.free(args);
+                                                break :blk null;
+                                            }
+                                        else
+                                            null;
+                                        break :blk ai_types.ToolCall{
+                                            .id = id,
+                                            .name = name,
+                                            .arguments_json = args,
+                                            .thought_signature = sig,
+                                        };
                                     };
 
-                                    _ = stream.pushBlocking(.{ .toolcall_end = .{
-                                        .content_index = content_blocks.items.len - 1,
-                                        .tool_call = event_tc,
-                                        .partial = createPartialMessage(model),
-                                    } });
+                                    if (event_tc) |tc| {
+                                        _ = stream.pushBlocking(.{ .toolcall_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .tool_call = tc,
+                                            .partial = createPartialMessage(model),
+                                        } });
+                                    }
                                 }
                             },
                         }
