@@ -219,8 +219,20 @@ func TestCancelledStreamLeavesNoGoroutines(t *testing.T) {
 	if err := stream.Close(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Close should report the same failure, got %v", err)
 	}
+
+	pid := client.transport.cmd.Process.Pid
 	if err := client.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+	// Cancelling the stream stops the stream; closing the client reaps the
+	// runtime. Neither leaves a process or a goroutine behind.
+	if client.transport.cmd.ProcessState == nil {
+		t.Fatal("expected the runtime to be reaped")
+	}
+	if process, err := os.FindProcess(pid); err == nil {
+		if err := process.Signal(os.Signal(nil)); err == nil {
+			t.Error("expected the runtime process to be gone")
+		}
 	}
 	waitForGoroutines(t, baseline)
 }
