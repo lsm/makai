@@ -35,6 +35,28 @@ pub const ToolStatus = enum {
     interrupted,
 };
 
+pub const TerminalEvidence = enum {
+    none,
+    execution,
+    result,
+    both,
+};
+
+pub const ToolEventClass = enum {
+    live_intent,
+    execution_outcome,
+    result_outcome,
+};
+
+const OccurrenceResolution = struct {
+    tool: *ToolEntry,
+    merge_state: bool,
+};
+
+pub fn isTerminalToolStatus(status: ToolStatus) bool {
+    return status != .pending and status != .running;
+}
+
 pub const ApprovalStatus = enum {
     none,
     pending,
@@ -104,6 +126,8 @@ pub const ToolEntry = struct {
     artifact_refs: []u8 = &.{},
     truncated: bool = false,
     error_detail_readable: bool = false,
+    terminal_evidence: TerminalEvidence = .none,
+    error_card_emitted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
@@ -360,6 +384,9 @@ pub const AppState = struct {
     active_tool_result_entry: ?usize = null,
     active_tool_summary_entry: ?usize = null,
     tool_families: std.StringHashMapUnmanaged(usize) = .empty,
+    finalized_tool_count: usize = 0,
+    summary_scan_floor: usize = 0,
+    summary_floor_tool: usize = 0,
     last_tool_calls_json: []u8 = &.{},
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
@@ -441,6 +468,9 @@ pub const AppState = struct {
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.clearRetainingCapacity();
         self.clearToolFamilies();
+        self.finalized_tool_count = 0;
+        self.summary_scan_floor = 0;
+        self.summary_floor_tool = 0;
     }
 
     pub fn resetReplayState(self: *AppState) void {
@@ -598,10 +628,28 @@ pub const AppState = struct {
                 },
                 .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), &self.active_user_entry, true),
                 .tool_result => {
-                    const tool = self.latestFamilyTool(payload.tool_call_id.slice());
-                    const suppress_text = if (tool) |found| found.status == .@"error" and found.error_detail_readable else false;
-                    const link_id = if (tool) |found| found.id else payload.tool_call_id.slice();
-                    try self.finishToolResultEntry(if (suppress_text) "" else payload.text.slice(), link_id);
+                    const status: ToolStatus = if (payload.is_error) .@"error" else .done;
+                    const resolution = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), "", .result_outcome, status);
+                    const tool = resolution.tool;
+                    if (resolution.merge_state) {
+                        const detail_source = if (payload.details_json.slice().len > 0) payload.details_json.slice() else payload.text.slice();
+                        try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
+                        terminalizeToolOccurrence(tool, status, .result);
+                        if (payload.is_error) {
+                            const unwrapped = try toolErrorMessage(self.allocator, detail_source);
+                            defer if (unwrapped) |message| self.allocator.free(message);
+                            tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, detail_source);
+                            if (tool.error_detail_readable) try self.emitToolErrorCard(tool, if (unwrapped) |message| message else detail_source);
+                        }
+                        const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, detail_source, payload.is_error, 0, 0, 0, 0);
+                        defer self.allocator.free(summary);
+                        try self.writeToolSummaryRow(summary, tool.id);
+                    } else if (tool.terminal_evidence == .execution) {
+                        tool.terminal_evidence = .both;
+                    }
+                    self.advanceSummaryScanFloor();
+                    const suppress_text = tool.status == .@"error" and tool.error_detail_readable;
+                    try self.finishToolResultEntry(if (suppress_text) "" else payload.text.slice(), tool.id);
                 },
             },
             .tool_approval_requested => |payload| {
@@ -609,32 +657,30 @@ pub const AppState = struct {
                 try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), label, payload.args_json.slice());
                 if (std.mem.eql(u8, payload.tool_name.slice(), "hashline_edit")) try self.setHashlinePreview(payload.args_json.slice());
                 self.mode = .approval;
-                _ = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .pending);
+                _ = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .live_intent, .pending);
             },
             .tool_execution_start => |payload| {
-                const tool = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
-                const summary = try toolInvocation(self.allocator, tool.label, payload.args_json.slice());
+                const resolution = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .live_intent, .running);
+                const summary = try toolInvocation(self.allocator, resolution.tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
-                try self.appendToolSummaryTranscript(summary, tool.id);
+                try self.appendToolSummaryTranscript(summary, resolution.tool.id);
                 self.active_tool_summary_entry = self.transcript.items.len - 1;
             },
             .tool_execution_update => |payload| {
-                const tool = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
+                const resolution = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .live_intent, .running);
+                const tool = resolution.tool;
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.partial_result_json.slice());
             },
             .tool_execution_end => |payload| {
                 const status: ToolStatus = if (payload.is_error) .@"error" else .done;
-                const tool = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), "", status);
-                if (tool.args_json.len == 0) {
-                    if (try self.recoverToolArgs(payload.tool_call_id.slice())) |args| {
-                        self.allocator.free(tool.args_json);
-                        tool.args_json = args;
-                    }
-                }
+                const resolution = try self.resolveToolOccurrence(payload.tool_call_id.slice(), payload.tool_name.slice(), "", .execution_outcome, status);
+                const tool = resolution.tool;
+                if (tool.args_json.len == 0) try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
+                terminalizeToolOccurrence(tool, status, .execution);
                 const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
                 try self.finalizeToolSummaryEntry(summary, tool.id);
@@ -643,15 +689,12 @@ pub const AppState = struct {
                     const unwrapped = try toolErrorMessage(self.allocator, payload.result_json.slice());
                     defer if (unwrapped) |message| self.allocator.free(message);
                     tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, payload.result_json.slice());
-                    const raw_detail = if (unwrapped) |message| message else payload.result_json.slice();
-                    const detail = try sanitizeTerminalText(self.allocator, raw_detail);
-                    defer self.allocator.free(detail);
-                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, detail });
-                    defer self.allocator.free(message);
-                    try self.status.setError(self.allocator, message);
-                    try self.appendTranscript(.@"error", message);
-                    if (tool.error_detail_readable) try self.removeLinkedResultRows(tool.id);
+                    if (tool.error_detail_readable) {
+                        try self.emitToolErrorCard(tool, if (unwrapped) |message| message else payload.result_json.slice());
+                        try self.removeLinkedResultRows(tool.id);
+                    }
                 }
+                self.advanceSummaryScanFloor();
             },
             .context_usage => |payload| self.applyContextUsage(payload),
             .prompt_segment_usage => {},
@@ -694,7 +737,6 @@ pub const AppState = struct {
         self.approval.always = always;
         self.mode = .normal;
     }
-
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
         var entry = try SessionEntry.init(self.allocator, id, label);
@@ -832,13 +874,51 @@ pub const AppState = struct {
                 self.active_tool_summary_entry = null;
             }
         }
+        try self.writeToolSummaryRow(summary, tool_call_id);
+    }
+
+    fn writeToolSummaryRow(self: *AppState, summary: []const u8, tool_call_id: []const u8) !void {
         if (try self.replaceLinkedSummaryRow(summary, tool_call_id)) return;
+        if (try self.insertBeforeLinkedResultRow(summary, tool_call_id)) return;
         try self.appendToolSummaryTranscript(summary, tool_call_id);
+    }
+
+    fn insertBeforeLinkedResultRow(self: *AppState, summary: []const u8, tool_call_id: []const u8) !bool {
+        if (self.active_tool_result_entry) |index| {
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == .tool and !self.transcript.items[index].tool_summary) {
+                const active_id = self.transcript.items[index].tool_call_id;
+                if (active_id.len == 0 or std.mem.eql(u8, active_id, tool_call_id)) {
+                    try self.insertToolSummaryRowAt(index, summary, tool_call_id);
+                    return true;
+                }
+            }
+        }
+        var i = self.summary_scan_floor;
+        while (i < self.transcript.items.len) : (i += 1) {
+            const entry = &self.transcript.items[i];
+            if (entry.kind != .tool or entry.tool_summary) continue;
+            if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
+            try self.insertToolSummaryRowAt(i, summary, tool_call_id);
+            return true;
+        }
+        return false;
+    }
+
+    fn insertToolSummaryRowAt(self: *AppState, index: usize, summary: []const u8, tool_call_id: []const u8) !void {
+        var row = try TranscriptEntry.init(self.allocator, .tool, summary);
+        errdefer row.deinit(self.allocator);
+        row.tool_summary = true;
+        row.tool_call_id = try self.allocator.dupe(u8, tool_call_id);
+        try self.transcript.insert(self.allocator, index, row);
+        self.adjustActiveTranscriptEntryAfterInsert(&self.active_user_entry, index);
+        self.adjustActiveTranscriptEntryAfterInsert(&self.active_assistant_entry, index);
+        self.adjustActiveTranscriptEntryAfterInsert(&self.active_tool_result_entry, index);
+        self.adjustActiveTranscriptEntryAfterInsert(&self.active_tool_summary_entry, index);
     }
 
     fn replaceLinkedSummaryRow(self: *AppState, summary: []const u8, tool_call_id: []const u8) !bool {
         var i = self.transcript.items.len;
-        while (i > 0) {
+        while (i > self.summary_scan_floor) {
             i -= 1;
             const entry = &self.transcript.items[i];
             if (entry.kind != .tool or !entry.tool_summary) continue;
@@ -851,7 +931,7 @@ pub const AppState = struct {
 
     fn removeLinkedResultRows(self: *AppState, tool_call_id: []const u8) !void {
         var i = self.transcript.items.len;
-        while (i > 0) {
+        while (i > self.summary_scan_floor) {
             i -= 1;
             const entry = &self.transcript.items[i];
             if (entry.kind != .tool or entry.tool_summary) continue;
@@ -881,6 +961,13 @@ pub const AppState = struct {
         _ = self;
         if (active_entry.*) |index| {
             active_entry.* = if (index == removed_index) null else if (index > removed_index) index - 1 else index;
+        }
+    }
+
+    fn adjustActiveTranscriptEntryAfterInsert(self: *AppState, active_entry: *?usize, inserted_index: usize) void {
+        _ = self;
+        if (active_entry.*) |index| {
+            if (index >= inserted_index) active_entry.* = index + 1;
         }
     }
 
@@ -949,23 +1036,18 @@ pub const AppState = struct {
 
     pub fn finalizeInterruptedTools(self: *AppState) !void {
         self.cleanupActiveTranscriptEntries();
-        for (self.tools.items) |*tool| {
-            if (tool.status != .pending and tool.status != .running) continue;
+        var i = self.finalized_tool_count;
+        while (i < self.tools.items.len) : (i += 1) {
+            const tool = &self.tools.items[i];
+            if (isTerminalToolStatus(tool.status)) continue;
             tool.status = .interrupted;
             const invocation = try toolInvocation(self.allocator, tool.label, tool.args_json);
             defer self.allocator.free(invocation);
             const message = try std.fmt.allocPrint(self.allocator, "{s} interrupted", .{invocation});
             defer self.allocator.free(message);
-            var i = self.transcript.items.len;
-            while (i > 0) {
-                i -= 1;
-                const entry = &self.transcript.items[i];
-                if (entry.kind != .tool or !entry.tool_summary) continue;
-                if (!std.mem.eql(u8, entry.tool_call_id, tool.id)) continue;
-                try self.replaceEntryText(i, message);
-                break;
-            }
+            try self.writeToolSummaryRow(message, tool.id);
         }
+        while (self.finalized_tool_count < self.tools.items.len and isTerminalToolStatus(self.tools.items[self.finalized_tool_count].status)) self.finalized_tool_count += 1;
     }
 
     fn rememberToolCalls(self: *AppState, tool_calls_json: []const u8) !void {
@@ -989,6 +1071,48 @@ pub const AppState = struct {
             return try self.allocator.dupe(u8, args);
         }
         return null;
+    }
+
+    fn recoverToolArgsInto(self: *AppState, tool: *ToolEntry, provider_id: []const u8) !void {
+        if (tool.args_json.len != 0) return;
+        if (try self.recoverToolArgs(provider_id)) |args| {
+            self.allocator.free(tool.args_json);
+            tool.args_json = args;
+        }
+    }
+
+    fn terminalizeToolOccurrence(tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) void {
+        if (tool.terminal_evidence == .none) {
+            tool.status = status;
+            tool.terminal_evidence = half;
+        } else if (tool.terminal_evidence != half and tool.terminal_evidence != .both) {
+            tool.terminal_evidence = .both;
+        }
+    }
+
+    fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8) !void {
+        if (tool.error_card_emitted) return;
+        const detail = try sanitizeTerminalText(self.allocator, raw_detail);
+        defer self.allocator.free(detail);
+        const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, detail });
+        defer self.allocator.free(message);
+        try self.status.setError(self.allocator, message);
+        try self.appendTranscript(.@"error", message);
+        tool.error_card_emitted = true;
+    }
+
+    fn advanceSummaryScanFloor(self: *AppState) void {
+        while (self.summary_floor_tool < self.tools.items.len and self.tools.items[self.summary_floor_tool].terminal_evidence == .both) self.summary_floor_tool += 1;
+        if (self.summary_floor_tool == 0) return;
+        const boundary = self.tools.items[self.summary_floor_tool - 1].id;
+        var i = self.transcript.items.len;
+        while (i > self.summary_scan_floor) {
+            i -= 1;
+            const entry = &self.transcript.items[i];
+            if (entry.kind != .tool or !std.mem.eql(u8, entry.tool_call_id, boundary)) continue;
+            self.summary_scan_floor = i + 1;
+            return;
+        }
     }
 
     fn finishToolResultEntry(self: *AppState, text: []const u8, tool_call_id: []const u8) !void {
@@ -1023,25 +1147,46 @@ pub const AppState = struct {
         entry.tool_call_id = owned;
     }
 
-    pub fn resolveToolOccurrenceForTest(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
-        return try self.resolveToolOccurrence(id, name, args_json, status);
+    pub fn resolveToolOccurrenceForTest(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, class: ToolEventClass, status: ToolStatus) !OccurrenceResolution {
+        return try self.resolveToolOccurrence(id, name, args_json, class, status);
     }
 
-    fn resolveToolOccurrence(self: *AppState, provider_id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
+    fn resolveToolOccurrence(self: *AppState, provider_id: []const u8, name: []const u8, args_json: []const u8, class: ToolEventClass, status: ToolStatus) !OccurrenceResolution {
         const label = self.toolLabel(name);
         if (self.liveFamilyTool(provider_id)) |tool| {
-            tool.status = status;
-            if (!std.mem.eql(u8, tool.label, label)) {
-                self.allocator.free(tool.label);
-                tool.label = try self.allocator.dupe(u8, label);
-            }
-            if (args_json.len > 0 and !std.mem.eql(u8, tool.args_json, args_json)) {
-                self.allocator.free(tool.args_json);
-                tool.args_json = try self.allocator.dupe(u8, args_json);
-            }
-            return tool;
+            if (class == .live_intent) tool.status = status;
+            try self.refreshToolIdentity(tool, label, args_json);
+            return .{ .tool = tool, .merge_state = true };
         }
-        return try self.allocateToolOccurrence(provider_id, name, args_json, label, status);
+        if (class != .live_intent) {
+            if (self.latestFamilyTool(provider_id)) |tool| {
+                const attach = switch (class) {
+                    .execution_outcome => tool.terminal_evidence == .none or tool.terminal_evidence == .result,
+                    .result_outcome => tool.terminal_evidence == .none,
+                    .live_intent => false,
+                };
+                if (attach) {
+                    try self.refreshToolIdentity(tool, label, args_json);
+                    return .{ .tool = tool, .merge_state = true };
+                }
+                if (class == .result_outcome) return .{ .tool = tool, .merge_state = false };
+            }
+        }
+        const tool = try self.allocateToolOccurrence(provider_id, name, args_json, label, status);
+        return .{ .tool = tool, .merge_state = true };
+    }
+
+    fn refreshToolIdentity(self: *AppState, tool: *ToolEntry, label: []const u8, args_json: []const u8) !void {
+        if (!std.mem.eql(u8, tool.label, label)) {
+            const owned = try self.allocator.dupe(u8, label);
+            self.allocator.free(tool.label);
+            tool.label = owned;
+        }
+        if (args_json.len > 0 and !std.mem.eql(u8, tool.args_json, args_json)) {
+            const owned = try self.allocator.dupe(u8, args_json);
+            self.allocator.free(tool.args_json);
+            tool.args_json = owned;
+        }
     }
 };
 
@@ -1272,6 +1417,26 @@ fn toolEndEvent(id: []const u8, name: []const u8, result_json: []const u8, is_er
     } };
 }
 
+fn toolResultMessageEvent(id: []const u8, name: []const u8, text: []const u8, details_json: []const u8, is_error: bool) !tui_runtime.TuiEvent {
+    return .{ .message_end = .{
+        .role = .tool_result,
+        .tool_call_id = try ownedText(id),
+        .tool_name = try ownedText(name),
+        .text = try ownedText(text),
+        .details_json = try ownedText(details_json),
+        .is_error = is_error,
+    } };
+}
+
+fn countRows(state: *const AppState, summary: bool, id: []const u8) usize {
+    var count: usize = 0;
+    for (state.transcript.items) |*entry| {
+        if (entry.kind != .tool or entry.tool_summary != summary) continue;
+        if (!std.mem.eql(u8, entry.tool_call_id, id)) continue;
+        count += 1;
+    }
+    return count;
+}
 
 pub fn noopToolForTest(
     tool_call_id: []const u8,
@@ -1289,7 +1454,6 @@ pub fn noopToolForTest(
     _ = allocator;
     return error.NotImplemented;
 }
-
 
 test "AppState applies transcript and tool events" {
     var state = AppState.init(std.testing.allocator);
@@ -1980,7 +2144,6 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "◈ shell_command ok") != null);
 }
 
-
 test "AppState appends visible transcript row for tool execution errors" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -2402,6 +2565,178 @@ test "AppState resets occurrence numbering when tools are cleared" {
     try std.testing.expectEqual(@as(usize, 1), state.tools.items[0].occurrence);
 }
 
+test "AppState reconciles an interrupted occurrence from a retained result" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-r", "shell", "{\"command\":\"ls\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+    try std.testing.expectEqual(ToolStatus.interrupted, state.tools.items[0].status);
+    try std.testing.expectEqual(TerminalEvidence.none, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, state.tools.items[0].id));
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "interrupted") != null);
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_event = try toolResultMessageEvent("call-r", "shell", "all good", "{\"ok\":true}", false);
+    defer result_event.deinit(std.testing.allocator);
+    try state.applyEvent(result_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqual(TerminalEvidence.result, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-r"));
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "interrupted") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "ok") != null);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, false, "call-r"));
+
+    var late_end = try toolEndEvent("call-r", "shell", "{\"ok\":true}", false);
+    defer late_end.deinit(std.testing.allocator);
+    try state.applyEvent(late_end);
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(TerminalEvidence.both, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-r"));
+}
+
+test "AppState merges a reversed replay into one occurrence and one summary row" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_event = try toolResultMessageEvent("call-v", "shell", "fine", "{\"ok\":true}", false);
+    defer result_event.deinit(std.testing.allocator);
+    try state.applyEvent(result_event);
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqual(TerminalEvidence.result, state.tools.items[0].terminal_evidence);
+
+    var end_event = try toolEndEvent("call-v", "shell", "{\"ok\":true}", false);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(TerminalEvidence.both, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-v"));
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "output=9B") != null);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, false, "call-v"));
+    try std.testing.expectEqual(state.transcript.items.len, state.summary_scan_floor);
+}
+
+test "AppState emits one error card when a failing result precedes its end" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_event = try toolResultMessageEvent("call-e", "shell", "Tool execution failed: Boom", "{\"ok\":false,\"err\":\"Boom\"}", true);
+    defer result_event.deinit(std.testing.allocator);
+    try state.applyEvent(result_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(ToolStatus.@"error", state.tools.items[0].status);
+    try std.testing.expect(state.tools.items[0].error_card_emitted);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-e"));
+    try std.testing.expectEqual(@as(usize, 0), countRows(&state, false, "call-e"));
+    var error_rows: usize = 0;
+    for (state.transcript.items) |*entry| {
+        if (entry.kind == .@"error") error_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), error_rows);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "Boom") != null);
+
+    var end_event = try toolEndEvent("call-e", "shell", "{\"ok\":false,\"err\":\"Boom\"}", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(TerminalEvidence.both, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(ToolStatus.@"error", state.tools.items[0].status);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-e"));
+    error_rows = 0;
+    for (state.transcript.items) |*entry| {
+        if (entry.kind == .@"error") error_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), error_rows);
+}
+
+test "AppState inserts a summary row for an interrupted occurrence without one" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var approval = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-a"),
+        .tool_name = try ownedText("shell"),
+        .args_json = try ownedText("{\"command\":\"ls\"}"),
+    } };
+    defer approval.deinit(std.testing.allocator);
+    try state.applyEvent(approval);
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.transcript.items.len);
+
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+
+    try std.testing.expectEqual(ToolStatus.interrupted, state.tools.items[0].status);
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expect(state.transcript.items[0].tool_summary);
+    try std.testing.expectEqualStrings("call-a", state.transcript.items[0].tool_call_id);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "interrupted") != null);
+    try std.testing.expectEqual(@as(usize, 1), state.finalized_tool_count);
+}
+
+test "AppState render-links a result after its end without new rows or state flips" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = try toolStartEvent("call-n", "shell", "{\"command\":\"ls\"}");
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+    var end_event = try toolEndEvent("call-n", "shell", "{\"ok\":true}", false);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+    const rows_after_end = state.transcript.items.len;
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_event = try toolResultMessageEvent("call-n", "shell", "all good", "{\"ok\":true}", false);
+    defer result_event.deinit(std.testing.allocator);
+    try state.applyEvent(result_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(TerminalEvidence.both, state.tools.items[0].terminal_evidence);
+    try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, true, "call-n"));
+    try std.testing.expectEqual(@as(usize, 1), countRows(&state, false, "call-n"));
+    try std.testing.expectEqual(rows_after_end + 1, state.transcript.items.len);
+    try std.testing.expectEqual(state.transcript.items.len, state.summary_scan_floor);
+    try std.testing.expectEqual(@as(usize, 1), state.summary_floor_tool);
+}
+
+test "AppState occurrence watermarks advance over completed families" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    for (0..6) |i| {
+        var buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buf, "call-{d}", .{i});
+        var start_event = try toolStartEvent(id, "shell", "{\"command\":\"ls\"}");
+        defer start_event.deinit(std.testing.allocator);
+        try state.applyEvent(start_event);
+        var end_event = try toolEndEvent(id, "shell", "{\"ok\":true}", false);
+        defer end_event.deinit(std.testing.allocator);
+        try state.applyEvent(end_event);
+        try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+        var result_event = try toolResultMessageEvent(id, "shell", "fine", "{\"ok\":true}", false);
+        defer result_event.deinit(std.testing.allocator);
+        try state.applyEvent(result_event);
+        try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+    }
+
+    try std.testing.expectEqual(@as(usize, 6), state.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 6), state.finalized_tool_count);
+    try std.testing.expectEqual(@as(usize, 6), state.summary_floor_tool);
+    try std.testing.expectEqual(state.transcript.items.len, state.summary_scan_floor);
+}
+
 test "lastAssistantText returns the most recent assistant reply" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -2458,4 +2793,3 @@ test "AppState updates backpressure status fields" {
     try std.testing.expect(!state.backpressure_active);
     try std.testing.expectEqual(@as(u64, 3), state.dropped_event_count);
 }
-
