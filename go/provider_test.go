@@ -355,6 +355,35 @@ func TestProviderStreamRaisesAuthRequired(t *testing.T) {
 	}
 }
 
+func TestProviderStreamSurfacesNack(t *testing.T) {
+	client := newTestClient(t, scenarioProtocol,
+		envNack+`=stream_request:{"error_code":"not_implemented","reason":"streaming is unavailable"}`)
+
+	stream, err := client.Provider.Stream(testContext(t), CompletionRequest{
+		ModelRef: testModelRef, Messages: []Message{UserMessage("hi")},
+	})
+	// A rejection arrives as a frame, so Stream itself succeeds and the
+	// failure surfaces from the iterator.
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	if stream.Next() {
+		t.Fatalf("expected no events after a rejection, got %#v", stream.Event())
+	}
+	var streamErr *StreamError
+	if !errors.As(stream.Err(), &streamErr) {
+		t.Fatalf("expected *StreamError, got %T: %v", stream.Err(), stream.Err())
+	}
+	if streamErr.Code != CodeNotImplemented || streamErr.Message != "streaming is unavailable" {
+		t.Errorf("error = %+v", streamErr)
+	}
+	if streamErr.StreamID == "" {
+		t.Error("expected the failing stream id to be attached")
+	}
+}
+
 func TestProviderStreamCloseAbandonsAnUnfinishedStream(t *testing.T) {
 	logPath, readLog := requestLogPath(t)
 	client := newTestClient(t, scenarioProtocol,
