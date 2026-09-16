@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const compat_mod = @import("compat");
+const provider_base_url = @import("provider_base_url");
 
 pub const config_file_name = "providers.json";
 
@@ -158,7 +159,7 @@ fn parseProvider(allocator: std.mem.Allocator, obj: *const std.json.ObjectMap) !
     try validateId(raw_id);
 
     const raw_base = objectString(obj, "base_url") orelse return ConfigError.MissingBaseUrl;
-    const base_trimmed = std.mem.trimEnd(u8, raw_base, "/");
+    const base_trimmed = provider_base_url.normalizeVersionedBaseUrl(raw_base);
     if (base_trimmed.len == 0) return ConfigError.MissingBaseUrl;
     _ = std.Uri.parse(base_trimmed) catch return ConfigError.InvalidBaseUrl;
 
@@ -399,7 +400,7 @@ test "custom providers parse a minimal entry and default the api" {
     try testing.expectEqualStrings("vllm", provider.id);
     try testing.expectEqualStrings("vllm", provider.name);
     try testing.expectEqualStrings("openai-completions", provider.api);
-    try testing.expectEqualStrings("http://localhost:8000/v1", provider.base_url);
+    try testing.expectEqualStrings("http://localhost:8000", provider.base_url);
     try testing.expect(provider.env_key == null);
     try testing.expect(provider.compat == null);
     try testing.expectEqual(@as(usize, 0), provider.models.len);
@@ -513,4 +514,22 @@ fn parseProbe(allocator: std.mem.Allocator) !void {
 test "custom providers free every allocation when parsing fails midway" {
     try parseProbe(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, parseProbe, .{});
+}
+
+test "custom providers normalise a versioned base url to the origin the providers expect" {
+    const cases = [_]struct { given: []const u8, want: []const u8 }{
+        .{ .given = "https://api.groq.com/openai/v1", .want = "https://api.groq.com/openai" },
+        .{ .given = "https://api.groq.com/openai/v1/", .want = "https://api.groq.com/openai" },
+        .{ .given = "http://localhost:8000/v1", .want = "http://localhost:8000" },
+        .{ .given = "https://gw.internal/anthropic", .want = "https://gw.internal/anthropic" },
+    };
+    for (cases) |case| {
+        const data = try std.fmt.allocPrint(testing.allocator,
+            \\{{"providers":[{{"id":"probe","base_url":"{s}"}}]}}
+        , .{case.given});
+        defer testing.allocator.free(data);
+        var provider = try parseOne(testing.allocator, data);
+        defer provider.deinit(testing.allocator);
+        try testing.expectEqualStrings(case.want, provider.base_url);
+    }
 }

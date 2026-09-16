@@ -993,6 +993,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "provider_base_url", .module = provider_base_url_mod },
         },
     });
     const custom_providers_test = b.addTest(.{ .root_module = custom_providers_mod });
