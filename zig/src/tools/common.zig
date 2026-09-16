@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const artifact_store = @import("artifact/store");
@@ -271,9 +272,37 @@ pub fn countLines(text: []const u8) usize {
     return count;
 }
 
+var test_artifact_root: if (builtin.is_test) ?std.Io.Dir else void = if (builtin.is_test) null else {};
+
+fn artifactRoot() std.Io.Dir {
+    if (builtin.is_test) {
+        return test_artifact_root orelse @panic("artifact store accessed without TestArtifactRoot.init(); tests must isolate the artifact root");
+    }
+    return std.Io.Dir.cwd();
+}
+
+pub const TestArtifactRoot = struct {
+    tmp: std.testing.TmpDir,
+    previous: ?std.Io.Dir,
+
+    pub fn init() TestArtifactRoot {
+        comptime std.debug.assert(builtin.is_test);
+        const tmp = std.testing.tmpDir(.{});
+        const previous = test_artifact_root;
+        test_artifact_root = tmp.dir;
+        return .{ .tmp = tmp, .previous = previous };
+    }
+
+    pub fn deinit(self: *TestArtifactRoot) void {
+        test_artifact_root = self.previous;
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
 pub fn storeArtifact(allocator: std.mem.Allocator, key: []const u8, data: []const u8) ![]u8 {
-    var cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(defaultIo(), ".makai/tool-artifacts") catch |err| switch (err) {
+    const root = artifactRoot();
+    root.createDirPath(defaultIo(), ".makai/tool-artifacts") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -281,24 +310,24 @@ pub fn storeArtifact(allocator: std.mem.Allocator, key: []const u8, data: []cons
     defer allocator.free(safe);
     const path = try std.fmt.allocPrint(allocator, ".makai/tool-artifacts/{s}.txt", .{safe});
     errdefer allocator.free(path);
-    try cwd.writeFile(defaultIo(), .{ .sub_path = path, .data = data });
+    try root.writeFile(defaultIo(), .{ .sub_path = path, .data = data });
     return path;
 }
 
 pub fn cleanupArtifacts() !void {
-    var cwd = std.Io.Dir.cwd();
-    if (cwd.access(defaultIo(), ".makai/tool-artifacts", .{})) {
-        try cwd.deleteTree(defaultIo(), ".makai/tool-artifacts");
+    const root = artifactRoot();
+    if (root.access(defaultIo(), ".makai/tool-artifacts", .{})) {
+        try root.deleteTree(defaultIo(), ".makai/tool-artifacts");
     } else |_| {}
 }
 
 pub fn retrieveArtifact(allocator: std.mem.Allocator, reference: []const u8, max_bytes: usize) ![]u8 {
     if (!std.mem.startsWith(u8, reference, ".makai/tool-artifacts/")) return error.InvalidArtifactReference;
     if (hasParentTraversal(reference) or std.Io.Dir.path.isAbsolute(reference)) return error.InvalidArtifactReference;
-    var cwd = std.Io.Dir.cwd();
-    const st = try cwd.statFile(defaultIo(), reference, .{ .follow_symlinks = false });
+    const root = artifactRoot();
+    const st = try root.statFile(defaultIo(), reference, .{ .follow_symlinks = false });
     if (st.kind == .sym_link) return error.InvalidArtifactReference;
-    var file = try cwd.openFile(defaultIo(), reference, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    var file = try root.openFile(defaultIo(), reference, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
     defer file.close(defaultIo());
     var reader = file.reader(defaultIo(), &.{});
     return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
@@ -498,6 +527,8 @@ test "common path and binary helpers" {
 }
 
 test "line hash and artifact helpers" {
+    var artifact_root = TestArtifactRoot.init();
+    defer artifact_root.deinit();
     try std.testing.expectEqual(@as(usize, 16), lineHash("one").len);
     try std.testing.expect(!std.mem.eql(u8, &lineHash("one"), &lineHash("two")));
     const buf = try std.testing.allocator.alloc(u8, tool_output_threshold + 10);
@@ -529,6 +560,8 @@ test "tool output limits classify by exact token prefix" {
 }
 
 test "artifact helper respects per-tool limits" {
+    var artifact_root = TestArtifactRoot.init();
+    defer artifact_root.deinit();
     const buf = try std.testing.allocator.alloc(u8, 12);
     defer std.testing.allocator.free(buf);
     @memset(buf, 'x');
@@ -569,15 +602,17 @@ test "artifact helper uses ArtifactStore backend when provided" {
 }
 
 test "artifact retrieval rejects symlink targets" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(defaultIo(), ".makai/tool-artifacts") catch |err| switch (err) {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var artifact_root = TestArtifactRoot.init();
+    defer artifact_root.deinit();
+    const root = artifactRoot();
+    root.createDirPath(defaultIo(), ".makai/tool-artifacts") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
     defer cleanupArtifacts() catch {};
-    try cwd.writeFile(defaultIo(), .{ .sub_path = ".makai/artifact-outside.txt", .data = "secret" });
-    defer cwd.deleteFile(defaultIo(), ".makai/artifact-outside.txt") catch {};
-    try cwd.symLink(defaultIo(), "../artifact-outside.txt", ".makai/tool-artifacts/link.txt", .{ .is_directory = false });
+    try root.writeFile(defaultIo(), .{ .sub_path = ".makai/artifact-outside.txt", .data = "secret" });
+    defer root.deleteFile(defaultIo(), ".makai/artifact-outside.txt") catch {};
+    try root.symLink(defaultIo(), "../artifact-outside.txt", ".makai/tool-artifacts/link.txt", .{ .is_directory = false });
     try std.testing.expectError(error.InvalidArtifactReference, retrieveArtifact(std.testing.allocator, ".makai/tool-artifacts/link.txt", 1024));
 }
