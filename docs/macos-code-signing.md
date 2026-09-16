@@ -83,13 +83,30 @@ two-factor prompts.
 
 ## GitHub secrets
 
-Add these under **Settings → Secrets and variables → Actions**. Base64-encode the
-two binary files, since secrets hold text:
+Once you hold the `.p12` and the `.p8`, one command validates them and uploads all
+five secrets:
 
 ```bash
-base64 -i DeveloperID.p12 | pbcopy
-base64 -i AuthKey_XXXXXXXXXX.p8 | pbcopy
+./scripts/setup-macos-signing-secrets.sh \
+  --p12 ~/Downloads/DeveloperID.p12 \
+  --notary-key ~/Downloads/AuthKey_XXXXXXXXXX.p8 \
+  --key-id XXXXXXXXXX \
+  --issuer 00000000-0000-0000-0000-000000000000
 ```
+
+It prompts for the `.p12` password without echoing it, confirms the certificate is
+a Developer ID Application certificate rather than an Apple Development one, prints
+the team identifier it carries, and pipes each value from disk into `gh secret set`.
+Nothing is typed into a browser or left in shell history. Add `--dry-run` to
+validate without uploading, and `--repo owner/name` to target another repository.
+
+Prefer this over pasting into the web form: base64 of a certificate is several
+thousand characters, and a truncated paste produces a release failure whose error
+message points at the certificate rather than at the copy.
+
+To do it by hand instead, add the following under **Settings → Secrets and variables
+→ Actions**, base64-encoding the two binary files since secrets hold text
+(`base64 -i DeveloperID.p12 | pbcopy`):
 
 | Secret | Contents | Required |
 | --- | --- | --- |
