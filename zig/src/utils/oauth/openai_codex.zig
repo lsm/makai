@@ -128,8 +128,12 @@ fn urlDecode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 }
 
 fn generateState(allocator: std.mem.Allocator) ![]u8 {
+    return generateStateWithRandom(allocator, compat.random.fillSecureBytes);
+}
+
+fn generateStateWithRandom(allocator: std.mem.Allocator, fill_random: fn ([]u8) void) ![]u8 {
     var random_bytes: [32]u8 = undefined;
-    compat.random.fillSecureBytes(&random_bytes);
+    fill_random(&random_bytes);
 
     const encoder = std.base64.url_safe_no_pad.Encoder;
     const state = try allocator.alloc(u8, encoder.calcSize(random_bytes.len));
@@ -648,4 +652,44 @@ test "parseTokenResponse maps oauth error payload to OAuthFailed" {
         \\{"error":"invalid_grant","error_description":"bad code"}
     ;
     try std.testing.expectError(error.OAuthFailed, parseTokenResponse(payload, std.testing.allocator));
+}
+
+fn fillTestStateBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, index| {
+        byte.* = @intCast(index % 256);
+    }
+}
+
+fn fillAltTestStateBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, index| {
+        byte.* = @intCast((index + 1) % 256);
+    }
+}
+
+test "generateStateWithRandom derives state from the supplied bytes" {
+    const state = try generateStateWithRandom(std.testing.allocator, fillTestStateBytes);
+    defer std.testing.allocator.free(state);
+
+    try std.testing.expectEqualStrings("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", state);
+}
+
+test "generateStateWithRandom output changes when the bytes change" {
+    const first = try generateStateWithRandom(std.testing.allocator, fillTestStateBytes);
+    defer std.testing.allocator.free(first);
+
+    const second = try generateStateWithRandom(std.testing.allocator, fillAltTestStateBytes);
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "generateState produces distinct values across calls" {
+    const first = try generateState(std.testing.allocator);
+    defer std.testing.allocator.free(first);
+
+    const second = try generateState(std.testing.allocator);
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqual(@as(usize, 43), first.len);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
