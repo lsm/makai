@@ -456,13 +456,27 @@ class AgentApi(_ExecutionBase):
                     if not started:
                         started = True
                         yield AgentStart(session_id=session_id)
-                    yield AgentEnd(
+                    settled = AgentEnd(
                         usage=aggregate or response.usage,
                         stop_reason=response.stop_reason,
                         error_message=response.error_message,
                         provider_id=response.provider_id or None,
                         api=response.api or None,
                     )
+                    # The host settles a provider auth failure through
+                    # agent_result too, so this path needs the same check the
+                    # agent_end branch applies; without it the stream yields a
+                    # normal-looking terminal and auto_once never retries.
+                    if settled.stop_reason == "error" and is_auth_failure_message(
+                        settled.error_message, api=settled.api
+                    ):
+                        raise MakaiStreamError(
+                            settled.error_message or "auth_required",
+                            kind="provider_error",
+                            code="auth_required",
+                            provider_id=settled.provider_id or fallback_provider_id,
+                        )
+                    yield settled
                     return
 
                 event: AgentStreamEvent = value
@@ -530,7 +544,7 @@ class AgentApi(_ExecutionBase):
         start_accepted = False
         message_sent = False
         message_message_id: Optional[str] = None
-        message_rejected = False
+        message_accepted = False
         stop_sent = False
         start_rejected = False
         # An id the SDK minted is exclusively ours, so a lost or delayed start
@@ -555,22 +569,20 @@ class AgentApi(_ExecutionBase):
                     in_reply_to = frame.get("in_reply_to")
 
                     if frame_type in ("ack", "agent_stopped"):
+                        if frame_type == "ack" and in_reply_to == message_message_id:
+                            message_accepted = True
                         continue
 
                     if frame_type == "nack":
                         if not start_accepted and in_reply_to not in (None, start_message_id):
                             continue
                         start_rejected = not start_accepted
-                        if in_reply_to == message_message_id:
-                            message_rejected = True
                         raise nack_to_stream_error(frame, fallback_provider_id)
 
                     if frame_type == "agent_error":
                         if not start_accepted and in_reply_to not in (None, start_message_id):
                             continue
                         start_rejected = not start_accepted
-                        if in_reply_to == message_message_id:
-                            message_rejected = True
                         raise error_frame_to_stream_error(frame)
 
                     if frame_type == "agent_started":
@@ -594,6 +606,11 @@ class AgentApi(_ExecutionBase):
                     if not start_accepted:
                         # Nothing but a reply to agent_start is meaningful yet.
                         continue
+
+                    # Any run output means the host processed agent_message and
+                    # advanced its inbound counter past it.
+                    if message_sent:
+                        message_accepted = True
 
                     if frame_type == "tool_execute":
                         await self._transport.send(
@@ -643,19 +660,87 @@ class AgentApi(_ExecutionBase):
                     # or whose agent_message was rejected, must reuse 2.
                     stop_sequence = (
                         _AGENT_STOP_SEQUENCE
-                        if message_sent and not message_rejected
+                        if message_accepted
                         else _AGENT_MESSAGE_SEQUENCE
                     )
                     with contextlib.suppress(Exception):
-                        await self._transport.send_best_effort(
-                            build_session_envelope(
-                                "agent_stop",
-                                session_id,
-                                stop_sequence,
-                                {"session_id": session_id, "reason": "completed"},
-                            )
+                        await _stop_agent_with_sequence_probe(
+                            self._transport, route, session_id, stop_sequence
                         )
-                        await route.drain()
+
+
+_STOP_PROBE_IDLE_S = 0.05
+_STOP_PROBE_BUDGET_S = 0.25
+
+
+def _correlated_rejection_code(frame: Mapping[str, Any]) -> Optional[str]:
+    if frame.get("type") not in ("agent_error", "nack"):
+        return None
+    payload = payload_of(frame)
+    code = payload.get("code") or payload.get("error_code")
+    if not isinstance(code, str):
+        return None
+    return "invalid_request" if code == "invalid_sequence" else code
+
+
+async def _stop_agent_with_sequence_probe(
+    transport: StdioTransport,
+    route: FrameRoute,
+    session_id: str,
+    preferred: int,
+) -> None:
+    """Send ``agent_stop``, retrying once with the other plausible sequence.
+
+    The host validates the stop against the session's next expected inbound
+    value and rejects a mismatch, leaving the session registered until the
+    idle sweep. Acceptance of ``agent_message`` is inferred, not guaranteed --
+    the message can be lost in flight -- so a rejection is answered by trying
+    the other candidate, as the TypeScript SDK does (spec 13.4.1).
+    """
+    alternate = (
+        _AGENT_MESSAGE_SEQUENCE if preferred == _AGENT_STOP_SEQUENCE else _AGENT_STOP_SEQUENCE
+    )
+    try:
+        await _probe_stop_sequences(transport, route, session_id, (preferred, alternate))
+    finally:
+        await route.drain()
+
+
+async def _probe_stop_sequences(
+    transport: StdioTransport,
+    route: FrameRoute,
+    session_id: str,
+    candidates: Tuple[int, int],
+) -> None:
+    for attempt, sequence in enumerate(candidates):
+        envelope = build_session_envelope(
+            "agent_stop", session_id, sequence, {"session_id": session_id, "reason": "completed"}
+        )
+        await transport.send_best_effort(envelope)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STOP_PROBE_BUDGET_S
+        rejected = False
+        while loop.time() < deadline:
+            remaining = min(_STOP_PROBE_IDLE_S, deadline - loop.time())
+            if remaining <= 0:
+                break
+            try:
+                frame = await route.next_frame(remaining)
+            except MakaiStreamError:
+                # A quiet slice, not a failure: the deadline ends the wait.
+                continue
+            except Exception:
+                break
+            if frame.get("in_reply_to") != envelope["message_id"]:
+                continue
+            if frame.get("type") == "agent_stopped":
+                return
+            if _correlated_rejection_code(frame) == "invalid_request":
+                rejected = True
+            break
+        if not rejected or attempt == 1:
+            return
 
 
 async def _next(route: FrameRoute, timeout: float, context: TimeoutContext) -> Dict[str, Any]:

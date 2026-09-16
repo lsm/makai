@@ -11,6 +11,7 @@ import pytest
 
 from conftest import FakeServerFactory, read_log
 from makai._ids import new_nano_id
+from makai.execution import _stop_agent_with_sequence_probe
 from makai.errors import MakaiAuthRequiredError, MakaiStreamError
 from makai.types import (
     AgentEnd,
@@ -807,3 +808,93 @@ async def test_a_generated_id_is_stopped_when_the_start_reply_is_lost(
     assert [frame["type"] for frame in frames] == ["agent_start", "agent_stop"]
     # agent_message was never sent, so the host still expects sequence 2.
     assert frames[1]["sequence"] == 2
+
+
+async def test_stream_raises_auth_required_from_an_agent_result(
+    fake: FakeServerFactory,
+) -> None:
+    """The host settles provider auth failures through agent_result too."""
+    client = await fake.client(
+        {
+            "handlers": {
+                "agent_start": [
+                    {"type": "agent_started", "payload": {"session_id": "$session_id"}}
+                ],
+                "agent_message": [
+                    {
+                        "type": "agent_result",
+                        "payload": {},
+                        "result_json": {
+                            "message": {"role": "assistant", "content": []},
+                            "provider_id": "anthropic",
+                            "api": "anthropic-messages",
+                            "stop_reason": "error",
+                            "error_message": "auth_required",
+                        },
+                    }
+                ],
+            }
+        }
+    )
+
+    with pytest.raises(MakaiAuthRequiredError) as excinfo:
+        async for _ in client.agent.stream(
+            model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}]
+        ):
+            pass
+    assert excinfo.value.provider_id == "anthropic"
+
+
+async def test_a_rejected_stop_sequence_is_retried_with_the_other_candidate() -> None:
+    """The host rejects a stop whose sequence does not match its counter."""
+    sent: List[Dict[str, Any]] = []
+
+    class StubTransport:
+        async def send_best_effort(self, frame: Dict[str, Any]) -> None:
+            sent.append(frame)
+
+    class StubRoute:
+        def __init__(self) -> None:
+            self.drained = False
+
+        async def next_frame(self, timeout: float) -> Dict[str, Any]:
+            last = sent[-1]
+            if last["sequence"] == 3:
+                return {
+                    "type": "agent_error",
+                    "in_reply_to": last["message_id"],
+                    "payload": {"code": "invalid_request", "message": "invalid sequence"},
+                }
+            return {"type": "agent_stopped", "in_reply_to": last["message_id"], "payload": {}}
+
+        async def drain(self, idle: float = 0.05, budget: float = 0.25) -> None:
+            self.drained = True
+
+    route = StubRoute()
+    await _stop_agent_with_sequence_probe(
+        StubTransport(), route, "Abcdefghijklmnopqrstu", 3  # type: ignore[arg-type]
+    )
+
+    assert [frame["sequence"] for frame in sent] == [3, 2]
+    assert route.drained
+
+
+async def test_an_accepted_stop_sequence_is_not_retried() -> None:
+    sent: List[Dict[str, Any]] = []
+
+    class StubTransport:
+        async def send_best_effort(self, frame: Dict[str, Any]) -> None:
+            sent.append(frame)
+
+    class StubRoute:
+        async def next_frame(self, timeout: float) -> Dict[str, Any]:
+            return {"type": "agent_stopped", "in_reply_to": sent[-1]["message_id"], "payload": {}}
+
+        async def drain(self, idle: float = 0.05, budget: float = 0.25) -> None:
+            return None
+
+    await _stop_agent_with_sequence_probe(
+        StubTransport(), StubRoute(), "Abcdefghijklmnopqrstu", 2  # type: ignore[arg-type]
+    )
+
+    assert [frame["sequence"] for frame in sent] == [2]
