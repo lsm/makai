@@ -81,9 +81,6 @@ pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
 }
 
 pub fn acceptEncoding(override: ?[]const u8) Headers.Value {
-    // Request identity explicitly rather than omitting the header: an
-    // intermediary proxy is free to compress an unqualified request, and no
-    // reader in the tree can decompress. An explicit caller value wins.
     return .{ .override = override orelse "identity" };
 }
 
