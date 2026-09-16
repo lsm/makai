@@ -643,7 +643,7 @@ pub const AppState = struct {
                             const unwrapped = try toolErrorMessage(self.allocator, detail_source);
                             defer if (unwrapped) |message| self.allocator.free(message);
                             tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, detail_source);
-                            try self.emitToolErrorCard(tool, if (unwrapped) |message| message else detail_source);
+                            try self.emitToolErrorCard(tool, if (unwrapped) |message| message else detail_source, tool.error_detail_readable);
                         }
                     } else if (tool.terminal_evidence == .execution) {
                         tool.terminal_evidence = .both;
@@ -690,7 +690,7 @@ pub const AppState = struct {
                     const unwrapped = try toolErrorMessage(self.allocator, payload.result_json.slice());
                     defer if (unwrapped) |message| self.allocator.free(message);
                     tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, payload.result_json.slice());
-                    try self.emitToolErrorCard(tool, if (unwrapped) |message| message else payload.result_json.slice());
+                    try self.emitToolErrorCard(tool, if (unwrapped) |message| message else payload.result_json.slice(), tool.error_detail_readable);
                     if (tool.error_detail_readable) try self.removeLinkedResultRows(tool.id);
                 }
             },
@@ -1090,14 +1090,27 @@ pub const AppState = struct {
         }
     }
 
-    fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8) !void {
-        if (tool.error_card_emitted) return;
+    fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8, readable: bool) !void {
         const detail = try sanitizeTerminalText(self.allocator, raw_detail);
         defer self.allocator.free(detail);
         const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, detail });
         defer self.allocator.free(message);
+        if (tool.error_card_emitted) {
+            if (!readable) return;
+            var i = self.transcript.items.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = &self.transcript.items[i];
+                if (entry.kind != .@"error" or !std.mem.eql(u8, entry.tool_call_id, tool.id)) continue;
+                try self.replaceEntryText(i, message);
+                break;
+            }
+            try self.status.setError(self.allocator, message);
+            return;
+        }
         try self.status.setError(self.allocator, message);
         try self.appendTranscript(.@"error", message);
+        try self.setEntryToolId(self.transcript.items.len - 1, tool.id);
         tool.error_card_emitted = true;
     }
 
@@ -1168,7 +1181,7 @@ pub const AppState = struct {
     }
 
     fn refreshToolIdentity(self: *AppState, tool: *ToolEntry, label: []const u8, args_json: []const u8) !void {
-        if (!std.mem.eql(u8, tool.label, label)) {
+        if (label.len > 0 and !std.mem.eql(u8, tool.label, label)) {
             const owned = try self.allocator.dupe(u8, label);
             self.allocator.free(tool.label);
             tool.label = owned;
@@ -2722,6 +2735,36 @@ test "AppState upgrades a done occurrence when its retained result reports failu
     try std.testing.expect(state.tools.items[0].error_card_emitted);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "failed") != null);
     try std.testing.expectEqual(@as(usize, 0), countRows(&state, false, "call-u"));
+}
+
+test "AppState refreshes an opaque error card when the end half recovers detail" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var result_event = try toolResultMessageEvent("call-c", "shell", "Tool execution failed", "null", true);
+    defer result_event.deinit(std.testing.allocator);
+    try state.applyEvent(result_event);
+    try std.testing.expect(state.tools.items[0].error_card_emitted);
+    try std.testing.expect(!state.tools.items[0].error_detail_readable);
+    const card_row = state.transcript.items[2];
+    try std.testing.expectEqual(TranscriptKind.@"error", card_row.kind);
+    try std.testing.expect(std.mem.indexOf(u8, card_row.text.items, "null") != null);
+
+    var end_event = try toolEndEvent("call-c", "shell", "{\"ok\":false,\"err\":\"Boom\"}", true);
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expect(state.tools.items[0].error_detail_readable);
+    var error_rows: usize = 0;
+    for (state.transcript.items) |*entry| {
+        if (entry.kind != .@"error") continue;
+        error_rows += 1;
+        try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "Boom") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "null") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), error_rows);
+    try std.testing.expect(std.mem.indexOf(u8, state.status.last_error, "Boom") != null);
 }
 
 test "AppState treats results after a completed or retired occurrence as new occurrences" {
