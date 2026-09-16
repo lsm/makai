@@ -613,18 +613,13 @@ impl AgentSession {
         }
 
         if !self.start_accepted {
-            let replies_to_start = frame.in_reply_to.as_deref() == Some(&self.start_message_id);
-            match frame.kind.as_str() {
-                "agent_started" | "nack" | "agent_error" if !replies_to_start => {
-                    // A reply to somebody else's request, or a stale settlement
-                    // from a previous run on this id. Not ours to act on.
-                    return FrameAction::Ignore;
-                }
-                // Before the start is accepted, uncorrelated session-scoped
-                // frames cannot belong to this attempt: our own run output only
-                // begins after `agent_message`.
-                _ if !replies_to_start => return FrameAction::Ignore,
-                _ => {}
+            // Until the start is accepted, only a reply to *our* `agent_start`
+            // belongs to this attempt. A reply naming another request is
+            // somebody else's; an uncorrelated session-scoped frame is stale
+            // output from a previous run on this id, because our own run output
+            // cannot begin before `agent_message` is even sent.
+            if frame.in_reply_to.as_deref() != Some(&self.start_message_id) {
+                return FrameAction::Ignore;
             }
             self.guard.start_reply_observed = true;
         }
