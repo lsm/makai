@@ -39,7 +39,9 @@ re-opens a live window, and `finalizeInterruptedTools` skips non-live occurrence
 Terminal state records which outcome halves have been seen: `none` (interrupted by
 inference at `turn_end`/`agent_end`), `execution` (`tool_execution_end`), `result`
 (`message_end.tool_result`), `both`. Status is set by the *first* arriving half; the
-second half merges missing fields (output, telemetry, error card) and never flips it.
+second half merges missing fields (output, telemetry, error card) and never flips it —
+with one refinement landed with slice 2: a later failing half upgrades `done` to
+`error` (failure evidence must not be rendered away; the reverse never happens).
 
 At most one occurrence per family is live at any time: a live occurrence absorbs later
 same-id live-intent events, so a second occurrence of a family is only ever allocated
@@ -147,8 +149,12 @@ One design, two PRs (~100 production lines each, per methodology):
    non-reused ids; reused ids stop overwriting earlier occurrences.
 2. **Loss and emission** (#283 / task #404): result-outcome resolution (reconciliation
    proper), the §2 evidence-conditional merge, the §4 write primitive + positioning,
-   error-card dedupe, interruption row insertion, both watermarks, PTY loss-path
-   assertions.
+   error-card dedupe, interruption row insertion, the `finalized_tool_count` watermark,
+   PTY loss-path assertions. Landed via PR #288 with two pieces deferred to #295 after
+   its review loop: the `summary_scan_floor` transcript watermark with occurrence
+   retirement (scans stay eager; §5's transcript bound is unimplemented until then),
+   and the retained-payload merge matrix (output/artifact retention on reconciled
+   entries), both as design-first follow-ups with the review findings as inputs.
 
 ## Non-goals
 
