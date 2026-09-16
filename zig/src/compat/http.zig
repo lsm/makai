@@ -81,14 +81,19 @@ pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
 }
 
 pub fn acceptEncoding(override: ?[]const u8) Headers.Value {
-    if (override) |value| return .{ .override = value };
-    return .omit;
+    // Request identity explicitly rather than omitting the header: an
+    // intermediary proxy is free to compress an unqualified request, and no
+    // reader in the tree can decompress. An explicit caller value wins.
+    return .{ .override = override orelse "identity" };
 }
 
-test "compat http omits accept-encoding unless a caller overrides it" {
-    try std.testing.expectEqual(Headers.Value.omit, acceptEncoding(null));
-    switch (acceptEncoding("identity")) {
+test "compat http requests identity encoding unless a caller overrides it" {
+    switch (acceptEncoding(null)) {
         .override => |value| try std.testing.expectEqualStrings("identity", value),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (acceptEncoding("gzip")) {
+        .override => |value| try std.testing.expectEqualStrings("gzip", value),
         else => return error.TestUnexpectedResult,
     }
 }
