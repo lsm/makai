@@ -11,7 +11,7 @@ import pytest
 
 from conftest import FIXTURE_SERVER, FakeServerFactory, process_alive
 from makai._wire import build_stream_envelope
-from makai.errors import MakaiStreamError
+from makai.errors import TIMEOUT_CODE, MakaiStreamError, is_timeout_error
 from makai.transport import StdioTransport
 
 
@@ -363,3 +363,26 @@ async def test_close_during_connect_does_not_orphan_the_child(
             break
         await asyncio.sleep(0.05)
     assert not process_alive(pid)
+
+
+async def test_a_frame_timeout_is_identified_by_code_not_message(
+    fake: FakeServerFactory,
+) -> None:
+    """Timeout classification must survive a reworded message.
+
+    Three call sites branch on 'is this a timeout?'; matching the wording of
+    the message transport.py happens to emit couples them all to that string.
+    """
+    transport = await fake.transport({"ack": False})
+    async with transport.route(stream_id="QUIET") as route:
+        with pytest.raises(MakaiStreamError) as excinfo:
+            await route.next_frame(0.2)
+
+    assert excinfo.value.code == TIMEOUT_CODE
+    assert is_timeout_error(excinfo.value)
+    assert not is_timeout_error(
+        MakaiStreamError("timed out waiting for frame for x", kind="transport_error")
+    )
+    assert not is_timeout_error(
+        MakaiStreamError("transport closed", kind="transport_error")
+    )

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 from ._diagnostics import TimeoutContext, build_diagnostics, format_timeout_message
 from ._ids import new_ulid
 from ._wire import build_stream_envelope, payload_of
-from .errors import MakaiAuthError, MakaiStreamError
+from .errors import MakaiAuthError, MakaiStreamError, is_timeout_error
 from .transport import StdioTransport
 from .types import (
     AuthErrorEvent,
@@ -278,7 +278,7 @@ class AuthApi:
         try:
             frame: Dict[str, Any] = await route.next_frame(self._frame_timeout)
         except MakaiStreamError as exc:
-            if exc.message.startswith("timed out waiting for"):
+            if is_timeout_error(exc):
                 raise MakaiAuthError(
                     format_timeout_message(context),
                     kind="transport_error",

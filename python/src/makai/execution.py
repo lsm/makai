@@ -42,7 +42,13 @@ from ._normalize import (
 )
 from ._wire import build_reply_envelope, build_session_envelope, build_stream_envelope, json_payload_field, payload_of
 from .auth import AuthApi
-from .errors import MakaiAuthError, MakaiAuthRequiredError, MakaiProtocolError, MakaiStreamError
+from .errors import (
+    MakaiAuthError,
+    MakaiAuthRequiredError,
+    MakaiProtocolError,
+    MakaiStreamError,
+    is_timeout_error,
+)
 from .models import ModelsApi
 from .transport import FrameRoute, StdioTransport
 from .types import (
@@ -737,7 +743,12 @@ async def _probe_stop_sequences(
                 break
             try:
                 frame = await route.next_frame(remaining)
-            except MakaiStreamError:
+            except MakaiStreamError as exc:
+                if not is_timeout_error(exc):
+                    # The route is failed, and next_frame re-arms that failure,
+                    # so retrying would busy-spin until the budget expires
+                    # without ever suspending. Nothing can answer the probe.
+                    return
                 # A quiet slice, not a failure: the deadline ends the wait.
                 continue
             except Exception:
@@ -757,7 +768,7 @@ async def _next(route: FrameRoute, timeout: float, context: TimeoutContext) -> D
     try:
         return await route.next_frame(timeout)
     except MakaiStreamError as exc:
-        if exc.message.startswith("timed out waiting for"):
+        if is_timeout_error(exc):
             raise MakaiStreamError(
                 format_timeout_message(context),
                 kind="transport_error",

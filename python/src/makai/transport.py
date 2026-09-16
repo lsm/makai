@@ -39,7 +39,7 @@ from types import TracebackType
 from typing import Any, Dict, Mapping, Optional, Sequence, Type
 
 from .binary import BinaryResolverOptions, resolve_makai_binary
-from .errors import MakaiStreamError
+from .errors import TIMEOUT_CODE, MakaiStreamError
 
 __all__ = ["Frame", "StdioTransport", "FrameRoute"]
 
@@ -117,6 +117,7 @@ class FrameRoute:
             raise MakaiStreamError(
                 f"timed out waiting for frame for {self.key} after {int(timeout * 1000)}ms",
                 kind="transport_error",
+                code=TIMEOUT_CODE,
             ) from exc
         if isinstance(item, BaseException):
             # Re-arm so a second waiter sees the same terminal condition.

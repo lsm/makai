@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any, Dict, List
 
 import pytest
 
 from conftest import FakeServerFactory, read_log
 from makai._ids import new_nano_id
-from makai.execution import _stop_agent_with_sequence_probe
+from makai.execution import _probe_stop_sequences, _stop_agent_with_sequence_probe
 from makai.errors import MakaiAuthRequiredError, MakaiStreamError
 from makai.types import (
     AgentEnd,
@@ -898,3 +899,23 @@ async def test_an_accepted_stop_sequence_is_not_retried() -> None:
     )
 
     assert [frame["sequence"] for frame in sent] == [2]
+
+
+async def test_the_stop_probe_gives_up_when_the_route_is_already_dead(
+    fake: FakeServerFactory,
+) -> None:
+    """A failed route must end the probe, not be retried until the budget runs out.
+
+    next_frame re-arms the queued failure for the next waiter, so treating it
+    as a quiet slice spins without ever suspending: both candidates burn their
+    full budget while nothing can answer.
+    """
+    transport = await fake.transport({"ack": False})
+    session_id = new_nano_id()
+    async with transport.route(session_id=session_id) as route:
+        await transport.close()
+        started = time.perf_counter()
+        await _probe_stop_sequences(transport, route, session_id, (2, 1))
+        elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
