@@ -63,6 +63,7 @@ FIXTURE_ENV_VAR = "MAKAI_TUI_FIXTURE"
 WELCOME_MARKER = b"Makai TUI"
 MODEL_PICKER_MARKER = b"Select model"
 SESSION_PICKER_MARKER = b"Sessions"
+STREAMING_MARKERS = (b"streaming", b"waiting for", b"running")
 READ_CHUNK = 65536
 PROBE_CARRY = 16
 TERMINAL_PROBE_REPLIES = (
@@ -511,6 +512,27 @@ class PtySession:
                 tail = self.plain[-400:].decode("ascii", "replace")
                 raise ScenarioError(
                     f"timed out after {timeout}s waiting for {what} ({marker!r}); "
+                    f"process alive={self.proc.poll() is None}; plain tail: {tail!r}"
+                )
+            self._read_once(min(0.05, remaining))
+
+    def wait_for_any(self, markers, timeout, what):
+        candidates = [plain_text(marker) for marker in markers]
+        if not candidates or not all(candidates):
+            raise ScenarioError(f"empty marker for {what}")
+        search_from = len(self.plain)
+        deadline = time.monotonic() + timeout
+        while True:
+            window = self.plain[search_from:]
+            for marker in candidates:
+                if marker in window:
+                    return self.last_read_at
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = self.plain[-400:].decode("ascii", "replace")
+                names = ", ".join(repr(marker) for marker in candidates)
+                raise ScenarioError(
+                    f"timed out after {timeout}s waiting for {what} (any of {names}); "
                     f"process alive={self.proc.poll() is None}; plain tail: {tail!r}"
                 )
             self._read_once(min(0.05, remaining))
@@ -1074,7 +1096,7 @@ def scenario_steer_abort(args):
 
         run.session.type_text("hold this thought")
         run.session.send(KEY_ENTER, "Enter (submit)")
-        run.session.wait_for(b"streaming", 10.0, "streaming status after submit")
+        run.session.wait_for_any(STREAMING_MARKERS, 10.0, "streaming status after submit")
         run.frame("streaming")
 
         run.session.type_text("steer this turn")
@@ -1103,7 +1125,7 @@ def scenario_steer_abort(args):
 
         run.session.type_text("run the slow tool")
         run.session.send(KEY_ENTER, "Enter (submit tool turn)")
-        run.session.wait_for(b"streaming", 10.0, "streaming status after tool submit")
+        run.session.wait_for_any(STREAMING_MARKERS, 10.0, "streaming status after tool submit")
         run.frame("tool-turn-streaming")
 
         run.session.type_text("steer this turn too")
