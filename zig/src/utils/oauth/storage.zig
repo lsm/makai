@@ -26,6 +26,7 @@ const KeychainLoadResult = union(enum) {
     found: AuthStorage,
     not_found,
     unavailable,
+    needs_interaction,
 };
 
 fn secureFree(allocator: std.mem.Allocator, data: []const u8) void {
@@ -589,7 +590,10 @@ fn loadFromKeychain(allocator: std.mem.Allocator) !KeychainLoadResult {
 }
 
 fn loadFromKeychainWithCodexImport(allocator: std.mem.Allocator, import_codex: bool) !KeychainLoadResult {
-    const content = macos_keychain.read(allocator) catch return .unavailable;
+    const content = macos_keychain.read(allocator) catch |err| {
+        if (err == error.KeychainNeedsInteraction) return .needs_interaction;
+        return .unavailable;
+    };
     const owned = content orelse return .not_found;
     defer secureFree(allocator, owned);
 
@@ -786,6 +790,11 @@ pub const AuthStorage = struct {
                     try maybeImportCodexCliCredentials(&storage);
                     return storage;
                 },
+                .needs_interaction => {
+                    var storage = try loadFromFile(allocator);
+                    try maybeImportCodexCliCredentials(&storage);
+                    return storage;
+                },
             }
         }
 
@@ -799,6 +808,7 @@ pub const AuthStorage = struct {
             switch (try loadFromKeychainWithCodexImport(allocator, false)) {
                 .found => |storage| return storage,
                 .not_found, .unavailable => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
+                .needs_interaction => return try loadFromFile(allocator),
             }
         }
 
