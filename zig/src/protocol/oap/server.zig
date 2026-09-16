@@ -384,9 +384,14 @@ pub const Server = struct {
             }
         }
 
+        const entry = try self.openSession(payload.session_id);
+        try self.emitSessionState(env.id, entry, .open);
+    }
+
+    fn openSession(self: *Self, requested: ?[]const u8) !*SessionEntry {
         const generated = protocol_types.generateSessionId();
-        const session_id = if (payload.session_id) |requested|
-            try self.allocator.dupe(u8, requested)
+        const session_id = if (requested) |value|
+            try self.allocator.dupe(u8, value)
         else
             try self.allocator.dupe(u8, generated[0..]);
         errdefer self.allocator.free(session_id);
@@ -409,8 +414,7 @@ pub const Server = struct {
             .run = null,
         });
 
-        const entry = self.sessions.getPtr(key).?;
-        try self.emitSessionState(env.id, entry, .open);
+        return self.sessions.getPtr(key).?;
     }
 
     fn handleSessionState(self: *Self, env: oap_types.Envelope, payload: oap_types.SessionStateRequest) !void {
@@ -603,23 +607,32 @@ pub const Server = struct {
             return;
         }
 
-        var run = try self.allocateRun(effective_model.?);
+        try self.admitSubmission(entry, env.id, effective_model.?, payload);
+        try self.emitRunStarted(entry);
+        try self.publishSessionState(entry);
+    }
+
+    fn admitSubmission(
+        self: *Self,
+        entry: *SessionEntry,
+        request_id: []const u8,
+        model_id: []const u8,
+        payload: oap_types.MessageSubmitRequest,
+    ) !void {
+        var run = try self.allocateRun(model_id);
         errdefer run.deinit(self.allocator);
 
         var pending = try self.buildPendingSubmission(entry.session_id, &run, payload);
         errdefer pending.deinit(self.allocator);
 
         try self.pending_submissions.ensureUnusedCapacity(self.allocator, 1);
-        try self.emitAdmission(env.id, entry.session_id, &run);
-        self.pending_submissions.appendAssumeCapacity(pending);
+        try self.emitAdmission(request_id, entry.session_id, &run);
 
+        self.pending_submissions.appendAssumeCapacity(pending);
         if (entry.run) |*previous| previous.deinit(self.allocator);
         entry.run = run;
         entry.status = .running;
         entry.updated_at_ms = compat.time.nowMillis();
-
-        try self.emitRunStarted(entry);
-        try self.publishSessionState(entry);
     }
 
     fn refuseRunControls(self: *Self, env: oap_types.Envelope, payload: oap_types.MessageSubmitRequest) !bool {
