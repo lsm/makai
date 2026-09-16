@@ -966,6 +966,7 @@ pub const AppState = struct {
     }
 
     fn removeTranscriptEntry(self: *AppState, index: usize) void {
+        if (index < self.summary_scan_floor) self.summary_scan_floor -= 1;
         var entry = self.transcript.orderedRemove(index);
         entry.deinit(self.allocator);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
