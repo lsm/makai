@@ -155,7 +155,7 @@ row names the exact source revision and host class it was measured on.
 | `755325d` (PR #262, final harness semantics) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 51.1 ms | 13.2 / 13.5 ms | 21,262,152 B | 14,617 (22 files) |
 | `9189785` (main, post-reconciliation arc #300) | github `ubuntu-latest` (Linux 6.17 azure x86_64) | 2.1 ms | 13.0 / 13.3 ms | 22,147,856 B | 19,525 (22 files) |
 
-Same run, phase timings: submit→fixture-reply 46.7 ms, `/model` picker open
+`755325d` same run, phase timings: submit→fixture-reply 46.7 ms, `/model` picker open
 13.4 ms, `/resume` picker open 13.3 ms, `/quit`→exit 13.0 ms. For comparison,
 before the driver answered the TUI's startup capability probes, first-frame
 was 457 ms — roughly 370 ms of that was the mode-2027 and primary-device-
