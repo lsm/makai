@@ -307,6 +307,20 @@ pub const Bridge = struct {
         self.allocator.free(kv.key);
     }
 
+    pub fn failUnmappedActiveRuns(self: *Self, server: *Server, message: []const u8) !bool {
+        var ids = std.ArrayList([]const u8).empty;
+        defer ids.deinit(self.allocator);
+        try server.appendActiveRunSessionIds(self.allocator, &ids);
+
+        var settled_any = false;
+        for (ids.items) |session_id| {
+            if (self.sessions.contains(session_id)) continue;
+            try server.settleFailed(session_id, .internal_error, message);
+            settled_any = true;
+        }
+        return settled_any;
+    }
+
     pub fn failActiveRuns(self: *Self, server: *Server, message: []const u8) !void {
         var iterator = self.sessions.iterator();
         while (iterator.next()) |entry| {
@@ -867,6 +881,58 @@ test "a message boundary event closes the portable assistant message" {
         first.payload.content_delta.message_id.?,
         second.payload.content_delta.message_id.?,
     ));
+}
+
+test "end of input leaves a dispatched run alone and settles an undispatched one" {
+    const allocator = testing.allocator;
+    var fixture = try startFixture(allocator, "oap-session-key");
+    defer fixture.deinit(allocator);
+
+    try testing.expect(fixture.server.hasActiveRun());
+    try testing.expect(!try fixture.bridge.failUnmappedActiveRuns(
+        &fixture.server,
+        "the makai host reached end of input before the run settled",
+    ));
+    try testing.expect(fixture.server.popOutbound() == null);
+    try testing.expect(fixture.server.hasActiveRun());
+
+    try fixture.server.handleEnvelope(.{
+        .id = "open-2",
+        .payload = .{ .session_open_request = .{ .session_id = "oap-session-stuck" } },
+    });
+    var parts = [_]oap_types.ContentPart{.{ .text = "go" }};
+    var messages = [_]oap_types.Message{.{ .role = .user, .content = .{ .parts = &parts } }};
+    try fixture.server.handleEnvelope(.{
+        .id = "submit-2",
+        .session_id = "oap-session-stuck",
+        .payload = .{ .message_submit_request = .{
+            .session_id = "oap-session-stuck",
+            .messages = &messages,
+            .delivery = .auto,
+        } },
+    });
+    drainOap(&fixture.server, allocator);
+    var pending = fixture.server.popPendingSubmission().?;
+    pending.deinit(allocator);
+
+    try testing.expect(try fixture.bridge.failUnmappedActiveRuns(
+        &fixture.server,
+        "the makai host reached end of input before the run settled",
+    ));
+
+    var failed = try nextOap(&fixture.server, allocator);
+    defer failed.deinit(allocator);
+    try testing.expectEqual(oap_types.Payload.run_failed, std.meta.activeTag(failed.payload));
+    try testing.expectEqualStrings("oap-session-stuck", failed.payload.run_failed.session_id);
+    drainOap(&fixture.server, allocator);
+
+    try feedNative(&fixture.bridge, &fixture.server, allocator, fixture.native_id, .{
+        .agent_event = try allocator.dupe(u8, "{\"type\":\"agent_end\",\"stop_reason\":\"end_turn\"}"),
+    });
+    var completed = try nextOap(&fixture.server, allocator);
+    defer completed.deinit(allocator);
+    try testing.expectEqual(oap_types.Payload.run_completed, std.meta.activeTag(completed.payload));
+    try testing.expectEqualStrings("oap-session-key", completed.payload.run_completed.session_id);
 }
 
 test "a transport failure settles every active run with one terminal" {

@@ -6637,8 +6637,6 @@ fn runOapMode(
         submission_lines.deinit(allocator);
     }
 
-    var settled_on_eof = false;
-
     while (true) {
         var did_work = false;
 
@@ -6652,15 +6650,6 @@ fn runOapMode(
             did_work = true;
         }
 
-        if (stdin_stream.isDone() and !stdin_stream.hasPending()) {
-            stdio_loop.markStdinDisconnected();
-            if (!settled_on_eof and oap.hasActiveRun()) {
-                settled_on_eof = true;
-                try bridge.failActiveRuns(&oap, OAP_EOF_MESSAGE);
-                did_work = true;
-            }
-        }
-
         while (oap.popEvictedSession()) |evicted| {
             defer allocator.free(evicted);
             bridge.forgetSession(evicted);
@@ -6668,6 +6657,13 @@ fn runOapMode(
         }
 
         if (try pumpOapIntents(allocator, &oap, &bridge, &stdio_loop, &submission_lines)) did_work = true;
+
+        if (stdin_stream.isDone() and !stdin_stream.hasPending()) {
+            stdio_loop.markStdinDisconnected();
+            if (oap.hasActiveRun()) {
+                if (try bridge.failUnmappedActiveRuns(&oap, OAP_EOF_MESSAGE)) did_work = true;
+            }
+        }
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
             try emitOapRuntimeFailure(&oap, &bridge, @errorName(err));

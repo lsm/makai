@@ -242,6 +242,19 @@ pub const Server = struct {
         return false;
     }
 
+    pub fn appendActiveRunSessionIds(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList([]const u8),
+    ) !void {
+        var iterator = self.sessions.iterator();
+        while (iterator.next()) |entry| {
+            const run = entry.value_ptr.run orelse continue;
+            if (run.settled) continue;
+            try out.append(allocator, entry.key_ptr.*);
+        }
+    }
+
     pub fn activeRunId(self: *Self, session_id: []const u8) ?[]const u8 {
         const entry = self.sessions.getPtr(session_id) orelse return null;
         const run = entry.run orelse return null;
@@ -1152,39 +1165,41 @@ pub const Server = struct {
         }
         const sequence = run.sequence + 1;
 
-        const id = try self.newUlidString();
-        errdefer self.allocator.free(id);
-        const scope_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(scope_session);
-        const scope_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(scope_run);
-        const payload_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(payload_session);
-        const payload_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(payload_run);
-        const owned_text = try self.allocator.dupe(u8, final_text);
-        errdefer self.allocator.free(owned_text);
-        const owned_reason = try self.allocator.dupe(u8, stop_reason);
-        errdefer self.allocator.free(owned_reason);
-        const model_id = try self.allocator.dupe(u8, run.model_id);
-        errdefer self.allocator.free(model_id);
+        {
+            const id = try self.newUlidString();
+            errdefer self.allocator.free(id);
+            const scope_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(scope_session);
+            const scope_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(scope_run);
+            const payload_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(payload_session);
+            const payload_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(payload_run);
+            const owned_text = try self.allocator.dupe(u8, final_text);
+            errdefer self.allocator.free(owned_text);
+            const owned_reason = try self.allocator.dupe(u8, stop_reason);
+            errdefer self.allocator.free(owned_reason);
+            const model_id = try self.allocator.dupe(u8, run.model_id);
+            errdefer self.allocator.free(model_id);
 
-        try self.pushEnvelope(.{
-            .id = id,
-            .session_id = scope_session,
-            .run_id = scope_run,
-            .sequence = sequence,
-            .timestamp_ms = compat.time.nowMillis(),
-            .payload = .{ .run_completed = .{
-                .session_id = payload_session,
-                .run_id = payload_run,
-                .final_response = .{ .role = .assistant, .content = .{ .text = owned_text } },
-                .stop_reason = owned_reason,
-                .model_id = model_id,
-                .usage = run.usage,
-                .duration_ms = elapsedMs(run.started_at_ms),
-            } },
-        });
+            try self.pushEnvelope(.{
+                .id = id,
+                .session_id = scope_session,
+                .run_id = scope_run,
+                .sequence = sequence,
+                .timestamp_ms = compat.time.nowMillis(),
+                .payload = .{ .run_completed = .{
+                    .session_id = payload_session,
+                    .run_id = payload_run,
+                    .final_response = .{ .role = .assistant, .content = .{ .text = owned_text } },
+                    .stop_reason = owned_reason,
+                    .model_id = model_id,
+                    .usage = run.usage,
+                    .duration_ms = elapsedMs(run.started_at_ms),
+                } },
+            });
+        }
 
         try self.commitTerminal(entry, sequence, .completed);
     }
@@ -1200,33 +1215,35 @@ pub const Server = struct {
         if (run.settled) return;
         const sequence = run.sequence + 1;
 
-        const id = try self.newUlidString();
-        errdefer self.allocator.free(id);
-        const scope_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(scope_session);
-        const scope_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(scope_run);
-        const payload_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(payload_session);
-        const payload_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(payload_run);
-        const owned_message = try self.allocator.dupe(u8, message);
-        errdefer self.allocator.free(owned_message);
+        {
+            const id = try self.newUlidString();
+            errdefer self.allocator.free(id);
+            const scope_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(scope_session);
+            const scope_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(scope_run);
+            const payload_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(payload_session);
+            const payload_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(payload_run);
+            const owned_message = try self.allocator.dupe(u8, message);
+            errdefer self.allocator.free(owned_message);
 
-        try self.pushEnvelope(.{
-            .id = id,
-            .session_id = scope_session,
-            .run_id = scope_run,
-            .sequence = sequence,
-            .timestamp_ms = compat.time.nowMillis(),
-            .payload = .{ .run_failed = .{
-                .session_id = payload_session,
-                .run_id = payload_run,
-                .err = .{ .code = code, .message = owned_message, .retriable = false },
-                .usage = run.usage,
-                .duration_ms = elapsedMs(run.started_at_ms),
-            } },
-        });
+            try self.pushEnvelope(.{
+                .id = id,
+                .session_id = scope_session,
+                .run_id = scope_run,
+                .sequence = sequence,
+                .timestamp_ms = compat.time.nowMillis(),
+                .payload = .{ .run_failed = .{
+                    .session_id = payload_session,
+                    .run_id = payload_run,
+                    .err = .{ .code = code, .message = owned_message, .retriable = false },
+                    .usage = run.usage,
+                    .duration_ms = elapsedMs(run.started_at_ms),
+                } },
+            });
+        }
 
         try self.commitTerminal(entry, sequence, .failed);
     }
@@ -1241,33 +1258,35 @@ pub const Server = struct {
         }
         const sequence = run.sequence + 1;
 
-        const id = try self.newUlidString();
-        errdefer self.allocator.free(id);
-        const scope_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(scope_session);
-        const scope_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(scope_run);
-        const payload_session = try self.allocator.dupe(u8, entry.session_id);
-        errdefer self.allocator.free(payload_session);
-        const payload_run = try self.allocator.dupe(u8, run.run_id);
-        errdefer self.allocator.free(payload_run);
-        const owned_reason = if (reason) |value| try self.allocator.dupe(u8, value) else null;
-        errdefer if (owned_reason) |value| self.allocator.free(value);
+        {
+            const id = try self.newUlidString();
+            errdefer self.allocator.free(id);
+            const scope_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(scope_session);
+            const scope_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(scope_run);
+            const payload_session = try self.allocator.dupe(u8, entry.session_id);
+            errdefer self.allocator.free(payload_session);
+            const payload_run = try self.allocator.dupe(u8, run.run_id);
+            errdefer self.allocator.free(payload_run);
+            const owned_reason = if (reason) |value| try self.allocator.dupe(u8, value) else null;
+            errdefer if (owned_reason) |value| self.allocator.free(value);
 
-        try self.pushEnvelope(.{
-            .id = id,
-            .session_id = scope_session,
-            .run_id = scope_run,
-            .sequence = sequence,
-            .timestamp_ms = compat.time.nowMillis(),
-            .payload = .{ .run_cancelled = .{
-                .session_id = payload_session,
-                .run_id = payload_run,
-                .reason = owned_reason,
-                .usage = run.usage,
-                .duration_ms = elapsedMs(run.started_at_ms),
-            } },
-        });
+            try self.pushEnvelope(.{
+                .id = id,
+                .session_id = scope_session,
+                .run_id = scope_run,
+                .sequence = sequence,
+                .timestamp_ms = compat.time.nowMillis(),
+                .payload = .{ .run_cancelled = .{
+                    .session_id = payload_session,
+                    .run_id = payload_run,
+                    .reason = owned_reason,
+                    .usage = run.usage,
+                    .duration_ms = elapsedMs(run.started_at_ms),
+                } },
+            });
+        }
 
         try self.commitTerminal(entry, sequence, .cancelled);
     }
@@ -2197,6 +2216,46 @@ fn cloneDetailsProbe(allocator: std.mem.Allocator) !void {
 
 test "cloneDetails survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneDetailsProbe, .{});
+}
+
+fn settleTerminalProbe(allocator: std.mem.Allocator) !void {
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+    try submitTestMessage(&server, "req-1", "sess-1");
+    drainOutbound(&server, allocator);
+    discardPending(&server, allocator);
+
+    try server.settleCompleted("sess-1", "done", "end_turn");
+    drainOutbound(&server, allocator);
+
+    try submitTestMessage(&server, "req-2", "sess-1");
+    drainOutbound(&server, allocator);
+    discardPending(&server, allocator);
+    try server.settleFailed("sess-1", .provider_error, "upstream refused");
+    drainOutbound(&server, allocator);
+
+    try submitTestMessage(&server, "req-3", "sess-1");
+    drainOutbound(&server, allocator);
+    discardPending(&server, allocator);
+    const run_id = try allocator.dupe(u8, server.activeRunId("sess-1").?);
+    defer allocator.free(run_id);
+    try server.handleEnvelope(.{
+        .id = "cancel-req",
+        .session_id = "sess-1",
+        .run_id = run_id,
+        .payload = .{ .run_cancel_request = .{ .session_id = "sess-1", .run_id = run_id } },
+    });
+    drainOutbound(&server, allocator);
+    discardPending(&server, allocator);
+    try server.settleCancelled("sess-1", "user stopped");
+    drainOutbound(&server, allocator);
+}
+
+test "every terminal settle survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, settleTerminalProbe, .{});
 }
 
 test "a syntactically invalid model selection is refused before admission" {
