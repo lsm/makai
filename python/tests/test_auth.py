@@ -403,13 +403,15 @@ async def test_login_timeout_carries_diagnostics(fake: FakeServerFactory) -> Non
 
 
 async def test_cancelling_login_sends_auth_cancel(fake: FakeServerFactory) -> None:
+    """Cancellation stays cancellation, and still cancels the flow on the wire."""
     log = fake.log_path()
     client = await fake.client({"log": log, "ack": False}, frame_timeout=5.0)
     task = asyncio.create_task(client.auth.login("anthropic"))
     await asyncio.sleep(0.2)
     task.cancel()
-    with pytest.raises((MakaiAuthError, asyncio.CancelledError)):
+    with pytest.raises(asyncio.CancelledError):
         await task
+    assert task.cancelled()
     await asyncio.sleep(0.1)
     assert any(frame["type"] == "auth_cancel" for frame in read_log(log))
 

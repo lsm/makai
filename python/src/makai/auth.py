@@ -218,10 +218,11 @@ class AuthApi:
                         f"unexpected envelope type during login flow: {frame_type}",
                         kind="transport_error",
                     )
-            except asyncio.CancelledError:
-                await self._cancel(flow_id, sequence)
-                raise MakaiAuthError("auth login cancelled", kind="cancelled") from None
             except BaseException:
+                # Also covers asyncio.CancelledError, which is re-raised
+                # unchanged: converting it to a normal exception would hide
+                # the cancellation from wait_for, task groups, and
+                # Task.cancelled(). The flow is still cancelled on the wire.
                 if not settled:
                     await self._cancel(flow_id, sequence)
                 raise
