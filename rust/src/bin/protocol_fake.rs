@@ -4,7 +4,7 @@
 //! a provider, so the SDK's transport, framing, sequencing, error mapping, and
 //! cancellation can be tested without credentials or a network. The integration
 //! tests drive it; downstream crates can too, by pointing
-//! `ClientBuilder::binary_path` at it.
+//! `ClientBuilder::command` at it.
 //!
 //! Scenarios are selected with `MAKAI_FAKE_SCENARIO`; see [`Scenario`]. Frames it
 //! receives are appended to `MAKAI_FAKE_REQUEST_LOG` when that is set, one JSON
@@ -41,6 +41,9 @@ enum Scenario {
     AgentBusy,
     /// An agent run that streams for a long time, for cancellation tests.
     AgentSlow,
+    /// An agent run that accepts the message and then says nothing, so the
+    /// client times out with the message still unresolved.
+    AgentSilentAfterMessage,
     /// A provider stream that never terminates, for cancellation tests.
     ProviderSlow,
     /// An interactive login that prompts, then succeeds.
@@ -69,6 +72,7 @@ impl Scenario {
             "agent_tools" => Self::AgentTools,
             "agent_busy" => Self::AgentBusy,
             "agent_slow" => Self::AgentSlow,
+            "agent_silent_after_message" => Self::AgentSilentAfterMessage,
             "provider_slow" => Self::ProviderSlow,
             "login_success" => Self::LoginSuccess,
             "login_cancelled" => Self::LoginCancelled,
@@ -591,6 +595,11 @@ fn handle_agent_message(fake: &mut Fake, request: &Value) {
             "agent_error",
             json!({ "code": "invalid_request", "message": "agent_message sequence must be 2" }),
         );
+        return;
+    }
+    if fake.scenario == Scenario::AgentSilentAfterMessage {
+        // Accepted — so the server's counter has advanced past 2 — but the
+        // client is told nothing, which is exactly what the stop probe is for.
         return;
     }
     if fake.scenario == Scenario::AuthRequired {

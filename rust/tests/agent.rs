@@ -456,6 +456,84 @@ async fn a_rejected_start_is_reported_without_a_stop() {
 }
 
 #[tokio::test]
+async fn an_unresolved_message_makes_the_stop_probe_both_sequences() {
+    // Spec §6.1: the stop must carry the session's next expected inbound
+    // sequence, and an out-of-order stop is rejected and leaves the session
+    // registered. While the `agent_message` is unresolved the client cannot
+    // know whether the server accepted it, so it probes: the pre-send value
+    // first, then the post-send value once the server rejects that as
+    // out-of-order. The fake here accepted the message — so it expects 3 — but
+    // told the client nothing before the call timed out.
+    let log = tempfile::NamedTempFile::new().expect("temp file");
+    let client = common::fake_builder("agent_silent_after_message")
+        .env("MAKAI_FAKE_REQUEST_LOG", log.path().display().to_string())
+        .env("MAKAI_FAKE_EXPECTED_STOP_SEQUENCE", "3")
+        .response_timeout(Duration::from_millis(300))
+        .connect()
+        .await
+        .expect("connects");
+
+    let error = client
+        .agent()
+        .run(ExecutionRequest::prompt(MODEL, "hi"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
+
+    let frames = common::wait_for_logged(log.path(), |frames| {
+        kinds(frames)
+            .iter()
+            .filter(|kind| *kind == "agent_stop")
+            .count()
+            == 2
+    })
+    .await;
+    let stops: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame["type"] == serde_json::json!("agent_stop"))
+        .filter_map(|frame| frame["sequence"].as_u64())
+        .collect();
+    assert_eq!(
+        stops,
+        vec![2, 3],
+        "expected a pre-send probe then the post-send retry: {:?}",
+        kinds(&frames)
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_settled_run_stops_once_without_probing() {
+    // The mirror of the probe test: any run output proves the message was
+    // admitted, so the stop goes straight to the post-send value.
+    let log = tempfile::NamedTempFile::new().expect("temp file");
+    let client = common::fake_builder("ok")
+        .env("MAKAI_FAKE_REQUEST_LOG", log.path().display().to_string())
+        .env("MAKAI_FAKE_EXPECTED_STOP_SEQUENCE", "3")
+        .connect()
+        .await
+        .expect("connects");
+
+    client
+        .agent()
+        .run(ExecutionRequest::prompt(MODEL, "hi"))
+        .await
+        .expect("runs");
+
+    let frames = common::wait_for_logged(log.path(), |frames| {
+        kinds(frames).iter().any(|kind| kind == "agent_stop")
+    })
+    .await;
+    let stops: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame["type"] == serde_json::json!("agent_stop"))
+        .filter_map(|frame| frame["sequence"].as_u64())
+        .collect();
+    assert_eq!(stops, vec![3]);
+    client.close().await;
+}
+
+#[tokio::test]
 async fn an_errored_run_with_an_auth_message_takes_the_auth_path() {
     // Spec §3.5: a provider auth failure settles as a *successful* run whose
     // stop_reason is "error"; it must still reach the typed auth error.

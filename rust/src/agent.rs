@@ -232,7 +232,10 @@ impl AgentApi {
             {
                 Ok(frame) => frame,
                 Err(error) => {
-                    session.teardown_on_error();
+                    // A run that never settled leaves the `agent_message`
+                    // unresolved, which is exactly the case the stop probe
+                    // exists for: the server may still be expecting sequence 2.
+                    session.teardown("completed").await;
                     return Err(error);
                 }
             };
@@ -701,10 +704,6 @@ impl AgentSession {
         } else {
             self.guard.abandon();
         }
-    }
-
-    fn teardown_on_error(&mut self) {
-        self.guard.stop("completed");
     }
 
     /// Stops the session and drains its tail.
