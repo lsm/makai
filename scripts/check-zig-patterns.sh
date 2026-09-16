@@ -50,7 +50,34 @@ strip_noncode() {
         i += 2
         while (i <= n) {
           ch = substr(line, i, 1)
-          if (ch == "\\") { out = out substr(line, i, 2); i += 2; continue }
+          if (ch == "\\") {
+            esc = substr(line, i + 1, 1)
+            if (esc == "x") {
+              hex = substr(line, i + 2, 2)
+              if (hex ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) {
+                v = (index("0123456789abcdef", tolower(substr(hex, 1, 1))) - 1) * 16 + index("0123456789abcdef", tolower(substr(hex, 2, 1))) - 1
+                if (v > 0) out = out sprintf("%c", v)
+                i += 4
+                continue
+              }
+            } else if (esc == "u") {
+              rest = substr(line, i + 2)
+              if (substr(rest, 1, 1) == "{") {
+                end = index(rest, "}")
+                if (end > 2) {
+                  cp = substr(rest, 2, end - 2)
+                  if (cp ~ /^[0-9A-Fa-f]+$/) {
+                    v = 0
+                    for (p = 1; p <= length(cp); p++) v = v * 16 + index("0123456789abcdef", tolower(substr(cp, p, 1))) - 1
+                    if (v > 0 && v < 128) out = out sprintf("%c", v)
+                    i += 2 + end
+                    continue
+                  }
+                }
+              }
+            }
+            out = out substr(line, i, 2); i += 2; continue
+          }
           i++
           if (ch == "\"") break
           out = out ch
@@ -171,7 +198,10 @@ if [[ ! -f "$ordinary_entropy_definition_file" ]]; then
   exit 1
 fi
 
-actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
+escaped_identifier_pattern='\\x[0-9A-Fa-f][0-9A-Fa-f]|\\u[{][0-9A-Fa-f]'
+scan_prefilter_pattern="$ordinary_entropy_pattern|$escaped_identifier_pattern"
+
+actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$scan_prefilter_pattern" zig/src \
   | code_matches_only "$ordinary_entropy_pattern" 2 \
   | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
 
@@ -194,6 +224,29 @@ if [[ -n "$stale_ordinary_entropy" ]]; then
   echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
   exit 1
 fi
+
+echo "[patterns] checking line-broken ordinary entropy..."
+while IFS= read -r -d '' file; do
+  joined_hits="$(awk '
+    { lines[NR] = $0 }
+    END {
+      k = 1
+      while (k <= NR) {
+        acc = lines[k]; first = lines[k]
+        while (k < NR && lines[k + 1] ~ /^[[:space:]]*[.(]/) { k++; acc = acc " " lines[k] }
+        if (acc != first) print acc
+        k++
+      }
+    }' "$file" \
+    | strip_noncode \
+    | grep -E "$ordinary_entropy_pattern" || true)"
+  if [[ -n "$joined_hits" ]]; then
+    echo "[patterns] ordinary entropy split across lines in $file" >&2
+    printf "%s\n" "$joined_hits" | sed "s|^|$file: joined: |" >&2
+    echo "[patterns] the deny patterns are line-based; write entropy calls on one line so the guard can see them" >&2
+    exit 1
+  fi
+done < <(find zig/src -name '*.zig' -print0 | sort -z)
 
 echo "[patterns] checking secure entropy call sites are present..."
 expected_secure_entropy_sites="$(cat <<'SECURE'
