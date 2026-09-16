@@ -56,7 +56,7 @@ strip_noncode() {
               hex = substr(line, i + 2, 2)
               if (hex ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) {
                 v = (index("0123456789abcdef", tolower(substr(hex, 1, 1))) - 1) * 16 + index("0123456789abcdef", tolower(substr(hex, 2, 1))) - 1
-                if (v > 0) out = out sprintf("%c", v)
+                if (v > 0 && v < 128) out = out sprintf("%c", v); else out = out "?"
                 i += 4
                 continue
               }
@@ -69,7 +69,7 @@ strip_noncode() {
                   if (cp ~ /^[0-9A-Fa-f]+$/) {
                     v = 0
                     for (p = 1; p <= length(cp); p++) v = v * 16 + index("0123456789abcdef", tolower(substr(cp, p, 1))) - 1
-                    if (v > 0 && v < 128) out = out sprintf("%c", v)
+                    if (v > 0 && v < 128) out = out sprintf("%c", v); else out = out "?"
                     i += 2 + end
                     continue
                   }
@@ -227,7 +227,8 @@ fi
 
 echo "[patterns] checking line-broken ordinary entropy..."
 while IFS= read -r -d '' file; do
-  joined_hits="$(awk '
+  joined_hits="$(strip_noncode < "$file" \
+    | awk '
     { lines[NR] = $0 }
     END {
       k = 1
@@ -237,8 +238,7 @@ while IFS= read -r -d '' file; do
         if (acc != first) print acc
         k++
       }
-    }' "$file" \
-    | strip_noncode \
+    }' \
     | grep -E "$ordinary_entropy_pattern" || true)"
   if [[ -n "$joined_hits" ]]; then
     echo "[patterns] ordinary entropy split across lines in $file" >&2
