@@ -105,6 +105,7 @@ fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadM
 }
 
 var test_custom_providers_config: ?[]const u8 = null;
+var test_custom_discovery_ids: ?[]const []const u8 = null;
 
 fn loadCustomModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage, mode: CatalogLoadMode) ![]ai_types.Model {
     const providers = if (builtin.is_test)
@@ -147,7 +148,7 @@ fn appendCustomProviderModels(
             errdefer model.deinit(allocator);
             try models.append(allocator, model);
         }
-        if (models.items.len > 0) return;
+        return;
     }
 
     for (provider.models) |spec| {
@@ -236,7 +237,20 @@ fn discoverCustomModelIds(
     storage: ?*oauth_storage.AuthStorage,
     mode: CatalogLoadMode,
 ) !?[][]const u8 {
-    if (builtin.is_test) return null;
+    if (builtin.is_test) {
+        const ids = test_custom_discovery_ids orelse return null;
+        const out = try allocator.alloc([]const u8, ids.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |value| allocator.free(value);
+            allocator.free(out);
+        }
+        for (ids, 0..) |id, i| {
+            out[i] = try allocator.dupe(u8, id);
+            filled = i + 1;
+        }
+        return out;
+    }
 
     const name = try customCatalogName(allocator, provider.id);
     defer allocator.free(name);
@@ -619,9 +633,6 @@ fn fetchCustomModelsCatalog(
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
-    for (provider.headers) |header| {
-        try headers.append(allocator, .{ .name = header.name, .value = header.value });
-    }
     if (token) |value| {
         if (std.mem.eql(u8, provider.api, "anthropic-messages")) {
             try headers.append(allocator, .{ .name = "x-api-key", .value = value });
@@ -630,6 +641,10 @@ fn fetchCustomModelsCatalog(
             bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{value});
             try headers.append(allocator, .{ .name = "authorization", .value = bearer.? });
         }
+    }
+    for (provider.headers) |header| {
+        if (compat.http.headerPresent(headers.items, header.name)) continue;
+        try headers.append(allocator, .{ .name = header.name, .value = header.value });
     }
 
     var req = try client.openRequest(.GET, uri, .{ .extra_headers = headers.items, .accept_encoding = "identity" });
@@ -1221,6 +1236,60 @@ const custom_gateway_config =
     \\ "models":[{"id":"claude-x","name":"Claude X","context_window":250000,"max_tokens":40000},"claude-y"],
     \\ "capabilities":{"cache_ttl":true}}]}
 ;
+
+const custom_two_provider_config =
+    \\{"providers":[
+    \\ {"id":"aaa","base_url":"https://aaa.test","models":["keep-a"]},
+    \\ {"id":"zzz","base_url":"https://zzz.test","models":["keep-z"]}
+    \\]}
+;
+
+test "discovery result is filtered per provider and never falls back to the declared list" {
+    test_custom_providers_config = custom_two_provider_config;
+    test_custom_discovery_ids = &[_][]const u8{ "keep-a", "keep-z", "noisy" };
+    defer {
+        test_custom_providers_config = null;
+        test_custom_discovery_ids = null;
+    }
+
+    const models = try loadCustomModels(std.testing.allocator, null, .allow_cache);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("keep-a", models[0].id);
+    try std.testing.expectEqualStrings("aaa", models[0].provider);
+    try std.testing.expectEqualStrings("keep-z", models[1].id);
+    try std.testing.expectEqualStrings("zzz", models[1].provider);
+}
+
+test "a provider whose discovery is fully filtered contributes nothing regardless of file order" {
+    const orders = [_][]const u8{
+        \\{"providers":[
+        \\ {"id":"empty","base_url":"https://empty.test","models":["absent"]},
+        \\ {"id":"full","base_url":"https://full.test","models":["present"]}
+        \\]}
+        ,
+        \\{"providers":[
+        \\ {"id":"full","base_url":"https://full.test","models":["present"]},
+        \\ {"id":"empty","base_url":"https://empty.test","models":["absent"]}
+        \\]}
+        ,
+    };
+    test_custom_discovery_ids = &[_][]const u8{"present"};
+    defer test_custom_discovery_ids = null;
+
+    for (orders) |config| {
+        test_custom_providers_config = config;
+        defer test_custom_providers_config = null;
+
+        const models = try loadCustomModels(std.testing.allocator, null, .allow_cache);
+        defer deinitModels(std.testing.allocator, models);
+
+        try std.testing.expectEqual(@as(usize, 1), models.len);
+        try std.testing.expectEqualStrings("present", models[0].id);
+        try std.testing.expectEqualStrings("full", models[0].provider);
+    }
+}
 
 test "loadProductionModels includes models from a declared custom provider" {
     test_custom_providers_config = custom_gateway_config;

@@ -51,9 +51,14 @@ the built-in ones.
 | `reasoning` | no | Whether models expose reasoning. Default `false`. |
 | `context_window`, `max_tokens` | no | Defaults for models that do not state their own. Default 128000 and 8192. |
 
-A malformed entry fails the whole file rather than being skipped, so a typo is
-visible instead of silently dropping a provider. Reserved ids, unparseable base
-URLs, unsupported `api` values and duplicate ids are all rejected by name.
+A malformed entry fails the whole file rather than being skipped, so a typo
+cannot silently drop one provider while the rest keep working. Reserved ids,
+unparseable base URLs, unsupported `api` values and duplicate ids are each
+rejected by name. Because that disables every custom provider at once, the TUI
+reports it on startup as an error row naming the file and the reason, for
+example `InvalidBaseUrl` or `ReservedProviderId`. Without that row a typo would
+look identical to having no config at all: nothing in `/model`, and
+`/login <id>` answering "unknown login provider".
 
 ## Base URLs
 
@@ -92,6 +97,12 @@ On first use makai fetches `<base_url>/v1/models` and caches the response under
 `~/.makai/model_catalog/custom-<id>.json` for 24 hours. `/model` forces a fresh
 fetch. When the fetch fails it falls back to the cached copy however old, and
 then to the declared `models` list.
+
+The declared list is a fallback **only** when discovery produced nothing at all.
+When discovery succeeds, its result is filtered by the list and that is what you
+get, even if the filter removes everything. A provider that discovers only models
+you did not allow therefore contributes nothing, rather than quietly falling back
+to its declared entries.
 
 A declared `models` list acts as an **allowlist** over whatever discovery
 returns. This is what keeps an aggregator usable: OpenRouter lists hundreds of

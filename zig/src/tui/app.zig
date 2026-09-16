@@ -820,6 +820,24 @@ pub const App = struct {
 
     const max_custom_provider_config_bytes = 1024 * 1024;
 
+    fn warnOnUnreadableCustomProviders(self: *App) void {
+        const path = custom_providers.configPath(self.allocator) catch return;
+        defer self.allocator.free(path);
+        const data = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, max_custom_provider_config_bytes) catch return;
+        defer self.allocator.free(data);
+        const providers = custom_providers.parse(self.allocator, data) catch |err| {
+            const msg = std.fmt.allocPrint(
+                self.allocator,
+                "{s} was not loaded: {s}. Custom providers are disabled until it parses.",
+                .{ path, @errorName(err) },
+            ) catch return;
+            defer self.allocator.free(msg);
+            self.state.appendTranscript(.@"error", msg) catch {};
+            return;
+        };
+        custom_providers.deinitProviders(self.allocator, providers);
+    }
+
     fn isDeclaredCustomProvider(self: *App, provider_id: []const u8) bool {
         const providers = custom_providers.load(self.allocator, max_custom_provider_config_bytes) catch return false;
         defer custom_providers.deinitProviders(self.allocator, providers);
@@ -895,7 +913,8 @@ pub const App = struct {
                 self.state.mode = .login_input;
             },
             .done => |creds| {
-                const provider_id = session.provider_id;
+                const provider_id = try self.allocator.dupe(u8, session.provider_id);
+                defer self.allocator.free(provider_id);
                 const save_err = self.saveLoginCredentials(provider_id, creds, session.storesApiKey());
                 creds.deinit(self.allocator);
                 self.finishLogin();
@@ -1612,6 +1631,7 @@ pub const TuiModel = struct {
                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
             };
             app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
+            app.warnOnUnreadableCustomProviders();
         }
         return .{ .every = 50 * std.time.ns_per_ms };
     }

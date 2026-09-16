@@ -949,15 +949,27 @@ fn parseChunk(
     }
 }
 
+const url_version_prefix = "/v1";
+
+fn effectiveUrlSuffix(trimmed_base: []const u8, suffix: []const u8) []const u8 {
+    if (!std.mem.endsWith(u8, trimmed_base, url_version_prefix)) return suffix;
+    if (!std.mem.startsWith(u8, suffix, url_version_prefix ++ "/")) return suffix;
+    return suffix[url_version_prefix.len..];
+}
+
 fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, suffix)) return allocator.dupe(u8, trimmed);
+    const effective = effectiveUrlSuffix(trimmed, suffix);
+
     var sb = StringBuilder{};
-    sb.count(base_url);
-    sb.count(suffix);
+    sb.count(trimmed);
+    sb.count(effective);
     try sb.allocate(allocator);
     errdefer sb.deinit(allocator);
 
-    _ = sb.append(base_url);
-    _ = sb.append(suffix);
+    _ = sb.append(trimmed);
+    _ = sb.append(effective);
 
     std.debug.assert(sb.len == sb.cap);
     const out = sb.ptr.?[0..sb.cap];
@@ -2795,4 +2807,20 @@ test "streamSimpleOpenAICompletions exits early when pre-cancelled" {
 
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}
+
+test "buildUrlWithSuffix never doubles the version segment" {
+    const cases = [_]struct { base: []const u8, suffix: []const u8, want: []const u8 }{
+        .{ .base = "https://api.openai.com", .suffix = "/v1/chat/completions", .want = "https://api.openai.com/v1/chat/completions" },
+        .{ .base = "https://api.groq.com/openai/v1", .suffix = "/v1/chat/completions", .want = "https://api.groq.com/openai/v1/chat/completions" },
+        .{ .base = "http://localhost:8000/v1/", .suffix = "/v1/chat/completions", .want = "http://localhost:8000/v1/chat/completions" },
+        .{ .base = "https://api.githubcopilot.com", .suffix = "/chat/completions", .want = "https://api.githubcopilot.com/chat/completions" },
+        .{ .base = "https://gw.test/v1", .suffix = "/chat/completions", .want = "https://gw.test/v1/chat/completions" },
+        .{ .base = "https://gw.test/v1/chat/completions", .suffix = "/v1/chat/completions", .want = "https://gw.test/v1/chat/completions" },
+    };
+    for (cases) |case| {
+        const url = try buildUrlWithSuffix(std.testing.allocator, case.base, case.suffix);
+        defer std.testing.allocator.free(url);
+        try std.testing.expectEqualStrings(case.want, url);
+    }
 }
