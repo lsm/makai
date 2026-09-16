@@ -80,6 +80,24 @@ pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
     return @ptrCast(@alignCast(response.reader(transfer_buf)));
 }
 
+pub fn headerPresent(headers: []const std.http.Header, name: []const u8) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    }
+    return false;
+}
+
+test "compat http header presence ignores case and reports absence" {
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer x" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    try std.testing.expect(headerPresent(&headers, "authorization"));
+    try std.testing.expect(headerPresent(&headers, "CONTENT-TYPE"));
+    try std.testing.expect(!headerPresent(&headers, "x-tenant"));
+    try std.testing.expect(!headerPresent(&.{}, "authorization"));
+}
+
 test "compat http client initializes and deinitializes" {
     var client = HttpClient.init(std.testing.allocator);
     client.deinit();

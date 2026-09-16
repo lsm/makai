@@ -1138,6 +1138,18 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
+    if (model.headers) |model_headers| {
+        for (model_headers) |header| {
+            if (compat_mod.http.headerPresent(headers.items, header.name)) continue;
+            headers.append(allocator, .{ .name = header.name, .value = header.value }) catch {
+                ctx.deinit();
+                stream.completeWithError("oom headers");
+                stream.markThreadDone();
+                return;
+            };
+        }
+    }
+
     const user_agent_override: ?[]const u8 = if (isKimiModel(model))
         "claude-code/0.1.0"
     else

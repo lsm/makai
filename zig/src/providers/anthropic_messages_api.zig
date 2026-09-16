@@ -1040,7 +1040,7 @@ const AnthropicHeaderSet = struct {
     }
 };
 
-fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !AnthropicHeaderSet {
+fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8, model_headers: ?[]const ai_types.HeaderPair) !AnthropicHeaderSet {
     var out = AnthropicHeaderSet{ .headers = .empty };
     errdefer out.deinit(allocator);
 
@@ -1060,6 +1060,13 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !Ant
 
     try out.headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" });
     try out.headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
+
+    if (model_headers) |extra| {
+        for (extra) |header| {
+            if (compat.http.headerPresent(out.headers.items, header.name)) continue;
+            try out.headers.append(allocator, .{ .name = header.name, .value = header.value });
+        }
+    }
 
     return out;
 }
@@ -1106,7 +1113,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var header_set = buildAnthropicHeaders(allocator, api_key) catch {
+    var header_set = buildAnthropicHeaders(allocator, api_key, model.headers) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom headers");
@@ -2161,8 +2168,28 @@ test "provider_cancellation_anthropic_cancel_mid_event_payload" {
     try expectSyntheticAnthropicBoundaryCancellation(.mid_event_payload);
 }
 
+test "anthropic model headers are forwarded and never shadow a built-in" {
+    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-api-test", &.{
+        .{ .name = "X-Tenant", .value = "acme" },
+        .{ .name = "Anthropic-Version", .value = "1999-01-01" },
+    });
+    defer header_set.deinit(std.testing.allocator);
+
+    var tenant: ?[]const u8 = null;
+    var version_count: usize = 0;
+    for (header_set.headers.items) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "x-tenant")) tenant = header.value;
+        if (std.ascii.eqlIgnoreCase(header.name, "anthropic-version")) {
+            version_count += 1;
+            try std.testing.expectEqualStrings("2023-06-01", header.value);
+        }
+    }
+    try std.testing.expectEqualStrings("acme", tenant.?);
+    try std.testing.expectEqual(@as(usize, 1), version_count);
+}
+
 test "anthropic_api_key_headers_are_forwarded_exactly" {
-    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-api-test");
+    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-api-test", null);
     defer header_set.deinit(std.testing.allocator);
 
     const headers = header_set.headers.items;
@@ -2178,7 +2205,7 @@ test "anthropic_api_key_headers_are_forwarded_exactly" {
 }
 
 test "anthropic_oauth_headers_are_forwarded_exactly" {
-    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-oat-test");
+    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-oat-test", null);
     defer header_set.deinit(std.testing.allocator);
 
     const headers = header_set.headers.items;

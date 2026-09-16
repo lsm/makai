@@ -632,7 +632,7 @@ fn fetchCustomModelsCatalog(
         }
     }
 
-    var req = try client.openRequest(.GET, uri, .{ .extra_headers = headers.items });
+    var req = try client.openRequest(.GET, uri, .{ .extra_headers = headers.items, .accept_encoding = "identity" });
     defer req.deinit();
 
     try compat.http.sendBodilessRequest(&req);
