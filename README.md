@@ -16,7 +16,7 @@ If you are consuming a scoped release, install the scope published by your regis
 npm install @anthropic/makai
 ```
 
-You also need access to the Makai runtime binary. By default the SDK looks for a local build under `zig-out/bin/makai` or `zig/zig-out/bin/makai`, then falls back to `makai` on `PATH`. See [Configuration](#configuration) for explicit binary resolver options.
+You also need access to the Makai runtime binary. By default the SDK prefers the installed `@makai/cli-<platform>-<arch>` optional dependency, then a local build under `zig-out/bin/makai` or `zig/zig-out/bin/makai`, then `makai` on `PATH`. See [Configuration](#configuration) for explicit binary resolver options.
 
 ## Quick start
 
@@ -337,11 +337,16 @@ Environment variable equivalents are `MAKAI_BINARY_URL` and `MAKAI_BINARY_SHA256
 
 ### PATH lookup and local builds
 
-With no resolver options, Makai checks:
+With no resolver options, Makai checks, in order:
 
-1. `./zig-out/bin/makai` (or `makai.exe` on Windows)
-2. `./zig/zig-out/bin/makai`
-3. `makai` on `PATH`
+1. The `@makai/cli-<platform>-<arch>` optional dependency, when it is installed
+2. `./zig-out/bin/makai` (or `makai.exe` on Windows)
+3. `./zig/zig-out/bin/makai`
+4. `makai` on `PATH`
+
+Step 1 outranks both local build paths, so an installed platform package wins over a fresh `zig build`. Set `MAKAI_BINARY_PATH` (or `resolver.binaryPath`) to pin an exact binary.
+
+`handshakeTimeoutMs` bounds the `ready` handshake in `connect()`; a failed handshake terminates the spawned runtime process. `responseTimeoutMs` bounds each `provider`, `agent`, and `models` frame wait. `frameTimeoutMs` bounds each `auth` frame wait, and is also the fallback for `responseTimeoutMs` when that is unset. Setting only `responseTimeoutMs` leaves `client.auth` on its 30s default.
 
 ```ts
 import { createMakaiClient } from "makai";
@@ -375,14 +380,40 @@ async function closeClient(client: { close(): Promise<void> }): Promise<void> {
 }
 ```
 
+## Cancellation
+
+Pass an `AbortSignal` as `options.signal` to cancel a `provider` or `agent` call. `client.auth.login(providerId, handlers, { signal })` takes one too. Aborting rejects the call with an `Error` whose `name` is `"AbortError"` — use the exported `isAbortError(error)` guard rather than `instanceof`, because it is not a `MakaiStreamError`.
+
+```ts
+import { createMakaiClient, isAbortError } from "makai";
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5_000);
+
+try {
+  for await (const event of client.provider.stream({
+    model_ref: model.model_ref,
+    messages: [{ role: "user", content: "Explain lock-free queues." }],
+    options: { signal: controller.signal },
+  })) {
+    if (event.type === "text_delta") process.stdout.write(event.delta);
+  }
+} catch (error: unknown) {
+  if (!isAbortError(error)) throw error;
+}
+```
+
+Leaving the loop early (a `break`, a `return`, or a thrown error inside the body) also cancels the run: the SDK sends a best-effort `abort_request` for `provider.stream` and an `agent_stop` for `agent.stream` when the iterator is disposed before a terminal event.
+
 ## Error handling
 
 The SDK exports error classes for common failure surfaces:
 
-- `MakaiStreamError` — provider, stream, transport, abort, or unknown failures while running `provider` or `agent` calls.
+- `MakaiStreamError` — provider, stream, transport, or unknown failures while running `provider` or `agent` calls, including a call made on a closed transport (`kind: "transport_error"`). Aborts do **not** use this class; see [Cancellation](#cancellation).
 - `MakaiAuthRequiredError` — specialized `MakaiStreamError` for `auth_required` failures. It includes `provider_id`.
-- `MakaiProtocolError` — models API protocol failures such as `invalid_request`, malformed responses, or request `nack`s.
+- `MakaiProtocolError` — models API protocol failures such as `invalid_request`, malformed responses, or request `nack`s. A `client.models` call made on a closed transport rejects with a plain `Error` instead.
 - `MakaiAuthError` — auth provider listing and login failures. The `kind` can be `provider_error`, `cancelled`, `transport_error`, or `unknown`.
+- `StdioProtocolError` — handshake failures from `connect()`, such as a protocol `version_mismatch`. A handshake timeout rejects with a plain `Error`.
 
 ```ts
 import {
@@ -496,6 +527,7 @@ type RunOptions = {
   auth_retry_policy?: "manual" | "auto_once";
   session_id?: string;
   metadata?: Record<string, string>;
+  signal?: AbortSignal;
 };
 ```
 
