@@ -120,14 +120,38 @@ export class MakaiStdioClient {
     this.lineReader.on("line", (line) => this.handleLine(line));
 
     this.logger.debug("stdio: waiting for handshake", { timeout_ms: this.options.handshakeTimeoutMs });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`stdio handshake timed out after ${this.options.handshakeTimeoutMs}ms`));
-        this.pendingHandshake = null;
-      }, this.options.handshakeTimeoutMs);
-      this.pendingHandshake = { resolve, reject, timer };
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`stdio handshake timed out after ${this.options.handshakeTimeoutMs}ms`));
+          this.pendingHandshake = null;
+        }, this.options.handshakeTimeoutMs);
+        this.pendingHandshake = { resolve, reject, timer };
+      });
+    } catch (error) {
+      this.terminateChild();
+      throw error;
+    }
     this.logger.info("stdio: handshake complete");
+  }
+
+  private terminateChild(): void {
+    const child = this.child;
+    if (!child) return;
+    this.logger.debug("stdio: terminating process after failed handshake", { pid: child.pid });
+    this.failPendingFrameWaiters(new Error("stdio handshake failed"));
+    this.cleanupProcessHandles();
+    try {
+      child.stdin.end();
+    } catch {
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill();
+      } catch {
+      }
+    }
+    child.unref();
   }
 
   send(frame: StdioFrame): void {
