@@ -15,6 +15,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         result: ?R = null,
         completed: std.atomic.Value(bool),
         err_msg: ?[]const u8 = null,
+        err_msg_static: bool = false,
         mutex: std.Io.Mutex = .init,
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
@@ -119,7 +120,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
 
             if (self.err_msg) |msg| {
-                self.allocator.free(msg);
+                if (!self.err_msg_static) self.allocator.free(msg);
             }
 
             self.* = undefined;
@@ -203,11 +204,27 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defer self.mutex.unlock(defaultIo());
 
             if (self.err_msg) |old| {
-                self.allocator.free(old);
+                if (!self.err_msg_static) self.allocator.free(old);
                 self.err_msg = null;
+                self.err_msg_static = false;
             }
 
-            self.err_msg = self.allocator.dupe(u8, msg) catch null;
+            self.err_msg = self.allocator.dupe(u8, msg) catch blk: {
+                self.err_msg_static = true;
+                break :blk "out of memory";
+            };
+            self.completed.store(true, .release);
+
+            _ = self.futex.fetchAdd(1, .release);
+            self.wake(std.math.maxInt(u32));
+        }
+
+        pub fn completeWithoutOutcomeForTesting(self: *Self) void {
+            if (!@import("builtin").is_test) @compileError("completeWithoutOutcomeForTesting is test-only");
+
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
+
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);
@@ -449,6 +466,36 @@ test "EventStream error" {
 
     try std.testing.expect(stream.isDone());
     try std.testing.expectEqualStrings("test error", stream.getError().?);
+}
+
+test "EventStream keeps a retrievable error when the allocator cannot duplicate the message" {
+    const TestStream = EventStream(u32, bool);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var stream = TestStream.init(failing.allocator());
+    defer stream.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    stream.completeWithError("oom final content");
+    failing.fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(stream.isDone());
+    try std.testing.expect(stream.getResult() == null);
+    try std.testing.expectEqualStrings("out of memory", stream.getError().?);
+}
+
+test "EventStream replaces a static oom error with an owned message" {
+    const TestStream = EventStream(u32, bool);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var stream = TestStream.init(failing.allocator());
+    defer stream.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    stream.completeWithError("oom final content");
+    failing.fail_index = std.math.maxInt(usize);
+
+    stream.completeWithError("later real error");
+
+    try std.testing.expectEqualStrings("later real error", stream.getError().?);
 }
 
 test "EventStream pollBatch" {

@@ -1562,11 +1562,24 @@ fn runThread(ctx: *ThreadCtx) void {
                                     };
 
                                     if (event_tc) |tc| {
-                                        _ = stream.pushBlocking(.{ .toolcall_end = .{
+                                        const queued = stream.pushBlocking(.{ .toolcall_end = .{
                                             .content_index = content_blocks.items.len - 1,
                                             .tool_call = tc,
                                             .partial = createPartialMessage(model),
                                         } });
+                                        if (queued) {
+                                            pending_delta_frees.append(allocator, tc.id) catch allocator.free(tc.id);
+                                            pending_delta_frees.append(allocator, tc.name) catch allocator.free(tc.name);
+                                            if (tc.arguments_json.len > 0) {
+                                                pending_delta_frees.append(allocator, tc.arguments_json) catch allocator.free(tc.arguments_json);
+                                            }
+                                            if (tc.thought_signature) |sig| {
+                                                pending_delta_frees.append(allocator, sig) catch allocator.free(sig);
+                                            }
+                                        } else {
+                                            var orphan_event_tc = tc;
+                                            ai_types.deinitToolCall(allocator, &orphan_event_tc);
+                                        }
                                     }
                                 }
                             },
