@@ -109,12 +109,16 @@ test "shell execute captures stdout" {
 
 test "shell execute supports filesystem root workspace" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     var result = try execute("call-root", "{\"workspace_root\":\"/\",\"command\":\"pwd && ls -al\",\"timeout_ms\":10000,\"compact_output\":true}", null, null, null, std.testing.allocator);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.content.slice()[0].text.text, "output stored as artifact") != null);
 }
 
 test "shell execute stores large output as artifact and supports compact output" {
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const large_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"command\":\"python3 - <<'PY'\\nimport sys\\nsys.stdout.write('x' * 11000)\\nPY\"}}", .{cwd});

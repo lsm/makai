@@ -141,6 +141,8 @@ fn globMatches(pattern: []const u8, path: []const u8) bool {
 }
 
 test "search text returns file line content and empty results" {
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);

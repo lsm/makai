@@ -220,6 +220,8 @@ test "file read write stat" {
 }
 
 test "file read stores large output as artifact" {
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);

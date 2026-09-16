@@ -63,6 +63,7 @@ FIXTURE_ENV_VAR = "MAKAI_TUI_FIXTURE"
 WELCOME_MARKER = b"Makai TUI"
 MODEL_PICKER_MARKER = b"Select model"
 SESSION_PICKER_MARKER = b"Sessions"
+STREAMING_MARKERS = (b"streaming", b"waiting for", b"running")
 READ_CHUNK = 65536
 PROBE_CARRY = 16
 TERMINAL_PROBE_REPLIES = (
@@ -511,6 +512,27 @@ class PtySession:
                 tail = self.plain[-400:].decode("ascii", "replace")
                 raise ScenarioError(
                     f"timed out after {timeout}s waiting for {what} ({marker!r}); "
+                    f"process alive={self.proc.poll() is None}; plain tail: {tail!r}"
+                )
+            self._read_once(min(0.05, remaining))
+
+    def wait_for_any(self, markers, timeout, what):
+        candidates = [plain_text(marker) for marker in markers]
+        if not candidates or not all(candidates):
+            raise ScenarioError(f"empty marker for {what}")
+        search_from = len(self.plain)
+        deadline = time.monotonic() + timeout
+        while True:
+            window = self.plain[search_from:]
+            for marker in candidates:
+                if marker in window:
+                    return self.last_read_at
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = self.plain[-400:].decode("ascii", "replace")
+                names = ", ".join(repr(marker) for marker in candidates)
+                raise ScenarioError(
+                    f"timed out after {timeout}s waiting for {what} (any of {names}); "
                     f"process alive={self.proc.poll() is None}; plain tail: {tail!r}"
                 )
             self._read_once(min(0.05, remaining))
@@ -1074,7 +1096,7 @@ def scenario_steer_abort(args):
 
         run.session.type_text("hold this thought")
         run.session.send(KEY_ENTER, "Enter (submit)")
-        run.session.wait_for(b"streaming", 10.0, "streaming status after submit")
+        run.session.wait_for_any(STREAMING_MARKERS, 10.0, "streaming status after submit")
         run.frame("streaming")
 
         run.session.type_text("steer this turn")
@@ -1103,7 +1125,7 @@ def scenario_steer_abort(args):
 
         run.session.type_text("run the slow tool")
         run.session.send(KEY_ENTER, "Enter (submit tool turn)")
-        run.session.wait_for(b"streaming", 10.0, "streaming status after tool submit")
+        run.session.wait_for_any(STREAMING_MARKERS, 10.0, "streaming status after tool submit")
         run.frame("tool-turn-streaming")
 
         run.session.type_text("steer this turn too")
@@ -1283,6 +1305,66 @@ def scenario_tool_loss_reconcile(args):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def scenario_tool_loss_flush_release(args):
+    home = tempfile.mkdtemp(prefix="makai-pty-home-flush-release-")
+    try:
+        sessions_dir = os.path.join(home, ".makai", "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        meta = {
+            "session_id": "tool-loss-flush-release",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "last_active": int(time.time() * 1000),
+        }
+        tool_calls_json = json.dumps([
+            {"type": "tool_call", "id": "call-flush-1", "name": "shell_command", "arguments_json": "{\"command\":\"ls\"}"},
+        ])
+        events = [
+            {"type": "message_start", "role": "user"},
+            {"type": "message_end", "role": "user", "text": "run the tool then report"},
+            {"type": "message_start", "role": "assistant"},
+            {"type": "message_end", "role": "assistant", "tool_calls_json": tool_calls_json},
+            {"type": "tool_execution_start", "tool_call_id": "call-flush-1", "tool_name": "shell_command", "args_json": "{\"command\":\"ls\"}"},
+            {"type": "tool_execution_end", "tool_call_id": "call-flush-1", "tool_name": "shell_command", "result_json": "{\"ok\":true}", "is_error": False},
+        ]
+        for i in range(30):
+            events.append({"type": "message_start", "role": "assistant"})
+            events.append({"type": "message_end", "role": "assistant", "text": f"release-row-{i:03d}"})
+        events.append({"type": "turn_end", "stop_reason": "stop"})
+        events.append({"type": "agent_end", "reason": "completed"})
+        with open(os.path.join(sessions_dir, "tool-loss-flush-release.jsonl"), "w") as handle:
+            for event in events:
+                handle.write(json.dumps({"metadata": meta, "event": event}) + "\n")
+
+        run = SweepRun(args, "tool-loss-flush-release", "loss-probe", home=home)
+        try:
+            run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+            run.settle()
+            run.command("/resume", SESSION_PICKER_MARKER.decode())
+            run.session.send(KEY_ENTER, "Enter (resume flush-release session)")
+            run.session.wait_for(b"release-row-029", 10.0, "final replay row")
+            run.settle(0.5)
+            run.frame("resumed-released")
+            shown = run.session.screen_text()
+            if b"release-row-000" not in shown:
+                raise ScenarioError("tool-loss-flush-release: the end-of-session release never flushed the early rows into scrollback")
+            if b"release-row-015" not in shown:
+                raise ScenarioError("tool-loss-flush-release: mid-session rows missing from scrollback after the release")
+            ok_rows = [row for row in shown.split(b"\n") if TOOL_OK_GLYPH in row and b"shell_command" in row and b"ls" in row]
+            if len(ok_rows) != 1:
+                raise ScenarioError(f"tool-loss-flush-release: expected exactly one ok summary row for the dropped-result tool, saw {len(ok_rows)}")
+            run.note("agent_end retires the execution-only occurrence and the flush releases the held prefix into scrollback")
+            run.quit()
+        except ScenarioError as err:
+            run.error = str(err)
+        finally:
+            run.close()
+            run.dump(os.path.join(args.output_dir, "tool-loss-flush-release"))
+        return run
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def scenario_session_roundtrip(args):
     home = tempfile.mkdtemp(prefix="makai-pty-home-roundtrip-")
     save_dir = os.path.join(args.output_dir, "session-roundtrip", "save")
@@ -1340,6 +1422,7 @@ SCENARIOS = {
     "approval-allow": scenario_approval_allow,
     "session-roundtrip": scenario_session_roundtrip,
     "tool-loss-reconcile": scenario_tool_loss_reconcile,
+    "tool-loss-flush-release": scenario_tool_loss_flush_release,
 }
 
 

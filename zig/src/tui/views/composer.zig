@@ -68,7 +68,9 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     }
     if (state.composer.text().len == 0) {
         const draft_width = content_width -| cursor_cell_width;
-        const placeholder = try tui_text.truncateLineToWidth(allocator, placeholderFor(state), draft_width);
+        const placeholder_source = try placeholderFor(allocator, state);
+        defer allocator.free(placeholder_source);
+        const placeholder = try tui_text.truncateLineToWidth(allocator, placeholder_source, draft_width);
         defer allocator.free(placeholder);
         const styled_placeholder = try tui_theme.composerPlaceholder().render(allocator, placeholder);
         defer allocator.free(styled_placeholder);
@@ -83,11 +85,19 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     return prefixFirstLine(allocator, prompt, draft);
 }
 
-fn placeholderFor(state: *const tui_state.AppState) []const u8 {
-    if (state.mode == .login_input) return if (state.login_input_secret) "paste the secret and press Enter" else "type your answer and press Enter";
-    if (state.mode == .approval) return "y / a / n to decide, or type /abort";
-    if (state.status.streaming) return "type to steer the running turn…";
-    return placeholder_text;
+fn placeholderFor(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]u8 {
+    if (state.mode == .login_input) return allocator.dupe(u8, if (state.login_input_secret) "paste the secret and press Enter" else "type your answer and press Enter");
+    if (state.mode == .approval) {
+        const queued = state.queue.total();
+        if (queued > 0) return std.fmt.allocPrint(allocator, "{d} queued · y / a / n to decide", .{queued});
+        return allocator.dupe(u8, "y / a / n to decide, or type /abort");
+    }
+    if (state.status.streaming) {
+        const queued = state.queue.total();
+        if (queued > 0) return std.fmt.allocPrint(allocator, "{d} queued · type to steer more…", .{queued});
+        return allocator.dupe(u8, "type to steer the running turn…");
+    }
+    return allocator.dupe(u8, placeholder_text);
 }
 
 fn maskedSecretInput(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -269,6 +279,36 @@ test "composer hint follows the interaction state" {
     defer std.testing.allocator.free(approval);
     try std.testing.expect(std.mem.indexOf(u8, approval, "allow") != null);
     try std.testing.expect(std.mem.indexOf(u8, approval, "deny") != null);
+}
+
+test "streaming placeholder carries the queued count at any width" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    state.status.streaming = true;
+    const steering = try placeholderFor(std.testing.allocator, &state);
+    defer std.testing.allocator.free(steering);
+    try std.testing.expectEqualStrings("type to steer the running turn…", steering);
+
+    state.queue.steering = 1;
+    const queued = try placeholderFor(std.testing.allocator, &state);
+    defer std.testing.allocator.free(queued);
+    try std.testing.expect(std.mem.indexOf(u8, queued, "1 queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, queued, "steer more") != null);
+
+    const rendered = try render(std.testing.allocator, &state, .{ .width = 30 });
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "1 queued") != null);
+
+    state.mode = .approval;
+    const approval = try placeholderFor(std.testing.allocator, &state);
+    defer std.testing.allocator.free(approval);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "y / a / n to decide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approval, "1 queued") != null);
+
+    const approval_rendered = try render(std.testing.allocator, &state, .{ .width = 30 });
+    defer std.testing.allocator.free(approval_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, approval_rendered, "1 queued") != null);
 }
 
 test "composer border reflects mode and streaming state" {

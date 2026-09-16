@@ -251,6 +251,8 @@ fn countLines(text: []const u8) usize {
 
 test "artifact_retrieve defaults to preview instead of full output" {
     const allocator = std.testing.allocator;
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     const path = try common.storeArtifact(allocator, "artifact-test", "line 1\nline 2\nline 3\n");
     defer allocator.free(path);
     const args = try std.fmt.allocPrint(allocator, "{{\"description\":\"preview\",\"reference\":\"{s}\"}}", .{path});
@@ -266,6 +268,8 @@ test "artifact_retrieve defaults to preview instead of full output" {
 
 test "artifact_retrieve supports range grep and full context modes" {
     const allocator = std.testing.allocator;
+    var artifact_root = common.TestArtifactRoot.init();
+    defer artifact_root.deinit();
     const path = try common.storeArtifact(allocator, "artifact-test-modes", "alpha\nbeta\nneedle\nomega\n");
     defer allocator.free(path);
 
