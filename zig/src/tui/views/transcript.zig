@@ -1655,7 +1655,7 @@ test "tool rows take their status from the linked tool entry rather than status 
 test "tool rows keep their status visible on narrow terminals" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    _ = try state.resolveToolOccurrenceForTest("call-narrow", "mcp__very_long_server_name__some_extremely_long_tool_identifier", "{\"path\":\"/tmp/x\"}", .running);
+    _ = try state.resolveToolOccurrenceForTest("call-narrow", "mcp__very_long_server_name__some_extremely_long_tool_identifier", "{\"path\":\"/tmp/x\"}", .live_intent, .running);
     try state.appendToolSummaryTranscript("◈ Some Extremely Long Tool Identifier From An MCP Server \"/tmp/x\" running", "call-narrow");
     const entry = &state.transcript.items[0];
     const rendered = try renderTranscriptEntry(std.testing.allocator, entry, 30);

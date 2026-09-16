@@ -1210,6 +1210,78 @@ def scenario_approval_allow(args):
     return run
 
 
+def scenario_tool_loss_reconcile(args):
+    home = tempfile.mkdtemp(prefix="makai-pty-home-tool-loss-")
+    try:
+        sessions_dir = os.path.join(home, ".makai", "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        meta = {
+            "session_id": "tool-loss-reconcile",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "last_active": int(time.time() * 1000),
+        }
+        tool_calls_json = json.dumps([
+            {"type": "tool_call", "id": "call-loss-1", "name": "shell_command", "arguments_json": "{\"command\":\"ls\"}"},
+            {"type": "tool_call", "id": "call-loss-2", "name": "shell_command", "arguments_json": "{\"command\":\"pwd\"}"},
+        ])
+        events = [
+            {"type": "message_start", "role": "user"},
+            {"type": "message_end", "role": "user", "text": "run both tools"},
+            {"type": "message_start", "role": "assistant"},
+            {"type": "message_end", "role": "assistant", "tool_calls_json": tool_calls_json},
+            {"type": "tool_execution_start", "tool_call_id": "call-loss-1", "tool_name": "shell_command", "args_json": "{\"command\":\"ls\"}"},
+            {"type": "turn_end", "stop_reason": "stop"},
+            {"type": "message_start", "role": "tool_result"},
+            {"type": "message_end", "role": "tool_result", "tool_call_id": "call-loss-1", "tool_name": "shell_command", "text": "recovered output", "details_json": "{\"ok\":true}", "is_error": False},
+            {"type": "message_start", "role": "tool_result"},
+            {"type": "message_end", "role": "tool_result", "tool_call_id": "call-loss-2", "tool_name": "shell_command", "text": "Tool execution failed: Boom", "details_json": "{\"ok\":false,\"err\":\"Boom\"}", "is_error": True},
+            {"type": "tool_execution_end", "tool_call_id": "call-loss-2", "tool_name": "shell_command", "result_json": "{\"ok\":false,\"err\":\"Boom\"}", "is_error": True},
+            {"type": "turn_end", "stop_reason": "stop"},
+            {"type": "agent_end", "reason": "completed"},
+        ]
+        with open(os.path.join(sessions_dir, "tool-loss-reconcile.jsonl"), "w") as handle:
+            for event in events:
+                handle.write(json.dumps({"metadata": meta, "event": event}) + "\n")
+
+        run = SweepRun(args, "tool-loss-reconcile", "loss-probe", home=home)
+        try:
+            run.session.wait_for(WELCOME_MARKER, args.startup_timeout, "welcome banner")
+            run.settle()
+            run.command("/resume", SESSION_PICKER_MARKER.decode())
+            run.session.send(KEY_ENTER, "Enter (resume tool-loss session)")
+            run.session.wait_for(b"Boom", 10.0, "reversed failing tool error card")
+            run.settle(0.5)
+            run.frame("resumed-reconciled")
+            if plain_text(b"interrupted") in run.session.plain:
+                raise ScenarioError("tool-loss-reconcile: scrollback still shows the interrupted placeholder after reconciliation")
+            shown = run.session.screen_text()
+            rows = shown.split(b"\n")
+            reconciled_rows = [row for row in rows if TOOL_OK_GLYPH in row and b"shell_command" in row and b"ls" in row]
+            if len(reconciled_rows) != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one ok summary row for the reconciled tool, saw {len(reconciled_rows)}")
+            failed_rows = [row for row in rows if TOOL_FAILED_GLYPH in row and b"failed" in row and b"pwd" in row]
+            if len(failed_rows) != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one failed summary row for the reversed tool, saw {len(failed_rows)}")
+            if b"recovered output" not in shown:
+                raise ScenarioError("tool-loss-reconcile: the retained result text never rendered under the reconciled row")
+            card_count = shown.count(b"failed:")
+            if card_count != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one error card, saw {card_count}")
+            if b"Boom" not in shown:
+                raise ScenarioError("tool-loss-reconcile: error detail Boom missing from the error card")
+            run.note("withheld end reconciled from retained result; reversed failing result merged with a single error card")
+            run.quit()
+        except ScenarioError as err:
+            run.error = str(err)
+        finally:
+            run.close()
+            run.dump(os.path.join(args.output_dir, "tool-loss-reconcile"))
+        return run
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def scenario_session_roundtrip(args):
     home = tempfile.mkdtemp(prefix="makai-pty-home-roundtrip-")
     save_dir = os.path.join(args.output_dir, "session-roundtrip", "save")
@@ -1266,6 +1338,7 @@ SCENARIOS = {
     "approval-deny": scenario_approval_deny,
     "approval-allow": scenario_approval_allow,
     "session-roundtrip": scenario_session_roundtrip,
+    "tool-loss-reconcile": scenario_tool_loss_reconcile,
 }
 
 

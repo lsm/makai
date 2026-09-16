@@ -37,11 +37,15 @@ makai -p [--agent] [--storage] [--model <id>] "<prompt>"
 
 There is no per-test filter; the smallest runnable unit is a group step. Tests are inline `test "name" { ... }` blocks in each `.zig` file.
 
-Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (3-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent tests to the specific `agent-*` subgroup (and to `test`), not just the aggregate.
+Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml` (6-minute timeout), but **`test-unit-agent` does not**. That matrix runs the six `agent-*` subgroups and never the aggregate, so a test wired only into `test-unit-agent` passes locally and is never executed by CI. Add new agent tests to the specific `agent-*` subgroup (and to `test`), not just the aggregate.
 
-`tools/*` tests are the sharp edge here: none of the `agent-*` subgroups contains them. Ten tool artifacts are wired into **`test-unit-tui`**, which the matrix does run, and duplicated into the local-only `test-unit-agent`. So a new `tools/*` test must go into `test_unit_tui_step` (plus `test`) to be covered by CI, however odd that group name reads.
+`tools/*` tests have their own matrix-covered group, **`test-unit-tools`**; none of the `agent-*` subgroups contains them. All eleven tool artifacts are wired there, and `test_unit_agent_step` pulls that step in rather than re-listing its members. So a new `tools/*` test goes into `test_unit_tools_step` (plus `test`).
 
-One exception is live today: `tools_artifact_test` (`zig/src/tools/artifact.zig`) is wired only into the global `test` step and the local-only `test-unit-agent`, so **no CI matrix job runs it**. `zig build test` covers it locally; CI does not. Do not copy that file's wiring as the pattern.
+The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`.
+
+Five tool tests share a single `b.addRunArtifact` run step each, chained `common -> artifact -> shell -> search -> file`, so they never run concurrently. They are the test binaries whose module can reach the cwd-relative `.makai/tool-artifacts` store — directly via `common.storeArtifact`/`retrieveArtifact`, or indirectly via `common.makeTextResultWithArtifact`, which `shell.zig` and `search.zig` call. `common.cleanupArtifacts()` deletes that whole tree, and `zig build` runs test binaries in parallel, so without the chain a cleanup in one binary wipes files another is mid-write or mid-read on and fails it intermittently (measured ~1 run in 20 for `tools_artifact_test`).
+
+The membership rule is static reachability, not observed behavior: `tools_search_test` writes nothing today, but `search.zig` holds a live `makeTextResultWithArtifact` call site, so a future test there would silently join the race. Grep for `makeTextResultWithArtifact|storeArtifact|retrieveArtifact|cleanupArtifacts` under `zig/src/tools/` when adding a tool, and chain any new participant. Do not replace those shared run steps with fresh `b.addRunArtifact(...)` calls per step.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
@@ -50,8 +54,9 @@ zig build test-unit-protocol      # provider/agent/auth/tool protocol types+enve
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
 zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
-zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport, plus 10 of the 11 tools/* tests (the CI-covered home for tool tests; see the artifact exception below)
-zig build test-unit-agent         # aggregate: permission, agent types/loop/mod/bridge, tools/*, tui runtime, zig/test/unit/*
+zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport
+zig build test-unit-tools         # all 11 tools/*: common, process_runner, artifact, shell, file, edit, hashline, search, workspace, mcp_bridge, registry
+zig build test-unit-agent         # aggregate (local-only, not in the CI matrix): permission, agent types/loop/mod/bridge, tools/*, tui runtime, zig/test/unit/*
 zig build test-unit-agent-types   # agent types + permission
 zig build test-unit-agent-loop    # agent loop only
 zig build test-unit-agent-mod     # agent module only

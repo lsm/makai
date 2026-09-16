@@ -76,6 +76,13 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   the second lists it via `/resume` and replays the saved transcript; each half
   dumps its own artifacts under `session-roundtrip/save/` and
   `session-roundtrip/resume/`.
+- `tool-loss-reconcile` — seeds a session file whose first tool call lost its
+  `tool_execution_end` (only the retained `tool_result` arrives) and whose
+  second call delivers its failing result before its end event, then `/resume`s
+  it. It judges the screen: exactly one `✓` summary row for the reconciled
+  call with its retained result text beneath it, exactly one `✗ failed` row for
+  the reversed call, exactly one error card carrying the `Boom` detail, and no
+  `interrupted` placeholder anywhere in the stream.
 
 These scenarios use the fixture step encoding, which extends the plain
 canned-reply value: `|`-separated steps `text:<body>`, `tool:<name>` or
