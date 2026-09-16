@@ -6,15 +6,13 @@ The SDK is async-first (`asyncio`) with a thin blocking wrapper for scripts. It 
 
 ## Installation
 
-```bash
-pip install makai
-```
-
-The package is not published yet; install it from this repository in the meantime:
+The package is not published to PyPI yet. Install it from a checkout of this repository:
 
 ```bash
 pip install ./python
 ```
+
+Once it is published, `pip install makai` will do the same.
 
 You also need access to the Makai runtime binary. By default the SDK looks for a local build under `zig-out/bin/makai` or `zig/zig-out/bin/makai`, then falls back to `makai` on `PATH`. See [Configuration](#configuration) for explicit binary resolver options.
 
