@@ -1,4 +1,5 @@
 const std = @import("std");
+const jf = @import("json_field");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const json_writer = @import("json_writer");
@@ -838,14 +839,14 @@ pub fn parseAssistantMessageEvent(
     };
 
     if (std.mem.eql(u8, type_str, "start")) {
-        const model = try allocator.dupe(u8, obj.get("model").?.string);
+        const model = try allocator.dupe(u8, try jf.requireString(obj, "model"));
         var partial = empty_partial;
         partial.model = model;
         partial.is_owned = true;
         return .{ .start = .{ .partial = partial } };
     }
     if (std.mem.eql(u8, type_str, "text_start")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
@@ -858,8 +859,8 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "text_delta")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
-        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
+        const delta = try allocator.dupe(u8, try jf.requireString(obj, "delta"));
         errdefer allocator.free(delta);
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
@@ -874,7 +875,7 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "text_end")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
@@ -888,7 +889,7 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_start")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
@@ -901,8 +902,8 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_delta")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
-        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
+        const delta = try allocator.dupe(u8, try jf.requireString(obj, "delta"));
         errdefer allocator.free(delta);
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
@@ -917,7 +918,7 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_end")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
             p
@@ -931,11 +932,11 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_start")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
 
-        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        const id = try allocator.dupe(u8, try jf.requireString(obj, "id"));
         errdefer allocator.free(id);
-        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
         errdefer allocator.free(name);
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
@@ -951,8 +952,8 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_delta")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
-        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
+        const delta = try allocator.dupe(u8, try jf.requireString(obj, "delta"));
         errdefer allocator.free(delta);
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
@@ -967,18 +968,18 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_end")) {
-        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const content_index: usize = try jf.requireUnsigned(usize, obj, "content_index");
         const thought_signature = if (obj.get("thought_signature")) |sig_val|
             try allocator.dupe(u8, sig_val.string)
         else
             null;
         errdefer if (thought_signature) |sig| allocator.free(sig);
 
-        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        const id = try allocator.dupe(u8, try jf.requireString(obj, "id"));
         errdefer allocator.free(id);
-        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
         errdefer allocator.free(name);
-        const arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string);
+        const arguments_json = try allocator.dupe(u8, try jf.requireString(obj, "arguments_json"));
         errdefer allocator.free(arguments_json);
 
         const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
@@ -998,10 +999,10 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
-        const message_obj = obj.get("message").?.object;
+        const message_obj = try jf.requireObject(obj, "message");
         const message = try parseAssistantMessage(message_obj, allocator);
         return .{ .done = .{
-            .reason = parseStopReason(obj.get("reason").?.string),
+            .reason = parseStopReason(try jf.requireString(obj, "reason")),
             .message = message,
         } };
     }
@@ -1017,16 +1018,16 @@ pub fn parseAssistantMessageEvent(
             if (usage_obj == .object) {
                 const u = usage_obj.object;
                 err_msg.usage = .{
-                    .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
-                    .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
-                    .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
-                    .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+                    .input = try jf.unsignedOr(u64, u, "input", 0),
+                    .output = try jf.unsignedOr(u64, u, "output", 0),
+                    .cache_read = try jf.unsignedOr(u64, u, "cache_read", 0),
+                    .cache_write = try jf.unsignedOr(u64, u, "cache_write", 0),
                 };
             }
         }
 
         return .{ .@"error" = .{
-            .reason = parseStopReason(obj.get("reason").?.string),
+            .reason = parseStopReason(try jf.requireString(obj, "reason")),
             .err = err_msg,
         } };
     }
@@ -1054,7 +1055,7 @@ pub fn parseAssistantMessage(
                 allocator.free(content);
             }
             for (content_array.items, 0..) |item, i| {
-                content[i] = try parseAssistantContent(item.object, allocator);
+                content[i] = try parseAssistantContent(try jf.elementAsObject(item), allocator);
                 parsed_count += 1;
             }
         }
@@ -1065,18 +1066,18 @@ pub fn parseAssistantMessage(
         if (usage_val == .object) {
             const u = usage_val.object;
             usage = .{
-                .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
-                .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
-                .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
-                .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+                .input = try jf.unsignedOr(u64, u, "input", 0),
+                .output = try jf.unsignedOr(u64, u, "output", 0),
+                .cache_read = try jf.unsignedOr(u64, u, "cache_read", 0),
+                .cache_write = try jf.unsignedOr(u64, u, "cache_write", 0),
             };
         }
     } else {
         usage = .{
-            .input = if (obj.get("input")) |v| @intCast(v.integer) else 0,
-            .output = if (obj.get("output")) |v| @intCast(v.integer) else 0,
-            .cache_read = if (obj.get("cache_read")) |v| @intCast(v.integer) else 0,
-            .cache_write = if (obj.get("cache_write")) |v| @intCast(v.integer) else 0,
+            .input = try jf.unsignedOr(u64, obj, "input", 0),
+            .output = try jf.unsignedOr(u64, obj, "output", 0),
+            .cache_read = try jf.unsignedOr(u64, obj, "cache_read", 0),
+            .cache_write = try jf.unsignedOr(u64, obj, "cache_write", 0),
         };
     }
 
@@ -1089,15 +1090,15 @@ pub fn parseAssistantMessage(
         allocator.free(result.content);
     }
 
-    result.stop_reason = parseStopReason(obj.get("stop_reason").?.string);
+    result.stop_reason = parseStopReason(try jf.requireString(obj, "stop_reason"));
 
-    result.model = try allocator.dupe(u8, obj.get("model").?.string);
+    result.model = try allocator.dupe(u8, try jf.requireString(obj, "model"));
     errdefer allocator.free(result.model);
 
-    result.api = try allocator.dupe(u8, obj.get("api").?.string);
+    result.api = try allocator.dupe(u8, try jf.requireString(obj, "api"));
     errdefer allocator.free(result.api);
 
-    result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
+    result.provider = try allocator.dupe(u8, try jf.requireString(obj, "provider"));
     errdefer allocator.free(result.provider);
 
     if (obj.get("error_message")) |em| {
@@ -1110,7 +1111,7 @@ pub fn parseAssistantMessage(
         result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
     }
 
-    result.timestamp = obj.get("timestamp").?.integer;
+    result.timestamp = try jf.requireInteger(obj, "timestamp");
     result.usage = usage;
     result.is_owned = true;
 
@@ -1144,7 +1145,7 @@ fn parseAssistantContent(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantContent {
-    const type_str = obj.get("type").?.string;
+    const type_str = try jf.requireString(obj, "type");
 
     if (std.mem.eql(u8, type_str, "text")) {
         const text_signature = if (obj.get("text_signature")) |sig_val|
@@ -1152,7 +1153,7 @@ fn parseAssistantContent(
         else
             null;
         return .{ .text = .{
-            .text = try allocator.dupe(u8, obj.get("text").?.string),
+            .text = try allocator.dupe(u8, try jf.requireString(obj, "text")),
             .text_signature = text_signature,
         } };
     }
@@ -1162,9 +1163,9 @@ fn parseAssistantContent(
         else
             null;
         return .{ .tool_call = .{
-            .id = try allocator.dupe(u8, obj.get("id").?.string),
-            .name = try allocator.dupe(u8, obj.get("name").?.string),
-            .arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string),
+            .id = try allocator.dupe(u8, try jf.requireString(obj, "id")),
+            .name = try allocator.dupe(u8, try jf.requireString(obj, "name")),
+            .arguments_json = try allocator.dupe(u8, try jf.requireString(obj, "arguments_json")),
             .thought_signature = thought_signature,
         } };
     }
@@ -1174,14 +1175,14 @@ fn parseAssistantContent(
         else
             null;
         return .{ .thinking = .{
-            .thinking = try allocator.dupe(u8, obj.get("thinking").?.string),
+            .thinking = try allocator.dupe(u8, try jf.requireString(obj, "thinking")),
             .thinking_signature = thinking_signature,
         } };
     }
     if (std.mem.eql(u8, type_str, "image")) {
         return .{ .image = .{
-            .data = try allocator.dupe(u8, obj.get("data").?.string),
-            .mime_type = try allocator.dupe(u8, obj.get("mime_type").?.string),
+            .data = try allocator.dupe(u8, try jf.requireString(obj, "data")),
+            .mime_type = try allocator.dupe(u8, try jf.requireString(obj, "mime_type")),
         } };
     }
 

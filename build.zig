@@ -430,11 +430,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_json_field_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/protocol/json_field.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const transport_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/transport.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "json_field", .module = protocol_json_field_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -512,12 +519,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
-    });
-
-    const protocol_json_field_mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/protocol/json_field.zig"),
-        .target = target,
-        .optimize = optimize,
     });
 
     const content_partial_mod = b.createModule(.{

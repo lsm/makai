@@ -1196,6 +1196,13 @@ fn deserializeModelDescriptor(
         capabilities[idx] = try parseModelCapability(try jf.elementAsString(item));
     }
 
+    const auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status"));
+    const lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle"));
+    const source = try parseModelSource(try jf.requireString(obj, "source"));
+    const context_window = try jf.optionalUnsigned(u32, obj, "context_window");
+    const max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens");
+    const reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null;
+
     var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
     if (try jf.optionalObject(obj, "metadata")) |metadata_value| {
         const metadata_obj = metadata_value;
@@ -1225,13 +1232,13 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status")),
-        .lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle")),
+        .auth_status = auth_status,
+        .lifecycle = lifecycle,
         .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(try jf.requireString(obj, "source")),
-        .context_window = try jf.optionalUnsigned(u32, obj, "context_window"),
-        .max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens"),
-        .reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null,
+        .source = source,
+        .context_window = context_window,
+        .max_output_tokens = max_output_tokens,
+        .reasoning_default = reasoning_default,
         .metadata = metadata,
     };
 }
@@ -1811,6 +1818,63 @@ pub const MAX_HEADER_VALUE_LENGTH: usize = 8192;
 
 fn validateLength(slice: []const u8, max_len: usize) EnvelopeError!void {
     if (slice.len > max_len) return error.InputTooLong;
+}
+
+test "a malformed result payload is rejected instead of aborting the host" {
+    const allocator = std.testing.allocator;
+
+    const prefix = "{\"type\":\"result\",\"stream_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"," ++
+        "\"message_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":";
+
+    const payloads = [_][]const u8{
+        "{}",
+        "{\"stop_reason\":5}",
+        "{\"stop_reason\":\"end_turn\"}",
+        "{\"stop_reason\":\"end_turn\",\"model\":\"m\"}",
+        "{\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\"}",
+        "{\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\",\"provider\":\"p\"}",
+        "{\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\",\"provider\":\"p\",\"timestamp\":\"soon\"}",
+        "{\"content\":[1],\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\",\"provider\":\"p\",\"timestamp\":1}",
+        "{\"content\":[{\"type\":\"text\"}],\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\",\"provider\":\"p\",\"timestamp\":1}",
+        "{\"usage\":{\"input\":\"lots\"},\"stop_reason\":\"end_turn\",\"model\":\"m\",\"api\":\"a\",\"provider\":\"p\",\"timestamp\":1}",
+    };
+
+    for (payloads) |payload| {
+        const line = try std.mem.concat(allocator, u8, &.{ prefix, payload, "}" });
+        defer allocator.free(line);
+
+        if (deserializeEnvelope(line, allocator)) |decoded| {
+            var owned = decoded;
+            owned.deinit(allocator);
+            return error.TestExpectedDecodeFailure;
+        } else |_| {}
+    }
+}
+
+test "a malformed event payload is rejected instead of aborting the host" {
+    const allocator = std.testing.allocator;
+
+    const prefix = "{\"type\":\"text_delta\",\"stream_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"," ++
+        "\"message_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":";
+
+    const payloads = [_][]const u8{
+        "{}",
+        "{\"content_index\":0}",
+        "{\"content_index\":\"first\",\"delta\":\"hi\"}",
+        "{\"content_index\":-1,\"delta\":\"hi\"}",
+        "{\"content_index\":0,\"delta\":7}",
+    };
+
+    for (payloads) |payload| {
+        const line = try std.mem.concat(allocator, u8, &.{ prefix, payload, "}" });
+        defer allocator.free(line);
+
+        if (deserializeEnvelope(line, allocator)) |decoded| {
+            var owned = decoded;
+            owned.deinit(allocator);
+            return error.TestExpectedDecodeFailure;
+        } else |_| {}
+    }
 }
 
 test "serializeEnvelope with ping payload" {

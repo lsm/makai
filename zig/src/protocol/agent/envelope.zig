@@ -556,6 +556,13 @@ fn deserializeModelDescriptor(
         capabilities[idx] = try parseModelCapability(try jf.elementAsString(item));
     }
 
+    const auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status"));
+    const lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle"));
+    const source = try parseModelSource(try jf.requireString(obj, "source"));
+    const context_window = try jf.optionalUnsigned(u32, obj, "context_window");
+    const max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens");
+    const reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null;
+
     var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
     if (try jf.optionalObject(obj, "metadata")) |metadata_value| {
         const metadata_obj = metadata_value;
@@ -585,13 +592,13 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status")),
-        .lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle")),
+        .auth_status = auth_status,
+        .lifecycle = lifecycle,
         .capabilities = OwnedSlice(model_catalog_types.ModelCapability).initOwned(capabilities),
-        .source = try parseModelSource(try jf.requireString(obj, "source")),
-        .context_window = try jf.optionalUnsigned(u32, obj, "context_window"),
-        .max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens"),
-        .reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null,
+        .source = source,
+        .context_window = context_window,
+        .max_output_tokens = max_output_tokens,
+        .reasoning_default = reasoning_default,
         .metadata = metadata,
     };
 }

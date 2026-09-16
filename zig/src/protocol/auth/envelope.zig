@@ -344,20 +344,20 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const flow_id = try parseUlidRequired(try jf.requireString(auth_url, "flow_id"));
         var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "url")));
+        var url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "url")));
+        errdefer url.deinit(allocator);
 
-        var result: auth_types.AuthEvent = .{ .auth_url = .{
+        var instructions = OwnedSlice(u8).initBorrowed("");
+        if (try jf.optionalString(auth_url, "instructions")) |value| {
+            instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
+        }
+
+        return .{ .auth_url = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
             .url = url,
+            .instructions = instructions,
         } };
-        errdefer result.deinit(allocator);
-
-        if (try jf.optionalString(auth_url, "instructions")) |instructions| {
-            result.auth_url.instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, instructions));
-        }
-
-        return result;
     }
 
     if (try jf.optionalObject(payload, "prompt")) |prompt| {
@@ -401,20 +401,20 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const flow_id = try parseUlidRequired(try jf.requireString(event_error, "flow_id"));
         var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "message")));
+        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "message")));
+        errdefer message.deinit(allocator);
 
-        var result: auth_types.AuthEvent = .{ .@"error" = .{
-            .flow_id = flow_id,
-            .provider_id = provider_id,
-            .message = message,
-        } };
-        errdefer result.deinit(allocator);
-
-        if (try jf.optionalString(event_error, "code")) |code| {
-            result.@"error".code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, code));
+        var code = OwnedSlice(u8).initBorrowed("");
+        if (try jf.optionalString(event_error, "code")) |value| {
+            code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
 
-        return result;
+        return .{ .@"error" = .{
+            .flow_id = flow_id,
+            .provider_id = provider_id,
+            .code = code,
+            .message = message,
+        } };
     }
 
     return error.InvalidPayloadType;
