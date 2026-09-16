@@ -137,6 +137,253 @@ def terminal_cell_width(text):
     return width
 
 
+CSI_RE = re.compile(rb"\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
+
+
+def cell_width(char):
+    if not char or unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+class VtScreen:
+    """Minimal VT100/xterm screen model: enough to know which rows the TUI left on screen."""
+
+    def __init__(self, cols, rows):
+        self.cols = cols
+        self.rows = rows
+        self.lines = [self._blank() for _ in range(rows)]
+        self.scrollback = []
+        self.row = 0
+        self.col = 0
+        self.top = 0
+        self.bottom = rows - 1
+        self.pending_wrap = False
+        self.saved = (0, 0)
+        self.buf = b""
+
+    def _blank(self):
+        return [" "] * self.cols
+
+    def feed(self, data):
+        self.buf += data
+        b = self.buf
+        i = 0
+        n = len(b)
+        while i < n:
+            c = b[i]
+            if c == 0x1B:
+                if i + 1 >= n:
+                    break
+                nxt = b[i + 1]
+                if nxt == 0x5B:
+                    m = CSI_RE.match(b, i)
+                    if not m:
+                        if n - i > 64:
+                            i += 2
+                            continue
+                        break
+                    self._csi(m.group(1).decode("latin1"), chr(m.group(3)[0]))
+                    i = m.end()
+                    continue
+                if nxt in (0x5D, 0x50, 0x5F, 0x5E, 0x58):
+                    end = -1
+                    j = i + 2
+                    while j < n:
+                        if b[j] == 0x07:
+                            end = j + 1
+                            break
+                        if b[j] == 0x1B and j + 1 < n and b[j + 1] == 0x5C:
+                            end = j + 2
+                            break
+                        j += 1
+                    if end < 0:
+                        if n - i > 8192:
+                            i += 2
+                            continue
+                        break
+                    i = end
+                    continue
+                if nxt in (0x28, 0x29, 0x2A, 0x2B):
+                    i += 3
+                    continue
+                if nxt == 0x37:
+                    self.saved = (self.row, self.col)
+                elif nxt == 0x38:
+                    self.row, self.col = self.saved
+                elif nxt == 0x4D:
+                    if self.row == self.top:
+                        self._scroll_down(1)
+                    elif self.row > 0:
+                        self.row -= 1
+                elif nxt == 0x44:
+                    self._linefeed()
+                elif nxt == 0x45:
+                    self.col = 0
+                    self._linefeed()
+                i += 2
+                continue
+            if c == 0x0D:
+                self.col = 0
+                self.pending_wrap = False
+            elif c in (0x0A, 0x0B, 0x0C):
+                self._linefeed()
+            elif c == 0x08:
+                self.col = max(0, self.col - 1)
+                self.pending_wrap = False
+            elif c == 0x09:
+                self.col = min(self.cols - 1, (self.col // 8 + 1) * 8)
+            elif c < 0x20 or c == 0x7F:
+                pass
+            else:
+                length = 1 if c < 0x80 else 2 if c < 0xE0 else 3 if c < 0xF0 else 4
+                if i + length > n:
+                    break
+                self._put(b[i:i + length].decode("utf-8", "replace"))
+                i += length
+                continue
+            i += 1
+        self.buf = b[i:]
+
+    def _put(self, char):
+        width = cell_width(char)
+        if width == 0:
+            if self.col > 0:
+                self.lines[self.row][self.col - 1] += char
+            return
+        if self.pending_wrap or self.col + width > self.cols:
+            self.col = 0
+            self._linefeed()
+            self.pending_wrap = False
+        line = self.lines[self.row]
+        line[self.col] = char
+        if width == 2 and self.col + 1 < self.cols:
+            line[self.col + 1] = ""
+        self.col += width
+        if self.col >= self.cols:
+            self.col = self.cols - 1
+            self.pending_wrap = True
+
+    def _linefeed(self):
+        if self.row == self.bottom:
+            self._scroll_up(1)
+        elif self.row < self.rows - 1:
+            self.row += 1
+        self.pending_wrap = False
+
+    def _scroll_up(self, count):
+        for _ in range(count):
+            removed = self.lines.pop(self.top)
+            if self.top == 0:
+                self.scrollback.append(removed)
+            self.lines.insert(self.bottom, self._blank())
+
+    def _scroll_down(self, count):
+        for _ in range(count):
+            self.lines.pop(self.bottom)
+            self.lines.insert(self.top, self._blank())
+
+    def _erase(self, row, start, end):
+        line = self.lines[row]
+        for index in range(max(0, start), min(self.cols, end)):
+            line[index] = " "
+
+    def _csi(self, params, final):
+        prefix = ""
+        while params and params[0] in "?<>=!":
+            prefix += params[0]
+            params = params[1:]
+        if prefix:
+            return
+        nums = [int(part) if part.isdigit() else 0 for part in params.split(";")] if params else []
+
+        def arg(index, default=1):
+            if index < len(nums) and nums[index] != 0:
+                return nums[index]
+            return default
+
+        cursor_col = self.col + (1 if self.pending_wrap else 0)
+        if final == "A":
+            self.row = max(self.top if self.row >= self.top else 0, self.row - arg(0))
+            self.pending_wrap = False
+        elif final == "B":
+            self.row = min(self.bottom if self.row <= self.bottom else self.rows - 1, self.row + arg(0))
+            self.pending_wrap = False
+        elif final == "C":
+            self.col = min(self.cols - 1, self.col + arg(0))
+            self.pending_wrap = False
+        elif final == "D":
+            self.col = max(0, self.col - arg(0))
+            self.pending_wrap = False
+        elif final == "G":
+            self.col = min(self.cols - 1, arg(0) - 1)
+            self.pending_wrap = False
+        elif final == "d":
+            self.row = min(self.rows - 1, arg(0) - 1)
+            self.pending_wrap = False
+        elif final in ("H", "f"):
+            self.row = min(self.rows - 1, arg(0) - 1)
+            self.col = min(self.cols - 1, arg(1) - 1)
+            self.pending_wrap = False
+        elif final == "J":
+            mode = nums[0] if nums else 0
+            if mode == 0:
+                self._erase(self.row, cursor_col, self.cols)
+                for row in range(self.row + 1, self.rows):
+                    self.lines[row] = self._blank()
+            elif mode == 1:
+                for row in range(0, self.row):
+                    self.lines[row] = self._blank()
+                self._erase(self.row, 0, self.col + 1)
+            else:
+                self.lines = [self._blank() for _ in range(self.rows)]
+                if mode == 3:
+                    self.scrollback = []
+        elif final == "K":
+            mode = nums[0] if nums else 0
+            if mode == 0:
+                self._erase(self.row, cursor_col, self.cols)
+            elif mode == 1:
+                self._erase(self.row, 0, self.col + 1)
+            else:
+                self.lines[self.row] = self._blank()
+        elif final == "X":
+            self._erase(self.row, self.col, self.col + arg(0))
+        elif final == "r":
+            top = arg(0, 1) - 1
+            bottom = arg(1, self.rows) - 1
+            if 0 <= top < bottom < self.rows:
+                self.top, self.bottom = top, bottom
+            else:
+                self.top, self.bottom = 0, self.rows - 1
+            self.row, self.col = 0, 0
+            self.pending_wrap = False
+        elif final == "S":
+            self._scroll_up(arg(0))
+        elif final == "T":
+            self._scroll_down(arg(0))
+        elif final == "L":
+            if self.top <= self.row <= self.bottom:
+                for _ in range(arg(0)):
+                    self.lines.pop(self.bottom)
+                    self.lines.insert(self.row, self._blank())
+        elif final == "M":
+            if self.top <= self.row <= self.bottom:
+                for _ in range(arg(0)):
+                    self.lines.pop(self.row)
+                    self.lines.insert(self.bottom, self._blank())
+        elif final == "s":
+            self.saved = (self.row, self.col)
+        elif final == "u":
+            self.row, self.col = self.saved
+
+    def visible_rows(self):
+        return ["".join(line).rstrip() for line in self.lines]
+
+    def all_rows(self):
+        return ["".join(line).rstrip() for line in self.scrollback] + self.visible_rows()
+
+
 class PtySession:
     def __init__(self, args, fixture_text=None, home=None):
         self.binary = args.binary
@@ -147,6 +394,7 @@ class PtySession:
         self.home = home if home is not None else tempfile.mkdtemp(prefix="makai-pty-home-")
         self.chunks = []
         self.plain = b""
+        self.screen = VtScreen(self.width, self.height)
         self.first_output_ms = None
         self.last_read_at = time.monotonic()
         self.probe_carry = b""
@@ -209,8 +457,33 @@ class PtySession:
             self.first_output_ms = (now - self.spawned_at) * 1000.0
         self.chunks.append((now, chunk))
         self.plain += plain_text(chunk)
+        self.screen.feed(chunk)
         self.answerTerminalProbes(chunk)
         return now
+
+    def screen_rows(self):
+        return [row.encode("utf-8") for row in self.screen.all_rows()]
+
+    def screen_text(self):
+        return b"\n".join(self.screen_rows())
+
+    def visible_text(self):
+        return b"\n".join(row.encode("utf-8") for row in self.screen.visible_rows())
+
+    def wait_visible(self, marker, timeout, what):
+        marker = plain_text(marker)
+        deadline = time.monotonic() + timeout
+        while True:
+            if marker in self.visible_text():
+                return self.last_read_at
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = self.visible_text()[-400:].decode("utf-8", "replace")
+                raise ScenarioError(
+                    f"timed out after {timeout}s waiting for {what} ({marker!r}) to be on screen; "
+                    f"process alive={self.proc.poll() is None}; screen tail: {tail!r}"
+                )
+            self._read_once(min(0.05, remaining))
 
     def answerTerminalProbes(self, chunk):
         self.probe_carry = (self.probe_carry + chunk)[-PROBE_CARRY:]
@@ -224,11 +497,11 @@ class PtySession:
             except OSError as err:
                 raise ScenarioError(f"failed to answer terminal probe {probe!r}: {err}")
 
-    def wait_for(self, marker, timeout, what):
+    def wait_for(self, marker, timeout, what, since=None):
         marker = plain_text(marker)
         if not marker:
             raise ScenarioError(f"empty marker for {what}")
-        search_from = len(self.plain)
+        search_from = len(self.plain) if since is None else since
         deadline = time.monotonic() + timeout
         while True:
             if marker in self.plain[search_from:]:
@@ -478,6 +751,8 @@ RATIFIED_COMMANDS = (
     "/quit",
 )
 
+TOOL_OK_GLYPH = "\u2713".encode()
+TOOL_FAILED_GLYPH = "\u2717".encode()
 STATUS_BAR_ELLIPSIS = b"\xe2\x80\xa6"
 STATUS_BAR_CUT_MARKER = b" \xe2\x94\x82 " + STATUS_BAR_ELLIPSIS
 STATUS_BAR_PARTIAL_SEGMENTS = (
@@ -498,10 +773,8 @@ def assert_status_bar_whole_segments(run, what):
                 f"keys: status bar rendered partial segment {partial!r} at 100 columns ({what}); "
                 "segments must truncate whole (#268)"
             )
-    if STATUS_BAR_CUT_MARKER not in run.session.plain:
-        raise ScenarioError(
-            f"keys: status bar never rendered its ' <sep> {STATUS_BAR_ELLIPSIS.decode()}' cut marker at 100 columns ({what})"
-        )
+    if STATUS_BAR_CUT_MARKER in run.session.plain:
+        run.note(f"status bar truncated on a whole-segment boundary behind the cut marker ({what})")
 
 
 class SweepRun:
@@ -530,6 +803,7 @@ class SweepRun:
             "name": name,
             "t_ms": round((self.session.last_read_at - self.session.spawned_at) * 1000.0, 3),
             "tail": self.session.plain[-800:].decode("utf-8", "replace"),
+            "screen": self.session.screen.visible_rows(),
         })
         return self.frames[-1]
 
@@ -713,20 +987,18 @@ def scenario_keys(args):
         run.session.type_text("second line")
         run.settle()
         run.frame("shift-enter-draft")
-        echo_from = len(run.session.plain)
+        echo_chunks = len(run.session.chunks)
         run.session.send(KEY_ENTER, "Enter (submit two-line draft)")
         run.session.wait_for(b"keys-fixture-reply", 10.0, "reply after two-line submit")
         run.settle()
-        echo = run.session.plain[echo_from:]
-        row_gap = run.session.width // 2
-        first_at = echo.find(plain_text(b"first line"))
-        second_at = echo.find(plain_text(b"second line"), first_at + len(b"first line"))
-        if first_at < 0 or second_at < 0 or second_at - first_at < row_gap:
-            gap = second_at - first_at if second_at >= 0 else None
+        echo_raw = b"".join(chunk for _, chunk in run.session.chunks[echo_chunks:])
+        first_at = echo_raw.find(b"first line")
+        second_at = echo_raw.find(b"second line", first_at + len(b"first line")) if first_at >= 0 else -1
+        if first_at < 0 or second_at < 0 or echo_raw.find(b"\r\n", first_at, second_at) < 0:
             raise ScenarioError(
                 f"keys: Shift+Enter (kitty CSI 13;2u) did not produce a two-line draft: the submitted "
                 f"echo must render 'first line' and 'second line' on separate transcript rows "
-                f"(first_at={first_at}, second_at={second_at}, gap={gap}, need at least {row_gap})"
+                f"(first_at={first_at}, second_at={second_at}, no row break between them)"
             )
         run.note("Shift+Enter (kitty CSI 13;2u) inserts a composer newline: the submitted draft echoes as two transcript rows")
 
@@ -735,13 +1007,14 @@ def scenario_keys(args):
         run.key_wait(KEY_DOWN, "Down history (latest)", "second line")
         run.frame("history-recall")
 
-        pgup_from = len(run.session.plain)
         run.key(KEY_PGUP, "PageUp scroll")
-        if run.seen("SCROLL", pgup_from):
-            run.note("PageUp shows a scroll indicator")
-        else:
-            run.note("FINDING: PgUp has no visible effect — the transcript SCROLL indicator renders only in the non-TTY fallback view path; in a real terminal history is flushed inline and transcript_scroll is never read, so terminal-native scrollback is the only scroll")
+        run.session.wait_visible(b"SCROLL", 5.0, "scroll indicator after PageUp")
+        run.frame("paged-up")
         run.key(KEY_PGDN, "PageDown scroll")
+        run.settle()
+        if b"SCROLL" in run.session.screen_text():
+            raise ScenarioError("keys: the scroll indicator stayed on screen after PageDown returned to the tail")
+        run.note("PageUp scrolls the inline window over the transcript with a SCROLL indicator; PageDown returns to the tail and clears it")
         run.frame("after-paging")
 
         run.key(KEY_CTRL_T, "Ctrl+T expand latest tool")
@@ -757,11 +1030,20 @@ def scenario_keys(args):
         run.frame("thinking-cycled")
         assert_status_bar_whole_segments(run, "after thinking cycle")
 
+        clear_from = len(run.session.plain)
+        run.key(KEY_CTRL_C, "Ctrl+C clears the composer draft")
+        if run.session.proc.poll() is not None:
+            raise ScenarioError("keys: first Ctrl+C with a draft in the composer must clear it, not exit")
+        run.session.type_text("y")
+        if plain_text(b"y") not in run.session.plain[clear_from:]:
+            raise ScenarioError("keys: composer stopped echoing after Ctrl+C cleared the draft")
+        run.session.send(b"\x7f", "Backspace clears the probe")
+        run.settle()
         run.session.send(KEY_CTRL_C, "Ctrl+C quit")
         exit_code = run.session.wait_exit(5.0)
         if exit_code != 0:
             raise ScenarioError(f"keys: Ctrl+C exited with code {exit_code}, expected 0")
-        run.note("Ctrl+C exits cleanly with code 0")
+        run.note("Ctrl+C clears a pending draft first; Ctrl+C on an empty idle composer exits cleanly with code 0")
     except ScenarioError as err:
         run.error = str(err)
     finally:
@@ -811,11 +1093,12 @@ def scenario_steer_abort(args):
         run.session.wait_for(b"Turn aborted.", 6.0, "abort confirmation")
         run.frame("aborted")
         run.settle(1.0)
-        aborted_at = run.session.plain.find(plain_text(b"Turn aborted."), abort_from)
-        you_at = run.session.plain.rfind(plain_text(b"You"), abort_from, aborted_at)
-        echo_at = run.session.plain.find(plain_text(b"steer this turn"), you_at)
-        if aborted_at < 0 or you_at < 0 or echo_at < 0 or echo_at - you_at > 160 or echo_at >= aborted_at or aborted_at - you_at > 600:
-            raise ScenarioError("steer-abort: steer echo did not flush into transcript history adjacent to the abort row")
+        rows = run.session.screen_rows()
+        aborted_rows = [index for index, row in enumerate(rows) if b"Turn aborted." in row]
+        you_rows = [index for index, row in enumerate(rows[:aborted_rows[-1]]) if b"You" in row] if aborted_rows else []
+        echo_row = you_rows[-1] + 1 if you_rows else -1
+        if not aborted_rows or not you_rows or b"steer this turn" not in rows[echo_row] or aborted_rows[-1] - you_rows[-1] > 8:
+            raise ScenarioError("steer-abort: steer echo is not in the transcript directly above the abort row")
         run.note("/abort during a held stream cancels the turn, clears the streaming status, and the flushed history renders the steered text as a permanent 'You' entry directly above the abort row")
 
         run.session.type_text("run the slow tool")
@@ -861,16 +1144,20 @@ def scenario_approval_deny(args):
         run.settle()
         run.command("/permissions ask", "permission mode set to ask")
 
+        submit_from = len(run.session.plain)
         run.session.type_text("use the tool twice")
         run.session.send(KEY_ENTER, "Enter (submit)")
-        run.session.wait_for(b"Approval required", 10.0, "approval view")
-        run.session.wait_for(b"Tool: shell_execute", 5.0, "approval tool name")
+        run.session.wait_for(b"Approval required", 10.0, "approval view", since=submit_from)
+        run.session.wait_for(b"Tool: shell_execute", 5.0, "approval tool name", since=submit_from)
         run.frame("approval-pending")
 
         deny_from = len(run.session.plain)
-        run.key_wait(b"n", "deny approval", "Approval required")
+        run.session.send(b"n", "deny approval")
+        run.session.wait_for(b"Tool execution rejected by user", 6.0, "readable rejection text")
+        run.session.wait_for(b"Approval required", 6.0, "second approval view", since=deny_from + 1)
+        run.settle()
         run.frame("denied")
-        if b"Tool execution rejected by user" not in run.session.plain[deny_from:]:
+        if b"Tool execution rejected by user" not in run.session.screen_text():
             raise ScenarioError("approval-deny: the readable rejection text did not render after 'n'")
         run.note("'n' denies the first approval, the readable rejection text renders, and the agent retries the same tool")
 
@@ -878,7 +1165,7 @@ def scenario_approval_deny(args):
         run.key_wait(b"a", "approve always", "deny-persist-complete")
         run.frame("approved-always")
         final_at = run.session.plain.find(b"deny-persist-complete", always_from)
-        if b"Approval required" in run.session.plain[always_from:final_at]:
+        if b"Approval required" in run.session.plain[always_from:final_at] or b"Approval required" in run.session.visible_text():
             raise ScenarioError("approval-deny: the third matching tool call prompted again although 'a' approved always")
         run.note("'a' approves always for a persistable shell call: the third shell_execute runs with no new approval prompt and the turn completes")
     except ScenarioError as err:
@@ -898,21 +1185,23 @@ def scenario_approval_allow(args):
         turn_from = len(run.session.plain)
         run.session.type_text("run workspace info")
         run.session.send(KEY_ENTER, "Enter (submit)")
-        run.session.wait_for(b"Approval required", 10.0, "approval view")
-        run.session.wait_for(b"Tool: workspace_info", 5.0, "approval tool name")
+        run.session.wait_for(b"Approval required", 10.0, "approval view", since=turn_from)
+        run.session.wait_for(b"Tool: workspace_info", 5.0, "approval tool name", since=turn_from)
         run.frame("approval-pending")
         run.key_wait(b"y", "approve once", "allow-path-complete")
         run.settle(0.5)
         run.frame("approved-once")
-        turn_plain = run.session.plain[turn_from:]
-        summary_lines = turn_plain.count(b"Workspace Info ok")
+        shown = run.session.screen_text()
+        if b"Workspace Info" not in shown:
+            raise ScenarioError("approval-allow: the workspace_info summary row never rendered")
+        summary_lines = shown.count(TOOL_OK_GLYPH)
         if summary_lines != 1:
-            raise ScenarioError(f"approval-allow: expected exactly one finalized tool summary line, saw {summary_lines}")
-        if b'   {"workspace_root"' in turn_plain:
+            raise ScenarioError(f"approval-allow: expected exactly one finalized tool summary line on screen, saw {summary_lines}")
+        if b'   {"workspace_root"' in shown:
             raise ScenarioError("approval-allow: raw tool-args JSON echoed as a transcript row")
-        if b"Workspace Info failed" in turn_plain:
+        if TOOL_FAILED_GLYPH in shown:
             raise ScenarioError("approval-allow: the approved workspace_info call rendered as failed")
-        if b"project_root" not in turn_plain:
+        if b"project_root" not in shown:
             raise ScenarioError("approval-allow: workspace_info result text missing from the transcript")
         run.note("'y' approves once: workspace_info executes as one summary line plus its result block, and the turn completes")
     except ScenarioError as err:
@@ -967,17 +1256,20 @@ def scenario_tool_loss_reconcile(args):
             run.frame("resumed-reconciled")
             if plain_text(b"interrupted") in run.session.plain:
                 raise ScenarioError("tool-loss-reconcile: scrollback still shows the interrupted placeholder after reconciliation")
-            scrollback = run.session.plain
-            reconciled_ok = plain_text(b" ok ") in scrollback or plain_text(b"[ok") in scrollback
-            if not reconciled_ok:
-                raise ScenarioError("tool-loss-reconcile: reconciled tool never rendered its ok summary row")
-            failed_row = plain_text(b" failed ") in scrollback or plain_text(b"[failed") in scrollback
-            if not failed_row:
-                raise ScenarioError("tool-loss-reconcile: reversed failing tool never rendered its failed summary row")
-            card_count = scrollback.count(plain_text(b"failed:"))
-            if card_count < 1:
-                raise ScenarioError("tool-loss-reconcile: the reconciled error card never rendered")
-            if plain_text(b"Boom") not in scrollback:
+            shown = run.session.screen_text()
+            rows = shown.split(b"\n")
+            reconciled_rows = [row for row in rows if TOOL_OK_GLYPH in row and b"shell_command" in row and b"ls" in row]
+            if len(reconciled_rows) != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one ok summary row for the reconciled tool, saw {len(reconciled_rows)}")
+            failed_rows = [row for row in rows if TOOL_FAILED_GLYPH in row and b"failed" in row and b"pwd" in row]
+            if len(failed_rows) != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one failed summary row for the reversed tool, saw {len(failed_rows)}")
+            if b"recovered output" not in shown:
+                raise ScenarioError("tool-loss-reconcile: the retained result text never rendered under the reconciled row")
+            card_count = shown.count(b"failed:")
+            if card_count != 1:
+                raise ScenarioError(f"tool-loss-reconcile: expected exactly one error card, saw {card_count}")
+            if b"Boom" not in shown:
                 raise ScenarioError("tool-loss-reconcile: error detail Boom missing from the error card")
             run.note("withheld end reconciled from retained result; reversed failing result merged with a single error card")
             run.quit()

@@ -12,7 +12,10 @@ fn defaultIo() std.Io {
 const auth_file_name = "auth.json";
 const auth_temp_prefix = auth_file_name ++ ".tmp.";
 const keychain_service = "com.makai.auth";
+const keychain_service_env = "MAKAI_KEYCHAIN_SERVICE";
 const keychain_account = auth_file_name;
+const keychain_shared_account = "auth.shared.json";
+const keychain_item_label = "makai credentials";
 const codex_keychain_service = "Codex Auth";
 const credential_file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
 const stale_temp_min_age_ms = 24 * 60 * 60 * 1000;
@@ -345,6 +348,27 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     extern "c" fn CFRelease(cf: ?*const anyopaque) void;
     extern "c" fn SecKeychainCopyDefault(outKeychain: *?*const anyopaque) OSStatus;
 
+    const SecAccessRef = ?*anyopaque;
+    const CFStringRef = ?*anyopaque;
+    const SecKeychainAttribute = extern struct { tag: u32, length: u32, data: ?*anyopaque };
+    const SecKeychainAttributeList = extern struct { count: u32, attr: [*]SecKeychainAttribute };
+    const kSecGenericPasswordItemClass: u32 = 0x67656E70;
+    const kSecServiceItemAttr: u32 = 0x73766365;
+    const kSecAccountItemAttr: u32 = 0x61636374;
+    const kCFStringEncodingUTF8: u32 = 0x08000100;
+    extern "c" fn SecKeychainItemCreateFromContent(
+        itemClass: u32,
+        attrList: *SecKeychainAttributeList,
+        length: UInt32,
+        data: ?*const anyopaque,
+        keychainRef: ?*const anyopaque,
+        initialAccess: SecAccessRef,
+        itemRef: *SecKeychainItemRef,
+    ) OSStatus;
+    extern "c" fn SecKeychainItemDelete(itemRef: SecKeychainItemRef) OSStatus;
+    extern "c" fn SecAccessCreate(descriptor: CFStringRef, trustedlist: ?*const anyopaque, accessRef: *SecAccessRef) OSStatus;
+    extern "c" fn CFStringCreateWithCString(alloc: ?*const anyopaque, cStr: [*:0]const u8, encoding: u32) CFStringRef;
+
     fn asUInt32(value: usize) !UInt32 {
         return std.math.cast(UInt32, value) orelse error.KeychainUnavailable;
     }
@@ -385,7 +409,9 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return try allocator.dupe(u8, bytes[0..password_len]);
     }
 
-    fn writeServiceAccount(service: []const u8, account: []const u8, data: []const u8) !void {
+    const KeychainError = error{KeychainUnavailable};
+
+    fn writeServiceAccount(service: []const u8, account: []const u8, data: []const u8) KeychainError!void {
         var password_len: UInt32 = 0;
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
@@ -420,29 +446,75 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         }
 
         if (find_status != errSecItemNotFound) return error.KeychainUnavailable;
+        try createSharedItem(kc, service, account, data);
+    }
 
-        const add_status = SecKeychainAddGenericPassword(
+    fn createSharedItem(kc: ?*const anyopaque, service: []const u8, account: []const u8, data: []const u8) KeychainError!void {
+        const label = CFStringCreateWithCString(null, keychain_item_label, kCFStringEncodingUTF8) orelse return error.KeychainUnavailable;
+        defer CFRelease(label);
+        var access: SecAccessRef = null;
+        if (SecAccessCreate(label, null, &access) != errSecSuccess) return error.KeychainUnavailable;
+        defer if (access) |ref| CFRelease(ref);
+
+        var attrs = [_]SecKeychainAttribute{
+            .{ .tag = kSecServiceItemAttr, .length = try asUInt32(service.len), .data = @ptrCast(@constCast(service.ptr)) },
+            .{ .tag = kSecAccountItemAttr, .length = try asUInt32(account.len), .data = @ptrCast(@constCast(account.ptr)) },
+        };
+        var list = SecKeychainAttributeList{ .count = attrs.len, .attr = &attrs };
+        var item: SecKeychainItemRef = null;
+        const status = SecKeychainItemCreateFromContent(
+            kSecGenericPasswordItemClass,
+            &list,
+            try asUInt32(data.len),
+            @ptrCast(data.ptr),
+            kc,
+            access,
+            &item,
+        );
+        defer if (item) |value| CFRelease(@ptrCast(value));
+        if (status == errSecDuplicateItem) return writeServiceAccount(service, account, data);
+        if (status != errSecSuccess) return error.KeychainUnavailable;
+    }
+
+    fn deleteServiceAccount(service: []const u8, account: []const u8) !void {
+        var password_len: UInt32 = 0;
+        var password_data: ?*anyopaque = null;
+        var item: SecKeychainItemRef = null;
+
+        const kc = defaultKeychain();
+        defer if (kc) |ref| CFRelease(ref);
+
+        const status = SecKeychainFindGenericPassword(
             kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
             account.ptr,
-            try asUInt32(data.len),
-            @ptrCast(data.ptr),
-            null,
+            &password_len,
+            &password_data,
+            &item,
         );
-        if (add_status != errSecSuccess and add_status != errSecDuplicateItem) {
-            return error.KeychainUnavailable;
-        }
-        if (add_status == errSecDuplicateItem) try writeServiceAccount(service, account, data);
+        if (password_data) |value| _ = SecKeychainItemFreeContent(null, value);
+        defer if (item) |value| CFRelease(@ptrCast(value));
+        if (status == errSecItemNotFound) return;
+        if (status != errSecSuccess) return error.KeychainUnavailable;
+        if (SecKeychainItemDelete(item) != errSecSuccess) return error.KeychainUnavailable;
     }
 
     fn read(allocator: std.mem.Allocator) !?[]u8 {
-        return try readServiceAccount(allocator, keychain_service, keychain_account);
+        const service = try keychainServiceName(allocator);
+        defer allocator.free(service);
+        if (try readServiceAccount(allocator, service, keychain_shared_account)) |content| return content;
+        const legacy = (try readServiceAccount(allocator, service, keychain_account)) orelse return null;
+        writeServiceAccount(service, keychain_shared_account, legacy) catch return legacy;
+        deleteServiceAccount(service, keychain_account) catch {};
+        return legacy;
     }
 
-    fn write(data: []const u8) !void {
-        try writeServiceAccount(keychain_service, keychain_account, data);
+    fn write(allocator: std.mem.Allocator, data: []const u8) !void {
+        const service = try keychainServiceName(allocator);
+        defer allocator.free(service);
+        try writeServiceAccount(service, keychain_shared_account, data);
     }
 } else struct {
     fn readServiceAccount(_: std.mem.Allocator, _: []const u8, _: []const u8) !?[]u8 {
@@ -457,10 +529,18 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return error.KeychainUnavailable;
     }
 
-    fn write(_: []const u8) !void {
+    fn write(_: std.mem.Allocator, _: []const u8) !void {
         return error.KeychainUnavailable;
     }
 };
+
+fn keychainServiceName(allocator: std.mem.Allocator) ![]u8 {
+    if (compat.getEnvVarOwned(allocator, keychain_service_env)) |override| {
+        if (override.len > 0) return override;
+        allocator.free(override);
+    } else |_| {}
+    return allocator.dupe(u8, keychain_service);
+}
 
 fn loadFromKeychain(allocator: std.mem.Allocator) !KeychainLoadResult {
     return loadFromKeychainWithCodexImport(allocator, true);
@@ -480,7 +560,7 @@ fn loadFromKeychainWithCodexImport(allocator: std.mem.Allocator, import_codex: b
 fn saveToKeychain(storage: *const AuthStorage) !void {
     const content = try serializeAuthJson(storage, storage.allocator);
     defer secureFree(storage.allocator, content);
-    try macos_keychain.write(content);
+    try macos_keychain.write(storage.allocator, content);
 }
 
 fn saveToPreferredStorage(storage: *const AuthStorage) !void {
@@ -802,7 +882,6 @@ test "AuthStorage - save and load" {
     const provider_id = try std.testing.allocator.dupe(u8, "test-provider");
     const api_key = try std.testing.allocator.dupe(u8, "test-key");
     try storage.providers.put(provider_id, .{ .api_key = api_key });
-
 }
 
 test "ProviderAuth - deinit api_key" {

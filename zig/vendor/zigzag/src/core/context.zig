@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const terminal_mod = @import("../terminal/terminal.zig");
 const Terminal = terminal_mod.Terminal;
@@ -48,10 +47,40 @@ pub const Context = struct {
 
     _logger: ?*Logger = null,
 
+    above_buffer: std.ArrayList(u8) = .empty,
+
+    clear_screen_requested: bool = false,
+
+    pub fn requestClearScreen(self: *Context) void {
+        self.clear_screen_requested = true;
+        self.above_buffer.clearRetainingCapacity();
+    }
+
     pub fn log(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         if (self._logger) |logger| {
             logger.log(fmt, args);
         }
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.above_buffer.deinit(self.persistent_allocator);
+        self.above_buffer = .empty;
+    }
+
+    pub fn printAbove(self: *Context, text: []const u8) !void {
+        try self.above_buffer.ensureUnusedCapacity(self.persistent_allocator, text.len + 1);
+        self.above_buffer.appendSliceAssumeCapacity(text);
+        self.above_buffer.appendAssumeCapacity('\n');
+    }
+
+    pub fn hasPendingAbove(self: *const Context) bool {
+        return self.above_buffer.items.len > 0;
+    }
+
+    pub fn takeAbove(self: *Context, allocator: std.mem.Allocator) ![]u8 {
+        const copy = try allocator.dupe(u8, self.above_buffer.items);
+        self.above_buffer.clearRetainingCapacity();
+        return copy;
     }
 
     pub fn init(
@@ -309,4 +338,6 @@ pub const Options = struct {
     unicode_width_strategy: ?unicode_mod.WidthStrategy = null,
 
     suspend_enabled: bool = true,
+
+    ctrl_c_quits: bool = true,
 };

@@ -213,13 +213,61 @@ fn pushDoneAndComplete(stream: *event_stream.AssistantMessageEventStream, alloca
     stream.complete(result_message);
 }
 
+const think_open = "<think>";
+const think_close = "</think>";
+
+fn splitThinking(text: []const u8) struct { thinking: []const u8, answer: []const u8 } {
+    if (!std.mem.startsWith(u8, text, think_open)) return .{ .thinking = "", .answer = text };
+    const close = std.mem.indexOf(u8, text, think_close) orelse return .{ .thinking = "", .answer = text };
+    var answer = text[close + think_close.len ..];
+    if (std.mem.startsWith(u8, answer, "\n")) answer = answer[1..];
+    return .{ .thinking = text[think_open.len..close], .answer = answer };
+}
+
 fn pushTextResponse(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator, model: ai_types.Model, text: []const u8) !void {
     const partial = emptyAssistantMessage(model, .stop);
     try stream.push(.{ .start = .{ .partial = partial } });
+    const split = splitThinking(text);
+    if (split.thinking.len > 0) {
+        try stream.push(.{ .thinking_delta = .{ .content_index = 0, .delta = split.thinking, .partial = partial } });
+        try stream.push(.{ .text_delta = .{ .content_index = 1, .delta = split.answer, .partial = partial } });
+        const content = [_]ai_types.AssistantContent{
+            .{ .thinking = .{ .thinking = split.thinking } },
+            .{ .text = .{ .text = split.answer } },
+        };
+        try pushDoneAndComplete(stream, allocator, model, &content, .stop);
+        return;
+    }
     try stream.push(.{ .text_delta = .{ .content_index = 0, .delta = text, .partial = partial } });
 
     const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = text } }};
     try pushDoneAndComplete(stream, allocator, model, &content, .stop);
+}
+
+test "mock provider splits a leading think block into thinking and text deltas" {
+    const steps = [_]ResponseStep{.{ .text = "<think>plan first</think>\nthen answer" }};
+    var provider = MockProvider.init(.{ .steps = &steps });
+    const client = provider.protocolClient();
+    const stream_ptr = try client.stream(test_model, .{ .messages = &.{}, .is_owned = false }, .{}, std.testing.allocator);
+    defer {
+        stream_ptr.deinit();
+        std.testing.allocator.destroy(stream_ptr);
+    }
+
+    var saw_thinking = false;
+    var saw_text = false;
+    while (stream_ptr.wait()) |event| {
+        var ev = event;
+        defer switch (ev) {
+            .done => |*payload| payload.message.deinit(std.testing.allocator),
+            .@"error" => |*payload| payload.err.deinit(std.testing.allocator),
+            else => {},
+        };
+        if (ev == .thinking_delta) saw_thinking = std.mem.eql(u8, ev.thinking_delta.delta, "plan first");
+        if (ev == .text_delta) saw_text = std.mem.eql(u8, ev.text_delta.delta, "then answer");
+    }
+    try std.testing.expect(saw_thinking);
+    try std.testing.expect(saw_text);
 }
 
 fn pushToolCalls(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator, model: ai_types.Model, calls: []const ToolCallSpec) !void {

@@ -995,6 +995,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
     });
 

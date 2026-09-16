@@ -22,6 +22,30 @@ pub fn compactNumber(allocator: std.mem.Allocator, value: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{value});
 }
 
+pub fn sanitizeTerminalText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const end = @min(text.len, i + len);
+        const codepoint: u21 = std.unicode.utf8Decode(text[i..end]) catch 0xFFFD;
+        const control = codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f) or codepoint == 0xFFFD;
+        if (control) try out.append(allocator, '?') else try out.appendSlice(allocator, text[i..end]);
+        i = end;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "sanitizeTerminalText neutralises control bytes and escape sequences" {
+    const cleaned = try sanitizeTerminalText(std.testing.allocator, "repo\x1b]0;evil\x07/dir\n\xc2\x9bx\x7fend");
+    defer std.testing.allocator.free(cleaned);
+    try std.testing.expectEqualStrings("repo?]0;evil?/dir??x?end", cleaned);
+    const plain = try sanitizeTerminalText(std.testing.allocator, "/Users/me/projects/日本語");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("/Users/me/projects/日本語", plain);
+}
+
 pub fn truncateToWidth(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
     return truncateLineToWidth(allocator, text, max_width);
 }

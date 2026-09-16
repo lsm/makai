@@ -12,6 +12,8 @@ const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
 const model_catalog = @import("model_catalog");
 const tui_config = @import("tui_config");
+const tui_theme = @import("tui_theme");
+const tui_text = @import("tui_text");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -87,22 +89,168 @@ fn loadRuntimeModelsWithCatalog(
     comptime loadCatalog: fn (std.mem.Allocator) anyerror![]ai_types.Model,
     comptime catch_catalog_errors: bool,
 ) ![]ai_types.Model {
-    var catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
+    const catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
         try allocator.alloc(ai_types.Model, 0)
     else
         return err;
-    errdefer model_catalog.deinitModels(allocator, catalog_models);
-
-    const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
-    errdefer allocator.free(models);
-    models[0] = defaultModel();
-    for (catalog_models, 0..) |model, idx| {
-        models[idx + 1] = model;
+    var consumed: usize = 0;
+    errdefer {
+        for (catalog_models[consumed..]) |*model| model.deinit(allocator);
+        allocator.free(catalog_models);
     }
+
+    var models = std.ArrayList(ai_types.Model).empty;
+    errdefer {
+        if (models.items.len > 1) for (models.items[1..]) |*model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+    try models.append(allocator, defaultModel());
+    for (catalog_models) |model| {
+        if (isDatedVariantOf(model.id, models.items[0].id)) {
+            models.items[0] = foldCatalogLimits(models.items[0], model);
+            var folded = model;
+            folded.deinit(allocator);
+            consumed += 1;
+            continue;
+        }
+        try models.append(allocator, model);
+        consumed += 1;
+    }
+    const result = try models.toOwnedSlice(allocator);
     allocator.free(catalog_models);
-    catalog_models = &.{};
-    errdefer for (models) |*model| model.deinit(allocator);
+    return result;
+}
+
+fn foldCatalogLimits(base: ai_types.Model, catalog: ai_types.Model) ai_types.Model {
+    var folded = base;
+    folded.max_tokens = catalog.max_tokens;
+    folded.context_window = catalog.context_window;
+    folded.reasoning = catalog.reasoning;
+    if (catalog.cost.input > 0) folded.cost = catalog.cost;
+    return folded;
+}
+
+fn ownedTestModel(allocator: std.mem.Allocator, id: []const u8, max_tokens: u32, input_cost: f64) !ai_types.Model {
+    var model = defaultModel();
+    model.id = id;
+    model.max_tokens = max_tokens;
+    model.context_window = 1_000_000;
+    model.cost = .{ .input = input_cost, .output = input_cost * 5, .cache_read = 0, .cache_write = 0 };
+    return ai_types.cloneModel(allocator, model);
+}
+
+fn datedDefaultCatalog(allocator: std.mem.Allocator) anyerror![]ai_types.Model {
+    const models = try allocator.alloc(ai_types.Model, 2);
+    errdefer allocator.free(models);
+    models[0] = try ownedTestModel(allocator, "claude-sonnet-4-5-20250929", 64_000, 0);
+    errdefer models[0].deinit(allocator);
+    models[1] = try ownedTestModel(allocator, "claude-opus-4-1", 32_000, 15.0);
     return models;
+}
+
+fn runtimeModelsFoldProbe(allocator: std.mem.Allocator) !void {
+    const models = try loadRuntimeModelsWithCatalog(allocator, datedDefaultCatalog, false);
+    defer model_catalog.deinitModels(allocator, models);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", models[0].id);
+    try std.testing.expectEqualStrings("Claude Sonnet 4.5", models[0].name);
+    try std.testing.expect(!models[0].is_owned);
+    try std.testing.expectEqual(@as(u32, 64_000), models[0].max_tokens);
+    try std.testing.expectEqual(@as(u32, 1_000_000), models[0].context_window);
+    try std.testing.expectEqual(@as(f64, 3.0), models[0].cost.input);
+    try std.testing.expectEqualStrings("claude-opus-4-1", models[1].id);
+    try std.testing.expect(models[1].is_owned);
+}
+
+test "runtime models fold the catalog's default alias into the fallback and keep one owner per model" {
+    try runtimeModelsFoldProbe(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runtimeModelsFoldProbe, .{});
+}
+
+fn isDatedVariantOf(id: []const u8, base: []const u8) bool {
+    if (std.mem.eql(u8, id, base)) return true;
+    if (id.len != base.len + 9 or !std.mem.startsWith(u8, id, base) or id[base.len] != '-') return false;
+    for (id[base.len + 1 ..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "isDatedVariantOf recognises dated aliases of the default model" {
+    try std.testing.expect(isDatedVariantOf("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"));
+    try std.testing.expect(isDatedVariantOf("claude-sonnet-4-5", "claude-sonnet-4-5"));
+    try std.testing.expect(!isDatedVariantOf("claude-sonnet-4-5-fast", "claude-sonnet-4-5"));
+    try std.testing.expect(!isDatedVariantOf("claude-opus-4-1-20250805", "claude-sonnet-4-5"));
+}
+
+test "App loginStatusFor reports stored, environment and expired credentials" {
+    var storage = oauth_storage.AuthStorage{ .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator), .allocator = std.testing.allocator };
+    defer storage.deinit();
+    try storage.providers.put(try std.testing.allocator.dupe(u8, "kimi"), .{ .api_key = try std.testing.allocator.dupe(u8, "sk-kimi") });
+    try storage.providers.put(try std.testing.allocator.dupe(u8, "anthropic"), .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, "r"),
+        .access = try std.testing.allocator.dupe(u8, "sk-ant-oat-x"),
+        .expires = std.math.maxInt(i64),
+    } });
+    try storage.providers.put(try std.testing.allocator.dupe(u8, "openai-codex"), .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, "r"),
+        .access = try std.testing.allocator.dupe(u8, "old"),
+        .expires = 1,
+    } });
+
+    try std.testing.expectEqual(App.LoginStatus.api_key, App.loginStatusFor(&storage, "kimi", false));
+    try std.testing.expectEqual(App.LoginStatus.oauth, App.loginStatusFor(&storage, "anthropic", false));
+    try std.testing.expectEqual(App.LoginStatus.env_key, App.loginStatusFor(null, "anthropic", true));
+    try std.testing.expectEqual(App.LoginStatus.none, App.loginStatusFor(null, "kimi", false));
+    try std.testing.expectEqual(App.LoginStatus.expired, App.loginStatusFor(&storage, "openai-codex", false));
+    try std.testing.expectEqual(App.LoginStatus.env_key, App.loginStatusFor(&storage, "github-copilot", true));
+    try std.testing.expectEqual(App.LoginStatus.none, App.loginStatusFor(&storage, "github-copilot", false));
+    try std.testing.expect(std.mem.indexOf(u8, App.loginBadge(.oauth).?, "logged in") != null);
+    try std.testing.expect(App.loginBadge(.none) == null);
+}
+
+test "App welcome banner neutralises control bytes in the working directory" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    std.testing.allocator.free(app.working_dir);
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/evil\x1b[2J\x1b]0;pwned\x07dir");
+    try app.appendWelcome();
+    const entry = app.state.transcript.items[app.state.transcript.items.len - 1];
+    try std.testing.expectEqual(tui_state.TranscriptKind.welcome, entry.kind);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.text.items, "/tmp/evil?[2J?]0;pwned?dir") != null);
+}
+
+test "Context requestClearScreen discards history queued before the request" {
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try tctx.ctx.printAbove("stale row");
+    tctx.ctx.requestClearScreen();
+    try std.testing.expect(!tctx.ctx.hasPendingAbove());
+    try tctx.ctx.printAbove("transcript cleared");
+    const above = try tctx.ctx.takeAbove(std.testing.allocator);
+    defer std.testing.allocator.free(above);
+    try std.testing.expectEqualStrings("transcript cleared\n", above);
+}
+
+test "TuiModel login picker shows which providers are logged in" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 80;
+    tctx.ctx.height = 24;
+    model.app.?.login_status[0] = .oauth;
+    model.app.?.login_status[3] = .api_key;
+    model.app.?.state.mode = .picker;
+    model.app.?.state.picker_kind = .login;
+
+    const frame = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "Login provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "logged in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "api key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "expired") == null);
 }
 
 pub const ProductionRuntime = struct {
@@ -384,12 +532,15 @@ pub const App = struct {
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
     inline_history_flushed: usize = 0,
-    last_inline_view_lines: usize = 4,
+    inline_flushed_rows: usize = 0,
+    login_status: [login_providers.len]LoginStatus = [_]LoginStatus{.none} ** login_providers.len,
     pending_session_reset: bool = false,
     quarantine_events: bool = false,
     quarantine_generation: u32 = 0,
     quarantine_buffer: std.ArrayList(tui_runtime.TuiEvent) = .empty,
     pending_clipboard: ?[]u8 = null,
+    interrupt_armed_tick: ?u64 = null,
+    pending_clear_screen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
         var runtime_options = options;
@@ -500,6 +651,7 @@ pub const App = struct {
         self.quarantine_buffer.clearRetainingCapacity();
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
+        self.inline_flushed_rows = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
         try self.state.status.setSessionId(self.allocator, self.session_id);
@@ -520,6 +672,47 @@ pub const App = struct {
     }
 
     const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
+    const login_env_keys = [_][]const []const u8{ &.{ "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY" }, &.{}, &.{}, &.{} };
+
+    pub const LoginStatus = enum { none, api_key, env_key, oauth, expired };
+
+    pub fn loginStatusFor(storage: ?*const oauth_storage.AuthStorage, provider_id: []const u8, env_key_present: bool) LoginStatus {
+        if (storage) |stored| {
+            if (stored.providers.get(provider_id)) |auth| {
+                return switch (auth) {
+                    .api_key => .api_key,
+                    .oauth => if (stored.credentialsExpired(provider_id)) .expired else .oauth,
+                };
+            }
+        }
+        return if (env_key_present) .env_key else .none;
+    }
+
+    pub fn loginBadge(status: LoginStatus) ?[]const u8 {
+        return switch (status) {
+            .none => null,
+            .api_key => tui_theme.glyph.check ++ " api key",
+            .env_key => tui_theme.glyph.check ++ " env key",
+            .oauth => tui_theme.glyph.check ++ " logged in",
+            .expired => "expired · login again",
+        };
+    }
+
+    fn refreshLoginStatus(self: *App) void {
+        var loaded: ?oauth_storage.AuthStorage = oauth_storage.AuthStorage.loadDefaultStoredOnly(self.allocator) catch null;
+        defer if (loaded) |*storage| storage.deinit();
+        const storage: ?*const oauth_storage.AuthStorage = if (loaded) |*stored| stored else null;
+        for (login_providers, 0..) |provider, i| {
+            var env_present = false;
+            for (login_env_keys[i]) |name| {
+                if (compat.getEnvVarOwned(self.allocator, name)) |value| {
+                    env_present = env_present or value.len > 0;
+                    self.allocator.free(value);
+                } else |_| {}
+            }
+            self.login_status[i] = loginStatusFor(storage, provider, env_present);
+        }
+    }
 
     const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
 
@@ -567,7 +760,7 @@ pub const App = struct {
                     }
                 }
             },
-            .login => {},
+            .login => self.refreshLoginStatus(),
         }
         self.state.mode = .picker;
         self.ensureMenuSelectionVisible();
@@ -676,6 +869,7 @@ pub const App = struct {
                 creds.deinit(self.allocator);
                 self.finishLogin();
                 if (save_err) |_| {
+                    self.refreshLoginStatus();
                     const refresh_err = self.refreshModelsAfterLogin();
                     const msg = try std.fmt.allocPrint(self.allocator, "logged in to {s}", .{provider_id});
                     defer self.allocator.free(msg);
@@ -977,6 +1171,7 @@ pub const App = struct {
         self.refreshQueuedCounts();
         self.state.reconcileSteers(session.steersConsumedCount());
         self.syncBackpressureState();
+        self.syncModelTelemetry();
         if (self.pending_session_reset and !self.state.status.streaming) {
             if (self.runtime) |runtime| {
                 if (runtime.local_agent) |*local| {
@@ -1066,6 +1261,7 @@ pub const App = struct {
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
+        self.state.transcript_scroll = 0;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
@@ -1154,6 +1350,8 @@ pub const App = struct {
                 self.state.clearTranscript();
                 self.state.clearTools();
                 self.inline_history_flushed = 0;
+                self.inline_flushed_rows = 0;
+                self.pending_clear_screen = true;
             },
             .open_session_picker => {
                 try self.loadSessions();
@@ -1239,26 +1437,58 @@ pub const App = struct {
     }
 
     pub fn appendWelcome(self: *App) !void {
+        const model = try tui_text.sanitizeTerminalText(self.allocator, if (self.state.status.model.len > 0) self.state.status.model else "no-model");
+        defer self.allocator.free(model);
+        const provider = try tui_text.sanitizeTerminalText(self.allocator, if (self.state.status.provider.len > 0) self.state.status.provider else "local");
+        defer self.allocator.free(provider);
+        const cwd = try tui_text.sanitizeTerminalText(self.allocator, if (self.working_dir.len > 0) self.working_dir else ".");
+        defer self.allocator.free(cwd);
+        const k = tui_theme.key;
         if (self.state.sessions.items.len == 0) {
-            const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
-            const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
-            const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
-            const tips = "Enter submit • Enter while streaming steers • /resume opens sessions • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
                 \\cwd: {s}
-                \\tips: {s}
-            , .{ provider, model, cwd, tips });
+                \\tips: {s} send {s} {s}{s} newline {s} {s}{s} thinking {s} {s}Y copy reply {s} /help commands
+            , .{ provider, model, cwd, k.enter, tui_theme.glyph.dot, k.shift, k.enter, tui_theme.glyph.dot, k.shift, k.tab, tui_theme.glyph.dot, k.ctrl, tui_theme.glyph.dot });
             defer self.allocator.free(welcome);
-            try self.state.appendTranscript(.system, welcome);
+            try self.state.appendTranscript(.welcome, welcome);
             return;
         }
-        const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
-        const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
-        const welcome = try std.fmt.allocPrint(self.allocator, "Makai TUI • {s}/{s} • /resume opens saved work", .{ provider, model });
+        const welcome = try std.fmt.allocPrint(self.allocator,
+            \\Makai TUI
+            \\model: {s}/{s}
+            \\cwd: {s}
+            \\sessions: {d} saved {s} /resume to continue one
+        , .{ provider, model, cwd, self.state.sessions.items.len, tui_theme.glyph.dot });
         defer self.allocator.free(welcome);
-        try self.state.appendTranscript(.system, welcome);
+        try self.state.appendTranscript(.welcome, welcome);
+    }
+
+    fn syncModelTelemetry(self: *App) void {
+        const runtime = self.runtime orelse return;
+        const model = runtime.currentModel() orelse return;
+        self.state.telemetry.input_cost_per_million = model.cost.input;
+    }
+
+    pub fn slashQuery(self: *const App) ?[]const u8 {
+        const text = self.state.composer.text();
+        if (text.len == 0 or text[0] != '/') return null;
+        if (std.mem.indexOfAny(u8, text, " \t\n") != null) return null;
+        return text[1..];
+    }
+
+    pub fn completeSlashCommand(self: *App) !bool {
+        const query = self.slashQuery() orelse return false;
+        for (&tui_commands.commands) |info| {
+            if (!std.mem.startsWith(u8, info.name, query)) continue;
+            const has_args = std.mem.indexOfScalar(u8, info.usage, ' ') != null;
+            const completed = try std.fmt.allocPrint(self.allocator, "/{s}{s}", .{ info.name, if (has_args) " " else "" });
+            defer self.allocator.free(completed);
+            try self.state.replaceComposerBuffer(completed);
+            return true;
+        }
+        return false;
     }
 
     pub fn decideApproval(self: *App, approved: bool, always: bool) !void {
@@ -1318,14 +1548,22 @@ fn encodeHexLower(out: []u8, bytes: []const u8) void {
     }
 }
 
+pub const RenderMode = enum {
+    auto,
+    inline_history,
+    full_transcript,
+};
+
 pub const TuiModel = struct {
     app: ?App = null,
     options: tui_runtime.TuiRuntimeOptions = .{},
+    render_mode: RenderMode = .auto,
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
         mouse: zz.MouseEvent,
         tick: struct { timestamp: u64, delta: u64 },
+        window_size: struct { width: u16, height: u16 },
         quit: void,
     };
 
@@ -1358,16 +1596,75 @@ pub const TuiModel = struct {
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
                     .char => |c| switch (c) {
-                        'c' => return .quit,
+                        'c' => return self.handleInterrupt(app, ctx),
+                        'd' => {
+                            if (app.state.composer.buffer.items.len == 0 and app.state.mode == .normal and !app.state.status.streaming) return self.quitCmd(app, ctx);
+                            return .none;
+                        },
                         'y' => {
                             app.copyLastAssistant();
                             app.flushClipboard(ctx);
                             return .none;
                         },
+                        'u' => {
+                            _ = app.state.composer.deleteToLineStart();
+                            return .none;
+                        },
+                        'k' => {
+                            _ = app.state.composer.deleteToLineEnd();
+                            return .none;
+                        },
+                        'w' => {
+                            _ = app.state.composer.deleteWordBeforeCursor();
+                            return .none;
+                        },
+                        'a' => {
+                            app.state.composer.moveCursorHome();
+                            return .none;
+                        },
+                        'e' => {
+                            app.state.composer.moveCursorEnd();
+                            return .none;
+                        },
                         else => return .none,
+                    },
+                    .left => {
+                        app.state.composer.moveCursorWordPrev();
+                        return .none;
+                    },
+                    .right => {
+                        app.state.composer.moveCursorWordNext();
+                        return .none;
                     },
                     else => {},
                 };
+                if (key.modifiers.alt) switch (key.key) {
+                    .left => {
+                        app.state.composer.moveCursorWordPrev();
+                        return .none;
+                    },
+                    .right => {
+                        app.state.composer.moveCursorWordNext();
+                        return .none;
+                    },
+                    .backspace => {
+                        _ = app.state.composer.deleteWordBeforeCursor();
+                        return .none;
+                    },
+                    .char => |c| switch (c) {
+                        'b' => {
+                            app.state.composer.moveCursorWordPrev();
+                            return .none;
+                        },
+                        'f' => {
+                            app.state.composer.moveCursorWordNext();
+                            return .none;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                };
+                app.interrupt_armed_tick = null;
                 if (key.key == .tab and key.modifiers.eql(.{ .shift = true })) {
                     app.cycleThinkingLevel();
                     return .none;
@@ -1478,7 +1775,7 @@ pub const TuiModel = struct {
                         var consumed = true;
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
-                                if (err == error.QuitRequested) return .quit;
+                                if (err == error.QuitRequested) return self.quitCmd(app, ctx);
                                 if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
                                 if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -1486,14 +1783,14 @@ pub const TuiModel = struct {
                             };
                         } else if (app.state.status.streaming) {
                             app.steer(text) catch |err| {
-                                if (err == error.QuitRequested) return .quit;
+                                if (err == error.QuitRequested) return self.quitCmd(app, ctx);
                                 if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
                                 if (err == error.PendingSessionReset) return .none;
                                 app.recordError(@errorName(err)) catch {};
                             };
                         } else {
                             app.submit(text) catch |err| {
-                                if (err == error.QuitRequested) return .quit;
+                                if (err == error.QuitRequested) return self.quitCmd(app, ctx);
                                 if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
                                 if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -1510,6 +1807,8 @@ pub const TuiModel = struct {
                         }
                     },
                     .backspace => _ = app.state.composer.deleteBeforeCursor(),
+                    .delete => _ = app.state.composer.deleteAtCursor(),
+                    .tab => _ = app.completeSlashCommand() catch false,
                     .char => |c| appendChar(app, c) catch {},
                     .paste => |text| app.state.composer.insertSlice(app.allocator, text) catch {},
                     .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
@@ -1525,22 +1824,92 @@ pub const TuiModel = struct {
                     },
                     .page_up => app.state.transcript_scroll += 5,
                     .page_down => app.state.transcript_scroll -|= 5,
-                    .escape => app.state.mode = .normal,
+                    .escape => self.handleEscape(app),
                     else => {},
                 }
             },
             .mouse => |mouse| handleMouse(app, mouse),
+            .window_size => self.refillInlineWindowAfterResize(app, ctx) catch |err| app.recordError(@errorName(err)) catch {},
             .tick => {
                 app.state.anim_tick +%= 1;
                 app.drainEvents() catch {};
                 app.pollLogin() catch {};
-                flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
+                app.state.refreshStreamingElapsed(compat.time.nowMillis());
+                if (app.interrupt_armed_tick) |armed| {
+                    if (app.state.anim_tick -% armed > interrupt_window_ticks) app.interrupt_armed_tick = null;
+                }
             },
-            .quit => return .quit,
+            .quit => return self.quitCmd(app, ctx),
         }
-        flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
+        if (app.pending_clear_screen) {
+            app.pending_clear_screen = false;
+            if (self.inlineMode(ctx)) ctx.requestClearScreen();
+        }
+        self.flushInlineHistory(app, ctx, false) catch |err| app.recordError(@errorName(err)) catch {};
         app.flushClipboard(ctx);
         return .none;
+    }
+
+    fn quitCmd(self: *TuiModel, app: *App, ctx: *zz.Context) zz.Cmd(Msg) {
+        self.flushInlineHistory(app, ctx, true) catch {};
+        return .quit;
+    }
+
+    const interrupt_window_ticks: u64 = 30;
+
+    fn streamActive(app: *const App) bool {
+        if (app.state.status.streaming) return true;
+        if (app.runtime) |runtime| return runtime.stream_active;
+        return false;
+    }
+
+    fn abortTurn(app: *App) void {
+        app.submit("/abort") catch |err| app.recordError(@errorName(err)) catch {};
+    }
+
+    fn handleInterrupt(self: *TuiModel, app: *App, ctx: *zz.Context) zz.Cmd(Msg) {
+        if (app.interrupt_armed_tick != null) return self.quitCmd(app, ctx);
+        if (app.state.mode == .login_input) {
+            app.cancelLogin();
+            return .none;
+        }
+        if (app.state.mode == .approval or streamActive(app)) {
+            abortTurn(app);
+            app.state.composer.clear();
+            app.interrupt_armed_tick = app.state.anim_tick;
+            return .none;
+        }
+        if (app.state.mode != .normal) {
+            app.state.mode = .normal;
+            return .none;
+        }
+        if (app.state.composer.buffer.items.len > 0) {
+            app.state.composer.clear();
+            app.interrupt_armed_tick = app.state.anim_tick;
+            return .none;
+        }
+        return self.quitCmd(app, ctx);
+    }
+
+    fn handleEscape(self: *TuiModel, app: *App) void {
+        _ = self;
+        if (app.state.composer.buffer.items.len > 0) {
+            app.state.composer.clear();
+            return;
+        }
+        if (streamActive(app)) {
+            abortTurn(app);
+            return;
+        }
+        app.state.mode = .normal;
+    }
+
+    pub fn inlineMode(self: *const TuiModel, ctx: *const zz.Context) bool {
+        return switch (self.render_mode) {
+            .auto => ctx._terminal != null,
+            .inline_history => true,
+            .full_transcript => false,
+        };
     }
 
     pub fn view(self: *TuiModel, ctx: *const zz.Context) []const u8 {
@@ -1548,9 +1917,74 @@ pub const TuiModel = struct {
         const width: usize = @max(ctx.width, 20);
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
-        const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
+        const chrome = self.renderChrome(app, ctx, width);
+        if (self.inlineMode(ctx)) {
+            const fixed = countLines(chrome.status) + countLines(chrome.composer) + countLines(chrome.extra) + 1;
+            const body_budget = height -| fixed;
+            const body = renderInlineBody(app, ctx, width, body_budget) catch "";
+            var parts: [5][]const u8 = undefined;
+            var len: usize = 0;
+            if (body.len > 0) {
+                parts[len] = body;
+                len += 1;
+            }
+            parts[len] = "";
+            len += 1;
+            if (chrome.extra.len > 0) {
+                parts[len] = chrome.extra;
+                len += 1;
+            }
+            parts[len] = chrome.composer;
+            len += 1;
+            parts[len] = chrome.status;
+            len += 1;
+            return tui_render.joinVertical(ctx.allocator, parts[0..len]) catch chrome.composer;
+        }
+
+        const fixed = countLines(chrome.status) + countLines(chrome.composer) + @max(countLines(chrome.extra), 1);
+        const transcript_height = if (height > fixed) height - fixed else 3;
+        const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height, .anim_tick = app.state.anim_tick }) catch "";
+        return tui_render.joinVertical(ctx.allocator, &.{ transcript, chrome.extra, chrome.composer, chrome.status }) catch "";
+    }
+
+    const Chrome = struct {
+        composer: []const u8,
+        status: []const u8,
+        extra: []const u8,
+    };
+
+    fn renderInlineBody(app: *App, ctx: *const zz.Context, width: usize, budget: usize) ![]const u8 {
+        if (app.state.transcript_scroll > 0 and budget >= 2) {
+            const stream = try renderInlineStream(ctx.allocator, &app.state, 0, 0, width, true);
+            const total = countLines(stream);
+            const view_rows = budget - 1;
+            const max_scroll = total -| view_rows;
+            const scroll = @min(app.state.transcript_scroll, max_scroll);
+            app.state.transcript_scroll = scroll;
+            if (scroll > 0) {
+                const window = try transcript_view.lineWindow(ctx.allocator, stream, view_rows, scroll);
+                const pct = transcript_view.scrollPercent(total, view_rows, scroll);
+                const label = try std.fmt.allocPrint(ctx.allocator, "\u{2191} SCROLL {d}% \u{b7} PgDn to return", .{pct});
+                const indicator = try tui_theme.muted().render(ctx.allocator, label);
+                return tui_render.joinVertical(ctx.allocator, &.{ indicator, window });
+            }
+        } else {
+            app.state.transcript_scroll = 0;
+        }
+        const stream = try renderInlineStream(ctx.allocator, &app.state, app.inline_history_flushed, app.inline_flushed_rows, width, true);
+        return tailLines(ctx.allocator, stream, budget);
+    }
+
+    fn renderChrome(self: *TuiModel, app: *App, ctx: *const zz.Context, width: usize) Chrome {
+        _ = self;
+        const hint = if (app.interrupt_armed_tick != null)
+            tui_theme.key.ctrl ++ "C again to quit"
+        else
+            composer_view.hintText(ctx.allocator, &app.state) catch "";
+        const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width, .hint = hint }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
+            .anim_tick = app.state.anim_tick,
         }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
@@ -1563,14 +1997,18 @@ pub const TuiModel = struct {
                 const items: []const menu_picker_view.Item = switch (app.state.picker_kind) {
                     .model => model_items: {
                         const models = if (app.runtime) |runtime| runtime.availableModels() else &[_]ai_types.Model{};
+                        const current = if (app.runtime) |runtime| runtime.currentModel() else null;
                         const list = ctx.allocator.alloc(menu_picker_view.Item, models.len) catch break :blk "";
-                        for (models, 0..) |model, i| list[i] = .{ .label = model.id, .detail = model.provider };
+                        for (models, 0..) |model, i| {
+                            const is_current = if (current) |active| std.mem.eql(u8, active.id, model.id) else false;
+                            list[i] = .{ .label = model.id, .detail = model.provider, .badge = if (is_current) tui_theme.glyph.system ++ " current" else null };
+                        }
                         title = "Select model";
                         empty_message = "  no models available";
                         break :model_items list;
                     },
                     .login => login_items_blk: {
-                        for (App.login_providers, 0..) |provider, i| login_items[i] = .{ .label = provider };
+                        for (App.login_providers, 0..) |provider, i| login_items[i] = .{ .label = provider, .badge = App.loginBadge(app.login_status[i]) };
                         title = "Login provider";
                         break :login_items_blk &login_items;
                     },
@@ -1593,83 +2031,88 @@ pub const TuiModel = struct {
                 }) catch "";
             },
             .login_input => "",
-            .normal => "",
+            .normal => renderCommandPalette(ctx.allocator, app, width) catch "",
         };
-        if (ctx._terminal != null) {
-            const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
-            const active_height = height -| fixed;
-            const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
-            const live_frame = if (active.len > 0)
-                tui_render.joinVertical(ctx.allocator, &.{ active, extra, composer, status }) catch ""
-            else
-                tui_render.joinVertical(ctx.allocator, &.{ extra, composer, status }) catch "";
-            app.last_inline_view_lines = @max(countLines(live_frame), 1);
-            return tui_render.withSynchronizedOutput(ctx.allocator, live_frame) catch live_frame;
-        }
-
-        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
-        const transcript_height = if (height > fixed) height - fixed else 3;
-        const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
-        return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
+        return .{ .composer = composer, .status = status, .extra = extra };
     }
 
-    fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize) ![]const u8 {
-        if (max_lines == 0) return allocator.dupe(u8, "");
+    fn flushBudget(self: *TuiModel, app: *App, ctx: *const zz.Context) usize {
+        const width: usize = @max(ctx.width, 20);
+        const height: usize = @max(ctx.height, 8);
+        const chrome = self.renderChrome(app, ctx, width);
+        return height -| (countLines(chrome.status) + countLines(chrome.composer) + 1);
+    }
 
-        var indices: [4]usize = undefined;
+    fn renderCommandPalette(allocator: std.mem.Allocator, app: *const App, width: usize) ![]const u8 {
+        const query = app.slashQuery() orelse return "";
+        var items: [tui_commands.commands.len]menu_picker_view.Item = undefined;
         var len: usize = 0;
-        addActiveTranscriptIndex(&indices, &len, state.active_user_entry, state.transcript.items.len);
-        addActiveTranscriptIndex(&indices, &len, state.active_assistant_entry, state.transcript.items.len);
-        addActiveTranscriptIndex(&indices, &len, state.active_tool_result_entry, state.transcript.items.len);
-        addActiveTranscriptIndex(&indices, &len, state.active_tool_summary_entry, state.transcript.items.len);
-        if (len == 0) return allocator.dupe(u8, "");
-        sortSmallIndices(indices[0..len]);
+        for (&tui_commands.commands) |info| {
+            if (!std.mem.startsWith(u8, info.name, query)) continue;
+            items[len] = .{ .label = info.usage, .detail = info.description };
+            len += 1;
+        }
+        if (len == 0) return "";
+        return menu_picker_view.render(allocator, .{
+            .title = "Commands",
+            .items = items[0..len],
+            .selected = 0,
+            .width = width,
+            .height = 8,
+            .footer = tui_theme.key.tab ++ " complete " ++ tui_theme.glyph.dot ++ " " ++ tui_theme.key.enter ++ " run",
+        });
+    }
 
+    fn renderInlineBlock(allocator: std.mem.Allocator, state: *const tui_state.AppState, index: usize, width: usize, live: bool) ![]u8 {
+        const entries = state.transcript.items;
+        const entry = &entries[index];
+        const detached = index == 0 or !transcript_view.entriesAttached(&entries[index - 1], entry);
+        const awaiting = live and state.mode == .approval and entry.kind == .tool and entry.tool_call_id.len > 0 and std.mem.eql(u8, entry.tool_call_id, state.approval.tool_call_id);
+        const rendered = try transcript_view.renderTranscriptEntryWith(allocator, entry, width, .{ .live = live and isLiveEntry(state, index), .anim_tick = state.anim_tick, .awaiting_approval = awaiting });
+        defer allocator.free(rendered);
+        if (!detached) return allocator.dupe(u8, rendered);
+        return std.mem.concat(allocator, u8, &.{ "\n", rendered });
+    }
+
+    fn renderInlineStream(allocator: std.mem.Allocator, state: *const tui_state.AppState, from: usize, skip_rows: usize, width: usize, live: bool) ![]const u8 {
+        const entries = state.transcript.items;
         var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
+        defer out.deinit();
         const writer = &out.writer;
-        for (indices[0..len], 0..) |idx, i| {
-            if (i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
-            defer allocator.free(rendered);
-            try writer.writeAll(rendered);
-            if (state.active_user_entry != null and idx == state.active_user_entry.?) {
-                var next = idx + 1;
-                while (next < state.transcript.items.len) : (next += 1) {
-                    if (state.transcript.items[next].kind != .user) continue;
-                    const extra = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[next], width);
-                    defer allocator.free(extra);
-                    try writer.writeAll("\n\n");
-                    try writer.writeAll(extra);
-                }
-            }
+        var first = true;
+        var i = @min(from, entries.len);
+        while (i < entries.len) : (i += 1) {
+            if (!first) try writer.writeAll("\n");
+            first = false;
+            const block = try renderInlineBlock(allocator, state, i, width, live);
+            defer allocator.free(block);
+            try writer.writeAll(block);
         }
-        const rendered_active = try out.toOwnedSlice();
-        defer allocator.free(rendered_active);
-        return tailLines(allocator, rendered_active, max_lines);
+        if (live and state.status.streaming and state.active_assistant_entry == null and state.active_tool_summary_entry == null and state.mode != .approval) {
+            if (!first) try writer.writeAll("\n");
+            try writer.writeAll("\n");
+            const waiting = try transcript_view.renderWaitingLine(allocator, state.status.model, state.anim_tick, state.status.streaming_elapsed_ms);
+            defer allocator.free(waiting);
+            try writer.writeAll(waiting);
+        }
+        return dropLines(allocator, out.written(), skip_rows);
     }
 
-    fn addActiveTranscriptIndex(indices: *[4]usize, len: *usize, maybe_index: ?usize, transcript_len: usize) void {
-        const idx = maybe_index orelse return;
-        if (idx >= transcript_len) return;
-        for (indices[0..len.*]) |existing| {
-            if (existing == idx) return;
+    fn dropLines(allocator: std.mem.Allocator, text: []const u8, count: usize) ![]const u8 {
+        var start: usize = 0;
+        var remaining = count;
+        while (remaining > 0) : (remaining -= 1) {
+            const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return allocator.dupe(u8, "");
+            start = newline + 1;
         }
-        indices[len.*] = idx;
-        len.* += 1;
+        return allocator.dupe(u8, text[start..]);
     }
 
-    fn sortSmallIndices(indices: []usize) void {
-        var i: usize = 1;
-        while (i < indices.len) : (i += 1) {
-            const value = indices[i];
-            var j = i;
-            while (j > 0 and indices[j - 1] > value) : (j -= 1) {
-                indices[j] = indices[j - 1];
-            }
-            indices[j] = value;
-        }
+    fn isLiveEntry(state: *const tui_state.AppState, index: usize) bool {
+        if (state.active_assistant_entry) |idx| if (idx == index) return true;
+        if (state.active_thinking_entry) |idx| if (idx == index) return true;
+        if (state.active_tool_summary_entry) |idx| if (idx == index) return true;
+        return false;
     }
 
     fn tailLines(allocator: std.mem.Allocator, text: []const u8, max_lines: usize) ![]const u8 {
@@ -1696,67 +2139,79 @@ pub const TuiModel = struct {
         try app.state.composer.insertSlice(app.allocator, buf[0..len]);
     }
 
-    fn flushInlineHistory(app: *App, ctx: *zz.Context) !void {
-        if (@import("builtin").is_test) {
-            const ok: anyerror!void = {};
-            return ok;
-        }
-        if (ctx._terminal == null) return;
-        if (app.inline_history_flushed >= app.state.transcript.items.len) return;
+    fn flushInlineHistory(self: *TuiModel, app: *App, ctx: *zz.Context, include_active: bool) !void {
+        if (!self.inlineMode(ctx)) return;
+        const entries = app.state.transcript.items;
+        if (app.inline_history_flushed >= entries.len) return;
 
-        const stop = inlineFlushStop(app);
-        if (stop <= app.inline_history_flushed) return;
+        const width: usize = @max(ctx.width, 20);
+        const stop = if (include_active) entries.len else inlineFlushStop(app);
+        var overflow: usize = std.math.maxInt(usize);
+        if (!include_active) {
+            const stream = try renderInlineStream(ctx.allocator, &app.state, app.inline_history_flushed, app.inline_flushed_rows, width, true);
+            defer ctx.allocator.free(stream);
+            overflow = countLines(stream) -| self.flushBudget(app, ctx);
+        }
+        while (overflow > 0 and app.inline_history_flushed < stop) {
+            const block = try renderInlineBlock(ctx.allocator, &app.state, app.inline_history_flushed, width, false);
+            defer ctx.allocator.free(block);
+            const block_rows = countLines(block);
+            const offset = app.inline_flushed_rows;
+            const take = @min(block_rows -| offset, overflow);
+            if (take == 0) break;
+            try printAboveRows(ctx, block, offset, take);
+            overflow -= take;
+            if (offset + take >= block_rows) {
+                app.inline_history_flushed += 1;
+                app.inline_flushed_rows = 0;
+            } else {
+                app.inline_flushed_rows = offset + take;
+            }
+        }
+    }
 
-        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-        defer out.deinit();
-        const writer = &out.writer;
-        for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
-            if (rel_i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
-            defer ctx.allocator.free(rendered);
-            try writer.writeAll(rendered);
+    fn printAboveRows(ctx: *zz.Context, text: []const u8, skip: usize, count: usize) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var index: usize = 0;
+        var printed: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            if (index < skip) continue;
+            if (printed >= count) break;
+            try ctx.printAbove(line);
+            printed += 1;
         }
-        const rendered_history = out.written();
-        if (rendered_history.len > 0) {
-            try writeInlineHistory(ctx, app.last_inline_view_lines, rendered_history);
-            app.inline_history_flushed = stop;
-            app.state.transcript_scroll = 0;
+    }
+
+    fn refillInlineWindowAfterResize(self: *TuiModel, app: *App, ctx: *zz.Context) !void {
+        app.state.transcript_scroll = 0;
+        if (!self.inlineMode(ctx)) return;
+        const width: usize = @max(ctx.width, 20);
+        const budget = self.flushBudget(app, ctx);
+        const entries = app.state.transcript.items;
+        var start = @min(app.inline_history_flushed, entries.len);
+        const visible = try renderInlineStream(ctx.allocator, &app.state, start, app.inline_flushed_rows, width, true);
+        defer ctx.allocator.free(visible);
+        var rows = countLines(visible);
+        if (rows >= budget) return;
+        rows += app.inline_flushed_rows;
+        while (start > 0 and rows < budget) {
+            start -= 1;
+            const block = try renderInlineBlock(ctx.allocator, &app.state, start, width, false);
+            defer ctx.allocator.free(block);
+            rows += countLines(block);
         }
+        app.inline_history_flushed = start;
+        app.inline_flushed_rows = rows -| budget;
     }
 
     fn inlineFlushStop(app: *const App) usize {
         var stop = app.state.transcript.items.len;
         if (app.state.active_user_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_assistant_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_thinking_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_summary_entry) |idx| stop = @min(stop, idx);
         return stop;
-    }
-
-    fn writeInlineHistory(ctx: *zz.Context, reserved_lines: usize, text: []const u8) !void {
-        const term = ctx._terminal orelse return;
-        const reserved: u16 = @intCast(@min(@max(reserved_lines, 1), @as(usize, ctx.height -| 1)));
-        const history_bottom: u16 = if (ctx.height > reserved) ctx.height - reserved else 1;
-        const writer = term.writer();
-
-        try writer.writeAll(zz.ansi.sync_start);
-        try zz.ansi.setScrollRegion(writer, 1, history_bottom);
-        try zz.ansi.cursorTo(writer, history_bottom, 1);
-
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var first = true;
-        while (lines.next()) |line| {
-            if (!first) try writer.writeAll("\r\n");
-            first = false;
-            try writer.writeAll(line);
-            try writer.writeAll(zz.ansi.line_clear_right);
-        }
-        try writer.writeAll("\r\n");
-
-        try zz.ansi.resetScrollRegion(writer);
-        try zz.ansi.cursorTo(writer, history_bottom + 1, 1);
-        try writer.writeAll(zz.ansi.sync_end);
-        try term.flush();
     }
 
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
@@ -1903,7 +2358,7 @@ fn defaultModel() ai_types.Model {
         .name = "Claude Sonnet 4.5",
         .api = "anthropic-messages",
         .provider = "anthropic",
-        .base_url = "https://api.anthropic.com/v1/messages",
+        .base_url = "https://api.anthropic.com",
         .reasoning = true,
         .input = &.{"text"},
         .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 },
@@ -1915,6 +2370,10 @@ fn defaultModel() ai_types.Model {
 pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     var environ_map = try compat.createEnvMap(allocator);
     defer environ_map.deinit();
+
+    var stderr_redirect = redirectStderrToLog(allocator, &environ_map);
+    defer stderr_redirect.restore();
+    if (stderr_redirect.active()) std.debug.print("--- makai --tui session started at {d} ms (stderr redirected here while the TUI owns the terminal) ---\n", .{compat.time.nowMillis()});
 
     const fixture = try FixtureRuntime.fromEnv(allocator, &environ_map);
     defer if (fixture) |runtime| runtime.deinit();
@@ -1932,14 +2391,94 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     try program.run();
 }
 
+const StderrRedirect = struct {
+    saved_fd: ?std.posix.fd_t = null,
+    log_fd: ?std.posix.fd_t = null,
+
+    fn active(self: *const StderrRedirect) bool {
+        return self.log_fd != null;
+    }
+
+    fn restore(self: *StderrRedirect) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
+        if (self.saved_fd) |saved| {
+            _ = std.c.dup2(saved, std.posix.STDERR_FILENO);
+            _ = std.c.close(saved);
+        }
+        if (self.log_fd) |fd| _ = std.c.close(fd);
+        self.* = .{};
+    }
+};
+
+pub fn stderrLogPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".makai", "tui-stderr.log" });
+}
+
+fn redirectStderrToLog(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map) StderrRedirect {
+    var redirect: StderrRedirect = .{};
+    if (comptime @import("builtin").os.tag == .windows) return redirect;
+    const fd = openStderrLog(allocator, environ_map) catch openDevNull() catch return redirect;
+    const saved = std.c.dup(std.posix.STDERR_FILENO);
+    if (saved < 0) {
+        _ = std.c.close(fd);
+        return redirect;
+    }
+    if (std.c.dup2(fd, std.posix.STDERR_FILENO) < 0) {
+        _ = std.c.close(saved);
+        _ = std.c.close(fd);
+        return redirect;
+    }
+    redirect.saved_fd = saved;
+    redirect.log_fd = fd;
+    return redirect;
+}
+
+fn openStderrLog(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map) !std.posix.fd_t {
+    const home = environ_map.get("HOME") orelse return error.HomeNotFound;
+    if (home.len == 0) return error.HomeNotFound;
+    const dir = try std.fs.path.join(allocator, &.{ home, ".makai" });
+    defer allocator.free(dir);
+    try compat.fs.createDir(compat.fs.getCwd(), dir);
+    const path = try stderrLogPath(allocator, home);
+    defer allocator.free(path);
+    return std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600);
+}
+
+fn openDevNull() !std.posix.fd_t {
+    return std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+}
+
+test "stderr log path lives under the makai home directory" {
+    const path = try stderrLogPath(std.testing.allocator, "/tmp/home");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/home/.makai/tui-stderr.log", path);
+}
+
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = true };
+    return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = false, .ctrl_c_quits = false };
 }
 
 pub fn tuiProgramOptionsForTest() zz.Options {
     if (!@import("builtin").is_test) @compileError("test-only helper");
     return tuiProgramOptions();
 }
+
+const TestContext = struct {
+    arena: std.heap.ArenaAllocator,
+    env: zz.Environment,
+    ctx: zz.Context,
+
+    fn setup(self: *TestContext) void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        self.env = .{};
+        self.ctx = zz.Context.init(self.arena.allocator(), std.testing.allocator, std.testing.io, &self.env);
+    }
+
+    fn deinit(self: *TestContext) void {
+        self.ctx.deinit();
+        self.arena.deinit();
+    }
+};
 
 test "App init seeds registered tools from runtime" {
     var production = try ProductionRuntime.init(std.testing.allocator, .{});
@@ -1989,6 +2528,178 @@ test "TUI program preserves native text selection" {
     try std.testing.expect(!tuiProgramOptions().alternate_scroll);
     try std.testing.expect(!tuiProgramOptions().alt_screen);
     try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
+}
+
+test "TUI program routes Ctrl+C to the model and hides the terminal cursor" {
+    try std.testing.expect(!tuiProgramOptions().ctrl_c_quits);
+    try std.testing.expect(!tuiProgramOptions().cursor);
+}
+
+test "TuiModel Ctrl+C clears a draft first and quits on the second press" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try model.app.?.state.replaceComposerBuffer("draft");
+
+    const first = model.update(.{ .key = .{ .key = .{ .char = 'c' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, first);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expect(model.app.?.interrupt_armed_tick != null);
+
+    const second = model.update(.{ .key = .{ .key = .{ .char = 'c' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, second);
+}
+
+test "TuiModel Ctrl+C quits immediately on an empty idle composer" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+
+    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'c' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
+}
+
+test "TuiModel window resize refills the inline window with the history tail" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 14;
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "history entry {d}", .{i});
+        defer std.testing.allocator.free(text);
+        try model.app.?.state.appendTranscript(.assistant, text);
+    }
+    model.app.?.inline_history_flushed = model.app.?.state.transcript.items.len;
+
+    _ = model.update(.{ .window_size = .{ .width = 60, .height = 14 } }, &tctx.ctx);
+    try std.testing.expect(!tctx.ctx.hasPendingAbove());
+    const frame = model.view(&tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 14), TuiModel.countLines(frame));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "history entry 11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "history entry 0") == null);
+    var lines = std.mem.splitScalar(u8, frame, '\n');
+    while (lines.next()) |line| try std.testing.expect(tui_text.visibleWidth(line) <= 60);
+}
+
+test "TuiModel inline flush keeps scrollback and window contiguous" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 14;
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "history entry {d}", .{i});
+        defer std.testing.allocator.free(text);
+        try model.app.?.state.appendTranscript(.assistant, text);
+    }
+
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    const above = try tctx.ctx.takeAbove(std.testing.allocator);
+    defer std.testing.allocator.free(above);
+    const frame = model.view(&tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 14), TuiModel.countLines(frame));
+    try std.testing.expect(std.mem.indexOf(u8, above, "history entry 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "history entry 11") != null);
+    try std.testing.expect(model.app.?.inline_flushed_rows > 0 or model.app.?.inline_history_flushed > 0);
+
+    const stream = try TuiModel.renderInlineStream(std.testing.allocator, &model.app.?.state, 0, 0, 60, true);
+    defer std.testing.allocator.free(stream);
+    const joined = try std.mem.concat(std.testing.allocator, u8, &.{ above, frame });
+    defer std.testing.allocator.free(joined);
+    var expected = std.mem.splitScalar(u8, stream, '\n');
+    var actual = std.mem.splitScalar(u8, joined, '\n');
+    while (expected.next()) |row| {
+        const got = actual.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, row, " "), std.mem.trimEnd(u8, got, " "));
+    }
+    try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, actual.next() orelse return error.TestUnexpectedResult, " "));
+}
+
+test "TuiModel inline frame keeps the composer on the bottom row across a picker" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 16;
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "history entry {d}", .{i});
+        defer std.testing.allocator.free(text);
+        try model.app.?.state.appendTranscript(.assistant, text);
+    }
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    tctx.ctx.above_buffer.clearRetainingCapacity();
+    const before = try std.testing.allocator.dupe(u8, model.view(&tctx.ctx));
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 16), TuiModel.countLines(before));
+
+    model.app.?.state.mode = .picker;
+    model.app.?.state.picker_kind = .model;
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    const during = model.view(&tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 16), TuiModel.countLines(during));
+    try std.testing.expect(std.mem.indexOf(u8, during, "Select model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, during, "history entry 11") != null);
+    try std.testing.expect(!tctx.ctx.hasPendingAbove());
+
+    model.app.?.state.mode = .normal;
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    try std.testing.expect(!tctx.ctx.hasPendingAbove());
+    try std.testing.expectEqualStrings(before, model.view(&tctx.ctx));
+}
+
+test "TuiModel Escape clears the draft before anything else" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try model.app.?.state.replaceComposerBuffer("draft");
+
+    _ = model.update(.{ .key = .{ .key = .escape } }, &tctx.ctx);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqual(tui_state.AppMode.normal, model.app.?.state.mode);
+}
+
+test "TuiModel Tab completes the first matching slash command" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try model.app.?.state.replaceComposerBuffer("/perm");
+
+    _ = model.update(.{ .key = .{ .key = .tab } }, &tctx.ctx);
+    try std.testing.expectEqualStrings("/permissions ", model.app.?.state.composer.text());
+    try std.testing.expect(model.app.?.slashQuery() == null);
+}
+
+test "TuiModel word editing shortcuts edit the composer" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    try model.app.?.state.replaceComposerBuffer("alpha beta gamma");
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'w' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqualStrings("alpha beta ", model.app.?.state.composer.text());
+    _ = model.update(.{ .key = .{ .key = .left, .modifiers = .{ .alt = true } } }, &tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 6), model.app.?.state.composer.cursor);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'u' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqualStrings("beta ", model.app.?.state.composer.text());
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
 }
 
 test "fixture runtime stays inactive without a non-empty env value" {
@@ -2388,7 +3099,8 @@ test "App welcome uses session count" {
     app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
 
     try app.appendWelcome();
-    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqual(tui_state.TranscriptKind.welcome, app.state.transcript.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Makai TUI") != null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
 
@@ -2558,19 +3270,25 @@ test "App steer handles fallback empty and session paths" {
 test "TuiModel exits quit command while streaming" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     model.app.?.state.status.streaming = true;
     try model.app.?.state.replaceComposerBuffer("/quit");
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
 }
 
 test "TuiModel Shift Enter inserts newline without submitting" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     try model.app.?.state.replaceComposerBuffer("first");
 
-    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .shift = true } } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .shift = true } } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqualStrings("first\n", model.app.?.state.composer.text());
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
@@ -2579,9 +3297,12 @@ test "TuiModel Shift Enter inserts newline without submitting" {
 test "TuiModel Shift Tab cycles thinking level" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
 
     try std.testing.expectEqual(ai_types.ThinkingLevel.low, model.app.?.state.thinking_level);
-    const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
 }
@@ -2814,6 +3535,9 @@ test "setting pickers apply selected values" {
 test "TuiModel drains events before routing Enter while streaming" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     var mock = MockAppSession{};
     defer mock.deinit();
     model.app.?.session = mock.session();
@@ -2822,7 +3546,7 @@ test "TuiModel drains events before routing Enter while streaming" {
     try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
     try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
@@ -2964,10 +3688,11 @@ test "TuiModel inline render shows every steer echo while assistant streams" {
     try std.testing.expectEqual(@as(usize, 0), state.active_assistant_entry.?);
     try std.testing.expectEqual(@as(usize, 1), state.active_user_entry.?);
 
-    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60);
+    const out = try TuiModel.renderInlineStream(std.testing.allocator, &state, 0, 0, 100, true);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "first steer") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "second steer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "status row between steers") != null);
 }
 
 test "App drain auto-resumes remaining steering after completed turn" {
@@ -3010,6 +3735,9 @@ test "TuiModel local streaming Enter steers when steering available" {
 
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     model.app.?.runtime = runtime;
     var mock = MockAppSession{};
     defer mock.deinit();
@@ -3017,7 +3745,7 @@ test "TuiModel local streaming Enter steers when steering available" {
     model.app.?.state.status.streaming = true;
     try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "steer now");
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
@@ -3028,6 +3756,9 @@ test "TuiModel local streaming Enter steers when steering available" {
 test "TuiModel stops Enter routing when drained event enters approval mode" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     var mock = MockAppSession{};
     defer mock.deinit();
     model.app.?.session = mock.session();
@@ -3039,7 +3770,7 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     } });
     try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "should wait");
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
     try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
@@ -3050,6 +3781,9 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
 test "TuiModel allows /abort slash command during approval mode" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     var mock = MockAppSession{};
     defer mock.deinit();
     model.app.?.session = mock.session();
@@ -3058,9 +3792,9 @@ test "TuiModel allows /abort slash command during approval mode" {
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'a', 'b', 'o', 'r', 't' };
-    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, &tctx.ctx);
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(tui_state.AppMode.normal, model.app.?.state.mode);
     try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
@@ -3073,6 +3807,9 @@ test "TuiModel allows /abort slash command during approval mode" {
 test "TuiModel blocks non-abort slash commands during approval mode" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     var mock = MockAppSession{};
     defer mock.deinit();
     model.app.?.session = mock.session();
@@ -3081,9 +3818,9 @@ test "TuiModel blocks non-abort slash commands during approval mode" {
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'h', 'e', 'l', 'p' };
-    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, &tctx.ctx);
 
-    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, &tctx.ctx);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
@@ -3093,14 +3830,17 @@ test "TuiModel blocks non-abort slash commands during approval mode" {
 test "TuiModel moves composer cursor and edits in place" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
 
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'a' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'b' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'c' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .left } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'X' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'a' } } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'b' } } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'c' } } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .left } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'X' } } }, &tctx.ctx);
     try std.testing.expectEqualStrings("abXc", model.app.?.state.composer.text());
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, &tctx.ctx);
     try std.testing.expectEqualStrings("abc", model.app.?.state.composer.text());
 }
 
@@ -3127,15 +3867,18 @@ test "session picker navigation pages through hidden rows" {
 test "session picker typing characters does not edit anything" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     model.app.?.state.mode = .session_picker;
     try model.app.?.state.addSession("s1", "Alpha");
     try model.app.?.state.addSession("s2", "Beta");
     model.app.?.state.session_index = 1;
 
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'g' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'p' } } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'g' } } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'p' } } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, &tctx.ctx);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, &tctx.ctx);
 
     try std.testing.expectEqual(@as(usize, 2), model.app.?.state.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.session_index);
@@ -3160,15 +3903,65 @@ fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64)
     try store.save(meta, .{ .turn_start = .{} });
 }
 
+test "TuiModel PageUp scrolls the inline window and PageDown returns to the tail" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 12;
+    var i: usize = 0;
+    while (i < 14) : (i += 1) {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "entry number {d}", .{i});
+        defer std.testing.allocator.free(text);
+        try model.app.?.state.appendTranscript(.user, text);
+    }
+    model.app.?.inline_history_flushed = 8;
+
+    const tail = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "SCROLL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "entry number 13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "entry number 0") == null);
+
+    _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 5), model.app.?.state.transcript_scroll);
+    const scrolled = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "SCROLL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "entry number 13") == null);
+    try std.testing.expect(TuiModel.countLines(scrolled) <= 12);
+
+    var n: usize = 0;
+    while (n < 20) : (n += 1) _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    const top = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, top, "entry number 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "SCROLL 100%") != null);
+    const clamped = model.app.?.state.transcript_scroll;
+    try std.testing.expect(clamped < 5 + 20 * 5);
+
+    _ = model.update(.{ .key = .{ .key = .page_down } }, &tctx.ctx);
+    try std.testing.expectEqual(clamped - 5, model.app.?.state.transcript_scroll);
+    while (model.app.?.state.transcript_scroll > 0) _ = model.update(.{ .key = .{ .key = .page_down } }, &tctx.ctx);
+    const back = model.view(&tctx.ctx);
+    try std.testing.expectEqualStrings(tail, back);
+
+    _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    try model.app.?.submit("/help");
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript_scroll);
+}
+
 test "TuiModel PageUp and PageDown scroll the transcript" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
     try model.app.?.state.appendTranscript(.user, "x");
     model.app.?.state.transcript_scroll = 0;
 
-    _ = model.update(.{ .key = .{ .key = .page_up } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
     try std.testing.expectEqual(@as(usize, 5), model.app.?.state.transcript_scroll);
-    _ = model.update(.{ .key = .{ .key = .page_down } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .page_down } }, &tctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript_scroll);
 }
 
