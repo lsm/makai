@@ -24,6 +24,7 @@ const anthropic_base_url = "https://api.anthropic.com";
 const anthropic_models_url = "https://api.anthropic.com/v1/models?limit=100";
 const anthropic_env_keys = [_][]const u8{ "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY" };
 const max_catalog_bytes = 2 * 1024 * 1024;
+const anthropic_catalog_max_age_ms: i64 = 24 * 60 * 60 * 1000;
 const default_codex_client_version = "0.0.0";
 const default_max_output_tokens: u32 = 16_384;
 
@@ -284,7 +285,7 @@ fn loadAnthropicModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.Au
     defer secureFree(allocator, token);
 
     if (mode == .allow_cache) {
-        if (try loadCachedAnthropicModels(allocator)) |models| return models;
+        if (try loadCachedAnthropicModels(allocator, anthropic_catalog_max_age_ms)) |models| return models;
     }
     if (fetchAnthropicModelsCatalog(allocator, token)) |body| {
         defer allocator.free(body);
@@ -296,13 +297,29 @@ fn loadAnthropicModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.Au
             allocator.free(models);
         } else |_| {}
     } else |_| {}
-    if (try loadCachedAnthropicModels(allocator)) |models| return models;
+    if (try loadCachedAnthropicModels(allocator, null)) |models| return models;
     return anthropicStaticModels(allocator);
 }
 
-fn loadCachedAnthropicModels(allocator: std.mem.Allocator) !?[]ai_types.Model {
+fn catalogIsFresh(modified_ms: i64, now_ms: i64, max_age_ms: i64) bool {
+    return now_ms - modified_ms <= max_age_ms;
+}
+
+test "catalogIsFresh accepts caches younger than the window and rejects older ones" {
+    try std.testing.expect(catalogIsFresh(1_000, 1_000 + anthropic_catalog_max_age_ms, anthropic_catalog_max_age_ms));
+    try std.testing.expect(!catalogIsFresh(1_000, 1_001 + anthropic_catalog_max_age_ms, anthropic_catalog_max_age_ms));
+    try std.testing.expect(catalogIsFresh(5_000, 4_000, anthropic_catalog_max_age_ms));
+    try std.testing.expect(catalogIsFresh(0, 0, 0));
+    try std.testing.expect(!catalogIsFresh(0, 1, 0));
+}
+
+fn loadCachedAnthropicModels(allocator: std.mem.Allocator, max_age_ms: ?i64) !?[]ai_types.Model {
     const path = makaiCatalogPath(allocator, makai_anthropic_catalog_name) catch return null;
     defer allocator.free(path);
+    if (max_age_ms) |max_age| {
+        const modified = compat.fs.modifiedMillis(compat.fs.getCwd(), path) catch return null;
+        if (!catalogIsFresh(modified, compat.time.nowMillis(), max_age)) return null;
+    }
     const data = compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), path, max_catalog_bytes) catch return null;
     defer allocator.free(data);
     const models = parseAnthropicModels(allocator, data) catch return null;

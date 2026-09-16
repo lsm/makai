@@ -58,6 +58,13 @@ pub fn createDir(dir: Dir, path: []const u8) !void {
     try dir.createDirPath(defaultIo(), path);
 }
 
+pub fn modifiedMillis(dir: Dir, path: []const u8) !i64 {
+    var file = try dir.openFile(defaultIo(), path, .{});
+    defer file.close(defaultIo());
+    const stat = try file.stat(defaultIo());
+    return stat.mtime.toMilliseconds();
+}
+
 test "compat filesystem wrappers read write and atomically replace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -126,4 +133,16 @@ test "compat filesystem wrappers create directories and open files" {
 test "compat getCwd returns a directory handle" {
     const cwd = getCwd();
     _ = cwd;
+}
+
+test "compat modifiedMillis reports a fresh file's write time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const before = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    try writeFile(tmp.dir, "stamp.txt", "x");
+    const modified = try modifiedMillis(tmp.dir, "stamp.txt");
+    const after = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    try std.testing.expect(modified >= before - 2000);
+    try std.testing.expect(modified <= after + 2000);
+    try std.testing.expectError(error.FileNotFound, modifiedMillis(tmp.dir, "missing.txt"));
 }

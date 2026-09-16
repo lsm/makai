@@ -89,30 +89,82 @@ fn loadRuntimeModelsWithCatalog(
     comptime loadCatalog: fn (std.mem.Allocator) anyerror![]ai_types.Model,
     comptime catch_catalog_errors: bool,
 ) ![]ai_types.Model {
-    var catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
+    const catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
         try allocator.alloc(ai_types.Model, 0)
     else
         return err;
-    errdefer model_catalog.deinitModels(allocator, catalog_models);
+    var consumed: usize = 0;
+    errdefer {
+        for (catalog_models[consumed..]) |*model| model.deinit(allocator);
+        allocator.free(catalog_models);
+    }
 
-    const fallback = defaultModel();
     var models = std.ArrayList(ai_types.Model).empty;
     errdefer {
-        for (models.items[1..]) |*model| model.deinit(allocator);
+        if (models.items.len > 1) for (models.items[1..]) |*model| model.deinit(allocator);
         models.deinit(allocator);
     }
-    try models.append(allocator, fallback);
+    try models.append(allocator, defaultModel());
     for (catalog_models) |model| {
-        if (isDatedVariantOf(model.id, fallback.id)) {
-            var dropped = model;
-            dropped.deinit(allocator);
+        if (isDatedVariantOf(model.id, models.items[0].id)) {
+            models.items[0] = foldCatalogLimits(models.items[0], model);
+            var folded = model;
+            folded.deinit(allocator);
+            consumed += 1;
             continue;
         }
         try models.append(allocator, model);
+        consumed += 1;
     }
+    const result = try models.toOwnedSlice(allocator);
     allocator.free(catalog_models);
-    catalog_models = &.{};
-    return models.toOwnedSlice(allocator);
+    return result;
+}
+
+fn foldCatalogLimits(base: ai_types.Model, catalog: ai_types.Model) ai_types.Model {
+    var folded = base;
+    folded.max_tokens = catalog.max_tokens;
+    folded.context_window = catalog.context_window;
+    folded.reasoning = catalog.reasoning;
+    if (catalog.cost.input > 0) folded.cost = catalog.cost;
+    return folded;
+}
+
+fn ownedTestModel(allocator: std.mem.Allocator, id: []const u8, max_tokens: u32, input_cost: f64) !ai_types.Model {
+    var model = defaultModel();
+    model.id = id;
+    model.max_tokens = max_tokens;
+    model.context_window = 1_000_000;
+    model.cost = .{ .input = input_cost, .output = input_cost * 5, .cache_read = 0, .cache_write = 0 };
+    return ai_types.cloneModel(allocator, model);
+}
+
+fn datedDefaultCatalog(allocator: std.mem.Allocator) anyerror![]ai_types.Model {
+    const models = try allocator.alloc(ai_types.Model, 2);
+    errdefer allocator.free(models);
+    models[0] = try ownedTestModel(allocator, "claude-sonnet-4-5-20250929", 64_000, 0);
+    errdefer models[0].deinit(allocator);
+    models[1] = try ownedTestModel(allocator, "claude-opus-4-1", 32_000, 15.0);
+    return models;
+}
+
+fn runtimeModelsFoldProbe(allocator: std.mem.Allocator) !void {
+    const models = try loadRuntimeModelsWithCatalog(allocator, datedDefaultCatalog, false);
+    defer model_catalog.deinitModels(allocator, models);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", models[0].id);
+    try std.testing.expectEqualStrings("Claude Sonnet 4.5", models[0].name);
+    try std.testing.expect(!models[0].is_owned);
+    try std.testing.expectEqual(@as(u32, 64_000), models[0].max_tokens);
+    try std.testing.expectEqual(@as(u32, 1_000_000), models[0].context_window);
+    try std.testing.expectEqual(@as(f64, 3.0), models[0].cost.input);
+    try std.testing.expectEqualStrings("claude-opus-4-1", models[1].id);
+    try std.testing.expect(models[1].is_owned);
+}
+
+test "runtime models fold the catalog's default alias into the fallback and keep one owner per model" {
+    try runtimeModelsFoldProbe(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runtimeModelsFoldProbe, .{});
 }
 
 fn isDatedVariantOf(id: []const u8, base: []const u8) bool {

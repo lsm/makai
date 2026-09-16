@@ -47,7 +47,13 @@ region**, the same model Bubble Tea's standard renderer and Ink's `<Static>` use
   entry that moves from the live frame into history never visibly moves.
 - `Context.requestClearScreen()` clears the screen and scrollback (`ED 2`, `ED 3`)
   before the next paint and resets the live region. `Cmd.println` routes through
-  `printAbove`.
+  `printAbove` in inline mode; a full-screen program (`inline_bottom_viewport = false`)
+  keeps the immediate cursor-save/home/restore write, since its render path never
+  drains the print-above queue.
+- Quitting erases the live region with the same reflow-aware row estimate the resize
+  relayout uses (`last_line_widths` against the current width), so a `/quit` that lands
+  inside the 150 ms resize debounce still clears every row the terminal rewrapped the
+  old frame into instead of counting on the pre-resize row count.
 - Resize is debounced (150 ms after the last `SIGWINCH`; nothing is painted while a
   resize is pending, because terminals reflow the old rows and a cursor-relative
   repaint would land in the wrong place). When it fires the Program performs a
@@ -177,9 +183,19 @@ code paths; add a transcript row instead.
 - The model catalog lists Anthropic models whenever Anthropic credentials exist
   (OAuth in storage or `ANTHROPIC_API_KEY`): it fetches `/v1/models` with the stored
   token, caches the response under `~/.makai/model_catalog/anthropic.json`, and falls
-  back to a static Claude list when the fetch fails. Prices come from a small table
-  keyed by model prefix; for an unknown model the status bar hides the cost instead of
-  guessing a rate. Dated aliases of the default model are folded into it.
+  back to a static Claude list when the fetch fails. A cached response is reused at
+  startup for 24 hours; after that startup fetches again and only falls back to the
+  stale copy when the fetch fails, and `/model` always fetches. Prices come from a
+  small table keyed by model prefix; for an unknown model the status bar hides the cost
+  instead of guessing a rate. Dated aliases of the default model are folded into it,
+  and the fold keeps the catalog entry's limits (max output tokens, context window,
+  reasoning flag, and price when known) on the default entry, so the built-in fallback's
+  conservative `max_tokens` only applies when no catalog entry matched.
+- Tool rows take their status (`running`, `✓`, `✗ failed`, `■ interrupted`) from the
+  linked `ToolEntry`, never from words in the row text; the status word written into
+  the row is parsed only for rows without a live link (a resumed session's transcript),
+  and that parse skips the known label so a tool named "Deployment failed checks" is
+  not read as failed.
 
 ## Keys
 

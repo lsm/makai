@@ -27,6 +27,7 @@ const DisplayEntry = struct {
     tool_name: []const u8 = "",
     title: []const u8 = "",
     tool_summary: bool = false,
+    tool_status: ?ToolRowStatus = null,
     live: bool = false,
     anim_tick: u64 = 0,
     awaiting_approval: bool = false,
@@ -199,7 +200,17 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
         .tool_name = if (entry.kind == .tool) (if (tool) |found| found.name else inferredToolName(entry.text.items)) else "",
         .title = if (entry.kind == .tool) (if (tool) |found| found.label else inferredToolTitle(entry.text.items)) else "",
         .tool_summary = entry.tool_summary or (entry.kind == .tool and parseToolSummary(entry.text.items) != null),
+        .tool_status = if (tool) |found| toolRowStatus(found.status) else null,
     });
+}
+
+fn toolRowStatus(status: tui_state.ToolStatus) ToolRowStatus {
+    return switch (status) {
+        .pending, .running => .running,
+        .done => .ok,
+        .@"error" => .failed,
+        .interrupted => .interrupted,
+    };
 }
 
 fn appendToolSummary(
@@ -240,6 +251,7 @@ fn appendToolSummary(
         .tool_name = tool.name,
         .title = tool.label,
         .tool_summary = true,
+        .tool_status = toolRowStatus(tool.status),
     });
 }
 
@@ -598,6 +610,10 @@ const ToolSummary = struct {
 };
 
 fn parseToolSummary(text: []const u8) ?ToolSummary {
+    return parseToolSummaryAfterLabel(text, "");
+}
+
+fn parseToolSummaryAfterLabel(text: []const u8, label: []const u8) ?ToolSummary {
     if (!std.mem.startsWith(u8, text, summary_prefix)) return null;
     const rest = text[summary_prefix.len..];
     if (rest.len == 0) return null;
@@ -606,11 +622,13 @@ fn parseToolSummary(text: []const u8) ?ToolSummary {
         .{ .word = "failed", .status = .failed },
         .{ .word = "interrupted", .status = .interrupted },
     };
+    const anchored = label.len > 0 and std.mem.startsWith(u8, rest, label);
+    const search_start: usize = if (anchored) label.len else 0;
     var best: ?usize = null;
     var best_status: ToolRowStatus = .running;
     var best_len: usize = 0;
     for (words) |candidate| {
-        var search: usize = 0;
+        var search: usize = search_start;
         while (std.mem.indexOfPos(u8, rest, search, candidate.word)) |pos| {
             search = pos + 1;
             if (pos == 0 or rest[pos - 1] != ' ') continue;
@@ -737,7 +755,8 @@ fn renderToolStatus(allocator: std.mem.Allocator, summary: ToolSummary, anim_tic
 }
 
 fn renderToolSummaryRow(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
-    const summary = parseToolSummary(entry.text) orelse ToolSummary{ .label = entry.text, .arg = "", .status = .running, .stats = "" };
+    var summary = parseToolSummaryAfterLabel(entry.text, entry.title) orelse ToolSummary{ .label = entry.text, .arg = "", .status = .running, .stats = "" };
+    if (entry.tool_status) |status| summary.status = status;
     const tool_name = if (entry.tool_name.len > 0) entry.tool_name else summary.label;
     const label_text = if (entry.title.len > 0) entry.title else summary.label;
 
@@ -1597,6 +1616,40 @@ test "single line system entries render as one muted row" {
     try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(rendered));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "System") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "model switched") != null);
+}
+
+test "tool rows take their status from the linked tool entry rather than status words in the label" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-label",
+        "mcp__ci__deployment_failed_checks",
+        "Deployment failed checks",
+        "{\"description\":\"push build\"}",
+        .running,
+    ));
+    try state.appendToolSummaryTranscript("◈ Deployment failed checks \"push build\"", "call-label");
+
+    const running = try render(std.testing.allocator, &state, .{ .width = 100, .height = 10 });
+    defer std.testing.allocator.free(running);
+    try std.testing.expect(std.mem.indexOf(u8, running, "Deployment failed checks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, running, "push build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, running, " running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, running, tui_theme.glyph.cross) == null);
+
+    state.tools.items[0].status = .done;
+    const done = try render(std.testing.allocator, &state, .{ .width = 100, .height = 10 });
+    defer std.testing.allocator.free(done);
+    try std.testing.expect(std.mem.indexOf(u8, done, "Deployment failed checks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, done, tui_theme.glyph.check) != null);
+    try std.testing.expect(std.mem.indexOf(u8, done, tui_theme.glyph.cross) == null);
+
+    const anchored = parseToolSummaryAfterLabel("◈ Deployment failed checks \"push build\" ok output=3B", "Deployment failed checks").?;
+    try std.testing.expectEqualStrings("Deployment failed checks", anchored.label);
+    try std.testing.expectEqualStrings("push build", anchored.arg);
+    try std.testing.expectEqual(ToolRowStatus.ok, anchored.status);
+    try std.testing.expectEqualStrings("output=3B", anchored.stats);
 }
 
 test "tool rows keep their status visible on narrow terminals" {

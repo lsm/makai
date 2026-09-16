@@ -668,7 +668,17 @@ pub fn Program(comptime Model: type) type {
                     }
                 },
                 .println => |line| {
-                    try self.context.printAbove(line);
+                    if (self.options.inline_bottom_viewport) {
+                        try self.context.printAbove(line);
+                    } else if (self.terminal) |*term| {
+                        const writer = term.writer();
+                        try writer.writeAll(ansi.cursor_save);
+                        try writer.writeAll(ansi.cursor_home);
+                        try writer.writeAll(line);
+                        try writer.writeAll("\n");
+                        try writer.writeAll(ansi.cursor_restore);
+                        try term.flush();
+                    }
                 },
                 .image_file => |image| {
                     self.pending_image = .{ .auto = image };
@@ -1039,12 +1049,7 @@ pub fn Program(comptime Model: type) type {
         fn scrollLiveRegionAway(self: *Self, writer: *std.Io.Writer, above: []const u8) !void {
             const height: usize = @max(@as(usize, self.context.height), 1);
             const width: usize = @max(@as(usize, self.context.width), 1);
-            const occupied = reflowedRowCount(self.last_line_widths.items, width);
-            if (occupied > 1) {
-                const up: u16 = @intCast(@min(occupied - 1, std.math.maxInt(u16)));
-                try ansi.cursorUp(writer, up);
-            }
-            try writer.writeAll("\r");
+            try self.moveToReflowedLiveRegionTop(writer);
             try writer.writeAll(ansi.screen_clear_below);
             try writeAboveLines(writer, above, width);
             var n: usize = 0;
@@ -1057,6 +1062,16 @@ pub fn Program(comptime Model: type) type {
         fn moveToLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
             if (self.last_line_count > 1) {
                 const up: u16 = @intCast(@min(self.last_line_count - 1, std.math.maxInt(u16)));
+                try ansi.cursorUp(writer, up);
+            }
+            try writer.writeAll("\r");
+        }
+
+        fn moveToReflowedLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            const occupied = reflowedRowCount(self.last_line_widths.items, width);
+            if (occupied > 1) {
+                const up: u16 = @intCast(@min(occupied - 1, std.math.maxInt(u16)));
                 try ansi.cursorUp(writer, up);
             }
             try writer.writeAll("\r");
@@ -1077,11 +1092,12 @@ pub fn Program(comptime Model: type) type {
             if (self.terminal) |*term| {
                 const writer = term.writer();
                 writer.writeAll(ansi.sync_start) catch return;
-                self.moveToLiveRegionTop(writer) catch return;
+                self.moveToReflowedLiveRegionTop(writer) catch return;
                 writer.writeAll(ansi.screen_clear_below) catch return;
                 writeAboveLines(writer, self.context.above_buffer.items, @max(@as(usize, self.context.width), 1)) catch return;
                 self.context.above_buffer.clearRetainingCapacity();
                 self.last_line_count = 0;
+                self.last_line_widths.clearRetainingCapacity();
                 writer.writeAll(ansi.sync_end) catch return;
                 term.flush() catch return;
             }
