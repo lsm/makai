@@ -31,7 +31,8 @@ pub const Prompt = struct {
 };
 
 fn buildAuthUrl(allocator: std.mem.Allocator, challenge: []const u8, state: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(allocator,
+    return try std.fmt.allocPrint(
+        allocator,
         "{s}?code=true&client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
         .{ auth_url_base, client_id, redirect_uri, scopes, challenge, state },
     );
@@ -279,8 +280,6 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         .accept_encoding = "identity",
     });
     defer request.deinit();
-
-    request.headers.accept_encoding = .omit;
 
     try http.sendRequest(&request, body);
 
