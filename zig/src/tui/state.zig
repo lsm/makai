@@ -691,11 +691,12 @@ pub const AppState = struct {
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
                 terminalizeToolOccurrence(tool, status, .execution);
-                const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
+                const effective_is_error = tool.status == .@"error";
+                const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), effective_is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
                 try self.finalizeToolSummaryEntry(summary, tool.id);
                 tool.error_detail_readable = false;
-                if (payload.is_error) {
+                if (effective_is_error) {
                     const unwrapped = try toolErrorMessage(self.allocator, payload.result_json.slice());
                     defer if (unwrapped) |message| self.allocator.free(message);
                     tool.error_detail_readable = unwrapped != null or plainTextErrorDetail(self.allocator, payload.result_json.slice());
@@ -1096,6 +1097,7 @@ pub const AppState = struct {
             tool.terminal_evidence = half;
         } else if (tool.terminal_evidence != half and tool.terminal_evidence != .both) {
             tool.terminal_evidence = .both;
+            if (status == .@"error") tool.status = .@"error";
         }
     }
 
@@ -1144,6 +1146,15 @@ pub const AppState = struct {
             if (std.mem.eql(u8, tool.id, id)) return tool;
         }
         return null;
+    }
+
+    pub fn ownsUnfrozenOccurrence(self: *const AppState, id: []const u8) bool {
+        var t = self.summary_floor_tool;
+        while (t < self.tools.items.len) : (t += 1) {
+            const tool = &self.tools.items[t];
+            if (!tool.isFrozen() and std.mem.eql(u8, tool.id, id)) return true;
+        }
+        return false;
     }
 
     fn finishToolResultEntry(self: *AppState, text: []const u8, tool_call_id: []const u8) !void {

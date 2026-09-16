@@ -1636,8 +1636,8 @@ pub const TuiModel = struct {
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
         }
-        for (indices[0..len], 0..) |idx, i| {
-            if (i > 0) try writer.writeAll("\n\n");
+        for (indices[0..len]) |idx| {
+            if (out.written().len > 0) try writer.writeAll("\n\n");
             const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
@@ -1742,8 +1742,8 @@ pub const TuiModel = struct {
             const entry = &app.state.transcript.items[i];
             if (entry.kind != .tool or !entry.tool_summary) continue;
             if (entry.tool_call_id.len == 0) continue;
-            const tool = app.state.toolById(entry.tool_call_id) orelse continue;
-            if (!tool.isFrozen()) return i;
+            if (i < app.state.summary_scan_floor) continue;
+            if (app.state.ownsUnfrozenOccurrence(entry.tool_call_id)) return i;
         }
         return stop;
     }
@@ -2163,6 +2163,24 @@ test "App inline flush holds tool summary rows until their occurrence freezes" {
 
     resolution.tool.terminal_evidence = .both;
     try std.testing.expectEqual(@as(usize, 2), TuiModel.inlineFlushStop(&app));
+}
+
+test "TuiModel inline render separates held rows from active entries" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    const resolution = try state.resolveToolOccurrenceForTest("call-sep", "shell_execute", "{\"command\":\"pwd\"}", .live_intent, .running);
+    try state.appendToolSummaryTranscript("held summary", resolution.tool.id);
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    var delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "streaming now")) } };
+    defer delta.deinit(std.testing.allocator);
+    try state.applyEvent(delta);
+
+    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60, 0);
+    defer std.testing.allocator.free(out);
+    const held_at = std.mem.indexOf(u8, out, "held summary") orelse return error.TestUnexpectedResult;
+    const active_at = std.mem.indexOf(u8, out, "streaming now") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(active_at > held_at + "held summary".len);
+    try std.testing.expect(std.mem.indexOf(u8, out[held_at + "held summary".len .. active_at], "\n\n") != null);
 }
 
 test "App clear_transcript clears the tool registry" {

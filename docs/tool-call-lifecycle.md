@@ -39,7 +39,9 @@ re-opens a live window, and `finalizeInterruptedTools` skips non-live occurrence
 Terminal state records which outcome halves have been seen: `none` (interrupted by
 inference at `turn_end`/`agent_end`), `execution` (`tool_execution_end`), `result`
 (`message_end.tool_result`), `both`. Status is set by the *first* arriving half; the
-second half merges missing fields (output, telemetry, error card) and never flips it.
+second half merges missing fields (output, telemetry, error card) and never flips it —
+with one refinement landed with slice 2: a later failing half upgrades `done` to
+`error` (failure evidence must not be rendered away; the reverse never happens).
 
 At most one occurrence per family is live at any time: a live occurrence absorbs later
 same-id live-intent events, so a second occurrence of a family is only ever allocated
