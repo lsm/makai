@@ -1007,13 +1007,14 @@ def scenario_keys(args):
         run.key_wait(KEY_DOWN, "Down history (latest)", "second line")
         run.frame("history-recall")
 
-        pgup_from = len(run.session.plain)
         run.key(KEY_PGUP, "PageUp scroll")
-        if run.seen("SCROLL", pgup_from):
-            run.note("PageUp shows a scroll indicator")
-        else:
-            run.note("FINDING: PgUp has no visible effect — the transcript SCROLL indicator renders only in the non-TTY fallback view path; in a real terminal history is flushed inline and transcript_scroll is never read, so terminal-native scrollback is the only scroll")
+        run.session.wait_visible(b"SCROLL", 5.0, "scroll indicator after PageUp")
+        run.frame("paged-up")
         run.key(KEY_PGDN, "PageDown scroll")
+        run.settle()
+        if b"SCROLL" in run.session.screen_text():
+            raise ScenarioError("keys: the scroll indicator stayed on screen after PageDown returned to the tail")
+        run.note("PageUp scrolls the inline window over the transcript with a SCROLL indicator; PageDown returns to the tail and clears it")
         run.frame("after-paging")
 
         run.key(KEY_CTRL_T, "Ctrl+T expand latest tool")

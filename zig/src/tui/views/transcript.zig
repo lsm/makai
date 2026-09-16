@@ -320,7 +320,7 @@ fn padTopToHeight(allocator: std.mem.Allocator, text: []const u8, height: usize)
     return out.toOwnedSlice();
 }
 
-fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
+pub fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
     if (total_lines <= view_height) return 0;
     const max_scroll = total_lines - view_height;
     const clamped = @min(scroll, max_scroll);
@@ -1432,7 +1432,7 @@ fn firstToolNameToken(text: []const u8) []const u8 {
     return text[start..end];
 }
 
-fn lineWindow(allocator: std.mem.Allocator, text: []const u8, height: usize, scroll: usize) ![]u8 {
+pub fn lineWindow(allocator: std.mem.Allocator, text: []const u8, height: usize, scroll: usize) ![]u8 {
     const total = tui_text.lineCount(text);
     if (total <= height and scroll == 0) return allocator.dupe(u8, text);
     const visible = @min(height, total);

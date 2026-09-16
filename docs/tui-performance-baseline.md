@@ -58,7 +58,8 @@ ANSI-stripped screen checkpoints), and `notes.json` (observed findings):
   failure), Shift+Enter (kitty
   `CSI 13;2u` encoding) composer newline (asserted positively: the submitted
   draft must echo as two separate transcript rows), Up/Down history recall,
-  PgUp/PgDn, Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
+  PgUp/PgDn (PgUp must put the `SCROLL` indicator on screen and PgDn must clear
+  it), Ctrl+T, Shift+Tab thinking cycle (status `think:` segment),
   Ctrl+C (clears a pending draft first; on an empty idle composer it exits).
 - `steer-abort` — a `hold` fixture step keeps the stream open so Enter mid-turn
   steers (queue indicator) and `/abort` cancels; a follow-up tool step

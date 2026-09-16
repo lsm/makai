@@ -179,7 +179,9 @@ code paths; add a transcript row instead.
   the fallback only when the keychain is unavailable.
 - `/login` shows each provider's state: `✓ logged in` (OAuth), `✓ api key` (stored key),
   `✓ env key` (key in the environment), or `expired · login again`. The state is read
-  when the picker opens and after a login completes.
+  when the picker opens and after a login completes; when stored auth cannot be loaded
+  (no `HOME`, unreadable or malformed store) the environment scan still runs, so an
+  `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` user sees `✓ env key` rather than nothing.
 - The model catalog lists Anthropic models whenever Anthropic credentials exist
   (OAuth in storage or `ANTHROPIC_API_KEY`): it fetches `/v1/models` with the stored
   token, caches the response under `~/.makai/model_catalog/anthropic.json`, and falls
@@ -203,9 +205,19 @@ code paths; add a transcript row instead.
 abort turn → close modal, `Ctrl+C` abort/clear first and quit on a second press
 within ~1.5 s (immediate quit when idle with an empty composer), `Ctrl+D` quit on an
 empty idle composer, `Tab` complete a slash command, `Ctrl+Y` copy the last reply,
-`Shift+Tab` cycle thinking, `Up/Down` history, `Ctrl+A/E` home/end, `Ctrl+U/K` cut to
-line start/end, `Ctrl+W` / `Alt+Backspace` delete word, `Ctrl+Left/Right`,
-`Alt+Left/Right`, `Alt+B/F` word moves, `Delete`.
+`Shift+Tab` cycle thinking, `Up/Down` history, `PgUp/PgDn` (and the mouse wheel when
+mouse reporting is on) scroll the live window over the whole transcript row stream,
+`Ctrl+A/E` home/end, `Ctrl+U/K` cut to line start/end, `Ctrl+W` / `Alt+Backspace`
+delete word, `Ctrl+Left/Right`, `Alt+Left/Right`, `Alt+B/F` word moves, `Delete`.
+
+Scrolling: while `transcript_scroll` is non-zero the inline body is a window over the
+full transcript rendered at the current width (rows already flushed into terminal
+scrollback are re-rendered inside the window while it is scrolled), topped by a
+`↑ SCROLL n% · PgDn to return` row. The offset is clamped to the rows above the tail
+and written back, so paging past the top and then back down returns in one step;
+submitting anything, resizing, or `/clear` snaps the window back to the tail. Key
+updates do not reset the offset, so paging is not undone by the flush that follows
+every update.
 
 ## Testing
 

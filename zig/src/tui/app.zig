@@ -198,6 +198,8 @@ test "App loginStatusFor reports stored, environment and expired credentials" {
 
     try std.testing.expectEqual(App.LoginStatus.api_key, App.loginStatusFor(&storage, "kimi", false));
     try std.testing.expectEqual(App.LoginStatus.oauth, App.loginStatusFor(&storage, "anthropic", false));
+    try std.testing.expectEqual(App.LoginStatus.env_key, App.loginStatusFor(null, "anthropic", true));
+    try std.testing.expectEqual(App.LoginStatus.none, App.loginStatusFor(null, "kimi", false));
     try std.testing.expectEqual(App.LoginStatus.expired, App.loginStatusFor(&storage, "openai-codex", false));
     try std.testing.expectEqual(App.LoginStatus.env_key, App.loginStatusFor(&storage, "github-copilot", true));
     try std.testing.expectEqual(App.LoginStatus.none, App.loginStatusFor(&storage, "github-copilot", false));
@@ -674,12 +676,14 @@ pub const App = struct {
 
     pub const LoginStatus = enum { none, api_key, env_key, oauth, expired };
 
-    pub fn loginStatusFor(storage: *const oauth_storage.AuthStorage, provider_id: []const u8, env_key_present: bool) LoginStatus {
-        if (storage.providers.get(provider_id)) |auth| {
-            return switch (auth) {
-                .api_key => .api_key,
-                .oauth => if (storage.credentialsExpired(provider_id)) .expired else .oauth,
-            };
+    pub fn loginStatusFor(storage: ?*const oauth_storage.AuthStorage, provider_id: []const u8, env_key_present: bool) LoginStatus {
+        if (storage) |stored| {
+            if (stored.providers.get(provider_id)) |auth| {
+                return switch (auth) {
+                    .api_key => .api_key,
+                    .oauth => if (stored.credentialsExpired(provider_id)) .expired else .oauth,
+                };
+            }
         }
         return if (env_key_present) .env_key else .none;
     }
@@ -695,8 +699,9 @@ pub const App = struct {
     }
 
     fn refreshLoginStatus(self: *App) void {
-        var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(self.allocator) catch return;
-        defer storage.deinit();
+        var loaded: ?oauth_storage.AuthStorage = oauth_storage.AuthStorage.loadDefaultStoredOnly(self.allocator) catch null;
+        defer if (loaded) |*storage| storage.deinit();
+        const storage: ?*const oauth_storage.AuthStorage = if (loaded) |*stored| stored else null;
         for (login_providers, 0..) |provider, i| {
             var env_present = false;
             for (login_env_keys[i]) |name| {
@@ -705,7 +710,7 @@ pub const App = struct {
                     self.allocator.free(value);
                 } else |_| {}
             }
-            self.login_status[i] = loginStatusFor(&storage, provider, env_present);
+            self.login_status[i] = loginStatusFor(storage, provider, env_present);
         }
     }
 
@@ -1256,6 +1261,7 @@ pub const App = struct {
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
+        self.state.transcript_scroll = 0;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
@@ -1915,8 +1921,7 @@ pub const TuiModel = struct {
         if (self.inlineMode(ctx)) {
             const fixed = countLines(chrome.status) + countLines(chrome.composer) + countLines(chrome.extra) + 1;
             const body_budget = height -| fixed;
-            const stream = renderInlineStream(ctx.allocator, &app.state, app.inline_history_flushed, app.inline_flushed_rows, width, true) catch "";
-            const body = tailLines(ctx.allocator, stream, body_budget) catch "";
+            const body = renderInlineBody(app, ctx, width, body_budget) catch "";
             var parts: [5][]const u8 = undefined;
             var len: usize = 0;
             if (body.len > 0) {
@@ -1947,6 +1952,28 @@ pub const TuiModel = struct {
         status: []const u8,
         extra: []const u8,
     };
+
+    fn renderInlineBody(app: *App, ctx: *const zz.Context, width: usize, budget: usize) ![]const u8 {
+        if (app.state.transcript_scroll > 0 and budget >= 2) {
+            const stream = try renderInlineStream(ctx.allocator, &app.state, 0, 0, width, true);
+            const total = countLines(stream);
+            const view_rows = budget - 1;
+            const max_scroll = total -| view_rows;
+            const scroll = @min(app.state.transcript_scroll, max_scroll);
+            app.state.transcript_scroll = scroll;
+            if (scroll > 0) {
+                const window = try transcript_view.lineWindow(ctx.allocator, stream, view_rows, scroll);
+                const pct = transcript_view.scrollPercent(total, view_rows, scroll);
+                const label = try std.fmt.allocPrint(ctx.allocator, "\u{2191} SCROLL {d}% \u{b7} PgDn to return", .{pct});
+                const indicator = try tui_theme.muted().render(ctx.allocator, label);
+                return tui_render.joinVertical(ctx.allocator, &.{ indicator, window });
+            }
+        } else {
+            app.state.transcript_scroll = 0;
+        }
+        const stream = try renderInlineStream(ctx.allocator, &app.state, app.inline_history_flushed, app.inline_flushed_rows, width, true);
+        return tailLines(ctx.allocator, stream, budget);
+    }
 
     fn renderChrome(self: *TuiModel, app: *App, ctx: *const zz.Context, width: usize) Chrome {
         _ = self;
@@ -2141,7 +2168,6 @@ pub const TuiModel = struct {
                 app.inline_flushed_rows = offset + take;
             }
         }
-        app.state.transcript_scroll = 0;
     }
 
     fn printAboveRows(ctx: *zz.Context, text: []const u8, skip: usize, count: usize) !void {
@@ -3875,6 +3901,53 @@ fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64)
     };
     defer meta.deinit(std.testing.allocator);
     try store.save(meta, .{ .turn_start = .{} });
+}
+
+test "TuiModel PageUp scrolls the inline window and PageDown returns to the tail" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 12;
+    var i: usize = 0;
+    while (i < 14) : (i += 1) {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "entry number {d}", .{i});
+        defer std.testing.allocator.free(text);
+        try model.app.?.state.appendTranscript(.user, text);
+    }
+    model.app.?.inline_history_flushed = 8;
+
+    const tail = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "SCROLL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "entry number 13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "entry number 0") == null);
+
+    _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 5), model.app.?.state.transcript_scroll);
+    const scrolled = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "SCROLL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "entry number 13") == null);
+    try std.testing.expect(TuiModel.countLines(scrolled) <= 12);
+
+    var n: usize = 0;
+    while (n < 20) : (n += 1) _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    const top = model.view(&tctx.ctx);
+    try std.testing.expect(std.mem.indexOf(u8, top, "entry number 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "SCROLL 100%") != null);
+    const clamped = model.app.?.state.transcript_scroll;
+    try std.testing.expect(clamped < 5 + 20 * 5);
+
+    _ = model.update(.{ .key = .{ .key = .page_down } }, &tctx.ctx);
+    try std.testing.expectEqual(clamped - 5, model.app.?.state.transcript_scroll);
+    while (model.app.?.state.transcript_scroll > 0) _ = model.update(.{ .key = .{ .key = .page_down } }, &tctx.ctx);
+    const back = model.view(&tctx.ctx);
+    try std.testing.expectEqualStrings(tail, back);
+
+    _ = model.update(.{ .key = .{ .key = .page_up } }, &tctx.ctx);
+    try model.app.?.submit("/help");
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript_scroll);
 }
 
 test "TuiModel PageUp and PageDown scroll the transcript" {
