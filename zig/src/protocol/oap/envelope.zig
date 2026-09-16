@@ -468,6 +468,23 @@ fn optionalEnum(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !?T 
     return std.meta.stringToEnum(T, value.string) orelse DecodeError.InvalidField;
 }
 
+fn decodeEnumList(
+    comptime T: type,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    allocator: std.mem.Allocator,
+) ![]const T {
+    const value = obj.get(key) orelse return &.{};
+    if (value != .array) return DecodeError.InvalidField;
+    const decoded = try allocator.alloc(T, value.array.items.len);
+    errdefer allocator.free(decoded);
+    for (value.array.items, 0..) |item, index| {
+        if (item != .string) return DecodeError.InvalidField;
+        decoded[index] = std.meta.stringToEnum(T, item.string) orelse return DecodeError.InvalidField;
+    }
+    return decoded;
+}
+
 fn ownedRawJson(value: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
     if (value == .string) return allocator.dupe(u8, value.string);
     return std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -603,12 +620,14 @@ fn deserializeSessionState(obj: std.json.ObjectMap, allocator: std.mem.Allocator
     const active_run_id = try optionalOwnedString(obj, "active_run_id", allocator);
     errdefer if (active_run_id) |owned| allocator.free(owned);
     const current_model_id = try optionalOwnedString(obj, "current_model_id", allocator);
+    errdefer if (current_model_id) |owned| allocator.free(owned);
+    const updated_at_ms = try optionalInteger(obj, "updated_at_ms");
     return .{
         .session_id = session_id,
         .status = status,
         .active_run_id = active_run_id,
         .current_model_id = current_model_id,
-        .updated_at_ms = try optionalInteger(obj, "updated_at_ms"),
+        .updated_at_ms = updated_at_ms,
     };
 }
 
@@ -721,16 +740,22 @@ fn deserializePayload(
         const run_id = try optionalOwnedString(obj, "run_id", allocator);
         errdefer if (run_id) |owned| allocator.free(owned);
         const model_id = try optionalOwnedString(obj, "model_id", allocator);
+        errdefer if (model_id) |owned| allocator.free(owned);
+        const accepted = try requiredBool(obj, "accepted");
+        const requested_delivery = try requiredEnum(oap_types.RequestedDelivery, obj, "requested_delivery");
+        const effective_delivery = try requiredEnum(oap_types.EffectiveDelivery, obj, "effective_delivery");
+        const admission = try requiredEnum(oap_types.Admission, obj, "admission");
+        const status = try optionalEnum(oap_types.RunStatus, obj, "status");
         return .{ .message_submit_response = .{
             .session_id = session_id,
-            .accepted = try requiredBool(obj, "accepted"),
+            .accepted = accepted,
             .submission_id = submission_id,
-            .requested_delivery = try requiredEnum(oap_types.RequestedDelivery, obj, "requested_delivery"),
-            .effective_delivery = try requiredEnum(oap_types.EffectiveDelivery, obj, "effective_delivery"),
+            .requested_delivery = requested_delivery,
+            .effective_delivery = effective_delivery,
             .delivery_resolution = delivery_resolution,
-            .admission = try requiredEnum(oap_types.Admission, obj, "admission"),
+            .admission = admission,
             .run_id = run_id,
-            .status = try optionalEnum(oap_types.RunStatus, obj, "status"),
+            .status = status,
             .model_id = model_id,
         } };
     }
@@ -749,11 +774,14 @@ fn deserializePayload(
         const session_id = try requiredOwnedString(obj, "session_id", allocator);
         errdefer allocator.free(session_id);
         const run_id = try requiredOwnedString(obj, "run_id", allocator);
+        errdefer allocator.free(run_id);
+        const accepted = try requiredBool(obj, "accepted");
+        const status = try requiredEnum(oap_types.RunStatus, obj, "status");
         return .{ .run_cancel_response = .{
             .session_id = session_id,
             .run_id = run_id,
-            .accepted = try requiredBool(obj, "accepted"),
-            .status = try requiredEnum(oap_types.RunStatus, obj, "status"),
+            .accepted = accepted,
+            .status = status,
         } };
     }
     if (std.mem.eql(u8, type_str, "run.started")) {
@@ -762,22 +790,27 @@ fn deserializePayload(
         const run_id = try requiredOwnedString(obj, "run_id", allocator);
         errdefer allocator.free(run_id);
         const model_id = try optionalOwnedString(obj, "model_id", allocator);
+        errdefer if (model_id) |owned| allocator.free(owned);
+        const started_at_ms = try optionalInteger(obj, "started_at_ms");
         return .{ .run_started = .{
             .session_id = session_id,
             .run_id = run_id,
             .model_id = model_id,
-            .started_at_ms = try optionalInteger(obj, "started_at_ms"),
+            .started_at_ms = started_at_ms,
         } };
     }
     if (std.mem.eql(u8, type_str, "run.status.updated")) {
         const session_id = try requiredOwnedString(obj, "session_id", allocator);
         errdefer allocator.free(session_id);
         const run_id = try requiredOwnedString(obj, "run_id", allocator);
+        errdefer allocator.free(run_id);
+        const status = try requiredEnum(oap_types.RunStatus, obj, "status");
+        const updated_at_ms = try optionalInteger(obj, "updated_at_ms");
         return .{ .run_status_updated = .{
             .session_id = session_id,
             .run_id = run_id,
-            .status = try requiredEnum(oap_types.RunStatus, obj, "status"),
-            .updated_at_ms = try optionalInteger(obj, "updated_at_ms"),
+            .status = status,
+            .updated_at_ms = updated_at_ms,
         } };
     }
     if (std.mem.eql(u8, type_str, "content.delta")) {
@@ -807,14 +840,17 @@ fn deserializePayload(
         const stop_reason = try requiredOwnedString(obj, "stop_reason", allocator);
         errdefer allocator.free(stop_reason);
         const model_id = try optionalOwnedString(obj, "model_id", allocator);
+        errdefer if (model_id) |owned| allocator.free(owned);
+        const usage = try deserializeUsage(obj);
+        const duration_ms = try optionalUnsigned(obj, "duration_ms");
         return .{ .run_completed = .{
             .session_id = session_id,
             .run_id = run_id,
             .final_response = final_response,
             .stop_reason = stop_reason,
             .model_id = model_id,
-            .usage = try deserializeUsage(obj),
-            .duration_ms = try optionalUnsigned(obj, "duration_ms"),
+            .usage = usage,
+            .duration_ms = duration_ms,
         } };
     }
     if (std.mem.eql(u8, type_str, "run.failed")) {
@@ -823,13 +859,16 @@ fn deserializePayload(
         const run_id = try requiredOwnedString(obj, "run_id", allocator);
         errdefer allocator.free(run_id);
         const error_value = obj.get("error") orelse return DecodeError.MissingField;
-        const err = try deserializeProtocolError(error_value, allocator);
+        var err = try deserializeProtocolError(error_value, allocator);
+        errdefer err.deinit(allocator);
+        const usage = try deserializeUsage(obj);
+        const duration_ms = try optionalUnsigned(obj, "duration_ms");
         return .{ .run_failed = .{
             .session_id = session_id,
             .run_id = run_id,
             .err = err,
-            .usage = try deserializeUsage(obj),
-            .duration_ms = try optionalUnsigned(obj, "duration_ms"),
+            .usage = usage,
+            .duration_ms = duration_ms,
         } };
     }
     if (std.mem.eql(u8, type_str, "run.cancelled")) {
@@ -837,12 +876,16 @@ fn deserializePayload(
         errdefer allocator.free(session_id);
         const run_id = try requiredOwnedString(obj, "run_id", allocator);
         errdefer allocator.free(run_id);
+        const reason = try optionalOwnedString(obj, "reason", allocator);
+        errdefer if (reason) |owned| allocator.free(owned);
+        const usage = try deserializeUsage(obj);
+        const duration_ms = try optionalUnsigned(obj, "duration_ms");
         return .{ .run_cancelled = .{
             .session_id = session_id,
             .run_id = run_id,
-            .reason = try optionalOwnedString(obj, "reason", allocator),
-            .usage = try deserializeUsage(obj),
-            .duration_ms = try optionalUnsigned(obj, "duration_ms"),
+            .reason = reason,
+            .usage = usage,
+            .duration_ms = duration_ms,
         } };
     }
     if (std.mem.eql(u8, type_str, "error.response")) {
@@ -914,8 +957,7 @@ fn deserializeCapabilities(
     allocator: std.mem.Allocator,
 ) !oap_types.CapabilitiesResponse {
     const endpoint_value = obj.get("endpoint") orelse return DecodeError.MissingField;
-    var endpoint = try deserializeEndpoint(endpoint_value, allocator);
-    errdefer endpoint.deinit(allocator);
+    const endpoint = try deserializeEndpoint(endpoint_value, allocator);
 
     var result = oap_types.CapabilitiesResponse{ .endpoint = endpoint };
     errdefer result.deinit(allocator);
@@ -929,23 +971,30 @@ fn deserializeCapabilities(
     if (obj.get("bindings")) |value| {
         if (value != .array) return DecodeError.InvalidField;
         const bindings = try allocator.alloc(oap_types.Binding, value.array.items.len);
-        result.bindings = bindings[0..0];
+        var filled: usize = 0;
+        errdefer {
+            for (bindings[0..filled]) |*binding| binding.deinit(allocator);
+            allocator.free(bindings);
+        }
         for (value.array.items, 0..) |item, index| {
             if (item != .object) return DecodeError.InvalidField;
             const kind = try requiredOwnedString(item.object, "kind", allocator);
             errdefer allocator.free(kind);
             const serialization = try optionalOwnedString(item.object, "serialization", allocator);
             bindings[index] = .{ .kind = kind, .serialization = serialization };
-            result.bindings = bindings[0 .. index + 1];
+            filled = index + 1;
         }
         result.bindings = bindings;
     }
     if (obj.get("features")) |value| {
         if (value != .object) return DecodeError.InvalidField;
         const features = try allocator.alloc(oap_types.Feature, value.object.count());
-        result.features = features[0..0];
+        var filled: usize = 0;
+        errdefer {
+            for (features[0..filled]) |*entry| entry.deinit(allocator);
+            allocator.free(features);
+        }
         var iterator = value.object.iterator();
-        var index: usize = 0;
         while (iterator.next()) |entry| {
             if (entry.value_ptr.* != .object) return DecodeError.InvalidField;
             const key = try allocator.dupe(u8, entry.key_ptr.*);
@@ -954,28 +1003,52 @@ fn deserializeCapabilities(
             const mode = try optionalOwnedString(entry.value_ptr.object, "mode", allocator);
             errdefer if (mode) |owned| allocator.free(owned);
             const reason = try optionalOwnedString(entry.value_ptr.object, "reason", allocator);
-            features[index] = .{ .key = key, .level = level, .mode = mode, .reason = reason };
-            index += 1;
-            result.features = features[0..index];
+            features[filled] = .{ .key = key, .level = level, .mode = mode, .reason = reason };
+            filled += 1;
         }
         result.features = features;
+    }
+    if (obj.get("layers")) |layers| {
+        if (layers != .object) return DecodeError.InvalidField;
+        if (layers.object.get("agent_loop")) |agent_loop| {
+            if (agent_loop != .object) return DecodeError.InvalidField;
+            result.requested_delivery_modes = try decodeEnumList(
+                oap_types.RequestedDelivery,
+                agent_loop.object,
+                "requested_delivery_modes",
+                allocator,
+            );
+            result.effective_delivery_modes = try decodeEnumList(
+                oap_types.EffectiveDelivery,
+                agent_loop.object,
+                "effective_delivery_modes",
+                allocator,
+            );
+        }
     }
     if (obj.get("degradation")) |value| {
         if (value != .array) return DecodeError.InvalidField;
         const records = try allocator.alloc(oap_types.Degradation, value.array.items.len);
-        result.degradation = records[0..0];
+        var filled: usize = 0;
+        errdefer {
+            for (records[0..filled]) |*record| record.deinit(allocator);
+            allocator.free(records);
+        }
         for (value.array.items, 0..) |item, index| {
             if (item != .object) return DecodeError.InvalidField;
             const feature = try requiredOwnedString(item.object, "feature", allocator);
             errdefer allocator.free(feature);
             const reason = try requiredOwnedString(item.object, "reason", allocator);
+            errdefer allocator.free(reason);
+            const from = try optionalEnum(oap_types.SupportLevel, item.object, "from");
+            const to = try requiredEnum(oap_types.SupportLevel, item.object, "to");
             records[index] = .{
                 .feature = feature,
-                .from = try optionalEnum(oap_types.SupportLevel, item.object, "from"),
-                .to = try requiredEnum(oap_types.SupportLevel, item.object, "to"),
+                .from = from,
+                .to = to,
                 .reason = reason,
             };
-            result.degradation = records[0 .. index + 1];
+            filled = index + 1;
         }
         result.degradation = records;
     }
@@ -1129,6 +1202,49 @@ test "round trips a capabilities response with features and degradation" {
     try std.testing.expectEqualStrings("per_run", capabilities.feature("run.model_selection").?.mode.?);
     try std.testing.expectEqual(@as(usize, 1), capabilities.degradation.len);
     try std.testing.expectEqual(oap_types.SupportLevel.degraded, capabilities.degradation[0].to);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.requested_delivery_modes.len);
+    try std.testing.expectEqual(oap_types.RequestedDelivery.auto, capabilities.requested_delivery_modes[0]);
+    try std.testing.expectEqual(@as(usize, 1), capabilities.effective_delivery_modes.len);
+    try std.testing.expectEqual(oap_types.EffectiveDelivery.start, capabilities.effective_delivery_modes[0]);
+}
+
+test "rejects an unknown delivery mode in a capabilities response" {
+    const allocator = std.testing.allocator;
+
+    const line = "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_types.PROFILE ++
+        "\",\"type\":\"capabilities.response\",\"id\":\"cap-2\",\"payload\":{\"endpoint\":{\"id\":\"makai\"}," ++
+        "\"layers\":{\"agent_loop\":{\"requested_delivery_modes\":[\"telepathy\"]}}}}";
+
+    try std.testing.expectError(DecodeError.InvalidField, deserializeEnvelope(line, allocator));
+}
+
+test "a recognized frame that fails validation late frees what it already decoded" {
+    const allocator = std.testing.allocator;
+
+    const prefix = "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++
+        oap_types.PROFILE ++ "\",\"id\":\"e-1\",\"type\":\"";
+
+    const lines = [_][]const u8{
+        prefix ++ "run.cancel.response\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\"}}",
+        prefix ++ "run.cancel.response\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"accepted\":true,\"status\":\"levitating\"}}",
+        prefix ++ "run.status.updated\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"status\":\"levitating\"}}",
+        prefix ++ "run.started\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"model_id\":\"m\",\"started_at_ms\":\"soon\"}}",
+        prefix ++ "run.cancelled\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"reason\":\"why\",\"duration_ms\":\"later\"}}",
+        prefix ++ "run.failed\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"error\":{\"code\":\"internal_error\",\"message\":\"boom\"},\"duration_ms\":\"later\"}}",
+        prefix ++ "run.completed\",\"payload\":{\"session_id\":\"s\",\"run_id\":\"r\",\"final_response\":{\"role\":\"assistant\",\"content\":\"hi\"},\"stop_reason\":\"end_turn\",\"model_id\":\"m\",\"duration_ms\":\"later\"}}",
+        prefix ++ "session.message.submit.response\",\"payload\":{\"session_id\":\"s\",\"submission_id\":\"sub\",\"delivery_resolution\":\"why\",\"run_id\":\"r\",\"model_id\":\"m\",\"accepted\":true,\"requested_delivery\":\"auto\",\"effective_delivery\":\"start\",\"admission\":\"telepathic\"}}",
+        prefix ++ "session.state.response\",\"payload\":{\"session_id\":\"s\",\"status\":\"open\",\"active_run_id\":\"r\",\"current_model_id\":\"m\",\"updated_at_ms\":\"soon\"}}",
+        prefix ++ "capabilities.response\",\"payload\":{\"endpoint\":{\"id\":\"makai\"},\"degradation\":[{\"feature\":\"run.cancel\",\"reason\":\"why\",\"to\":\"levitating\"}]}}",
+        prefix ++ "capabilities.response\",\"payload\":{\"endpoint\":{\"id\":\"makai\"},\"layers\":{\"agent_loop\":{\"effective_delivery_modes\":[\"telepathy\"]}}}}",
+    };
+
+    for (lines) |line| {
+        if (deserializeEnvelope(line, allocator)) |decoded| {
+            var owned = decoded;
+            owned.deinit(allocator);
+            return error.TestExpectedDecodeFailure;
+        } else |_| {}
+    }
 }
 
 test "rejects a foreign protocol, version, or profile" {

@@ -3,6 +3,7 @@ const compat = @import("compat");
 const protocol_types = @import("protocol_types");
 const oap_types = @import("oap_types");
 const oap_envelope = @import("oap_envelope");
+const model_ref = @import("model_ref");
 
 pub const ENDPOINT_ID = "makai.agent-control";
 pub const ENDPOINT_NAME = "Makai";
@@ -120,13 +121,18 @@ pub const Server = struct {
     pub const Options = struct {
         endpoint_version: []const u8 = "dev",
         default_model_id: ?[]const u8 = null,
+        session_idle_ttl_ms: u64 = DEFAULT_SESSION_IDLE_TTL_MS,
     };
+
+    pub const DEFAULT_SESSION_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 
     allocator: std.mem.Allocator,
     endpoint_version: []const u8,
     default_model_id: ?[]const u8,
     initialized: bool = false,
+    session_idle_ttl_ms: u64,
     sessions: std.StringHashMap(SessionEntry),
+    evicted: std.ArrayList([]const u8),
     outbound: std.ArrayList([]const u8),
     pending_submissions: std.ArrayList(PendingSubmission),
     pending_cancels: std.ArrayList(PendingCancel),
@@ -144,7 +150,9 @@ pub const Server = struct {
             .allocator = allocator,
             .endpoint_version = endpoint_version,
             .default_model_id = default_model_id,
+            .session_idle_ttl_ms = options.session_idle_ttl_ms,
             .sessions = std.StringHashMap(SessionEntry).init(allocator),
+            .evicted = std.ArrayList([]const u8).empty,
             .outbound = std.ArrayList([]const u8).empty,
             .pending_submissions = std.ArrayList(PendingSubmission).empty,
             .pending_cancels = std.ArrayList(PendingCancel).empty,
@@ -159,6 +167,9 @@ pub const Server = struct {
         }
         self.sessions.deinit();
 
+        for (self.evicted.items) |id| self.allocator.free(id);
+        self.evicted.deinit(self.allocator);
+
         for (self.outbound.items) |line| self.allocator.free(line);
         self.outbound.deinit(self.allocator);
 
@@ -171,6 +182,39 @@ pub const Server = struct {
         self.allocator.free(self.endpoint_version);
         if (self.default_model_id) |value| self.allocator.free(value);
         self.* = undefined;
+    }
+
+    pub fn popEvictedSession(self: *Self) ?[]const u8 {
+        if (self.evicted.items.len == 0) return null;
+        return self.evicted.orderedRemove(0);
+    }
+
+    fn sweepIdleSessions(self: *Self) !void {
+        if (self.session_idle_ttl_ms == 0) return;
+        if (self.sessions.count() == 0) return;
+
+        const now = compat.time.nowMillis();
+        const ttl: i64 = @intCast(@min(self.session_idle_ttl_ms, @as(u64, std.math.maxInt(i64))));
+
+        var stale = std.ArrayList([]const u8).empty;
+        defer stale.deinit(self.allocator);
+
+        var iterator = self.sessions.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.run) |run| {
+                if (!run.settled) continue;
+            }
+            if (now -| entry.value_ptr.updated_at_ms < ttl) continue;
+            try stale.append(self.allocator, entry.key_ptr.*);
+        }
+
+        for (stale.items) |key| {
+            try self.evicted.ensureUnusedCapacity(self.allocator, 1);
+            const kv = self.sessions.fetchRemove(key) orelse continue;
+            var value = kv.value;
+            value.deinit(self.allocator);
+            self.evicted.appendAssumeCapacity(kv.key);
+        }
     }
 
     pub fn popOutbound(self: *Self) ?[]const u8 {
@@ -252,6 +296,8 @@ pub const Server = struct {
         }
 
         if (try self.rejectStaleRevision(env)) return;
+
+        try self.sweepIdleSessions();
 
         switch (env.payload) {
             .session_open_request => |payload| try self.handleSessionOpen(env, payload),
@@ -417,7 +463,45 @@ pub const Server = struct {
         return self.sessions.getPtr(key).?;
     }
 
+    fn refuseScopeDisagreement(
+        self: *Self,
+        env: oap_types.Envelope,
+        session_id: []const u8,
+        run_id: ?[]const u8,
+    ) !bool {
+        if (env.session_id) |scoped| {
+            if (!std.mem.eql(u8, scoped, session_id)) {
+                try self.pushError(
+                    env.id,
+                    env.session_id,
+                    env.run_id,
+                    .invalid_request,
+                    "envelope and payload session_id disagree",
+                    &.{},
+                );
+                return true;
+            }
+        }
+        if (run_id) |payload_run| {
+            if (env.run_id) |scoped| {
+                if (!std.mem.eql(u8, scoped, payload_run)) {
+                    try self.pushError(
+                        env.id,
+                        env.session_id,
+                        env.run_id,
+                        .invalid_request,
+                        "envelope and payload run_id disagree",
+                        &.{},
+                    );
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     fn handleSessionState(self: *Self, env: oap_types.Envelope, payload: oap_types.SessionStateRequest) !void {
+        if (try self.refuseScopeDisagreement(env, payload.session_id, null)) return;
         const entry = self.sessions.getPtr(payload.session_id) orelse {
             try self.pushError(
                 env.id,
@@ -516,21 +600,10 @@ pub const Server = struct {
     }
 
     fn handleSubmit(self: *Self, env: oap_types.Envelope, payload: oap_types.MessageSubmitRequest) !void {
-        if (env.session_id) |scoped| {
-            if (!std.mem.eql(u8, scoped, payload.session_id)) {
-                try self.pushError(
-                    env.id,
-                    env.session_id,
-                    null,
-                    .invalid_request,
-                    "envelope and payload session_id disagree",
-                    &.{},
-                );
-                return;
-            }
-        }
+        if (try self.refuseScopeDisagreement(env, payload.session_id, null)) return;
 
         if (try self.refuseRunControls(env, payload)) return;
+        if (try self.refuseUnsupportedContent(env, payload)) return;
 
         if (payload.delivery != .auto) {
             const key = switch (payload.delivery) {
@@ -607,6 +680,22 @@ pub const Server = struct {
             return;
         }
 
+        if (model_ref.parseModelRef(self.allocator, effective_model.?)) |parsed| {
+            var owned = parsed;
+            owned.deinit(self.allocator);
+        } else |err| {
+            if (err == error.OutOfMemory) return err;
+            try self.pushError(
+                env.id,
+                env.session_id,
+                null,
+                .model_not_found,
+                "the selected model reference is not a valid provider_id/api@model_id",
+                &.{.{ .key = "model_id", .value = effective_model.? }},
+            );
+            return;
+        }
+
         try self.admitSubmission(entry, env.id, effective_model.?, payload);
         try self.emitRunStarted(entry);
         try self.publishSessionState(entry);
@@ -633,6 +722,40 @@ pub const Server = struct {
         entry.run = run;
         entry.status = .running;
         entry.updated_at_ms = compat.time.nowMillis();
+    }
+
+    fn refuseUnsupportedContent(
+        self: *Self,
+        env: oap_types.Envelope,
+        payload: oap_types.MessageSubmitRequest,
+    ) !bool {
+        for (payload.messages) |message| {
+            const parts = switch (message.content) {
+                .text => continue,
+                .parts => |items| items,
+            };
+            for (parts) |part| {
+                const key = switch (part) {
+                    .text => continue,
+                    .reasoning => "session.message.content.reasoning",
+                    .tool_call => "session.message.content.tool_call",
+                    .tool_result => "session.message.content.tool_result",
+                };
+                try self.pushError(
+                    env.id,
+                    env.session_id,
+                    null,
+                    .unsupported_feature,
+                    "this endpoint forwards text content only",
+                    &.{
+                        .{ .key = "feature", .value = key },
+                        .{ .key = "reason", .value = "unadvertised" },
+                    },
+                );
+                return true;
+            }
+        }
+        return false;
     }
 
     fn refuseRunControls(self: *Self, env: oap_types.Envelope, payload: oap_types.MessageSubmitRequest) !bool {
@@ -813,6 +936,8 @@ pub const Server = struct {
     }
 
     fn handleCancel(self: *Self, env: oap_types.Envelope, payload: oap_types.RunCancelRequest) !void {
+        if (try self.refuseScopeDisagreement(env, payload.session_id, payload.run_id)) return;
+
         const entry = self.sessions.getPtr(payload.session_id) orelse {
             try self.pushError(
                 env.id,
@@ -1566,7 +1691,7 @@ test "session state for an unopened session is a typed error" {
 
 test "a complete run emits admission, contiguous run events, and one terminal" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1583,7 +1708,7 @@ test "a complete run emits admission, contiguous run events, and one terminal" {
     try std.testing.expectEqual(oap_types.Admission.started, submit.admission);
     try std.testing.expectEqual(oap_types.RunStatus.running, submit.status.?);
     try std.testing.expectEqualStrings(DELIVERY_RESOLUTION_IDLE, submit.delivery_resolution.?);
-    try std.testing.expectEqualStrings("m", submit.model_id.?);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@m", submit.model_id.?);
     try std.testing.expect(admission.sequence == null);
     const run_id = try allocator.dupe(u8, submit.run_id.?);
     defer allocator.free(run_id);
@@ -1592,7 +1717,7 @@ test "a complete run emits admission, contiguous run events, and one terminal" {
     defer started.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), started.sequence.?);
     try std.testing.expectEqualStrings(run_id, started.run_id.?);
-    try std.testing.expectEqualStrings("m", started.payload.run_started.model_id.?);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@m", started.payload.run_started.model_id.?);
 
     var state_event = try nextEnvelope(&server, allocator);
     defer state_event.deinit(allocator);
@@ -1638,7 +1763,7 @@ test "a complete run emits admission, contiguous run events, and one terminal" {
 
 test "a submission hands the host exactly one pending native run" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
 
     try openTestSession(&server, allocator, "sess-1");
@@ -1648,7 +1773,7 @@ test "a submission hands the host exactly one pending native run" {
     var pending = server.popPendingSubmission().?;
     defer pending.deinit(allocator);
     try std.testing.expectEqualStrings("sess-1", pending.session_id);
-    try std.testing.expectEqualStrings("m", pending.model_id);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@m", pending.model_id);
     try std.testing.expectEqual(@as(usize, 1), pending.messages.len);
     try std.testing.expectEqualStrings("go", pending.messages[0].content.parts[0].text);
     try std.testing.expect(server.popPendingSubmission() == null);
@@ -1656,7 +1781,7 @@ test "a submission hands the host exactly one pending native run" {
 
 test "a second submission is refused while a run is nonterminal" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1682,7 +1807,7 @@ test "a second submission is refused while a run is nonterminal" {
 
 test "cancellation acknowledges intent and only settlement emits the terminal" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1732,7 +1857,7 @@ test "cancellation acknowledges intent and only settlement emits the terminal" {
 
 test "repeated cancellation is idempotent and queues one native teardown" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1769,7 +1894,7 @@ test "repeated cancellation is idempotent and queues one native teardown" {
 
 test "natural completion wins a race with an accepted cancellation" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1803,7 +1928,7 @@ test "natural completion wins a race with an accepted cancellation" {
 
 test "a duplicate native terminal never produces a second portable terminal" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1822,7 +1947,7 @@ test "a duplicate native terminal never produces a second portable terminal" {
 
 test "cancelling a settled run reports run_already_terminal" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1847,7 +1972,7 @@ test "cancelling a settled run reports run_already_terminal" {
 
 test "a stale cancellation never targets a replacement run" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1874,7 +1999,7 @@ test "a stale cancellation never targets a replacement run" {
 
 test "a native stop without an accepted cancellation settles as a failure" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1891,7 +2016,7 @@ test "a native stop without an accepted cancellation settles as a failure" {
 
 test "a cancelled session refuses further submissions" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1916,7 +2041,7 @@ test "a cancelled session refuses further submissions" {
 
 test "an unadvertised run control is refused before any identity is allocated" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1948,7 +2073,7 @@ test "an unadvertised run control is refused before any identity is allocated" {
 
 test "run control refusal follows the declared control order" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1980,7 +2105,7 @@ test "run control refusal follows the declared control order" {
 
 test "an advertised run control admits and is reported on the run" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "session-default" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@session-default" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -1995,29 +2120,206 @@ test "an advertised run control admits and is reported on the run" {
             .session_id = "sess-1",
             .messages = &messages,
             .delivery = .auto,
-            .model_id = "per-run-model",
+            .model_id = "anthropic/anthropic-messages@per-run",
         } },
     });
 
     var admission = try nextEnvelope(&server, allocator);
     defer admission.deinit(allocator);
-    try std.testing.expectEqualStrings("per-run-model", admission.payload.message_submit_response.model_id.?);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@per-run", admission.payload.message_submit_response.model_id.?);
 
     var started = try nextEnvelope(&server, allocator);
     defer started.deinit(allocator);
-    try std.testing.expectEqualStrings("per-run-model", started.payload.run_started.model_id.?);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@per-run", started.payload.run_started.model_id.?);
 
     var state_event = try nextEnvelope(&server, allocator);
     defer state_event.deinit(allocator);
     try std.testing.expectEqualStrings(
-        "session-default",
+        "anthropic/anthropic-messages@session-default",
         state_event.payload.session_state_updated.current_model_id.?,
     );
 }
 
+test "a syntactically invalid model selection is refused before admission" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+
+    var parts = [_]oap_types.ContentPart{.{ .text = "go" }};
+    var messages = [_]oap_types.Message{.{ .role = .user, .content = .{ .parts = &parts } }};
+    try server.handleEnvelope(.{
+        .id = "req-bad-model",
+        .session_id = "sess-1",
+        .payload = .{ .message_submit_request = .{
+            .session_id = "sess-1",
+            .messages = &messages,
+            .delivery = .auto,
+            .model_id = "claude-sonnet-4-5",
+        } },
+    });
+
+    var reply = try nextEnvelope(&server, allocator);
+    defer reply.deinit(allocator);
+    const err = reply.payload.error_response;
+    try std.testing.expectEqual(oap_types.ErrorCode.model_not_found, err.code);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", err.detail("model_id").?);
+    try std.testing.expect(server.popOutbound() == null);
+    try std.testing.expect(server.popPendingSubmission() == null);
+}
+
+test "a submission carrying non-text content is refused instead of silently dropped" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { part: oap_types.ContentPart, feature: []const u8 }{
+        .{ .part = .{ .reasoning = "because" }, .feature = "session.message.content.reasoning" },
+        .{
+            .part = .{ .tool_call = .{ .tool_call_id = "c1", .name = "grep", .arguments_json = "{}" } },
+            .feature = "session.message.content.tool_call",
+        },
+        .{
+            .part = .{ .tool_result = .{ .tool_call_id = "c1", .result_json = "{}" } },
+            .feature = "session.message.content.tool_result",
+        },
+    };
+
+    for (cases) |case| {
+        var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+        defer server.deinit();
+        defer discardPending(&server, allocator);
+
+        try openTestSession(&server, allocator, "sess-1");
+
+        var parts = [_]oap_types.ContentPart{ .{ .text = "go" }, case.part };
+        var messages = [_]oap_types.Message{.{ .role = .user, .content = .{ .parts = &parts } }};
+        try server.handleEnvelope(.{
+            .id = "req-parts",
+            .session_id = "sess-1",
+            .payload = .{ .message_submit_request = .{
+                .session_id = "sess-1",
+                .messages = &messages,
+                .delivery = .auto,
+            } },
+        });
+
+        var reply = try nextEnvelope(&server, allocator);
+        defer reply.deinit(allocator);
+        const err = reply.payload.error_response;
+        try std.testing.expectEqual(oap_types.ErrorCode.unsupported_feature, err.code);
+        try std.testing.expectEqualStrings(case.feature, err.detail("feature").?);
+        try std.testing.expect(server.popOutbound() == null);
+        try std.testing.expect(server.popPendingSubmission() == null);
+    }
+}
+
+test "an idle settled session is evicted and reported to the host" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{
+        .default_model_id = "anthropic/anthropic-messages@m",
+        .session_idle_ttl_ms = 1,
+    });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+    try std.testing.expectEqual(@as(u32, 1), server.sessions.count());
+
+    compat.time.sleepNs(5 * std.time.ns_per_ms);
+
+    try server.handleEnvelope(.{
+        .id = "req-state",
+        .session_id = "sess-1",
+        .payload = .{ .session_state_request = .{ .session_id = "sess-1" } },
+    });
+
+    try std.testing.expectEqual(@as(u32, 0), server.sessions.count());
+
+    const evicted = server.popEvictedSession() orelse return error.TestExpectedEviction;
+    defer allocator.free(evicted);
+    try std.testing.expectEqualStrings("sess-1", evicted);
+
+    var reply = try nextEnvelope(&server, allocator);
+    defer reply.deinit(allocator);
+    try std.testing.expectEqual(oap_types.ErrorCode.session_not_found, reply.payload.error_response.code);
+}
+
+test "a zero idle ttl disables session eviction" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{
+        .default_model_id = "anthropic/anthropic-messages@m",
+        .session_idle_ttl_ms = 0,
+    });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+    compat.time.sleepNs(5 * std.time.ns_per_ms);
+
+    try server.handleEnvelope(.{
+        .id = "req-state",
+        .session_id = "sess-1",
+        .payload = .{ .session_state_request = .{ .session_id = "sess-1" } },
+    });
+
+    try std.testing.expectEqual(@as(u32, 1), server.sessions.count());
+    try std.testing.expect(server.popEvictedSession() == null);
+    drainOutbound(&server, allocator);
+}
+
+test "a cancel whose envelope scope disagrees with its payload is refused" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+
+    try server.handleEnvelope(.{
+        .id = "req-cancel",
+        .session_id = "sess-other",
+        .payload = .{ .run_cancel_request = .{
+            .session_id = "sess-1",
+            .run_id = "run-1",
+        } },
+    });
+
+    var reply = try nextEnvelope(&server, allocator);
+    defer reply.deinit(allocator);
+    const err = reply.payload.error_response;
+    try std.testing.expectEqual(oap_types.ErrorCode.invalid_request, err.code);
+    try std.testing.expect(server.popOutbound() == null);
+}
+
+test "a cancel whose envelope run_id disagrees with its payload is refused" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
+    defer server.deinit();
+    defer discardPending(&server, allocator);
+
+    try openTestSession(&server, allocator, "sess-1");
+
+    try server.handleEnvelope(.{
+        .id = "req-cancel",
+        .session_id = "sess-1",
+        .run_id = "run-other",
+        .payload = .{ .run_cancel_request = .{
+            .session_id = "sess-1",
+            .run_id = "run-1",
+        } },
+    });
+
+    var reply = try nextEnvelope(&server, allocator);
+    defer reply.deinit(allocator);
+    const err = reply.payload.error_response;
+    try std.testing.expectEqual(oap_types.ErrorCode.invalid_request, err.code);
+    try std.testing.expect(server.popOutbound() == null);
+}
+
 test "an explicit unsupported delivery mode is refused with a typed error" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -2060,7 +2362,7 @@ test "a submission with no model anywhere is refused" {
 
 test "envelope and payload session_id must agree" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -2104,7 +2406,7 @@ test "a malformed inbound line answers with a typed error rather than crashing" 
 
 test "a full conversation drives the endpoint end to end over lines" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 
@@ -2152,7 +2454,7 @@ test "a full conversation drives the endpoint end to end over lines" {
 
 test "a message boundary starts a new portable assistant message id" {
     const allocator = std.testing.allocator;
-    var server = try Server.init(allocator, .{ .default_model_id = "m" });
+    var server = try Server.init(allocator, .{ .default_model_id = "anthropic/anthropic-messages@m" });
     defer server.deinit();
     defer discardPending(&server, allocator);
 

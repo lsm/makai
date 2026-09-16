@@ -6652,7 +6652,20 @@ fn runOapMode(
             did_work = true;
         }
 
-        if (stdin_stream.isDone() and !stdin_stream.hasPending()) stdio_loop.markStdinDisconnected();
+        if (stdin_stream.isDone() and !stdin_stream.hasPending()) {
+            stdio_loop.markStdinDisconnected();
+            if (!settled_on_eof and oap.hasActiveRun()) {
+                settled_on_eof = true;
+                try bridge.failActiveRuns(&oap, OAP_EOF_MESSAGE);
+                did_work = true;
+            }
+        }
+
+        while (oap.popEvictedSession()) |evicted| {
+            defer allocator.free(evicted);
+            bridge.forgetSession(evicted);
+            did_work = true;
+        }
 
         if (try pumpOapIntents(allocator, &oap, &bridge, &stdio_loop, &submission_lines)) did_work = true;
 
@@ -6679,11 +6692,6 @@ fn runOapMode(
         if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams() and
             !stdio_loop.hasActiveAgentRuns() and !stdio_loop.hasActiveAuthFlows())
         {
-            if (oap.hasActiveRun() and !settled_on_eof) {
-                settled_on_eof = true;
-                try bridge.failActiveRuns(&oap, OAP_EOF_MESSAGE);
-                continue;
-            }
             break;
         }
 

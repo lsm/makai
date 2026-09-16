@@ -164,11 +164,11 @@ pub const Bridge = struct {
         switch (env.payload) {
             .agent_event => |event_json| try self.applyAgentEvent(server, oap_session_id, event_json),
             .agent_result => |result_json| try self.retainResultEvidence(oap_session_id, result_json),
-            .agent_error => |payload| try server.settleFailed(
-                oap_session_id,
-                mapNativeErrorCode(payload.code),
-                payload.message,
-            ),
+            .agent_error => |payload| {
+                const mapped = mapNativeErrorCode(payload.code);
+                try server.settleFailed(oap_session_id, mapped, payload.message);
+                if (mapped == .session_not_found) self.forgetSession(oap_session_id);
+            },
             .agent_stopped => try server.settleCancelled(oap_session_id, null),
             else => {},
         }
@@ -295,6 +295,16 @@ pub const Bridge = struct {
 
         if (session.evidence) |*retained| retained.deinit(self.allocator);
         session.evidence = null;
+    }
+
+    pub fn forgetSession(self: *Self, oap_session_id: []const u8) void {
+        const kv = self.sessions.fetchRemove(oap_session_id) orelse return;
+        if (self.reverse.fetchRemove(kv.value.native_id[0..])) |reverse_kv| {
+            self.allocator.free(reverse_kv.key);
+        }
+        var value = kv.value;
+        value.deinit(self.allocator);
+        self.allocator.free(kv.key);
     }
 
     pub fn failActiveRuns(self: *Self, server: *Server, message: []const u8) !void {
