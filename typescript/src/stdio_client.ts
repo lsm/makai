@@ -103,12 +103,14 @@ export class MakaiStdioClient {
     this.child = child;
 
     child.on("error", (error) => {
+      if (this.child !== child) return;
       this.logger.error("stdio: process error event", { error: error.message });
       this.failHandshakeIfPending(error);
       this.failPendingFrameWaiters(error);
     });
 
     child.on("exit", (code, signal) => {
+      if (this.child !== child) return;
       this.logger.debug("stdio: process exited", { code, signal: signal ?? undefined });
       const error = new Error(`stdio process exited (code=${code}, signal=${signal})`);
       this.failHandshakeIfPending(error);
@@ -140,7 +142,9 @@ export class MakaiStdioClient {
     if (!child) return;
     this.logger.debug("stdio: terminating process after failed handshake", { pid: child.pid });
     this.failPendingFrameWaiters(new Error("stdio handshake failed"));
-    this.cleanupProcessHandles();
+    this.lineReader?.close();
+    this.lineReader = null;
+    this.child = null;
     try {
       child.stdin.end();
     } catch {
@@ -150,6 +154,16 @@ export class MakaiStdioClient {
         child.kill();
       } catch {
       }
+      const killer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+          }
+        }
+      }, 500);
+      killer.unref();
+      child.once("exit", () => clearTimeout(killer));
     }
     child.unref();
   }
