@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Fixed a cross-binary race in the tool artifact-store tests. `tools/common.zig`'s `storeArtifact`/`retrieveArtifact`/`cleanupArtifacts` resolved `.makai/tool-artifacts` against the process cwd, so every tool test binary shared one directory; `zig build` runs those binaries in parallel, and a `cleanupArtifacts()` `deleteTree` in one deleted files another was mid-read, failing `artifact_retrieve supports range grep and full context modes` with `error.FileNotFound`. The artifact root is now injectable: production still resolves against cwd (the branch is comptime-dead outside test builds, so the shipped binary is unchanged), while tests take a per-test `std.testing.tmpDir` root via `common.TestArtifactRoot`. Tests in `common.zig`, `artifact.zig`, `file.zig`, and `shell.zig` are isolated, and in test builds an unisolated access panics rather than silently sharing the real store.
+
 ## [0.2.0] - 2026-09-11
 
 ### Added

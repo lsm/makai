@@ -254,6 +254,7 @@ Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completion
 - **`oom.unreachableOnOom(...)`** (`utils/oom.zig`) instead of `catch unreachable` (only `utils/retry.zig` is exempt).
 - **Two-phase `StringBuilder`** (`string_builder.zig`): `count`/`countFmt`, one `allocate`, then `append`/`appendFmt`.
 - **`HiveArray(T, capacity)`** (`hive_array.zig`) for bounded high-churn pools.
+- **Artifact-store tests must isolate their root.** `tools/common.zig`'s `storeArtifact`/`retrieveArtifact`/`cleanupArtifacts` resolve `.makai/tool-artifacts` against an injectable root that is the process cwd in production and a per-test `std.testing.tmpDir` in tests. Any test that reaches the artifact store — directly, or through a tool like `file_read`/`shell_execute` that stores large output — must open with `var artifact_root = common.TestArtifactRoot.init(); defer artifact_root.deinit();`. Without it the access panics, because a cwd-shared store lets one binary's `cleanupArtifacts()` delete files another parallel test binary is mid-read on.
 - Background reading: `docs/bun-zig-patterns.md`, `docs/tigerbeetle-zig-patterns.md` (invariant helpers, explicit limits at external accumulation points, validate-at-boundary vs assert-internal).
 
 ## Docs and PR Process
