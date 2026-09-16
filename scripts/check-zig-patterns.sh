@@ -31,21 +31,245 @@ if [[ -n "$all_crypto_random" ]]; then
   fi
 fi
 
+ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)\b|\b(IoSource|DefaultPrng|DeterministicSource)\b|random\.int\b|\.random[[:space:]]*;|\.random\(|\.Random[[:space:]]*[.;]'
+secure_entropy_pattern='\b(fillSecureBytes|secureBytes|secureIntRangeLessThan|randomSecure)\b'
+
+strip_noncode() {
+  awk '
+  {
+    line = $0
+    out = ""
+    n = length(line)
+    i = 1
+    while (i <= n) {
+      c = substr(line, i, 1)
+      d = substr(line, i + 1, 1)
+      if (c == "/" && d == "/") break
+      if (c == "\\" && d == "\\") break
+      if (c == "\"" || c == "'"'"'") {
+        quote = c
+        i++
+        while (i <= n) {
+          ch = substr(line, i, 1)
+          if (ch == "\\") { i += 2; continue }
+          i++
+          if (ch == quote) break
+        }
+        out = out " "
+        continue
+      }
+      out = out c
+      i++
+    }
+    print out
+  }'
+}
+
+code_matches_only() {
+  local pattern="$1" prefix_fields="$2" hit content stripped
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    content="$hit"
+    for ((i = 0; i < prefix_fields; i++)); do content="${content#*:}"; done
+    stripped="$(printf '%s' "$content" | strip_noncode)"
+    if printf '%s' "$stripped" | grep -qE "$pattern"; then printf '%s\n' "$hit"; fi
+  done
+}
+
 secure_random_files=(
   "zig/src/oauth/pkce.zig"
   "zig/src/utils/oauth/pkce.zig"
-  "zig/src/oauth/openai_codex.zig"
-  "zig/src/oauth/google_gemini_cli.zig"
-  "zig/src/oauth/google_antigravity.zig"
+  "zig/src/utils/oauth/openai_codex.zig"
   "zig/src/transports/websocket.zig"
   "zig/src/protocol/provider/types.zig"
+  "zig/src/tui/app.zig"
 )
 
+ordinary_entropy_definition_file="zig/src/compat/random.zig"
+
+expected_ordinary_entropy_sites="$(cat <<'SITES'
+zig/src/compat/random.zig|        const ordinary_value = randomIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        const ordinary_value = randomIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        return .{ .prng = std.Random.DefaultPrng.init(seed) };
+zig/src/compat/random.zig|        self.prng.random().bytes(buf);
+zig/src/compat/random.zig|    const OrdinaryHelper = @TypeOf(fillRandomBytes);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 0);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 17);
+zig/src/compat/random.zig|    const ordinary = try randomBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    defaultIo().random(buf);
+zig/src/compat/random.zig|    fillRandomBytes(&empty);
+zig/src/compat/random.zig|    fillRandomBytes(buf);
+zig/src/compat/random.zig|    prng: std.Random.DefaultPrng,
+zig/src/compat/random.zig|    pub fn allocBytes(self: *DeterministicSource, allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|    pub fn bytes(self: *DeterministicSource, buf: []u8) void {
+zig/src/compat/random.zig|    pub fn init(seed: u64) DeterministicSource {
+zig/src/compat/random.zig|    try std.testing.expect(fillSecureBytes != fillRandomBytes);
+zig/src/compat/random.zig|    try std.testing.expectEqual(@as(usize, 0), randomIntRangeLessThan(usize, 1));
+zig/src/compat/random.zig|    var different_source = DeterministicSource.init(0x8765_4321);
+zig/src/compat/random.zig|    var first_source = DeterministicSource.init(0x1234_5678);
+zig/src/compat/random.zig|    var second_source = DeterministicSource.init(0x1234_5678);
+zig/src/compat/random.zig|    var source: std.Random.IoSource = .{ .io = defaultIo() };
+zig/src/compat/random.zig|    var source: std.Random.IoSource = .{ .io = defaultIo() };
+zig/src/compat/random.zig|pub const DeterministicSource = struct {
+zig/src/compat/random.zig|pub fn fillRandomBytes(buf: []u8) void {
+zig/src/compat/random.zig|pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|pub fn randomIntRangeLessThan(comptime T: type, upper_bound: T) T {
+zig/src/model_catalog.zig|    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}.{x}", .{ path, compat.time.nowMillis(), compat.random.int(u64) });
+zig/src/providers/sse_parser.zig|    const random = prng.random();
+zig/src/providers/sse_parser.zig|    var prng = std.Random.DefaultPrng.init(seed);
+zig/src/transports/transport_retry.zig|        return prng.random().intRangeAtMost(u64, self.base_delay_ms, capped);
+zig/src/transports/transport_retry.zig|        var prng = std.Random.DefaultPrng.init(seed);
+zig/src/utils/oauth/storage.zig|    const tmp_name = try std.fmt.allocPrint(allocator, "{s}{d}.{x}", .{ auth_temp_prefix, compat.time.nowMillis(), compat.random.int(u64) });
+zig/src/utils/retry.zig|            const rand = prng.random().float(f32);
+zig/src/utils/retry.zig|            var prng = std.Random.DefaultPrng.init(seed);
+zig/src/utils/tool_utils.zig|    return generateMistralToolCallIdWithRandom(allocator, compat.random.fillRandomBytes);
+SITES
+)"
+
+echo "[patterns] checking security-sensitive entropy call sites..."
 for file in "${secure_random_files[@]}"; do
-  if grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >/dev/null; then
+  if [[ ! -f "$file" ]]; then
+    echo "[patterns] secure_random_files lists a path that does not exist: $file" >&2
+    echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+    exit 1
+  fi
+  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" || true)"
+  if [[ -n "$secure_file_matches" ]]; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
-    grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >&2
+    echo "$secure_file_matches" >&2
     echo "[patterns] use compat.random secure helpers / io.randomSecure for OAuth, WebSocket, and protocol IDs" >&2
+    exit 1
+  fi
+done
+
+echo "[patterns] checking ordinary entropy call sites are declared..."
+if [[ ! -f "$ordinary_entropy_definition_file" ]]; then
+  echo "[patterns] ordinary_entropy_definition_file does not exist: $ordinary_entropy_definition_file" >&2
+  exit 1
+fi
+
+actual_ordinary_entropy_sites="$(grep -RnsE --include="*.zig" "$ordinary_entropy_pattern" zig/src \
+  | code_matches_only "$ordinary_entropy_pattern" 2 \
+  | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
+
+undeclared_ordinary_entropy="$(comm -13 \
+  <(printf "%s\n" "$expected_ordinary_entropy_sites" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_ordinary_entropy_sites" | grep -v '^$' | sort))"
+if [[ -n "$undeclared_ordinary_entropy" ]]; then
+  echo "[patterns] undeclared ordinary entropy call site:" >&2
+  echo "$undeclared_ordinary_entropy" >&2
+  echo "[patterns] use compat.random secure helpers, or declare the exact call site in expected_ordinary_entropy_sites with rationale in the commit message" >&2
+  exit 1
+fi
+
+stale_ordinary_entropy="$(comm -23 \
+  <(printf "%s\n" "$expected_ordinary_entropy_sites" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_ordinary_entropy_sites" | grep -v '^$' | sort))"
+if [[ -n "$stale_ordinary_entropy" ]]; then
+  echo "[patterns] expected_ordinary_entropy_sites declares a call site that no longer exists:" >&2
+  echo "$stale_ordinary_entropy" >&2
+  echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
+  exit 1
+fi
+
+echo "[patterns] checking secure entropy call sites are present..."
+expected_secure_entropy_sites="$(cat <<'SECURE'
+zig/src/compat/random.zig|        const secure_value = secureIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        const secure_value = secureIntRangeLessThan(usize, 62);
+zig/src/compat/random.zig|        fillSecureBytes(&bytes);
+zig/src/compat/random.zig|    const SecureHelper = @TypeOf(fillSecureBytes);
+zig/src/compat/random.zig|    const first = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const second = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 0);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    const secure = try secureBytes(std.testing.allocator, 32);
+zig/src/compat/random.zig|    defaultIo().randomSecure(buf) catch |err| {
+zig/src/compat/random.zig|    fillSecureBytes(&empty);
+zig/src/compat/random.zig|    fillSecureBytes(buf);
+zig/src/compat/random.zig|    try std.testing.expect(fillSecureBytes != fillRandomBytes);
+zig/src/compat/random.zig|    try std.testing.expectEqual(@as(usize, 0), secureIntRangeLessThan(usize, 1));
+zig/src/compat/random.zig|pub fn fillSecureBytes(buf: []u8) void {
+zig/src/compat/random.zig|pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
+zig/src/compat/random.zig|pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
+zig/src/oauth/pkce.zig|    return generatePKCEWithRandom(compat.random.fillSecureBytes);
+zig/src/protocol/provider/types.zig|    return generateSessionIdWithRandomInt(compat.random.secureIntRangeLessThan);
+zig/src/protocol/provider/types.zig|    return generateUlidWithRandom(compat.random.fillSecureBytes);
+zig/src/transports/websocket.zig|        compat.random.fillSecureBytes(&mask);
+zig/src/transports/websocket.zig|    compat.random.fillSecureBytes(&nonce);
+zig/src/tui/app.zig|    compat.random.fillSecureBytes(&random_bytes);
+zig/src/utils/oauth/openai_codex.zig|    compat.random.fillSecureBytes(&random_bytes);
+zig/src/utils/oauth/pkce.zig|    return generateWithRandom(allocator, compat.random.fillSecureBytes);
+SECURE
+)"
+
+actual_secure_entropy_sites="$(grep -RnsE --include="*.zig" "$secure_entropy_pattern" zig/src \
+  | code_matches_only "$secure_entropy_pattern" 2 \
+  | sed 's/^\([^:]*\):[0-9]*:/\1|/' || true)"
+
+if [[ "$(printf "%s\n" "$expected_secure_entropy_sites" | sort)" != "$(printf "%s\n" "$actual_secure_entropy_sites" | sort)" ]]; then
+  echo "[patterns] secure entropy call sites changed:" >&2
+  diff <(printf "%s\n" "$expected_secure_entropy_sites" | sort) \
+       <(printf "%s\n" "$actual_secure_entropy_sites" | sort) >&2 || true
+  echo "[patterns] a security-sensitive generator must keep consuming secure entropy; declare intentional changes here" >&2
+  exit 1
+fi
+
+echo "[patterns] checking compat.random public exports..."
+expected_compat_random_exports="$(cat <<'EXPORTS'
+pub const DeterministicSource
+pub fn fillRandomBytes
+pub fn fillSecureBytes
+pub fn int
+pub fn randomBytes
+pub fn randomIntRangeLessThan
+pub fn secureBytes
+pub fn secureIntRangeLessThan
+EXPORTS
+)"
+
+actual_compat_random_exports="$(grep -oE '^pub (const|fn) [A-Za-z_][A-Za-z0-9_]*' \
+  "$ordinary_entropy_definition_file" | sort)"
+
+if [[ "$expected_compat_random_exports" != "$actual_compat_random_exports" ]]; then
+  echo "[patterns] public exports of $ordinary_entropy_definition_file changed:" >&2
+  diff <(printf "%s\n" "$expected_compat_random_exports") \
+       <(printf "%s\n" "$actual_compat_random_exports") >&2 || true
+  echo "[patterns] every public export of the entropy module must be classified as secure or ordinary and declared here" >&2
+  exit 1
+fi
+
+echo "[patterns] checking compat.random secure wrapper bodies..."
+compat_random_file="zig/src/compat/random.zig"
+secure_wrappers=(
+  "fillSecureBytes:defaultIo().randomSecure("
+  "secureBytes:fillSecureBytes("
+  "secureIntRangeLessThan:fillSecureBytes("
+)
+
+for wrapper in "${secure_wrappers[@]}"; do
+  wrapper_fn="${wrapper%%:*}"
+  wrapper_requires="${wrapper##*:}"
+  wrapper_body="$(awk -v target="pub fn $wrapper_fn(" \
+    'index($0, target) == 1 { inside = 1 } inside { print } inside && $0 == "}" { exit }' \
+    "$compat_random_file")"
+
+  if [[ -z "$wrapper_body" ]]; then
+    echo "[patterns] secure wrapper $wrapper_fn not found in $compat_random_file" >&2
+    echo "[patterns] update scripts/check-zig-patterns.sh when the compat.random secure helpers are renamed" >&2
+    exit 1
+  fi
+
+  if ! printf "%s\n" "$wrapper_body" | grep -qF "$wrapper_requires"; then
+    echo "[patterns] secure wrapper $wrapper_fn no longer calls $wrapper_requires in $compat_random_file" >&2
+    printf "%s\n" "$wrapper_body" >&2
+    echo "[patterns] every secure call site depends on this wrapper staying on secure entropy" >&2
+    exit 1
+  fi
+
+  if printf "%s\n" "$wrapper_body" | grep -qE "$ordinary_entropy_pattern"; then
+    echo "[patterns] secure wrapper $wrapper_fn uses ordinary entropy in $compat_random_file" >&2
+    printf "%s\n" "$wrapper_body" | grep -nE "$ordinary_entropy_pattern" >&2
+    echo "[patterns] every secure call site depends on this wrapper staying on secure entropy" >&2
     exit 1
   fi
 done
