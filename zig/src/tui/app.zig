@@ -1598,7 +1598,7 @@ pub const TuiModel = struct {
         if (ctx._terminal != null) {
             const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
             const active_height = height -| fixed;
-            const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height, app.inline_history_flushed) catch "";
+            const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
             const live_frame = if (active.len > 0)
                 tui_render.joinVertical(ctx.allocator, &.{ active, extra, composer, status }) catch ""
             else
@@ -1614,7 +1614,7 @@ pub const TuiModel = struct {
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
-    fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize, flushed_from: usize) ![]const u8 {
+    fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize) ![]const u8 {
         if (max_lines == 0) return allocator.dupe(u8, "");
 
         var indices: [4]usize = undefined;
@@ -1623,21 +1623,14 @@ pub const TuiModel = struct {
         addActiveTranscriptIndex(&indices, &len, state.active_assistant_entry, state.transcript.items.len);
         addActiveTranscriptIndex(&indices, &len, state.active_tool_result_entry, state.transcript.items.len);
         addActiveTranscriptIndex(&indices, &len, state.active_tool_summary_entry, state.transcript.items.len);
+        if (len == 0) return allocator.dupe(u8, "");
         sortSmallIndices(indices[0..len]);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         const writer = &out.writer;
-        const unflushed_limit = if (len == 0) state.transcript.items.len else indices[0];
-        var held = flushed_from;
-        while (held < unflushed_limit) : (held += 1) {
-            if (out.written().len > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[held], width);
-            defer allocator.free(rendered);
-            try writer.writeAll(rendered);
-        }
-        for (indices[0..len]) |idx| {
-            if (out.written().len > 0) try writer.writeAll("\n\n");
+        for (indices[0..len], 0..) |idx, i| {
+            if (i > 0) try writer.writeAll("\n\n");
             const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
@@ -1737,14 +1730,6 @@ pub const TuiModel = struct {
         if (app.state.active_assistant_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
         if (app.state.active_tool_summary_entry) |idx| stop = @min(stop, idx);
-        var i = app.inline_history_flushed;
-        while (i < stop) : (i += 1) {
-            const entry = &app.state.transcript.items[i];
-            if (entry.kind != .tool or !entry.tool_summary) continue;
-            if (entry.tool_call_id.len == 0) continue;
-            if (i < app.state.summary_scan_floor) continue;
-            if (app.state.ownsUnfrozenOccurrence(entry.tool_call_id)) return i;
-        }
         return stop;
     }
 
@@ -2151,36 +2136,6 @@ test "App saveEvent keeps debug-visible event types" {
     try std.testing.expect(loaded.events.items[4] == .@"error");
     try std.testing.expect(loaded.events.items[5] == .tool_execution_start);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", loaded.events.items[5].tool_execution_start.args_json.slice());
-}
-
-test "App inline flush holds tool summary rows until their occurrence freezes" {
-    var app = App.initWithoutRuntime(std.testing.allocator);
-    defer app.deinit();
-    var resolution = try app.state.resolveToolOccurrenceForTest("call-h", "shell_execute", "{\"command\":\"pwd\"}", .live_intent, .running);
-    try app.state.appendToolSummaryTranscript("running now", resolution.tool.id);
-    try app.state.appendTranscript(.assistant, "later text");
-    try std.testing.expectEqual(@as(usize, 0), TuiModel.inlineFlushStop(&app));
-
-    resolution.tool.terminal_evidence = .both;
-    try std.testing.expectEqual(@as(usize, 2), TuiModel.inlineFlushStop(&app));
-}
-
-test "TuiModel inline render separates held rows from active entries" {
-    var state = tui_state.AppState.init(std.testing.allocator);
-    defer state.deinit();
-    const resolution = try state.resolveToolOccurrenceForTest("call-sep", "shell_execute", "{\"command\":\"pwd\"}", .live_intent, .running);
-    try state.appendToolSummaryTranscript("held summary", resolution.tool.id);
-    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
-    var delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "streaming now")) } };
-    defer delta.deinit(std.testing.allocator);
-    try state.applyEvent(delta);
-
-    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60, 0);
-    defer std.testing.allocator.free(out);
-    const held_at = std.mem.indexOf(u8, out, "held summary") orelse return error.TestUnexpectedResult;
-    const active_at = std.mem.indexOf(u8, out, "streaming now") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(active_at > held_at + "held summary".len);
-    try std.testing.expect(std.mem.indexOf(u8, out[held_at + "held summary".len .. active_at], "\n\n") != null);
 }
 
 test "App clear_transcript clears the tool registry" {
@@ -3009,7 +2964,7 @@ test "TuiModel inline render shows every steer echo while assistant streams" {
     try std.testing.expectEqual(@as(usize, 0), state.active_assistant_entry.?);
     try std.testing.expectEqual(@as(usize, 1), state.active_user_entry.?);
 
-    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60, 0);
+    const out = try TuiModel.renderInlineActiveTranscript(std.testing.allocator, &state, 100, 60);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "first steer") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "second steer") != null);
