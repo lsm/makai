@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 import pytest
 
 from conftest import FakeServerFactory, read_log
+from makai._ids import new_nano_id
 from makai.errors import MakaiAuthRequiredError, MakaiStreamError
 from makai.types import (
     AgentEnd,
@@ -765,3 +766,44 @@ async def test_concurrent_agent_runs_are_independent(fake: FakeServerFactory) ->
         )
     )
     assert all(response.text == "agent says hi" for response in responses)
+
+
+async def test_a_caller_supplied_id_is_not_stopped_when_the_start_reply_is_lost(
+    fake: FakeServerFactory,
+) -> None:
+    """Spec 6.1: teardown after an unknown start outcome needs an exclusive id.
+
+    A caller-supplied id may name someone else's live run, and a stop that
+    happens to carry their next expected sequence would cancel it.
+    """
+    log = fake.log_path()
+    client = await fake.client(
+        {"log": log, "handlers": {"agent_start": [{"type": "silent"}]}},
+        response_timeout=0.3,
+    )
+    with pytest.raises(MakaiStreamError):
+        await client.agent.run(
+            model_ref=MODEL_REF,
+            messages=[{"role": "user", "content": "hi"}],
+            options=RunOptions(session_id=new_nano_id()),
+        )
+    await asyncio.sleep(0.2)
+    assert [frame["type"] for frame in read_log(log)] == ["agent_start"]
+
+
+async def test_a_generated_id_is_stopped_when_the_start_reply_is_lost(
+    fake: FakeServerFactory,
+) -> None:
+    """A locally minted id cannot be anyone else's, so teardown is safe."""
+    log = fake.log_path()
+    client = await fake.client(
+        {"log": log, "handlers": {"agent_start": [{"type": "silent"}]}},
+        response_timeout=0.3,
+    )
+    with pytest.raises(MakaiStreamError):
+        await client.agent.run(model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}])
+    await asyncio.sleep(0.2)
+    frames = read_log(log)
+    assert [frame["type"] for frame in frames] == ["agent_start", "agent_stop"]
+    # agent_message was never sent, so the host still expects sequence 2.
+    assert frames[1]["sequence"] == 2

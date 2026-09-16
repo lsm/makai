@@ -161,8 +161,14 @@ class ProviderApi(_ExecutionBase):
         fallback_provider_id = _provider_id_from_ref(model_ref)
 
         async with self._transport.route(stream_id=stream_id) as route:
-            await self._transport.send(build_stream_envelope("complete_request", stream_id, payload))
+            # The send is inside the handler: it can suspend in drain() with
+            # the request bytes already queued, and cancelling there would
+            # otherwise close the route without an abort and leave a billable
+            # completion running in the child.
             try:
+                await self._transport.send(
+                    build_stream_envelope("complete_request", stream_id, payload)
+                )
                 while True:
                     frame = await _next(route, self._response_timeout, context)
                     frame_type = frame.get("type")
@@ -243,8 +249,10 @@ class ProviderApi(_ExecutionBase):
         terminal = False
 
         async with self._transport.route(stream_id=stream_id) as route:
-            await self._transport.send(build_stream_envelope("stream_request", stream_id, payload))
             try:
+                await self._transport.send(
+                    build_stream_envelope("stream_request", stream_id, payload)
+                )
                 while not terminal:
                     frame = await _next(route, self._response_timeout, context)
                     frame_type = frame.get("type")
@@ -343,6 +351,9 @@ class AgentApi(_ExecutionBase):
         session = self._session(model_ref, messages, tools, options, policy)
         async with contextlib.aclosing(session):
             async for kind, value in session:
+                if kind == "tool_executed":
+                    tools_executed = True
+                    continue
                 if kind == "response":
                     response = value
                     break
@@ -388,9 +399,10 @@ class AgentApi(_ExecutionBase):
         effective_options = options
         while True:
             yielded_content = False
+            progress: Dict[str, bool] = {"tools_executed": False}
             try:
                 inner = self._stream_once(
-                    model_ref, messages, tools, effective_options, policy
+                    model_ref, messages, tools, effective_options, policy, progress
                 )
                 async with contextlib.aclosing(inner):
                     async for event in inner:
@@ -402,7 +414,13 @@ class AgentApi(_ExecutionBase):
                 provider_id = _retryable_auth_provider(exc, fallback_provider_id)
                 if provider_id is None:
                     raise
-                if yielded_content or attempt > 0 or policy != "auto_once" or self._auth is None:
+                if (
+                    yielded_content
+                    or progress["tools_executed"]
+                    or attempt > 0
+                    or policy != "auto_once"
+                    or self._auth is None
+                ):
                     raise MakaiAuthRequiredError(provider_id, exc.message) from exc
                 await self._relogin(provider_id, exc)
                 effective_options = _with_fresh_session_id(effective_options)
@@ -415,6 +433,7 @@ class AgentApi(_ExecutionBase):
         tools: Optional[Sequence[ToolDefinition]],
         options: Optional[RunOptions],
         policy: Optional[str],
+        progress: Optional[Dict[str, bool]] = None,
     ) -> AsyncGenerator[AgentStreamEvent, None]:
         started = False
         aggregate: Optional[Usage] = None
@@ -426,6 +445,10 @@ class AgentApi(_ExecutionBase):
         )
         async with contextlib.aclosing(session):
             async for kind, value in session:
+                if kind == "tool_executed":
+                    if progress is not None:
+                        progress["tools_executed"] = True
+                    continue
                 if kind == "response":
                     # agent.run's non-streaming settlement shape; project it as
                     # a terminal agent_end so streaming consumers still see one.
@@ -506,8 +529,14 @@ class AgentApi(_ExecutionBase):
         tool_map = {tool.name: tool for tool in (tools or [])}
         start_accepted = False
         message_sent = False
+        message_message_id: Optional[str] = None
+        message_rejected = False
         stop_sent = False
         start_rejected = False
+        # An id the SDK minted is exclusively ours, so a lost or delayed start
+        # reply still leaves it safe to tear down. A caller-supplied id may
+        # belong to someone else's live run (spec 6.1).
+        exclusive_session = options is None or options.session_id is None
 
         async with self._transport.route(session_id=session_id) as route:
             start_envelope = build_session_envelope(
@@ -532,12 +561,16 @@ class AgentApi(_ExecutionBase):
                         if not start_accepted and in_reply_to not in (None, start_message_id):
                             continue
                         start_rejected = not start_accepted
+                        if in_reply_to == message_message_id:
+                            message_rejected = True
                         raise nack_to_stream_error(frame, fallback_provider_id)
 
                     if frame_type == "agent_error":
                         if not start_accepted and in_reply_to not in (None, start_message_id):
                             continue
                         start_rejected = not start_accepted
+                        if in_reply_to == message_message_id:
+                            message_rejected = True
                         raise error_frame_to_stream_error(frame)
 
                     if frame_type == "agent_started":
@@ -545,16 +578,16 @@ class AgentApi(_ExecutionBase):
                             continue
                         start_accepted = True
                         if not message_sent:
-                            await self._transport.send(
-                                build_session_envelope(
-                                    "agent_message",
-                                    session_id,
-                                    _AGENT_MESSAGE_SEQUENCE,
-                                    _build_agent_message_payload(
-                                        model_ref, messages, tools, options, policy, session_id
-                                    ),
-                                )
+                            message_envelope = build_session_envelope(
+                                "agent_message",
+                                session_id,
+                                _AGENT_MESSAGE_SEQUENCE,
+                                _build_agent_message_payload(
+                                    model_ref, messages, tools, options, policy, session_id
+                                ),
                             )
+                            message_message_id = message_envelope["message_id"]
+                            await self._transport.send(message_envelope)
                             message_sent = True
                         continue
 
@@ -566,6 +599,11 @@ class AgentApi(_ExecutionBase):
                         await self._transport.send(
                             await _execute_tool_frame(frame, tool_map)
                         )
+                        # Reported separately from the lifecycle events,
+                        # because a runtime may execute a tool without
+                        # delivering tool_execution_start/end -- and an
+                        # auth retry after a side effect would repeat it.
+                        yield ("tool_executed", None)
                         continue
 
                     if frame_type == "agent_result":
@@ -593,16 +631,27 @@ class AgentApi(_ExecutionBase):
             finally:
                 # A rejected agent_start means this session was never ours --
                 # `agent_busy` in particular says someone else holds the id.
-                # Stopping it could tear down their run if our hardcoded stop
-                # sequence happened to match their counter, so stay out.
-                if not stop_sent and not start_rejected:
+                # Neither is a caller-supplied id whose start reply never
+                # arrived: the run behind it may be someone else's, and a stop
+                # that happens to carry their next expected sequence would
+                # tear it down.
+                if not stop_sent and not start_rejected and (start_accepted or exclusive_session):
                     stop_sent = True
+                    # The host validates agent_stop against the session's next
+                    # expected inbound sequence, and only advances it for a
+                    # frame it accepted. A stop that never sent agent_message,
+                    # or whose agent_message was rejected, must reuse 2.
+                    stop_sequence = (
+                        _AGENT_STOP_SEQUENCE
+                        if message_sent and not message_rejected
+                        else _AGENT_MESSAGE_SEQUENCE
+                    )
                     with contextlib.suppress(Exception):
                         await self._transport.send_best_effort(
                             build_session_envelope(
                                 "agent_stop",
                                 session_id,
-                                _AGENT_STOP_SEQUENCE,
+                                stop_sequence,
                                 {"session_id": session_id, "reason": "completed"},
                             )
                         )

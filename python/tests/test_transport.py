@@ -242,3 +242,30 @@ async def test_async_context_manager_closes(fake: FakeServerFactory) -> None:
             break
         await asyncio.sleep(0.05)
     assert not process_alive(pid)
+
+
+async def test_concurrent_connects_do_not_spawn_two_children(
+    fake: FakeServerFactory,
+) -> None:
+    """The connected check used to sit before the first suspension point."""
+    import os
+
+    env = dict(os.environ)
+    env["MAKAI_FAKE_CONFIG"] = fake.write_config({})
+    env.pop("MAKAI_BINARY_PATH", None)
+    transport = StdioTransport(command=sys.executable, args=[FIXTURE_SERVER], env=env)
+
+    results = await asyncio.gather(
+        transport.connect(), transport.connect(), return_exceptions=True
+    )
+    # One call wins; the other is refused rather than spawning a second child.
+    assert sum(1 for result in results if result is None) == 1
+    refusals = [result for result in results if isinstance(result, RuntimeError)]
+    assert len(refusals) == 1
+    assert "already connected" in str(refusals[0])
+
+    pid = transport.pid
+    assert pid is not None
+    await transport.close()
+    await asyncio.sleep(0.1)
+    assert not process_alive(pid)

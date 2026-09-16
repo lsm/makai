@@ -188,6 +188,7 @@ class StdioTransport:
         self._handshake: Optional[asyncio.Future[None]] = None
         self._closed = False
         self._write_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
         self.dropped_frames = 0
         """Count of frames that arrived for a route nobody had open."""
 
@@ -200,11 +201,25 @@ class StdioTransport:
         return self._process.pid if self._process is not None else None
 
     async def connect(self) -> None:
-        """Spawn the child process and complete the ``ready`` handshake."""
+        """Spawn the child process and complete the ``ready`` handshake.
+
+        Serialized: the first suspension point used to be the spawn itself, so
+        two concurrent calls could both pass the connected check, both spawn a
+        child, and leave one of them orphaned with a second reader competing
+        for the same stdout.
+        """
+        async with self._connect_lock:
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
         if self._process is not None:
             raise RuntimeError("transport is already connected")
 
-        command = self._command or resolve_makai_binary(self._resolver)
+        command = self._command
+        if command is None:
+            # Resolution may download a binary over HTTP with a 120s timeout;
+            # running it inline would stall every other task on this loop.
+            command = await asyncio.to_thread(resolve_makai_binary, self._resolver)
         logger.debug("spawning %s %s", command, self._args)
 
         env = self._env

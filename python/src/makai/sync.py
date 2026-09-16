@@ -81,6 +81,9 @@ class _LoopThread:
         future: Future[T] = asyncio.run_coroutine_threadsafe(coro, self._loop)  # type: ignore[arg-type]
         return future.result()
 
+    def is_closed(self) -> bool:
+        return self._loop.is_closed()
+
     def close(self) -> None:
         if self._loop.is_closed():
             return
@@ -117,7 +120,11 @@ def _iterate(
                 return
             yield item
     finally:
-        loop.run(stop())
+        # The caller may have closed the client before abandoning this
+        # iterator, in which case the loop is gone and there is nowhere left
+        # to run the teardown; the runtime process is already terminated.
+        if not loop.is_closed():
+            loop.run(stop())
 
 
 class SyncAuthApi:
@@ -233,6 +240,7 @@ class SyncMakaiClient:
         self.models = SyncModelsApi(loop, client)
         self.provider = SyncProviderApi(loop, client)
         self.agent = SyncAgentApi(loop, client)
+        self._closed = False
 
     @property
     def transport(self) -> "StdioTransport":
@@ -240,7 +248,15 @@ class SyncMakaiClient:
         return self._client.transport
 
     def close(self) -> None:
-        """Terminate the runtime process and stop the background loop."""
+        """Terminate the runtime process and stop the background loop.
+
+        Idempotent: closing inside a ``with connect_sync()`` block and letting
+        ``__exit__`` close again is the common pattern, and the second call
+        must not build a coroutine for a loop that is already gone.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._loop.run(self._client.close())
         finally:

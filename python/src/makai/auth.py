@@ -117,9 +117,15 @@ class AuthApi:
         "success"}`` carries no additional information.
 
         Raises:
-            MakaiAuthError: ``kind="cancelled"`` when the user or the SDK
-                cancelled, ``kind="provider_error"`` when the provider
-                rejected the login, ``kind="transport_error"`` on timeouts.
+            asyncio.CancelledError: when the caller cancels the awaiting task.
+                This propagates rather than being converted, so a cancelled
+                login is indistinguishable from any other cancelled await; the
+                SDK still sends ``auth_cancel`` before re-raising.
+            MakaiAuthError: ``kind="cancelled"`` when the runtime reports the
+                flow as cancelled, or when the SDK cancels it because a prompt
+                arrived with no ``on_prompt`` handler;
+                ``kind="provider_error"`` when the provider rejected the
+                login; ``kind="transport_error"`` on timeouts.
         """
         effective = handlers or self._default_handlers
         flow_id = new_ulid()

@@ -172,6 +172,41 @@ def test_context_manager_closes() -> None:
         assert not process_alive(pid)
 
 
+def test_close_is_idempotent() -> None:
+    """Closing inside a ``with`` block and letting ``__exit__`` close again."""
+    with tempfile.TemporaryDirectory(prefix="makai-sync-tests-") as directory:
+        config_path = Path(directory) / "config.json"
+        config_path.write_text(json.dumps(CONFIG), encoding="utf-8")
+        env = dict(os.environ)
+        env["MAKAI_FAKE_CONFIG"] = str(config_path)
+        env.pop("MAKAI_BINARY_PATH", None)
+        with connect_sync(command=sys.executable, args=[FIXTURE_SERVER], env=env) as client:
+            pid = client.transport.pid
+            client.close()
+            client.close()
+        assert pid is not None
+        assert not process_alive(pid)
+
+
+def test_an_abandoned_stream_does_not_raise_after_the_client_is_closed() -> None:
+    """The generator's finalizer must not run teardown on a dead loop."""
+    with tempfile.TemporaryDirectory(prefix="makai-sync-tests-") as directory:
+        config_path = Path(directory) / "config.json"
+        config_path.write_text(json.dumps(CONFIG), encoding="utf-8")
+        env = dict(os.environ)
+        env["MAKAI_FAKE_CONFIG"] = str(config_path)
+        env.pop("MAKAI_BINARY_PATH", None)
+        client = connect_sync(command=sys.executable, args=[FIXTURE_SERVER], env=env)
+        stream = client.provider.stream(
+            model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}]
+        )
+        assert next(iter(stream)) is not None
+        client.close()
+        closer = getattr(stream, "close", None)
+        assert closer is not None
+        closer()
+
+
 async def test_connect_sync_refuses_inside_a_running_loop() -> None:
     assert asyncio.get_running_loop() is not None
     with pytest.raises(RuntimeError, match="running event loop"):

@@ -8,6 +8,7 @@ import pytest
 
 from conftest import FakeServerFactory, read_log
 from makai.errors import MakaiProtocolError
+from makai.models import DEFAULT_CACHE_MAX_AGE_MS, _parse_models_response
 
 MODEL = {
     "model_ref": "anthropic/anthropic-messages@claude-sonnet-4-5",
@@ -231,3 +232,23 @@ async def test_agent_models_is_a_separate_instance(fake: FakeServerFactory) -> N
     client = await fake.client(models_config([MODEL]))
     assert client.agent.models is not client.models
     assert (await client.agent.models.list()).models[0].model_ref == MODEL["model_ref"]
+
+
+def test_non_finite_timestamps_are_typed_protocol_errors() -> None:
+    """Python's JSON decoder accepts NaN and Infinity, and both are floats.
+
+    Without a finiteness check they reach ``int()``, which raises a raw
+    ``ValueError`` or ``OverflowError`` instead of this module's typed error.
+    """
+    for value in (float("nan"), float("inf"), float("-inf")):
+        frame = {"payload": {"models": [], "fetched_at_ms": value}}
+        with pytest.raises(MakaiProtocolError) as excinfo:
+            _parse_models_response(frame)
+        assert excinfo.value.code == "malformed_response"
+
+
+def test_a_non_finite_cache_age_falls_back_to_the_default() -> None:
+    response = _parse_models_response(
+        {"payload": {"models": [], "fetched_at_ms": 1, "cache_max_age_ms": float("inf")}}
+    )
+    assert response.cache_max_age_ms == DEFAULT_CACHE_MAX_AGE_MS

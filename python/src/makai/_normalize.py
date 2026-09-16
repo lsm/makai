@@ -188,8 +188,9 @@ def normalize_agent_frame(frame: Mapping[str, Any], buffers: ToolBuffers) -> Lis
         return _normalize_agent_event(json_payload_field(frame, "event_json"), buffers)
     if frame_type == "event":
         payload = payload_of(frame)
-        merged: Dict[str, Any] = dict(frame) if payload is not frame else dict(frame)
-        merged.update(payload)
+        merged: Dict[str, Any] = dict(frame)
+        if payload is not frame:
+            merged.update(payload)
         inner_raw = merged.get("event")
         inner = inner_raw if isinstance(inner_raw, dict) else merged
         kind = _event_kind(inner)

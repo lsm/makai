@@ -30,8 +30,11 @@ def test_ids_are_unique() -> None:
 
 
 def test_ulids_sort_by_creation_time() -> None:
-    values = [new_ulid() for _ in range(50)]
-    assert values == sorted(values) or values[0][:10] == values[-1][:10]
+    # Only the 10-character timestamp prefix is ordered; the 16-character
+    # suffix is random, so values minted within one millisecond are unordered
+    # among themselves and the whole list is sorted only by accident.
+    prefixes = [new_ulid()[:10] for _ in range(50)]
+    assert prefixes == sorted(prefixes)
 
 
 def test_validators_reject_wrong_shapes() -> None:

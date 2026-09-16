@@ -9,6 +9,7 @@ one matching model.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Mapping, Optional, Set
 
 from ._diagnostics import TimeoutContext, build_diagnostics, format_timeout_message
@@ -227,6 +228,21 @@ def _malformed(message: str) -> MakaiProtocolError:
     return MakaiProtocolError(message, MALFORMED_RESPONSE_CODE)
 
 
+def _finite_int(value: Any) -> Optional[int]:
+    """Convert a JSON number to ``int``, or ``None`` when it is not one.
+
+    Python's JSON decoder accepts ``NaN``, ``Infinity`` and ``-Infinity``, all
+    of which are floats, so an isinstance check alone lets them through to an
+    ``int()`` that raises ``ValueError`` or ``OverflowError`` instead of this
+    module's typed error.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(value)
+
+
 def _parse_models_response(frame: Mapping[str, Any]) -> ListModelsResponse:
     raw_payload = frame.get("payload")
     if not isinstance(raw_payload, dict):
@@ -236,19 +252,19 @@ def _parse_models_response(frame: Mapping[str, Any]) -> ListModelsResponse:
     if not isinstance(raw_models, list):
         raise _malformed("models_response missing 'models' array")
 
-    fetched_at_ms = raw_payload.get("fetched_at_ms")
-    if not isinstance(fetched_at_ms, (int, float)) or isinstance(fetched_at_ms, bool):
+    fetched_at_ms = _finite_int(raw_payload.get("fetched_at_ms"))
+    if fetched_at_ms is None:
         raise _malformed("models_response missing numeric 'fetched_at_ms'")
 
-    cache_max_age_ms = raw_payload.get("cache_max_age_ms")
-    if not isinstance(cache_max_age_ms, (int, float)) or isinstance(cache_max_age_ms, bool):
+    cache_max_age_ms = _finite_int(raw_payload.get("cache_max_age_ms"))
+    if cache_max_age_ms is None:
         cache_max_age_ms = DEFAULT_CACHE_MAX_AGE_MS
 
     models = [_parse_descriptor(item, index) for index, item in enumerate(raw_models)]
     return ListModelsResponse(
         models=models,
-        fetched_at_ms=int(fetched_at_ms),
-        cache_max_age_ms=int(cache_max_age_ms),
+        fetched_at_ms=fetched_at_ms,
+        cache_max_age_ms=cache_max_age_ms,
     )
 
 
