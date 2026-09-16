@@ -35,7 +35,34 @@ ordinary_entropy_pattern='\b(fillRandomBytes|randomBytes|randomIntRangeLessThan)
 secure_entropy_pattern='\b(fillSecureBytes|secureBytes|secureIntRangeLessThan|randomSecure)\b'
 
 strip_noncode() {
-  sed -E 's/"([^"\]|\\.)*"//g; s/\\\\.*//; s|//.*||'
+  awk '
+  {
+    line = $0
+    out = ""
+    n = length(line)
+    i = 1
+    while (i <= n) {
+      c = substr(line, i, 1)
+      d = substr(line, i + 1, 1)
+      if (c == "/" && d == "/") break
+      if (c == "\\" && d == "\\") break
+      if (c == "\"" || c == "'"'"'") {
+        quote = c
+        i++
+        while (i <= n) {
+          ch = substr(line, i, 1)
+          if (ch == "\\") { i += 2; continue }
+          i++
+          if (ch == quote) break
+        }
+        out = out " "
+        continue
+      }
+      out = out c
+      i++
+    }
+    print out
+  }'
 }
 
 code_matches_only() {
@@ -106,8 +133,7 @@ for file in "${secure_random_files[@]}"; do
     echo "[patterns] update scripts/check-zig-patterns.sh when entropy call sites move or are deleted" >&2
     exit 1
   fi
-  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" \
-    | code_matches_only "$ordinary_entropy_pattern" 1 || true)"
+  secure_file_matches="$(grep -nE "$ordinary_entropy_pattern" "$file" || true)"
   if [[ -n "$secure_file_matches" ]]; then
     echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
     echo "$secure_file_matches" >&2
