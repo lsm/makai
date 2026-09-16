@@ -169,9 +169,11 @@ Startup→first frame dropped from the 51.1 ms recorded at `755325d` to ~2 ms
 on the same host class and is stable across the `cc5109f` / `04821ce` /
 `9189785` CI artifacts (1.7 / 2.0 / 2.1 ms), so the older row reflects an
 earlier startup path rather than a transient runner win; the shift landed
-somewhere in the 2026-09-15 → 2026-09-16 transcript-rewrite and
-reconciliation window, or in a runner-image update inside that window, and
-was not bisected further. Keypress latency is unchanged between the rows.
+somewhere between the `755325d` run (2026-09-14) and the `04821ce` run
+(2026-09-16) — a window spanning the UX-sweep, transcript-rewrite,
+reconciliation, and PTY-harness PRs, whose TUI and driver changes could both
+move the measurement, or a runner-image update inside it — and was not
+bisected further. Keypress latency is unchanged between the rows.
 
 ## Rendering model
 
