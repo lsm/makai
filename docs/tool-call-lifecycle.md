@@ -258,7 +258,12 @@ resume (a crashed session replays without an `agent_end` record; after the repla
 the same boundary holds). `turn_end` never retires: the agent loop emits tool-result
 `message_end`s after `turn_end` (§3 loss mode 1), so the reconcile window spans the turn
 boundary. A retired occurrence's late half arrives as a **corrected row**: a fresh
-occurrence with fresh rows, never a rewrite of scrollback.
+occurrence with fresh rows, never a rewrite of scrollback. Retirement itself drains a
+**retire-candidate list**: an occurrence appends its registry index exactly once, at its
+live→terminal transition (terminalization or interruption inference), and retirement
+retires the drained set — each occurrence is visited once, so a live gap (an occurrence
+whose boundaries were evicted, blocking any monotone watermark) cannot make retirement
+rescan the suffix it already processed.
 
 **The floor.** `summary_scan_floor` is one watermark: the index of the earliest
 transcript row *owned* by an unfrozen occurrence (a `.tool` row whose `tool_call_id`

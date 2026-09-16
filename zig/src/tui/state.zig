@@ -470,10 +470,10 @@ pub const AppState = struct {
     active_tool_summary_entry: ?usize = null,
     tool_families: std.StringHashMapUnmanaged(usize) = .empty,
     unfrozen_occurrence_ids: std.StringHashMapUnmanaged(void) = .empty,
+    retire_candidates: std.ArrayListUnmanaged(usize) = .empty,
     finalized_tool_count: usize = 0,
     summary_scan_floor: usize = 0,
     summary_floor_tool: usize = 0,
-    retired_scan_index: usize = 0,
     last_tool_calls_json: []u8 = &.{},
     stream_aborted: bool = false,
     dropped_event_count: u64 = 0,
@@ -491,6 +491,7 @@ pub const AppState = struct {
         for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
         self.registered_tools.deinit(self.allocator);
         self.unfrozen_occurrence_ids.deinit(self.allocator);
+        self.retire_candidates.deinit(self.allocator);
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.deinit(self.allocator);
         self.clearToolFamilies();
@@ -554,13 +555,13 @@ pub const AppState = struct {
 
     pub fn clearTools(self: *AppState) void {
         self.unfrozen_occurrence_ids.clearRetainingCapacity();
+        self.retire_candidates.clearRetainingCapacity();
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.clearRetainingCapacity();
         self.clearToolFamilies();
         self.finalized_tool_count = 0;
         self.summary_scan_floor = 0;
         self.summary_floor_tool = 0;
-        self.retired_scan_index = 0;
     }
 
     pub fn resetReplayState(self: *AppState) void {
@@ -733,7 +734,7 @@ pub const AppState = struct {
                     if (resolution.merge_state or upgrade_failure) {
                         const detail_source = if (payload.details_json.slice().len > 0) payload.details_json.slice() else payload.text.slice();
                         try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
-                        self.terminalizeToolOccurrence(tool, status, .result);
+                        try self.terminalizeToolOccurrence(tool, status, .result);
                         if (resolution.merge_state) {
                             try self.mergeTerminalOutput(tool, detail_source);
                             const artifact_count = countArtifactsJson(self.allocator, payload.artifacts_json.slice());
@@ -785,7 +786,7 @@ pub const AppState = struct {
                 if (tool.args_json.len == 0) try self.recoverToolArgsInto(tool, payload.tool_call_id.slice());
                 try self.mergeTerminalOutput(tool, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                self.terminalizeToolOccurrence(tool, status, .execution);
+                try self.terminalizeToolOccurrence(tool, status, .execution);
                 const effective_is_error = tool.status == .@"error";
                 const summary = try toolResultSummary(self.allocator, tool.label, tool.args_json, payload.result_json.slice(), effective_is_error, tool.raw_total_bytes, tool.returned_total_bytes, tool.estimated_returned_tokens, tool.artifact_count);
                 defer self.allocator.free(summary);
@@ -1211,6 +1212,7 @@ pub const AppState = struct {
             const tool = &self.tools.items[i];
             if (isTerminalToolStatus(tool.status)) continue;
             tool.status = .interrupted;
+            try self.retire_candidates.append(self.allocator, i);
             const invocation = try toolInvocation(self.allocator, tool.label, tool.args_json);
             defer self.allocator.free(invocation);
             const message = try std.fmt.allocPrint(self.allocator, "{s} interrupted", .{invocation});
@@ -1222,15 +1224,12 @@ pub const AppState = struct {
     }
 
     pub fn retireToolOccurrences(self: *AppState) void {
-        var i = self.retired_scan_index;
-        while (i < self.tools.items.len) : (i += 1) {
-            const tool = &self.tools.items[i];
-            if (isTerminalToolStatus(tool.status)) {
-                tool.retired = true;
-                _ = self.unfrozen_occurrence_ids.remove(tool.id);
-            }
+        for (self.retire_candidates.items) |index| {
+            const tool = &self.tools.items[index];
+            tool.retired = true;
+            _ = self.unfrozen_occurrence_ids.remove(tool.id);
         }
-        while (self.retired_scan_index < self.tools.items.len and isTerminalToolStatus(self.tools.items[self.retired_scan_index].status)) self.retired_scan_index += 1;
+        self.retire_candidates.clearRetainingCapacity();
         self.advanceSummaryScanFloor();
     }
 
@@ -1283,7 +1282,12 @@ pub const AppState = struct {
         }
     }
 
-    fn terminalizeToolOccurrence(self: *AppState, tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) void {
+    fn toolIndexOf(self: *const AppState, tool: *const ToolEntry) usize {
+        return (@intFromPtr(tool) - @intFromPtr(self.tools.items.ptr)) / @sizeOf(ToolEntry);
+    }
+
+    fn terminalizeToolOccurrence(self: *AppState, tool: *ToolEntry, status: ToolStatus, half: TerminalEvidence) !void {
+        const was_terminal = isTerminalToolStatus(tool.status);
         if (tool.terminal_evidence == .none) {
             tool.status = status;
             tool.terminal_evidence = half;
@@ -1292,6 +1296,7 @@ pub const AppState = struct {
             if (status == .@"error") tool.status = .@"error";
         }
         if (tool.isFrozen()) _ = self.unfrozen_occurrence_ids.remove(tool.id);
+        if (!was_terminal and isTerminalToolStatus(tool.status)) try self.retire_candidates.append(self.allocator, self.toolIndexOf(tool));
     }
 
     fn emitToolErrorCard(self: *AppState, tool: *ToolEntry, raw_detail: []const u8, readable: bool) !void {
@@ -3160,6 +3165,47 @@ test "AppState retires terminal occurrences at agent_end and releases the floor"
     try state.applyEvent(late_result);
     try std.testing.expectEqual(@as(usize, 2), state.tools.items.len);
     try std.testing.expectEqualStrings("call-g\x1f2", state.tools.items[1].id);
+}
+
+test "AppState retires terminal occurrences behind a live gap without rescanning" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var gap_start = try toolStartEvent("call-gap", "shell", "{\"command\":\"watch\"}");
+    defer gap_start.deinit(std.testing.allocator);
+    try state.applyEvent(gap_start);
+    for (0..4) |i| {
+        var buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buf, "call-{d}", .{i});
+        var start_event = try toolStartEvent(id, "shell", "{\"command\":\"ls\"}");
+        defer start_event.deinit(std.testing.allocator);
+        try state.applyEvent(start_event);
+        var end_event = try toolEndEvent(id, "shell", "{\"ok\":true}", false);
+        defer end_event.deinit(std.testing.allocator);
+        try state.applyEvent(end_event);
+    }
+
+    try state.applyEvent(.{ .turn_start = .{} });
+    try std.testing.expect(!state.tools.items[0].retired);
+    for (1..5) |i| try std.testing.expect(state.tools.items[i].retired);
+    try std.testing.expectEqual(@as(usize, 0), state.retire_candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.summary_scan_floor);
+
+    var late_start = try toolStartEvent("call-late", "shell", "{\"command\":\"id\"}");
+    defer late_start.deinit(std.testing.allocator);
+    try state.applyEvent(late_start);
+    var late_end = try toolEndEvent("call-late", "shell", "{\"ok\":true}", false);
+    defer late_end.deinit(std.testing.allocator);
+    try state.applyEvent(late_end);
+    try state.applyEvent(.{ .turn_start = .{} });
+    try std.testing.expect(state.tools.items[5].retired);
+    try std.testing.expectEqual(@as(usize, 0), state.retire_candidates.items.len);
+
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+    try std.testing.expectEqual(ToolStatus.interrupted, state.tools.items[0].status);
+    try state.applyEvent(.{ .turn_start = .{} });
+    try std.testing.expect(state.tools.items[0].retired);
+    try std.testing.expectEqual(state.transcript.items.len, state.summary_scan_floor);
 }
 
 test "AppState scans below the floor for delayed halves of interleaved occurrences" {
