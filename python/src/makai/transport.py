@@ -126,18 +126,6 @@ class FrameRoute:
         frame: Frame = item
         return frame
 
-    def try_next_frame(self) -> Optional[Frame]:
-        """Return a already-queued frame, or ``None`` when the queue is empty."""
-        try:
-            item = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
-        if isinstance(item, BaseException):
-            self._queue.put_nowait(item)
-            return None
-        frame: Frame = item
-        return frame
-
     async def drain(self, idle: float = 0.05, budget: float = 0.25) -> None:
         """Consume frames until the route goes quiet or ``budget`` elapses.
 

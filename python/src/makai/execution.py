@@ -576,9 +576,16 @@ class AgentApi(_ExecutionBase):
                 _build_agent_start_payload(model_ref, tools, session_id),
             )
             start_message_id = start_envelope["message_id"]
-            await self._transport.send(start_envelope)
 
+            # The send is inside the handler for the same reason
+            # _complete_once does it: it can suspend on the write lock or in
+            # drain() with the start frame already queued to the child, and a
+            # cancellation there would otherwise skip the finally and leave a
+            # session the host holds until idle-TTL eviction. The
+            # exclusive-session guard below keeps the stop ownership-safe when
+            # the send never reached the child at all.
             try:
+                await self._transport.send(start_envelope)
                 while True:
                     frame = await _next(route, self._response_timeout, context)
                     frame_type = frame.get("type")

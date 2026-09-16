@@ -919,3 +919,51 @@ async def test_the_stop_probe_gives_up_when_the_route_is_already_dead(
         elapsed = time.perf_counter() - started
 
     assert elapsed < 0.1
+
+
+async def test_cancelling_during_the_start_send_still_stops_the_session(
+    fake: FakeServerFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel landing mid-send must not orphan the session.
+
+    send() can suspend on the write lock or in drain() with the start frame
+    already queued to the child. With the send outside the try, that
+    cancellation skipped the finally and the host kept a session nobody
+    stopped until idle-TTL eviction (30 minutes by default).
+    """
+    log = fake.log_path()
+    client = await fake.client(
+        {
+            "log": log,
+            "handlers": {
+                "agent_start": [
+                    {"type": "agent_started", "payload": {"session_id": "$session_id"}}
+                ]
+            },
+        },
+        response_timeout=10.0,
+    )
+
+    transport = client.transport
+    real_send = transport.send
+    suspended = asyncio.Event()
+    held = asyncio.Event()
+
+    async def send_holding_the_first_start(frame: Dict[str, Any]) -> None:
+        if frame.get("type") == "agent_start" and not suspended.is_set():
+            suspended.set()
+            await held.wait()
+        await real_send(frame)
+
+    monkeypatch.setattr(transport, "send", send_holding_the_first_start)
+
+    task = asyncio.create_task(
+        client.agent.run(model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}])
+    )
+    await asyncio.wait_for(suspended.wait(), 3.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)
+
+    assert any(frame["type"] == "agent_stop" for frame in read_log(log))
