@@ -1191,6 +1191,10 @@ pub const AppState = struct {
         try self.unfrozen_occurrence_ids.put(self.allocator, entry.id, {});
         errdefer _ = self.unfrozen_occurrence_ids.remove(entry.id);
         if (self.tool_families.getPtr(provider_id)) |latest| {
+            if (isTerminalToolStatus(status)) try self.retire_candidates.append(self.allocator, self.tools.items.len);
+            errdefer {
+                if (isTerminalToolStatus(status)) _ = self.retire_candidates.pop();
+            }
             try self.tools.append(self.allocator, entry);
             latest.* = self.tools.items.len - 1;
             return &self.tools.items[self.tools.items.len - 1];
@@ -1201,6 +1205,10 @@ pub const AppState = struct {
         gop.key_ptr.* = family_key;
         gop.value_ptr.* = self.tools.items.len;
         errdefer _ = self.tool_families.remove(provider_id);
+        if (isTerminalToolStatus(status)) try self.retire_candidates.append(self.allocator, self.tools.items.len);
+        errdefer {
+            if (isTerminalToolStatus(status)) _ = self.retire_candidates.pop();
+        }
         try self.tools.append(self.allocator, entry);
         return &self.tools.items[self.tools.items.len - 1];
     }
