@@ -497,11 +497,22 @@ fn cloneArtifactsToAgent(allocator: std.mem.Allocator, artifacts: []const tool_t
 }
 
 fn toolMetadataFromAgentTool(allocator: std.mem.Allocator, tool: agent_types.AgentTool) !tool_types.ToolMetadata {
+    const name = try allocator.dupe(u8, tool.name);
+    errdefer allocator.free(name);
+
+    const description = try allocator.dupe(u8, tool.description);
+    errdefer allocator.free(description);
+
+    const parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json);
+    errdefer allocator.free(parameters_schema_json);
+
+    const version = try allocator.dupe(u8, "1.0.0");
+
     return .{
-        .name = try allocator.dupe(u8, tool.name),
-        .description = try allocator.dupe(u8, tool.description),
-        .parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json),
-        .version = try allocator.dupe(u8, "1.0.0"),
+        .name = name,
+        .description = description,
+        .parameters_schema_json = parameters_schema_json,
+        .version = version,
     };
 }
 
@@ -722,4 +733,42 @@ fn cloneArtifactsToAgentProbe(allocator: std.mem.Allocator) !void {
 
 test "cloneArtifactsToAgent survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneArtifactsToAgentProbe, .{});
+}
+
+fn toolMetadataFromAgentToolProbe(allocator: std.mem.Allocator) !void {
+    const stub = struct {
+        fn execute(
+            tool_call_id: []const u8,
+            args_json: []const u8,
+            cancel_token: ?ai_types.CancelToken,
+            on_update_ctx: ?*anyopaque,
+            on_update: ?agent_types.ToolUpdateCallback,
+            tool_allocator: std.mem.Allocator,
+        ) anyerror!agent_types.AgentToolResult {
+            _ = tool_call_id;
+            _ = args_json;
+            _ = cancel_token;
+            _ = on_update_ctx;
+            _ = on_update;
+            _ = tool_allocator;
+            return .{};
+        }
+    };
+
+    const tool = agent_types.AgentTool{
+        .label = "Shell",
+        .name = "shell_execute",
+        .description = "Run a shell command in the workspace and return its output",
+        .parameters_schema_json =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        ,
+        .execute = stub.execute,
+    };
+
+    var meta = try toolMetadataFromAgentTool(allocator, tool);
+    deinitToolMetadata(&meta, allocator);
+}
+
+test "toolMetadataFromAgentTool survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolMetadataFromAgentToolProbe, .{});
 }

@@ -564,33 +564,100 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
     if (std.mem.eql(u8, kind, "thinking_delta")) return .{ .thinking_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_call_delta")) return .{ .tool_call_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "provider_event")) return .{ .provider_event = .{ .event_json = try owned(allocator, stringField(obj, "event_json") orelse "") } };
-    if (std.mem.eql(u8, kind, "message_end")) return .{ .message_end = .{
-        .role = parseRole(stringField(obj, "role") orelse "assistant"),
-        .text = try owned(allocator, stringField(obj, "text") orelse ""),
-        .content_json = try owned(allocator, stringField(obj, "content_json") orelse ""),
-        .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""),
-        .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""),
-        .args_json = try owned(allocator, stringField(obj, "args_json") orelse ""),
-        .tool_calls_json = try owned(allocator, stringField(obj, "tool_calls_json") orelse ""),
-        .details_json = try owned(allocator, stringField(obj, "details_json") orelse ""),
-        .artifacts_json = try owned(allocator, stringField(obj, "artifacts_json") orelse ""),
-        .stop_reason = parseStopReason(stringField(obj, "stop_reason") orelse "stop"),
-        .is_error = boolField(obj, "is_error", false),
-    } };
-    if (std.mem.eql(u8, kind, "tool_approval_requested")) return .{ .tool_approval_requested = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
-    if (std.mem.eql(u8, kind, "tool_execution_start")) return .{ .tool_execution_start = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
-    if (std.mem.eql(u8, kind, "tool_execution_update")) return .{ .tool_execution_update = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse ""), .partial_result_json = try owned(allocator, stringField(obj, "partial_result_json") orelse "") } };
-    if (std.mem.eql(u8, kind, "tool_execution_end")) return .{ .tool_execution_end = .{
-        .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""),
-        .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""),
-        .result_json = try owned(allocator, stringField(obj, "result_json") orelse ""),
-        .is_error = boolField(obj, "is_error", false),
-        .raw_total_bytes = uint64Field(obj, "raw_total_bytes") orelse 0,
-        .returned_total_bytes = uint64Field(obj, "returned_total_bytes") orelse 0,
-        .estimated_returned_tokens = uint64Field(obj, "estimated_returned_tokens") orelse 0,
-        .artifact_count = uint32Field(obj, "artifact_count") orelse 0,
-        .artifact_refs = try owned(allocator, stringField(obj, "artifact_refs") orelse ""),
-    } };
+    if (std.mem.eql(u8, kind, "message_end")) {
+        const text = try allocator.dupe(u8, stringField(obj, "text") orelse "");
+        errdefer allocator.free(text);
+        const content_json = try allocator.dupe(u8, stringField(obj, "content_json") orelse "");
+        errdefer allocator.free(content_json);
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+        const args_json = try allocator.dupe(u8, stringField(obj, "args_json") orelse "");
+        errdefer allocator.free(args_json);
+        const tool_calls_json = try allocator.dupe(u8, stringField(obj, "tool_calls_json") orelse "");
+        errdefer allocator.free(tool_calls_json);
+        const details_json = try allocator.dupe(u8, stringField(obj, "details_json") orelse "");
+        errdefer allocator.free(details_json);
+        const artifacts_json = try allocator.dupe(u8, stringField(obj, "artifacts_json") orelse "");
+
+        return .{ .message_end = .{
+            .role = parseRole(stringField(obj, "role") orelse "assistant"),
+            .text = OwnedSlice(u8).initOwned(text),
+            .content_json = OwnedSlice(u8).initOwned(content_json),
+            .tool_call_id = OwnedSlice(u8).initOwned(tool_call_id),
+            .tool_name = OwnedSlice(u8).initOwned(tool_name),
+            .args_json = OwnedSlice(u8).initOwned(args_json),
+            .tool_calls_json = OwnedSlice(u8).initOwned(tool_calls_json),
+            .details_json = OwnedSlice(u8).initOwned(details_json),
+            .artifacts_json = OwnedSlice(u8).initOwned(artifacts_json),
+            .stop_reason = parseStopReason(stringField(obj, "stop_reason") orelse "stop"),
+            .is_error = boolField(obj, "is_error", false),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "tool_approval_requested")) {
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+        const args_json = try allocator.dupe(u8, stringField(obj, "args_json") orelse "");
+
+        return .{ .tool_approval_requested = .{
+            .tool_call_id = OwnedSlice(u8).initOwned(tool_call_id),
+            .tool_name = OwnedSlice(u8).initOwned(tool_name),
+            .args_json = OwnedSlice(u8).initOwned(args_json),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "tool_execution_start")) {
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+        const args_json = try allocator.dupe(u8, stringField(obj, "args_json") orelse "");
+
+        return .{ .tool_execution_start = .{
+            .tool_call_id = OwnedSlice(u8).initOwned(tool_call_id),
+            .tool_name = OwnedSlice(u8).initOwned(tool_name),
+            .args_json = OwnedSlice(u8).initOwned(args_json),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "tool_execution_update")) {
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+        const args_json = try allocator.dupe(u8, stringField(obj, "args_json") orelse "");
+        errdefer allocator.free(args_json);
+        const partial_result_json = try allocator.dupe(u8, stringField(obj, "partial_result_json") orelse "");
+
+        return .{ .tool_execution_update = .{
+            .tool_call_id = OwnedSlice(u8).initOwned(tool_call_id),
+            .tool_name = OwnedSlice(u8).initOwned(tool_name),
+            .args_json = OwnedSlice(u8).initOwned(args_json),
+            .partial_result_json = OwnedSlice(u8).initOwned(partial_result_json),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "tool_execution_end")) {
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+        const result_json = try allocator.dupe(u8, stringField(obj, "result_json") orelse "");
+        errdefer allocator.free(result_json);
+        const artifact_refs = try allocator.dupe(u8, stringField(obj, "artifact_refs") orelse "");
+
+        return .{ .tool_execution_end = .{
+            .tool_call_id = OwnedSlice(u8).initOwned(tool_call_id),
+            .tool_name = OwnedSlice(u8).initOwned(tool_name),
+            .result_json = OwnedSlice(u8).initOwned(result_json),
+            .is_error = boolField(obj, "is_error", false),
+            .raw_total_bytes = uint64Field(obj, "raw_total_bytes") orelse 0,
+            .returned_total_bytes = uint64Field(obj, "returned_total_bytes") orelse 0,
+            .estimated_returned_tokens = uint64Field(obj, "estimated_returned_tokens") orelse 0,
+            .artifact_count = uint32Field(obj, "artifact_count") orelse 0,
+            .artifact_refs = OwnedSlice(u8).initOwned(artifact_refs),
+        } };
+    }
     if (std.mem.eql(u8, kind, "context_usage")) return .{ .context_usage = .{
         .system_prompt_bytes = uint64Field(obj, "system_prompt_bytes") orelse 0,
         .message_bytes = uint64Field(obj, "message_bytes") orelse 0,
@@ -873,14 +940,26 @@ fn toolResultMessage(allocator: std.mem.Allocator, p: anytype) !ai_types.ToolRes
 }
 
 fn toolResultFromFields(allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, result: []const u8, is_error: bool) !ai_types.ToolResultMessage {
+    const part_text = try allocator.dupe(u8, result);
+    errdefer allocator.free(part_text);
+
     const parts = try allocator.alloc(ai_types.UserContentPart, 1);
     errdefer allocator.free(parts);
-    parts[0] = .{ .text = .{ .text = try allocator.dupe(u8, result) } };
+    parts[0] = .{ .text = .{ .text = part_text } };
+
+    const owned_tool_call_id = try allocator.dupe(u8, tool_call_id);
+    errdefer allocator.free(owned_tool_call_id);
+
+    const owned_tool_name = try allocator.dupe(u8, tool_name);
+    errdefer allocator.free(owned_tool_name);
+
+    const details_json = try allocator.dupe(u8, result);
+
     return .{
-        .tool_call_id = try allocator.dupe(u8, tool_call_id),
-        .tool_name = try allocator.dupe(u8, tool_name),
+        .tool_call_id = owned_tool_call_id,
+        .tool_name = owned_tool_name,
         .content = parts,
-        .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, result)),
+        .details_json = OwnedSlice(u8).initOwned(details_json),
         .is_error = is_error,
         .timestamp = compat.time.nowMillis(),
     };
@@ -895,14 +974,26 @@ fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.M
     if (std.mem.eql(u8, role, "user")) return .{ .user = .{ .content = .{ .text = try allocator.dupe(u8, stringField(obj, "text") orelse "") }, .timestamp = intField(obj, "timestamp") orelse 0 } };
     if (std.mem.eql(u8, role, "assistant")) return .{ .assistant = try assistantTextMessage(allocator, stringField(obj, "text") orelse "", parseStopReason(stringField(obj, "stop_reason") orelse "stop")) };
     if (std.mem.eql(u8, role, "tool_result")) {
+        const part_text = try allocator.dupe(u8, stringField(obj, "text") orelse "");
+        errdefer allocator.free(part_text);
+
         const parts = try allocator.alloc(ai_types.UserContentPart, 1);
         errdefer allocator.free(parts);
-        parts[0] = .{ .text = .{ .text = try allocator.dupe(u8, stringField(obj, "text") orelse "") } };
+        parts[0] = .{ .text = .{ .text = part_text } };
+
+        const tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(tool_call_id);
+
+        const tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse "");
+        errdefer allocator.free(tool_name);
+
+        const details_json = try allocator.dupe(u8, stringField(obj, "details_json") orelse "");
+
         return .{ .tool_result = .{
-            .tool_call_id = try allocator.dupe(u8, stringField(obj, "tool_call_id") orelse ""),
-            .tool_name = try allocator.dupe(u8, stringField(obj, "tool_name") orelse ""),
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
             .content = parts,
-            .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "details_json") orelse "")),
+            .details_json = OwnedSlice(u8).initOwned(details_json),
             .is_error = boolField(obj, "is_error", false),
             .timestamp = intField(obj, "timestamp") orelse 0,
         } };
@@ -1378,4 +1469,63 @@ fn parseToolResultFromPayloadProbe(allocator: std.mem.Allocator) !void {
 
 test "parseToolResultFromPayload survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolResultFromPayloadProbe, .{});
+}
+
+fn parseEventProbe(allocator: std.mem.Allocator) !void {
+    const payloads = [_][]const u8{
+        \\{"type":"message_end","role":"assistant","text":"final answer text","content_json":"[{\"type\":\"text\"}]","tool_call_id":"call-0123456789","tool_name":"shell_execute","args_json":"{\"command\":\"ls\"}","tool_calls_json":"[]","details_json":"{\"ok\":true}","artifacts_json":"[]","stop_reason":"stop","is_error":false}
+        ,
+        \\{"type":"tool_approval_requested","tool_call_id":"call-0123456789","tool_name":"shell_execute","args_json":"{\"command\":\"ls\"}"}
+        ,
+        \\{"type":"tool_execution_start","tool_call_id":"call-0123456789","tool_name":"shell_execute","args_json":"{\"command\":\"ls\"}"}
+        ,
+        \\{"type":"tool_execution_update","tool_call_id":"call-0123456789","tool_name":"shell_execute","args_json":"{\"command\":\"ls\"}","partial_result_json":"{\"stdout\":\"part\"}"}
+        ,
+        \\{"type":"tool_execution_end","tool_call_id":"call-0123456789","tool_name":"shell_execute","result_json":"{\"stdout\":\"done\"}","is_error":false,"artifact_count":1,"artifact_refs":"art-one,art-two"}
+        ,
+    };
+
+    for (payloads) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+
+        var event = try parseEvent(allocator, parsed.value);
+        event.deinit(allocator);
+    }
+}
+
+test "parseEvent survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseEventProbe, .{});
+}
+
+fn toolResultFromFieldsProbe(allocator: std.mem.Allocator) !void {
+    var message = try toolResultFromFields(
+        allocator,
+        "call-0123456789",
+        "shell_execute",
+        \\{"stdout":"output from the tool","exit_code":0}
+    ,
+        false,
+    );
+    message.deinit(allocator);
+}
+
+test "toolResultFromFields survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolResultFromFieldsProbe, .{});
+}
+
+fn parseMessageToolResultProbe(allocator: std.mem.Allocator) !void {
+    const payload =
+        \\{"role":"tool_result","text":"stdout from the tool","tool_call_id":"call-0123456789","tool_name":"shell_execute","details_json":"{\"ok\":true}","is_error":false,"timestamp":1700000000000}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    var message = try parseMessage(allocator, parsed.value);
+    message.deinit(allocator);
+}
+
+test "parseMessage tool_result survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseMessageToolResultProbe, .{});
 }
