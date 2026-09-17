@@ -2152,7 +2152,6 @@ test "an api-key-shaped entry under a vendor id stays bound to the vendor origin
     try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
 }
 
-
 test "an OAuth provider id with no declared origin is refused a request base_url" {
     var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
     auth_test_state = &state;
