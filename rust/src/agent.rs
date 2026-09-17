@@ -1010,7 +1010,10 @@ mod tests {
         };
 
         let retryable = retryable_or_auth_error(auth_failure(), None, true);
-        assert!(retryable.is_retryable_auth(), "auto_once gates on a retryable Stream error");
+        assert!(
+            retryable.is_retryable_auth(),
+            "auto_once gates on a retryable Stream error"
+        );
         assert_eq!(retryable.provider_id(), Some("anthropic"));
 
         let terminal = retryable_or_auth_error(auth_failure(), None, false);
