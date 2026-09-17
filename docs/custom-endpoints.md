@@ -30,7 +30,8 @@ the built-in ones.
     {
       "id": "local",
       "api": "openai-completions",
-      "base_url": "http://localhost:8000/v1"
+      "base_url": "http://localhost:8000/v1",
+      "auth": { "env": "LOCAL_API_KEY" }
     }
   ]
 }
@@ -83,9 +84,14 @@ and a 404, since the OpenAI request builder concatenates without checking.
 - **Environment**, by naming a variable in `auth.env`. The name is not a secret;
   the value never enters the file.
 
-The keychain is checked first. A provider with neither still lists its models,
-because a local llama.cpp or vLLM usually needs no key at all; a request to an
-endpoint that does need one then fails with the endpoint's own auth error.
+The keychain is checked first. A provider with neither source still appears in
+`/model` and still lists its models, but it cannot complete a turn: both
+providers raise `MissingApiKey` before a request leaves the process when no key
+resolves. A local llama.cpp or vLLM that ignores authentication entirely
+therefore still needs `auth.env` naming a variable that holds any non-empty
+value, which the server is free to discard. See The Anthropic wire format and
+vendor credentials below for why, and for the follow-up that would remove the
+requirement.
 
 `/login` with no argument shows the built-in providers. Custom providers are
 reached by naming them, `/login gateway`, and only if they are declared in the
@@ -112,8 +118,9 @@ available here.
 The fetch happens off that path. A successful `/login <id>` refreshes every
 catalog, which is what populates the cache the first time, and a refresh
 requests `<base_url>/v1/models`, writes the cache, and falls back to the cached
-copy however old when it fails. A keyless endpoint has no login step, so it
-serves its declared `models` list until some other login triggers a refresh.
+copy however old when it fails. An endpoint whose key comes from `auth.env` has no
+login step, so it serves its declared `models` list until some other login
+triggers a refresh.
 
 The declared list is a fallback **only** when discovery produced nothing at all.
 When discovery succeeds, its result is filtered by the list and that is what you
