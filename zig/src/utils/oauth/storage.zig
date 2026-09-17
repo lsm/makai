@@ -23,6 +23,7 @@ const stale_temp_min_age_ms = 24 * 60 * 60 * 1000;
 const keychain_save_fn: SaveFn = saveToPreferredStorage;
 
 const KeychainError = error{ KeychainUnavailable, KeychainNeedsInteraction, KeychainBusy };
+const KeychainAllocError = KeychainError || std.mem.Allocator.Error;
 
 const keychain_busy_attempts = 30;
 const keychain_busy_backoff_ms = 2;
@@ -438,13 +439,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return kc;
     }
 
-    fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
+    fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) KeychainAllocError!?[]u8 {
         const scope = KeychainScope.tryBegin(0) orelse return error.KeychainBusy;
         defer scope.end();
         return findServiceAccount(allocator, service, account);
     }
 
-    fn findServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
+    fn findServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) KeychainAllocError!?[]u8 {
         var password_len: UInt32 = 0;
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
@@ -541,7 +542,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         if (status != errSecSuccess) return error.KeychainUnavailable;
     }
 
-    fn deleteServiceAccount(service: []const u8, account: []const u8) !void {
+    fn deleteServiceAccount(service: []const u8, account: []const u8) KeychainError!void {
         var password_len: UInt32 = 0;
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
@@ -566,7 +567,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         if (SecKeychainItemDelete(item) != errSecSuccess) return error.KeychainUnavailable;
     }
 
-    fn read(allocator: std.mem.Allocator) !?[]u8 {
+    fn read(allocator: std.mem.Allocator) KeychainAllocError!?[]u8 {
         const service = try keychainServiceName(allocator);
         defer allocator.free(service);
 
@@ -580,7 +581,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return legacy;
     }
 
-    fn write(allocator: std.mem.Allocator, data: []const u8) !void {
+    fn write(allocator: std.mem.Allocator, data: []const u8) KeychainAllocError!void {
         const service = try keychainServiceName(allocator);
         defer allocator.free(service);
 
@@ -590,7 +591,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         try writeServiceAccount(service, keychain_shared_account, data);
     }
 } else struct {
-    fn readServiceAccount(_: std.mem.Allocator, _: []const u8, _: []const u8) KeychainError!?[]u8 {
+    fn readServiceAccount(_: std.mem.Allocator, _: []const u8, _: []const u8) KeychainAllocError!?[]u8 {
         return error.KeychainUnavailable;
     }
 
@@ -598,11 +599,11 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return error.KeychainUnavailable;
     }
 
-    fn read(_: std.mem.Allocator) KeychainError!?[]u8 {
+    fn read(_: std.mem.Allocator) KeychainAllocError!?[]u8 {
         return error.KeychainUnavailable;
     }
 
-    fn write(_: std.mem.Allocator, _: []const u8) KeychainError!void {
+    fn write(_: std.mem.Allocator, _: []const u8) KeychainAllocError!void {
         return error.KeychainUnavailable;
     }
 };
