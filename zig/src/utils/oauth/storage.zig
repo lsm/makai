@@ -22,6 +22,8 @@ const stale_temp_min_age_ms = 24 * 60 * 60 * 1000;
 
 const keychain_save_fn: SaveFn = saveToPreferredStorage;
 
+const KeychainError = error{ KeychainUnavailable, KeychainNeedsInteraction, KeychainBusy };
+
 const keychain_busy_attempts = 30;
 const keychain_busy_backoff_ms = 2;
 
@@ -474,8 +476,6 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         return try allocator.dupe(u8, bytes[0..password_len]);
     }
 
-    const KeychainError = error{ KeychainUnavailable, KeychainNeedsInteraction };
-
     fn writeServiceAccount(service: []const u8, account: []const u8, data: []const u8) KeychainError!void {
         var password_len: UInt32 = 0;
         var password_data: ?*anyopaque = null;
@@ -590,19 +590,19 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         try writeServiceAccount(service, keychain_shared_account, data);
     }
 } else struct {
-    fn readServiceAccount(_: std.mem.Allocator, _: []const u8, _: []const u8) !?[]u8 {
+    fn readServiceAccount(_: std.mem.Allocator, _: []const u8, _: []const u8) KeychainError!?[]u8 {
         return error.KeychainUnavailable;
     }
 
-    fn writeServiceAccount(_: []const u8, _: []const u8, _: []const u8) !void {
+    fn writeServiceAccount(_: []const u8, _: []const u8, _: []const u8) KeychainError!void {
         return error.KeychainUnavailable;
     }
 
-    fn read(_: std.mem.Allocator) !?[]u8 {
+    fn read(_: std.mem.Allocator) KeychainError!?[]u8 {
         return error.KeychainUnavailable;
     }
 
-    fn write(_: std.mem.Allocator, _: []const u8) !void {
+    fn write(_: std.mem.Allocator, _: []const u8) KeychainError!void {
         return error.KeychainUnavailable;
     }
 };
