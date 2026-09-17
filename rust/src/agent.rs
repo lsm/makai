@@ -244,11 +244,19 @@ impl AgentApi {
                 FrameAction::Ignore => continue,
                 FrameAction::Rejected(error) => {
                     session.finish_without_stop();
-                    return Err(promote_auth_error(error, fallback_provider.clone()));
+                    return Err(retryable_or_auth_error(
+                        error,
+                        fallback_provider.clone(),
+                        !tools_executed,
+                    ));
                 }
                 FrameAction::Failed(error) => {
                     session.teardown("completed").await;
-                    return Err(promote_auth_error(error, fallback_provider.clone()));
+                    return Err(retryable_or_auth_error(
+                        error,
+                        fallback_provider.clone(),
+                        !tools_executed,
+                    ));
                 }
                 FrameAction::Started => {
                     session.send_message(request, self.auth_retry_policy)?;
@@ -302,13 +310,14 @@ impl AgentApi {
                         }) = &event
                         {
                             session.teardown("completed").await;
-                            return Err(promote_auth_error(
+                            return Err(retryable_or_auth_error(
                                 Error::provider_stream(
                                     message.clone(),
                                     code.clone(),
                                     provider_id.clone(),
                                 ),
                                 fallback_provider.clone(),
+                                !tools_executed,
                             ));
                         }
                         if matches!(
@@ -843,6 +852,26 @@ async fn execute_tool(frame: &Frame, request: &ExecutionRequest) -> Envelope {
 /// Spec §3.5: a provider auth failure can settle as a *successful* run whose
 /// `stop_reason` is `error`. Those must reach the typed auth path rather than
 /// being handed back as a completed response.
+/// Keeps an `auth_required` frame failure in its retryable `Stream` form while
+/// `run` can still act on it, and promotes it to the terminal `AuthRequired`
+/// only once a replay would re-run tools that already had side effects.
+///
+/// `run`'s `auto_once` gate matches `is_retryable_auth`, which is true only for
+/// a `Stream` error coded `auth_required`; promoting inside `run_once` closed
+/// that gate before `run` ever saw it. `run` promotes on every path it takes
+/// after deciding, so returning the raw error here loses nothing -- it derives
+/// the same `fallback_provider` from the same `request.model_ref`.
+fn retryable_or_auth_error(
+    error: Error,
+    fallback_provider: Option<String>,
+    allow_retry: bool,
+) -> Error {
+    if allow_retry {
+        return error;
+    }
+    promote_auth_error(error, fallback_provider)
+}
+
 fn response_or_auth_error(
     response: CompletionResponse,
     fallback_provider: Option<String>,
@@ -968,6 +997,51 @@ mod tests {
 
         let terminal = response_or_auth_error(response, None, false).unwrap_err();
         assert!(matches!(terminal, Error::AuthRequired { .. }));
+    }
+
+    #[test]
+    fn frame_failures_stay_retryable_until_tools_have_run() {
+        let auth_failure = || {
+            Error::provider_stream(
+                "auth_required".to_owned(),
+                Some("auth_required".to_owned()),
+                Some("anthropic".to_owned()),
+            )
+        };
+
+        let retryable = retryable_or_auth_error(auth_failure(), None, true);
+        assert!(retryable.is_retryable_auth(), "auto_once gates on a retryable Stream error");
+        assert_eq!(retryable.provider_id(), Some("anthropic"));
+
+        let terminal = retryable_or_auth_error(auth_failure(), None, false);
+        assert!(matches!(terminal, Error::AuthRequired { .. }));
+    }
+
+    #[test]
+    fn frame_failures_take_the_fallback_provider_when_promoted() {
+        let anonymous = Error::provider_stream(
+            "auth_required".to_owned(),
+            Some("auth_required".to_owned()),
+            None,
+        );
+        let terminal = retryable_or_auth_error(anonymous, Some("openai".to_owned()), false);
+        assert_eq!(terminal.provider_id(), Some("openai"));
+    }
+
+    #[test]
+    fn non_auth_frame_failures_are_never_promoted() {
+        let rate_limited = || {
+            Error::provider_stream(
+                "rate limited".to_owned(),
+                Some("rate_limited".to_owned()),
+                Some("anthropic".to_owned()),
+            )
+        };
+        assert!(!retryable_or_auth_error(rate_limited(), None, true).is_retryable_auth());
+        assert!(matches!(
+            retryable_or_auth_error(rate_limited(), None, false),
+            Error::Stream { .. }
+        ));
     }
 
     #[test]
