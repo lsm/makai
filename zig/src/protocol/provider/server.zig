@@ -161,13 +161,45 @@ const AUTH_REFRESH_FAILED_MESSAGE = "auth_refresh_failed";
 const AUTH_REQUIRED_MESSAGE = "auth_required";
 const AUTH_EXPIRED_MESSAGE = "auth_expired";
 
+fn statusFromMessage(err_msg: []const u8) ?u16 {
+    const marker = "HTTP ";
+    const idx = std.mem.find(u8, err_msg, marker) orelse return null;
+    const start = idx + marker.len;
+    var end = start;
+    while (end < err_msg.len and std.ascii.isDigit(err_msg[end])) end += 1;
+    if (end == start) return null;
+    return std.fmt.parseInt(u16, err_msg[start..end], 10) catch null;
+}
+
 fn defaultAuthFailureDetector(err_msg: []const u8) bool {
-    return std.mem.eql(u8, err_msg, AUTH_REQUIRED_MESSAGE) or
-        std.mem.eql(u8, err_msg, AUTH_EXPIRED_MESSAGE) or
-        std.mem.find(u8, err_msg, "401") != null or
+    if (std.mem.eql(u8, err_msg, AUTH_REQUIRED_MESSAGE)) return true;
+    if (std.mem.eql(u8, err_msg, AUTH_EXPIRED_MESSAGE)) return true;
+    if (statusFromMessage(err_msg)) |status| return status == 401 or status == 403;
+    return std.mem.find(u8, err_msg, "401") != null or
         std.mem.find(u8, err_msg, "403") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "unauthorized") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "forbidden") != null;
+}
+
+test "an explicit status decides auth failure instead of text anywhere in the message" {
+    try std.testing.expect(defaultAuthFailureDetector("anthropic request failed: HTTP 401 (check key)"));
+    try std.testing.expect(defaultAuthFailureDetector("kimi request failed: HTTP 403 (access_terminated_error: limit)"));
+
+    try std.testing.expect(!defaultAuthFailureDetector("openai request failed: HTTP 502 (bad gateway: 403 Forbidden)"));
+    try std.testing.expect(!defaultAuthFailureDetector("openai request failed: HTTP 429 (usage_limit_reached: unauthorized usage)"));
+    try std.testing.expect(!defaultAuthFailureDetector("azure request failed: HTTP 500"));
+
+    try std.testing.expect(defaultAuthFailureDetector(AUTH_REQUIRED_MESSAGE));
+    try std.testing.expect(defaultAuthFailureDetector(AUTH_EXPIRED_MESSAGE));
+    try std.testing.expect(defaultAuthFailureDetector("request was forbidden"));
+    try std.testing.expect(defaultAuthFailureDetector("got a 401 back"));
+    try std.testing.expect(!defaultAuthFailureDetector("stream ended early"));
+}
+
+test "statusFromMessage reads the first status and ignores the rest" {
+    try std.testing.expectEqual(@as(?u16, 403), statusFromMessage("kimi request failed: HTTP 403 (HTTP 500 inside)"));
+    try std.testing.expectEqual(@as(?u16, null), statusFromMessage("no status here"));
+    try std.testing.expectEqual(@as(?u16, null), statusFromMessage("HTTP nope"));
 }
 
 pub fn streamErrorCode(err_msg: []const u8) protocol_types.ErrorCode {
