@@ -1198,14 +1198,15 @@ fn deserializeModelDescriptor(
     }
 
     var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
+    var metadata_items: []protocol_types.MetadataEntry = &.{};
+    var metadata_count: usize = 0;
+    errdefer {
+        for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
+        allocator.free(metadata_items);
+    }
     if (obj.get("metadata")) |metadata_value| {
         const metadata_obj = try fields.asObject(metadata_value);
-        const metadata_items = try allocator.alloc(protocol_types.MetadataEntry, metadata_obj.count());
-        var metadata_count: usize = 0;
-        errdefer {
-            for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
-            allocator.free(metadata_items);
-        }
+        metadata_items = try allocator.alloc(protocol_types.MetadataEntry, metadata_obj.count());
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
@@ -3274,4 +3275,25 @@ test "provider envelope rejects malformed assistant content without leaking" {
     try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_tool_result, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_content_part, allocator));
     try std.testing.expectError(error.MissingField, deserializeEnvelope(bad_tool_definition, allocator));
+}
+
+test "provider model descriptor frees metadata when a trailing field is malformed" {
+    const allocator = std.testing.allocator;
+    const base = "{\"type\":\"models_response\",\"stream_id\":\"01M2MYK69FX2M3DY769FEHK3M0\",\"message_id\":\"01M2MYK69FX2M3DY769FEHK3M1\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"fetched_at_ms\":1,\"cache_max_age_ms\":1,\"models\":[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"d\",\"provider_id\":\"p\",\"api\":\"a\",\"capabilities\":[\"chat\"],\"metadata\":{\"one\":\"1\",\"two\":\"2\"},";
+
+    const missing_auth_status = base ++ "\"lifecycle\":\"stable\",\"source\":\"dynamic\"}]}}";
+    const missing_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"source\":\"dynamic\"}]}}";
+    const bad_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"nope\",\"source\":\"dynamic\"}]}}";
+    const missing_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\"}]}}";
+    const bad_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"nope\"}]}}";
+    const bad_context_window = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"context_window\":-1}]}}";
+    const bad_reasoning_default = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"reasoning_default\":\"nope\"}]}}";
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_auth_status, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_lifecycle, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_lifecycle, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_source, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_source, allocator));
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(bad_context_window, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_reasoning_default, allocator));
 }

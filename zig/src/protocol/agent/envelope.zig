@@ -566,13 +566,14 @@ fn deserializeModelDescriptor(
     }
 
     var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
+    var metadata_items: []model_catalog_types.MetadataEntry = &.{};
+    var metadata_count: usize = 0;
+    errdefer {
+        for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
+        allocator.free(metadata_items);
+    }
     if (try fields.optionalObject(obj, "metadata")) |metadata_obj| {
-        const metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
-        var metadata_count: usize = 0;
-        errdefer {
-            for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
-            allocator.free(metadata_items);
-        }
+        metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
@@ -1029,4 +1030,25 @@ test "a wrong-typed optional after an owned field is rejected without leaking" {
     for (cases) |json| {
         try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
     }
+}
+
+test "agent model descriptor frees metadata when a trailing field is malformed" {
+    const allocator = std.testing.allocator;
+    const base = "{\"type\":\"models_response\",\"session_id\":\"V1StGXR8Z5jdHi6BmyT0a\",\"message_id\":\"01M2MYK69FX2M3DY769FEHK3M1\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"fetched_at_ms\":1,\"cache_max_age_ms\":1,\"models\":[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"d\",\"provider_id\":\"p\",\"api\":\"a\",\"capabilities\":[\"chat\"],\"metadata\":{\"one\":\"1\",\"two\":\"2\"},";
+
+    const missing_auth_status = base ++ "\"lifecycle\":\"stable\",\"source\":\"dynamic\"}]}}";
+    const missing_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"source\":\"dynamic\"}]}}";
+    const bad_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"nope\",\"source\":\"dynamic\"}]}}";
+    const missing_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\"}]}}";
+    const bad_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"nope\"}]}}";
+    const bad_context_window = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"context_window\":-1}]}}";
+    const bad_reasoning_default = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"reasoning_default\":\"nope\"}]}}";
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_auth_status, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_lifecycle, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_lifecycle, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_source, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_source, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(bad_context_window, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_reasoning_default, allocator));
 }
