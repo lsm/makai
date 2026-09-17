@@ -133,6 +133,20 @@ Capability detection is otherwise a hostname guess, which cannot work for an
 endpoint on your own domain. Anything you declare wins; anything you leave out
 falls back to that guess, so existing providers are unaffected.
 
+That fallback is per key, not per block. Declaring one capability does not opt
+the others into anything: the undeclared keys are seeded with the same generic
+values the guess produces for an endpoint it does not recognise, which is what a
+declared endpoint always is. In particular `max_tokens_field` stays `max_tokens`
+and strict tool schemas stay off unless you ask for them, so declaring
+`cache_ttl` on a gateway cannot quietly start sending `max_completion_tokens`
+and `strict` to an endpoint that implements neither.
+
+The one case worth knowing: an endpoint that would have been *recognised* by the
+guess gets the generic seed anyway once you declare any capability. That means a
+custom entry pointing at `api.openai.com`, or at a host the guess knows to want
+the `zai` or `qwen` thinking format, should state `max_tokens_field` or
+`thinking_format` explicitly rather than relying on detection.
+
 | Key | Effect |
 | --- | --- |
 | `cache_ttl` | Endpoint honours long Anthropic prompt-cache TTL. This is the one that matters for an Anthropic-compatible gateway, which otherwise silently loses long cache TTL because `isAnthropicHost` matches on hostname. |

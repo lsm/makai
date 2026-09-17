@@ -2459,6 +2459,42 @@ test "mergeCompat keeps custom OpenAI endpoints generic" {
     try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
 }
 
+test "a declared capability does not drag OpenAI-native defaults along with it" {
+    const model: ai_types.Model = .{
+        .id = "gateway-model",
+        .name = "Gateway Model",
+        .api = "openai-completions",
+        .provider = "gateway",
+        .base_url = "https://gw.internal",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_anthropic_cache_ttl = true,
+            .supports_usage_in_streaming = null,
+            .supports_strict_mode = null,
+            .max_tokens_field = .max_tokens,
+            .thinking_format = .openai,
+        },
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+    try std.testing.expect(!merged.supports_strict_mode);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+
+    var keyless = model;
+    keyless.compat = null;
+    const detected = mergeCompat(keyless);
+    try std.testing.expectEqualStrings(detected.max_tokens_field, merged.max_tokens_field);
+    try std.testing.expectEqual(detected.supports_strict_mode, merged.supports_strict_mode);
+    try std.testing.expectEqual(detected.supports_usage_in_streaming, merged.supports_usage_in_streaming);
+}
+
 test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
     const model: ai_types.Model = .{
         .id = "custom-model",

@@ -282,7 +282,12 @@ fn parseModels(allocator: std.mem.Allocator, obj: *const std.json.ObjectMap) ![]
 
 fn parseCapabilities(obj: *const std.json.ObjectMap) ?ai_types.OpenAICompatOptions {
     const caps = objectObject(obj, "capabilities") orelse return null;
-    var options = ai_types.OpenAICompatOptions{};
+    var options = ai_types.OpenAICompatOptions{
+        .supports_usage_in_streaming = null,
+        .supports_strict_mode = null,
+        .max_tokens_field = .max_tokens,
+        .thinking_format = .openai,
+    };
     var any = false;
 
     if (objectBool(caps, "cache_ttl")) |value| {
@@ -336,6 +341,44 @@ fn parseCapabilities(obj: *const std.json.ObjectMap) ?ai_types.OpenAICompatOptio
     }
 
     return if (any) options else null;
+}
+
+test "declaring one capability leaves the rest at generic values" {
+    const json =
+        \\{"providers":[{
+        \\  "id":"gateway","name":"Gateway","api":"openai-completions",
+        \\  "base_url":"https://gw.internal",
+        \\  "capabilities":{"cache_ttl":true}
+        \\}]}
+    ;
+    const providers = try parse(testing.allocator, json);
+    defer deinitProviders(testing.allocator, providers);
+
+    const caps = providers[0].compat orelse return error.TestExpectedCapabilities;
+    try testing.expectEqual(@as(?bool, true), caps.supports_anthropic_cache_ttl);
+    try testing.expect(caps.max_tokens_field == .max_tokens);
+    try testing.expect(caps.thinking_format == .openai);
+    try testing.expectEqual(@as(?bool, null), caps.supports_strict_mode);
+    try testing.expectEqual(@as(?bool, null), caps.supports_usage_in_streaming);
+    try testing.expectEqual(@as(?bool, null), caps.supports_store);
+    try testing.expectEqual(@as(?bool, null), caps.supports_developer_role);
+    try testing.expectEqual(@as(?bool, null), caps.supports_reasoning_effort);
+}
+
+test "an explicit max_tokens_field still overrides the generic seed" {
+    const json =
+        \\{"providers":[{
+        \\  "id":"gateway","name":"Gateway","api":"openai-completions",
+        \\  "base_url":"https://gw.internal",
+        \\  "capabilities":{"max_tokens_field":"max_completion_tokens","strict_mode":true}
+        \\}]}
+    ;
+    const providers = try parse(testing.allocator, json);
+    defer deinitProviders(testing.allocator, providers);
+
+    const caps = providers[0].compat orelse return error.TestExpectedCapabilities;
+    try testing.expect(caps.max_tokens_field == .max_completion_tokens);
+    try testing.expectEqual(@as(?bool, true), caps.supports_strict_mode);
 }
 
 fn validateId(id: []const u8) ConfigError!void {
