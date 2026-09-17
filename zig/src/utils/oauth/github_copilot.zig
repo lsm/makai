@@ -261,6 +261,9 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
             const provider_data = try buildProviderData(allocator, enterprise_url, resolved_base_url, enabled_models);
 
+            const result_base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null;
+            errdefer if (result_base_url) |value| allocator.free(value);
+
             if (base_url) |bu| allocator.free(bu);
 
             return .{
@@ -269,7 +272,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
                 .expires = compat.time.nowMillis() + (3600 * 1000),
                 .provider_data = provider_data,
                 .enabled_models = enabled_models,
-                .base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null,
+                .base_url = result_base_url,
             };
         }
 
