@@ -93,11 +93,16 @@ async function downloadToCache(url: string, targetPath: string, checksumSha256: 
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   const tempPath = `${targetPath}.tmp`;
-  await fs.writeFile(tempPath, content);
-  if (process.platform !== "win32") {
-    await fs.chmod(tempPath, 0o755);
+  try {
+    await fs.writeFile(tempPath, content);
+    if (process.platform !== "win32") {
+      await fs.chmod(tempPath, 0o755);
+    }
+    await fs.rename(tempPath, targetPath);
+  } catch (error: unknown) {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
   }
-  await fs.rename(tempPath, targetPath);
 }
 
 export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): Promise<string> {
