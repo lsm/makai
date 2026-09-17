@@ -707,8 +707,8 @@ fn runThread(ctx: *ThreadCtx) void {
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request cancelled");
+            stream.markThreadDone();
             return;
         }
     }
@@ -718,16 +718,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const url = buildStreamGenerateContentUrl(allocator, base_url, model.id) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom url");
+        stream.markThreadDone();
         return;
     };
     defer allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("invalid URL");
+        stream.markThreadDone();
         return;
     };
 
@@ -751,8 +751,8 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -770,13 +770,13 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request failed");
+            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -789,13 +789,13 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("send failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -807,13 +807,13 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("receive failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -857,8 +857,8 @@ fn runThread(ctx: *ThreadCtx) void {
 
             if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
 
@@ -871,8 +871,8 @@ fn runThread(ctx: *ThreadCtx) void {
 
     if (response.head.status != .ok) {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("google request failed");
+        stream.markThreadDone();
         return;
     }
 
@@ -917,24 +917,24 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
 
         const n = compat.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("read failed");
+            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError(sse_parser.errorMessage(err));
+            stream.markThreadDone();
             return;
         };
 
@@ -1222,24 +1222,24 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom content");
+        stream.markThreadDone();
         return;
     };
 
     const api_dup = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const provider_dup = allocator.dupe(u8, model.provider) catch {
         allocator.free(api_dup);
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const model_dup = allocator.dupe(u8, model.id) catch {
@@ -1247,8 +1247,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_dup);
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
 
@@ -1265,8 +1265,8 @@ fn runThread(ctx: *ThreadCtx) void {
 
     ctx.deinit();
 
-    stream.markThreadDone();
     stream.complete(out);
+    stream.markThreadDone();
 }
 
 pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
