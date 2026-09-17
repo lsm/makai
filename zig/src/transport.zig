@@ -992,20 +992,19 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
+        const reason = parseStopReason(try jf.requireString(obj, "reason"));
         const message_obj = try jf.requireObject(obj, "message");
         const message = try parseAssistantMessage(message_obj, allocator);
         return .{ .done = .{
-            .reason = parseStopReason(try jf.requireString(obj, "reason")),
+            .reason = reason,
             .message = message,
         } };
     }
     if (std.mem.eql(u8, type_str, "error")) {
+        const reason = parseStopReason(try jf.requireString(obj, "reason"));
+
         var err_msg = empty_partial;
         err_msg.is_owned = true;
-
-        if (try jf.optionalString(obj, "error_message")) |em| {
-            err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em));
-        }
 
         if (obj.get("usage")) |usage_obj| {
             if (usage_obj == .object) {
@@ -1019,8 +1018,12 @@ pub fn parseAssistantMessageEvent(
             }
         }
 
+        if (try jf.optionalString(obj, "error_message")) |em| {
+            err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em));
+        }
+
         return .{ .@"error" = .{
-            .reason = parseStopReason(try jf.requireString(obj, "reason")),
+            .reason = reason,
             .err = err_msg,
         } };
     }
@@ -2126,6 +2129,16 @@ test "deserialize rejects malformed event payloads instead of panicking" {
         \\{"type":"result","content":[{"type":"tool_call","id":"c","name":"t","arguments_json":"{}","thought_signature":5}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
         ,
         \\{"type":"result","error_message":5,"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}
+        ,
+        \\{"type":"done","message":{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}}
+        ,
+        \\{"type":"done","reason":7,"message":{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","model":"m","api":"a","provider":"p","timestamp":1}}
+        ,
+        \\{"type":"error","error_message":"boom"}
+        ,
+        \\{"type":"error","reason":7,"error_message":"boom"}
+        ,
+        \\{"type":"error","reason":"error","error_message":"boom","usage":{"input":-1}}
         ,
     };
 
