@@ -147,7 +147,9 @@ pub const ToolProtocolServer = struct {
                     if (prefix) |p| {
                         if (!std.mem.startsWith(u8, tool.name, p)) continue;
                     }
-                    try metas.append(allocator, try toolMetadataFromAgentTool(allocator, tool));
+                    const meta = try toolMetadataFromAgentTool(allocator, tool);
+                    errdefer meta.deinit(allocator);
+                    try metas.append(allocator, meta);
                 }
                 return self.nextEnvelope(env.message_id, .{ .tool_list_response = .{ .tools = try metas.toOwnedSlice(allocator) } });
             },
