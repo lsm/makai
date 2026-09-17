@@ -4,6 +4,7 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
+const error_detail = @import("provider_error_detail");
 const json_writer = @import("json_writer");
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -293,12 +294,17 @@ fn runThread(ctx: *ThreadCtx) void {
         const error_body = compat.http.allocRemainingResponse(ctx.allocator, error_reader, 8192) catch null;
         defer if (error_body) |eb| ctx.allocator.free(eb);
 
-        std.debug.print("Azure OpenAI Responses API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), ctx.model.name });
-        if (error_body) |eb| {
-            std.debug.print("Error body: {s}\n", .{eb});
-        }
+        const detail = if (error_body) |eb| error_detail.describe(ctx.allocator, eb) catch null else null;
+        defer if (detail) |text| ctx.allocator.free(text);
 
-        ctx.stream.completeWithError("azure request failed");
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const error_msg = std.fmt.allocPrint(ctx.allocator, "azure request failed: HTTP {d}{s}", .{
+            status_code,
+            detail orelse "",
+        }) catch "azure request failed";
+        defer if (!std.mem.eql(u8, error_msg, "azure request failed")) ctx.allocator.free(error_msg);
+
+        ctx.stream.completeWithError(error_msg);
         return;
     }
 
