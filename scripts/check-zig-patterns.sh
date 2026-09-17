@@ -357,6 +357,8 @@ required_files=(
   "zig/src/agent/agent.zig"
   "zig/src/protocol/provider/client.zig"
   "zig/src/protocol/provider/server.zig"
+  "zig/src/protocol/oap/server.zig"
+  "zig/src/protocol/oap/bridge.zig"
   "zig/src/tool_call_tracker.zig"
   "zig/src/streaming_json.zig"
   "zig/src/providers/sse_parser.zig"

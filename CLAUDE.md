@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
+Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus a native Open Agent Protocol endpoint (`protocol/oap/`), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -109,7 +109,7 @@ The invariant behind both paragraphs: every artifact wired into the global `test
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
 zig build test-unit-transport     # transport, stdio, sse, websocket, in_process, transport_retry
-zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
+zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, oap types+envelope+server+bridge (incl. the three golden OAP traces), partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
 zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, storage, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
@@ -201,7 +201,9 @@ The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see
 │  Local tools (tools/): shell, file, edit, search, workspace, │
 │    artifact, hashline, mcp_bridge, registry, permission      │
 ├──────────────────────────────────────────────────────────────┤
-│  Protocol Layer (protocol/): auth/, provider/, agent/, tool/ │
+│  Protocol Layer (protocol/): auth/, provider/, agent/, tool/,│
+│    oap/ (native Open Agent Protocol endpoint: types, envelope,│
+│    server, bridge; translates to/from the agent protocol)    │
 │    all: types + envelope + runtime. provider/agent add       │
 │    client+server; auth adds server; tool keeps its           │
 │    server/client/pipe inside local_runtime.zig               │
@@ -291,6 +293,7 @@ Passing an explicit `std.mem.Allocator` is the convention, not a guarantee the c
 ```
 makai --version
 makai --stdio                                   # protocol host for the TS SDK (NDJSON frames on stdin/stdout)
+makai --oap [--model <model-ref>]               # native Open Agent Protocol host (OAP JSONL frames on stdin/stdout)
 makai --tui                                     # local-only terminal UI
 makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream one prompt, dump every event
 makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
