@@ -13,6 +13,13 @@ follow-up wrapper added in the same PR. After migration, the goal is for the
 only direct `std.time.*` / `std.Thread.sleep` references in `zig/src/` to live
 inside `zig/src/compat/time.zig` itself.
 
+> **Note (added with the dead-code deletion in this repository's `chore: delete
+> never-compiled AWS, Bedrock, Google OAuth, and login programs` change):** this
+> document is a point-in-time record and its inventories are left verbatim. Three
+> paths it names no longer exist, having been deleted as never-compiled dead code:
+> `zig/src/utils/aws_sigv4.zig`, `zig/src/utils/oauth/google.zig` and
+> `zig/src/utils/oauth/callback_server.zig`. Their entries below are historical.
+
 ## Summary
 
 - 277 remaining `std.time.{timestamp,milliTimestamp,nanoTimestamp,Timer,Instant}`

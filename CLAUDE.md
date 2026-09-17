@@ -25,6 +25,69 @@ A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, 
 `makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
 (project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
 
+### macOS: the Keychain, non-interactive runs, and test isolation
+
+On macOS, credential storage is Keychain-first, and the two directions behave differently.
+
+**Reads fail fast.** Every read path runs under `SecKeychainSetUserInteractionAllowed(0)`, so a
+binary the `com.makai.auth` item's access list does not authorize gets `errSecInteractionNotAllowed`
+rather than an authorization prompt, and `AuthStorage.loadDefault` falls back to `~/.makai/auth.json`.
+That fallback goes through `loadFromFile`, **not** `loadFromFileWithSaveFn`, so a background token
+refresh cannot re-save and re-arm the prompt. The degradation is silent by design: the run continues
+with whatever the file holds, which may be nothing. Reads also tell contention apart from refusal —
+the keychain mutex is taken with a bounded retry, and a holder that outlasts the budget yields a
+distinct `busy` result instead of being reported as `needs_interaction`, so an interactive write
+mid-prompt no longer makes a concurrent read look like an authorization failure.
+
+**Writes still prompt.** `macos_keychain.write` takes the mutex blocking and leaves interaction
+enabled, so persisting credentials from an unauthorized binary raises the prompt — and in a
+non-interactive shell that prompt never surfaces, so the write blocks rather than failing. Access
+lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again; the
+macOS artifacts this repo publishes are plain `zig build install` output and are unsigned too. Only
+a Developer-ID-signed build, keyed by team ID, escapes it. Bound any invocation that may persist
+credentials with an external timeout so a hang is visible rather than silent.
+
+Reads blocked the same way before #315, which is why older notes describe `makai auth providers
+--json` printing `ready` and then going silent on the first credential-touching request. That
+symptom is gone. A machine with no `com.makai.auth` item never reproduced it either —
+`SecKeychainFindGenericPassword` returns `errSecItemNotFound` and the load falls back to the file —
+so a clean CI runner was never a useful test of it.
+
+```bash
+export MAKAI_KEYCHAIN_SERVICE="makai-test-$(uuidgen)"
+```
+
+This redirects the whole makai store — `keychainServiceName` in `zig/src/utils/oauth/storage.zig`
+picks the service for every makai keychain read and write, not one item. Use a genuinely unique
+name per run: a stable one stops being unused the moment anything writes to it, and `$(date +%s)-$$`
+collides between subshells started in the same second.
+
+Four limits:
+
+1. **It does not isolate `~/.makai/auth.json`.** With no item under the overridden service,
+   `loadDefault` falls back to that file, so a supposedly isolated run can still consume real
+   tokens. Redirect `HOME` as well if it may hold live credentials.
+2. **It does not isolate the Codex CLI import**, which reads the fixed `Codex Auth` service. That
+   import runs on `loadDefault` paths — `makai auth providers` among them — and reads a service the
+   override does not cover. It does **not** run on `loadDefaultStoredOnly`, which passes
+   `import_codex = false` and serves provider credential resolution, TUI login-status refreshes and
+   stored Kimi lookup.
+3. **A unique service accumulates credential items.** Anything that persists credentials writes one
+   there — not just logins: an ordinary request that refreshes an expired token
+   (`streamWithRefresh` → `refreshCredentials` → `persist()`) writes too. makai never deletes them;
+   its only delete path is the legacy `auth.json` migration. Clean up on every exit path with
+   `security delete-generic-password -s "$MAKAI_KEYCHAIN_SERVICE"`.
+4. **The real-binary SDK tests cannot pass on macOS as written.** With or without the override,
+   `loadDefault` attaches the Keychain save callback when the service has no item (the `.not_found`
+   branch, which the read-side fail-fast change does not touch), so login writes go to the Keychain
+   rather than the temporary `HOME`'s `auth.json` and the login assertions in
+   `typescript/test/makai_binary_smoke.test.ts` and `typescript/test/demo_server.test.ts` fail on
+   `ENOENT`. There is no switch that forces file-backed storage — `shouldUseKeychain()` is
+   hardcoded to macOS non-test builds. Run those on Linux.
+
+This does not change where credentials live (see On-disk state below) and is not a reason to move
+them to a file.
+
 ### Print Mode CLI
 
 ```bash
@@ -122,8 +185,8 @@ The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see
 - **Module roots** are reached by name. Adding one means: create the module in `build.zig`, list every import it needs, add an `addTest`, and add the run artifact to both `test_step` and the right group step. A missing import fails at compile time with "no module named ...".
 - **Files compiled through an existing root** are reached by relative `@import("sibling.zig")` and may need no `build.zig` entry; their tests then run as part of the root's test artifact. `zig/src/compat/{time,random,fs,stdio,http,net}.zig` hang off `compat/mod.zig` this way, as does `agent/agent.zig` off `agent/mod.zig`.
 - **A relative import does not by itself mean a file has no module.** `protocol/provider/{partial_serializer,partial_reconstructor}.zig` are imported relatively by `server.zig` and `client.zig` *and* have their own modules and test artifacts wired into `test-unit-protocol`, deliberately, so their tests run as a named group. Decide by checking both the existing importers and `build.zig`, never from the import syntax alone.
-- Some tracked files are neither. Eleven files, about 3,400 lines, have no module, no importer, and are **never compiled by any build step**: `utils/aws_sigv4.zig`, `utils/message_transform.zig`, `utils/tokens.zig`, `utils/tool_utils.zig`, `utils/streaming_json.zig` (a different and larger file than the live top-level `streaming_json.zig`), `utils/oauth.zig` together with the `utils/oauth/google.zig` and `utils/oauth/callback_server.zig` island — those two do have importers, but only `oauth.zig` itself, which nothing else reaches, `tools/anthropic_login.zig`, `tools/copilot_login.zig`, and `providers/bedrock_converse_stream_api.zig`. Nothing type-checks them, so they rot silently rather than loudly. They are not free: repo-wide tooling still maintains them, and `utils/tool_utils.zig` holds a declared entry in `check-zig-patterns.sh`'s `expected_ordinary_entropy_sites`, which means a security allowlist carries an exemption for code that never runs. Confirm with a grep for an `@import` of the file before treating one as load-bearing, and do not copy their wiring as a pattern.
-- The live OAuth code is the `zig/src/utils/oauth/` module roots: `storage`, `refresh_lock`, `pkce`, `anthropic`, `github_copilot`, `openai_codex`. Its `google.zig` and `callback_server.zig` are reachable only through the unreferenced `utils/oauth.zig`, and `zig/src/oauth/` contributes just `mod.zig` + `pkce.zig` to the utils test group. Prefer `utils/oauth/` when adding OAuth code.
+- Some tracked files are neither. Four files, about 2,300 lines, have no module, no importer, and are **never compiled by any build step**: `utils/streaming_json.zig` (a different and larger file than the live top-level `streaming_json.zig`), `utils/message_transform.zig`, `utils/tool_utils.zig`, and `utils/tokens.zig`. Nothing type-checks them, so they rot silently rather than loudly, and `utils/tool_utils.zig` still holds a declared entry in `check-zig-patterns.sh`'s `expected_ordinary_entropy_sites` — a security allowlist carrying an exemption for code that never runs, which cannot be removed while the file stays. Confirm with a grep for an `@import` of the file before treating one as load-bearing, and do not copy their wiring as a pattern.
+- The live OAuth code is the `zig/src/utils/oauth/` module roots: `storage`, `refresh_lock`, `pkce`, `anthropic`, `github_copilot`, `openai_codex`. The unreferenced `utils/oauth.zig` aggregator and the Google OAuth island it alone reached (`google.zig`, `callback_server.zig`) were deleted; `zig/src/oauth/` contributes just `mod.zig` + `pkce.zig` to the utils test group. Prefer `utils/oauth/` when adding OAuth code.
 - `zigzag` is the only **`build.zig.zon`** dependency: a vendored TUI framework at `zig/vendor/zigzag`, declared as a path dependency, and subject to the zero-comments policy like everything else. The repo is not dependency-free overall — `package.json` adds runtime deps (`nanoid`, `ulid`), dev deps (`typescript`, `@types/node`), and six optional `@makai/cli-*` platform packages, all of which `npm ci` resolves. Count both graphs for offline-build or supply-chain work.
 
 ## Architecture
@@ -244,13 +307,15 @@ On-disk state: **credential storage is platform-dependent.** On macOS the login 
 
 **Adding a transport**: implement `Sender`/`Receiver` from `transport.zig` in `zig/src/transports/<name>.zig`; wire into `build.zig` with the `transport` import and the `test-unit-transport` group.
 
-Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`. **Vertex is also not reachable at runtime**: `register_builtins.zig` never imports or registers `google_vertex_api.zig`, so there is no `google-vertex` API in the registry and a request for one fails provider lookup. The module is compiled only as its own test artifact. Registered APIs are exactly: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported: `providers/bedrock_converse_stream_api.zig` is an unwired stub returning `error.NotImplemented`.
+**Custom endpoints**: users declare OpenAI- and Anthropic-compatible endpoints in `~/.makai/providers.json`, parsed by `zig/src/custom_providers.zig` and turned into models by `loadCustomModels` in `model_catalog.zig`. That file never holds a key: credentials come from the keychain under the provider id (`/login <id>`) or from an environment variable the entry names. A declared `models` list is an allowlist over live `/v1/models` discovery, not just a fallback. `base_url` is normalised to the origin, because `openai_completions_api.buildUrlWithSuffix` concatenates without a double-suffix guard and a pasted `.../v1` would otherwise 404. A `capabilities` block populates `Model.compat`, which both OpenAI providers honor through `mergeCompat`. Capability fallback is per key: `parseCapabilities` seeds undeclared keys with the generic values URL detection yields for an unrecognised host, because the struct's own defaults are OpenAI-native and cannot express unset. Custom providers reach the TUI and CLI only; `models.list` is a separate catalog. See `docs/custom-endpoints.md`.
+
+Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`. **Vertex is also not reachable at runtime**: `register_builtins.zig` never imports or registers `google_vertex_api.zig`, so there is no `google-vertex` API in the registry and a request for one fails provider lookup. The module is compiled only as its own test artifact. Registered APIs are exactly: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported and has no implementation in the tree; the unwired stub and the unused SigV4 signing helper were deleted rather than left to rot.
 
 ## TUI
 
 `zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (10 ratified `CommandKind`s — help, model, login, provider, status, resume, permissions, clear, abort, quit — exposed as 12 accepted names, since `/sessions` aliases `/resume` and `/perm` aliases `/permissions`), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
 
-`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS. Reads run with user interaction disabled, so a binary the item's access list does not authorize fails fast and falls back to `auth.json` rather than raising a prompt — which in a non-interactive shell would block rather than fail; that fallback deliberately does not re-save, so a background refresh cannot walk back into the prompt. Writes still prompt, and unsigned dev builds get one per new binary there because access lists bind to the code hash (signed releases are keyed by team ID). Never move credentials to a plain file. `MAKAI_KEYCHAIN_SERVICE` isolates keychain items in local runs. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
+`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS: reads fail fast and fall back to `auth.json`, writes still prompt, and `MAKAI_KEYCHAIN_SERVICE` isolates items in local runs — see the macOS Keychain section above for the mechanism and the four limits of that override. Never move credentials to a plain file. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
 
 ## Zig Conventions
 

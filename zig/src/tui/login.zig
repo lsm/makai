@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const compat = @import("compat");
 const storage = @import("oauth/storage");
@@ -11,6 +10,7 @@ pub const Provider = enum {
     github_copilot,
     openai_codex,
     kimi,
+    api_key,
 };
 
 pub fn providerStorageKey(provider: Provider) []const u8 {
@@ -19,7 +19,12 @@ pub fn providerStorageKey(provider: Provider) []const u8 {
         .github_copilot => "github-copilot",
         .openai_codex => "openai-codex",
         .kimi => "kimi",
+        .api_key => "",
     };
+}
+
+pub fn storesApiKeyFor(provider: Provider) bool {
+    return provider == .kimi or provider == .api_key;
 }
 
 const Phase = enum { running, done, failed };
@@ -55,6 +60,7 @@ pub const LoginSession = struct {
 
     result: ?storage.Credentials = null,
     error_name: []u8 = &.{},
+    owned_provider_id: ?[]u8 = null,
 
     pub fn start(allocator: std.mem.Allocator, provider: Provider) !*LoginSession {
         if (g_active != null) return error.LoginInProgress;
@@ -75,8 +81,36 @@ pub const LoginSession = struct {
             .github_copilot => try std.Thread.spawn(.{}, runGithub, .{self}),
             .openai_codex => try std.Thread.spawn(.{}, runCodex, .{self}),
             .kimi => try std.Thread.spawn(.{}, runKimi, .{self}),
+            .api_key => try std.Thread.spawn(.{}, runApiKey, .{self}),
         };
         return self;
+    }
+
+    pub fn startApiKey(allocator: std.mem.Allocator, provider_id: []const u8) !*LoginSession {
+        if (g_active != null) return error.LoginInProgress;
+        if (provider_id.len == 0) return error.InvalidProviderId;
+
+        const owned_id = try allocator.dupe(u8, provider_id);
+        errdefer allocator.free(owned_id);
+
+        const self = try allocator.create(LoginSession);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .provider = .api_key,
+            .provider_id = owned_id,
+            .owned_provider_id = owned_id,
+        };
+
+        g_active = self;
+        errdefer g_active = null;
+
+        self.thread = try std.Thread.spawn(.{}, runApiKey, .{self});
+        return self;
+    }
+
+    pub fn storesApiKey(self: *const LoginSession) bool {
+        return storesApiKeyFor(self.provider);
     }
 
     fn lock(self: *LoginSession) void {
@@ -97,6 +131,7 @@ pub const LoginSession = struct {
         if (self.input_value.len > 0) allocator.free(self.input_value);
         if (self.error_name.len > 0) allocator.free(self.error_name);
         if (self.result) |creds| creds.deinit(allocator);
+        if (self.owned_provider_id) |owned| allocator.free(owned);
         g_active = null;
         allocator.destroy(self);
     }
@@ -301,6 +336,23 @@ fn runKimi(self: *LoginSession) void {
     defer self.allocator.free(provider_data);
 
     self.finishSuccess("", trimmed_api_key, std.math.maxInt(i64), provider_data);
+}
+
+fn runApiKey(self: *LoginSession) void {
+    const prompt = std.fmt.allocPrint(self.allocator, "Enter API key for {s}:", .{self.provider_id}) catch {
+        self.finishError("OutOfMemory");
+        return;
+    };
+    defer self.allocator.free(prompt);
+
+    const api_key = self.waitForInput(prompt, false);
+    defer self.allocator.free(api_key);
+    const trimmed = std.mem.trim(u8, api_key, " \t\r\n");
+    if (trimmed.len == 0) {
+        self.finishError("ApiKeyRequired");
+        return;
+    }
+    self.finishSuccess("", trimmed, std.math.maxInt(i64), null);
 }
 
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {
