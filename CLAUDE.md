@@ -25,6 +25,60 @@ A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, 
 `makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
 (project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
 
+### macOS: the Keychain can block a non-interactive run
+
+On macOS, credential storage is Keychain-first. Reading an **existing** `com.makai.auth` item
+whose access list does not authorize the running binary raises an authorization prompt, and in a
+non-interactive shell that prompt never surfaces: the read does not fail, it blocks. `makai auth
+providers --json` hangs; the same command with the service overridden returns in well under a
+second.
+
+This needs an item that is already there. On a machine with no `com.makai.auth` item,
+`SecKeychainFindGenericPassword` returns `errSecItemNotFound`, `AuthStorage.loadDefault` falls
+back to the auth file, and the command returns normally — so a clean CI runner does not reproduce
+it. Access lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts
+again; the macOS artifacts this repo publishes are plain `zig build install` output and are
+unsigned too, so they behave the same way. Only a Developer-ID-signed build, keyed by team ID,
+escapes it.
+
+Symptom to recognise: the runtime prints `ready` and then goes silent on the first request that
+touches credentials, with no error and no timeout of its own. Bound any such invocation with an
+external timeout so a hang is visible rather than silent.
+
+```bash
+export MAKAI_KEYCHAIN_SERVICE="makai-test-$(uuidgen)"
+```
+
+This redirects the whole makai store — `keychainServiceName` in `zig/src/utils/oauth/storage.zig`
+picks the service for every makai keychain read and write, not one item. Use a genuinely unique
+name per run: a stable one stops being unused the moment anything writes to it, and `$(date +%s)-$$`
+collides between subshells started in the same second.
+
+Four limits:
+
+1. **It does not isolate `~/.makai/auth.json`.** With no item under the overridden service,
+   `loadDefault` falls back to that file, so a supposedly isolated run can still consume real
+   tokens. Redirect `HOME` as well if it may hold live credentials.
+2. **It does not isolate the Codex CLI import**, which reads the fixed `Codex Auth` service. That
+   import runs on `loadDefault` paths — `makai auth providers` among them — and can trigger the
+   same invisible prompt. It does **not** run on `loadDefaultStoredOnly`, which passes
+   `import_codex = false` and serves provider credential resolution, TUI login-status refreshes and
+   stored Kimi lookup.
+3. **A unique service accumulates credential items.** Anything that persists credentials writes one
+   there — not just logins: an ordinary request that refreshes an expired token
+   (`streamWithRefresh` → `refreshCredentials` → `persist()`) writes too. makai never deletes them;
+   its only delete path is the legacy `auth.json` migration. Clean up on every exit path with
+   `security delete-generic-password -s "$MAKAI_KEYCHAIN_SERVICE"`.
+4. **The real-binary SDK tests cannot pass on macOS as written.** With or without the override,
+   `loadDefault` attaches the Keychain save callback when the service has no item, so login writes
+   go to the Keychain rather than the temporary `HOME`'s `auth.json` and the login assertions in
+   `typescript/test/makai_binary_smoke.test.ts` and `typescript/test/demo_server.test.ts` fail on
+   `ENOENT`. There is no switch that forces file-backed storage — `shouldUseKeychain()` is
+   hardcoded to macOS non-test builds. Run those on Linux.
+
+This does not change where credentials live (see On-disk state below) and is not a reason to move
+them to a file.
+
 ### Print Mode CLI
 
 ```bash
