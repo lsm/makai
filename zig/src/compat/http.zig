@@ -35,7 +35,7 @@ pub const HttpClient = struct {
             .extra_headers = options.extra_headers,
             .keep_alive = options.keep_alive,
             .headers = .{
-                .accept_encoding = if (options.accept_encoding) |value| .{ .override = value } else .default,
+                .accept_encoding = acceptEncoding(options.accept_encoding),
                 .user_agent = if (options.user_agent) |value| .{ .override = value } else .default,
             },
         });
@@ -78,6 +78,21 @@ pub fn allocRemainingResponse(allocator: std.mem.Allocator, reader: *ResponseRea
 
 pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
     return @ptrCast(@alignCast(response.reader(transfer_buf)));
+}
+
+pub fn acceptEncoding(override: ?[]const u8) Headers.Value {
+    return .{ .override = override orelse "identity" };
+}
+
+test "compat http requests identity encoding unless a caller overrides it" {
+    switch (acceptEncoding(null)) {
+        .override => |value| try std.testing.expectEqualStrings("identity", value),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (acceptEncoding("gzip")) {
+        .override => |value| try std.testing.expectEqualStrings("gzip", value),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "compat http client initializes and deinitializes" {

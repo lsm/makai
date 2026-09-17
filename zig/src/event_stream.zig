@@ -40,6 +40,19 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             };
         }
 
+        fn deinitResultValue(self: *Self, result: *R) void {
+            const has_deinit = comptime blk: {
+                const info = @typeInfo(R);
+                switch (info) {
+                    .@"struct", .@"union", .@"enum", .@"opaque" => break :blk @hasDecl(R, "deinit"),
+                    else => break :blk false,
+                }
+            };
+            if (has_deinit) {
+                result.deinit(self.allocator);
+            }
+        }
+
         fn deinitGenericEvent(self: *Self, event: *T) void {
             const is_assistant_message_event = comptime blk: {
                 if (@hasDecl(ai_types, "AssistantMessageEvent")) {
@@ -104,18 +117,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
 
             if (self.result) |*result| {
-                const has_deinit = comptime blk: {
-                    const info = @typeInfo(R);
-                    switch (info) {
-                        .@"struct", .@"union", .@"enum", .@"opaque" => {
-                            break :blk @hasDecl(R, "deinit");
-                        },
-                        else => break :blk false,
-                    }
-                };
-                if (has_deinit) {
-                    result.deinit(self.allocator);
-                }
+                self.deinitResultValue(result);
             }
 
             if (self.err_msg) |msg| {
@@ -190,6 +192,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         pub fn complete(self: *Self, result: R) void {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
+
+            if (self.result) |*previous| {
+                self.deinitResultValue(previous);
+                self.result = null;
+            }
 
             self.result = result;
             self.completed.store(true, .release);
@@ -391,11 +398,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
             };
             self.mutex.lockUncancelable(defaultIo());
-            const snapshot = self.result;
-            const err = self.err_msg;
-            self.mutex.unlock(defaultIo());
-            if (err != null) return null;
-            const result = snapshot orelse return null;
+            defer self.mutex.unlock(defaultIo());
+            if (self.err_msg != null) return null;
+            const result = self.result orelse return null;
             return try ai_types.cloneAssistantMessage(allocator, result);
         }
 
@@ -541,7 +546,6 @@ test "AssistantMessageStream deinit drains unpollled events" {
         .timestamp = 0,
     };
     stream.complete(result);
-
 }
 
 test "EventStream push returns QueueFull when ring buffer exhausted" {
@@ -952,6 +956,43 @@ test "double_completion_is_idempotent_or_errors_predictably" {
     try std.testing.expectEqual(@as(?u32, 2), stream.getResult());
     try std.testing.expect(stream.getError() == null);
     try std.testing.expect(stream.wait() == null);
+}
+
+test "double completion frees the superseded result on an owning result type" {
+    const allocator = std.testing.allocator;
+    var stream = AssistantMessageStream.init(allocator);
+    defer stream.deinit();
+
+    const first = try allocator.alloc(ai_types.AssistantContent, 1);
+    first[0] = .{ .text = .{ .text = try allocator.dupe(u8, "superseded") } };
+    stream.complete(.{
+        .content = first,
+        .api = try allocator.dupe(u8, "api"),
+        .provider = try allocator.dupe(u8, "provider"),
+        .model = try allocator.dupe(u8, "model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 1,
+        .is_owned = true,
+    });
+
+    const second = try allocator.alloc(ai_types.AssistantContent, 1);
+    second[0] = .{ .text = .{ .text = try allocator.dupe(u8, "winner") } };
+    stream.complete(.{
+        .content = second,
+        .api = try allocator.dupe(u8, "api"),
+        .provider = try allocator.dupe(u8, "provider"),
+        .model = try allocator.dupe(u8, "model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 2,
+        .is_owned = true,
+    });
+
+    const held = stream.getResult() orelse return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), held.content.len);
+    try std.testing.expectEqualStrings("winner", held.content[0].text.text);
+    try std.testing.expectEqual(@as(i64, 2), held.timestamp);
 }
 
 const WaitTimeoutCtx = struct {

@@ -43,5 +43,16 @@ tmp/
 tui-pty-out/
 scripts/__pycache__/
 
+# Python SDK (python/)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+python/build/
+python/dist/
+
 # Rust build cache
 rust/target/
