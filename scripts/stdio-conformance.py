@@ -1142,14 +1142,20 @@ def group_shutdown(ctx):
 
     # Immediate EOF: the host prints ready and exits cleanly.
     started = time.time()
-    completed = subprocess.run([ctx.binary, "--stdio"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=20)
+    try:
+        completed = subprocess.run([ctx.binary, "--stdio"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=20)
+        exited_clean = completed.returncode == 0
+        outcome = "exit=%d" % completed.returncode
+    except subprocess.TimeoutExpired:
+        exited_clean = False
+        outcome = "HANG (no exit within 20s)"
     elapsed = time.time() - started
     results.append(Result(
         "immediate stdin EOF exits 0", "shutdown",
-        "pass" if completed.returncode == 0 else "fail",
+        "pass" if exited_clean else "fail",
         "spec 13.2.7 (the process exits when stdin closes and no work remains)",
-        "exit 0", "exit=%d in %.2fs" % (completed.returncode, elapsed)))
+        "exit 0", "%s in %.2fs" % (outcome, elapsed)))
 
     # Half-close with an idle session registered.
     host = ctx.host()
@@ -1211,9 +1217,12 @@ def group_resources(ctx):
     time.sleep(1.0)
 
     def rss_kb():
-        out = subprocess.run(["ps", "-o", "rss=", "-p", str(host.proc.pid)],
-                             capture_output=True, text=True).stdout.strip()
-        return int(out) if out else -1
+        try:
+            out = subprocess.run(["ps", "-o", "rss=", "-p", str(host.proc.pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except subprocess.TimeoutExpired:
+            return -1
+        return int(out) if out.isdigit() else -1
 
     window = ctx.resource_window
     first = rss_kb()
