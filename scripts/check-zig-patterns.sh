@@ -372,6 +372,147 @@ for file in "${required_files[@]}"; do
   fi
 done
 
+known_multi_alloc_literals="$(cat <<'LITERALS'
+zig/src/agent/agent.zig|                .data = try self._allocator.dupe(u8, i.data),
+zig/src/agent/agent_loop.zig|        .tool_call_id = try allocator.dupe(u8, tool_call.id),
+zig/src/agent/agent_loop.zig|        .tool_call_id = try allocator.dupe(u8, tool_call.id),
+zig/src/agent/provider_protocol_bridge.zig|        .api_key = if (options.api_key) |k| try allocator.dupe(u8, k) else null,
+zig/src/ai_types.zig|                .name = try allocator.dupe(u8, hp.name),
+zig/src/protocol/auth/server.zig|                .id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, definition.id)),
+zig/src/protocol/auth/server.zig|                .prompt_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, prompt_id)),
+zig/src/protocol/auth/server.zig|                .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
+zig/src/protocol/auth/server.zig|                .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
+zig/src/protocol/auth/server.zig|            .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
+zig/src/protocol/auth/server.zig|            .refresh = try self.allocator.dupe(u8, "fixture-refresh-token"),
+zig/src/protocol/provider/partial_reconstructor.zig|                    .id = if (tc.id) |id| try self.allocator.dupe(u8, id) else try self.allocator.dupe(u8, ""),
+zig/src/protocol/provider/server.zig|            .refresh = try allocator.dupe(u8, "refresh"),
+zig/src/protocol/provider/server.zig|        .model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, model_id_value)),
+zig/src/protocol/provider/server.zig|        .refresh = try allocator.dupe(u8, "refresh"),
+zig/src/protocol/provider/server.zig|        .refresh = try allocator.dupe(u8, credentials.refresh),
+zig/src/tools/auth_cli.zig|            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
+zig/src/tools/makai.zig|            .prompt_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
+zig/src/tools/makai.zig|            .tool_call_id = try allocator.dupe(u8, tool_call_id),
+zig/src/tools/permission.zig|                .tool_name = try self.allocator.dupe(u8, tool_name),
+zig/src/transport.zig|            .api = try allocator.dupe(u8, ""),
+zig/src/transport.zig|            .api = try allocator.dupe(u8, ""),
+zig/src/transport.zig|            .api = try allocator.dupe(u8, ""),
+zig/src/tui/config.zig|            .model = try allocator.dupe(u8, "claude-sonnet-4-5"),
+zig/src/tui/runtime.zig|                .data = try allocator.dupe(u8, img.data),
+zig/src/tui/runtime.zig|                .id = try allocator.dupe(u8, tc.id),
+zig/src/tui/runtime.zig|                .text = try allocator.dupe(u8, t.text),
+zig/src/tui/runtime.zig|                .thinking = try allocator.dupe(u8, t.thinking),
+zig/src/tui/session_store.zig|        .session_id = try allocator.dupe(u8, session_id),
+zig/src/tui/state.zig|            .id = try allocator.dupe(u8, id),
+zig/src/tui/state.zig|            .tool_call_id = try allocator.dupe(u8, tool_call_id),
+zig/src/utils/oauth/anthropic.zig|        .access_token = try allocator.dupe(u8, access_token),
+zig/src/utils/oauth/anthropic.zig|        .code = try allocator.dupe(u8, input),
+zig/src/utils/oauth/anthropic.zig|        .refresh = try allocator.dupe(u8, token_response.refresh_token),
+zig/src/utils/oauth/anthropic.zig|        .refresh = try allocator.dupe(u8, token_response.refresh_token),
+zig/src/utils/oauth/github_copilot.zig|        .device_code = try allocator.dupe(u8, parsed.value.device_code),
+zig/src/utils/oauth/openai_codex.zig|        .code = try allocator.dupe(u8, trimmed),
+zig/src/utils/pre_transform.zig|                                        .thinking = try allocator.dupe(u8, t.thinking),
+zig/src/utils/pre_transform.zig|                                    .text = try allocator.dupe(u8, t.text),
+zig/src/utils/pre_transform.zig|                                    .thinking = try allocator.dupe(u8, t.thinking),
+zig/src/utils/pre_transform.zig|                                .data = try allocator.dupe(u8, img.data),
+LITERALS
+)"
+
+multi_alloc_literal_pattern='try[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\\.(dupe|dupeZ|allocSentinel)[[:space:]]*\\(|try[[:space:]]+std\\.fmt\\.allocPrint[[:space:]]*\\(|try[[:space:]]+owned[[:space:]]*\\('
+
+scan_multi_alloc_literals() {
+  local file="$1"
+  awk -v file="$file" -v pattern="$multi_alloc_literal_pattern" '
+    NR == FNR { code[FNR] = $0; next }
+    { orig[FNR] = $0; if (FNR > last) last = FNR }
+    END {
+      in_test = 0
+      test_depth = 0
+      depth = 0
+      count = 0
+      first = 0
+      for (i = 1; i <= last; i++) {
+        line = code[i]
+        opens = gsub(/\{/, "{", line)
+        closes = gsub(/\}/, "}", line)
+        line = code[i]
+
+        if (!in_test && orig[i] ~ /^[[:space:]]*test[[:space:]]*["{]/) {
+          in_test = 1
+          test_depth = opens - closes
+          continue
+        }
+        if (in_test) {
+          test_depth += opens - closes
+          if (test_depth <= 0) in_test = 0
+          continue
+        }
+
+        if (depth == 0) {
+          trimmed = line
+          sub(/[[:space:]]+$/, "", trimmed)
+          if (trimmed ~ /\.\{$/ && opens > closes) {
+            depth = opens - closes
+            count = 0
+            first = 0
+          }
+          continue
+        }
+
+        depth += opens - closes
+        if (line ~ pattern) {
+          count++
+          if (first == 0) first = i
+        }
+        if (depth <= 0) {
+          if (count >= 2) print file "|" orig[first]
+          depth = 0
+          count = 0
+          first = 0
+        }
+      }
+    }
+  ' <(strip_noncode < "$file") "$file"
+}
+
+echo "[patterns] checking struct literals that allocate more than once..."
+actual_multi_alloc_literals=""
+while IFS= read -r -d '' file; do
+  literal_hits="$(scan_multi_alloc_literals "$file")"
+  if [[ -n "$literal_hits" ]]; then
+    actual_multi_alloc_literals+="$literal_hits"$'\n'
+  fi
+done < <(find zig/src -name "*.zig" -print0 | sort -z)
+
+undeclared_multi_alloc="$(comm -13 \
+  <(printf "%s\n" "$known_multi_alloc_literals" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_multi_alloc_literals" | grep -v '^$' | sort))"
+if [[ -n "$undeclared_multi_alloc" ]]; then
+  echo "[patterns] struct literal allocates more than once with no way to unwind:" >&2
+  echo "$undeclared_multi_alloc" >&2
+  echo "[patterns] Zig evaluates literal fields in order, so when a later allocation fails the" >&2
+  echo "[patterns] literal never completes and every field already allocated for it leaks. An" >&2
+  echo "[patterns] errdefer cannot help from inside a literal, and one placed after it never runs," >&2
+  echo "[patterns] because the assignment it guards was never reached. Build each field into a" >&2
+  echo "[patterns] local with its own errdefer first, so the literal itself becomes infallible;" >&2
+  echo "[patterns] see cloneModelDescriptor in zig/src/protocol/model_catalog_types.zig." >&2
+  echo "[patterns] Prove the fix with std.testing.checkAllAllocationFailures." >&2
+  echo "[patterns] known_multi_alloc_literals is a shrinking backlog of sites that predate this" >&2
+  echo "[patterns] check, not a list of approved ones. Adding to it needs a reason in the commit" >&2
+  echo "[patterns] message that says why this literal cannot leak - an arena freed wholesale on" >&2
+  echo "[patterns] error, for example. New code is expected to be fixed, not declared." >&2
+  exit 1
+fi
+
+stale_multi_alloc="$(comm -23 \
+  <(printf "%s\n" "$known_multi_alloc_literals" | grep -v '^$' | sort) \
+  <(printf "%s\n" "$actual_multi_alloc_literals" | grep -v '^$' | sort))"
+if [[ -n "$stale_multi_alloc" ]]; then
+  echo "[patterns] known_multi_alloc_literals declares a literal that no longer exists:" >&2
+  echo "$stale_multi_alloc" >&2
+  echo "[patterns] a fixed site must be removed from the list so the count keeps ratcheting down" >&2
+  exit 1
+fi
+
 echo "[patterns] checking providers do not drop stream events..."
 dropped_events="$(grep -n '\.push(' zig/src/providers/*.zig | grep -v 'keepalive' || true)"
 if [[ -n "$dropped_events" ]]; then
