@@ -453,9 +453,6 @@ const PollResult = struct {
 };
 
 fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.Allocator) !PollResult {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = if (std.mem.eql(u8, domain, "github.com"))
         token_url
     else
