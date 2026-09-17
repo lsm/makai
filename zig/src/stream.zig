@@ -40,10 +40,7 @@ pub fn complete(
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {
     const s = try stream(registry, model, context, options, allocator);
-    defer {
-        s.deinit();
-        allocator.destroy(s);
-    }
+    defer _ = s.deinitAndDestroy();
 
     while (s.wait()) |event| {
         s.releaseEvent(event);
@@ -61,10 +58,7 @@ pub fn completeSimple(
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {
     const s = try streamSimple(registry, model, context, options, allocator);
-    defer {
-        s.deinit();
-        allocator.destroy(s);
-    }
+    defer _ = s.deinitAndDestroy();
 
     while (s.wait()) |event| {
         s.releaseEvent(event);
