@@ -47,6 +47,7 @@ from .errors import (
     MakaiAuthRequiredError,
     MakaiProtocolError,
     MakaiStreamError,
+    TIMEOUT_CODE,
     is_timeout_error,
 )
 from .models import ModelsApi
@@ -779,6 +780,7 @@ async def _next(route: FrameRoute, timeout: float, context: TimeoutContext) -> D
             raise MakaiStreamError(
                 format_timeout_message(context),
                 kind="transport_error",
+                code=TIMEOUT_CODE,
                 diagnostics=build_diagnostics(context),
             ) from exc
         raise

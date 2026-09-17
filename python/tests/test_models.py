@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 import pytest
 
 from conftest import FakeServerFactory, read_log
-from makai.errors import MakaiProtocolError
+from makai.errors import TIMEOUT_CODE, MakaiProtocolError
 from makai.models import DEFAULT_CACHE_MAX_AGE_MS, _parse_models_response
 
 MODEL = {
@@ -211,6 +211,7 @@ async def test_timeout_carries_diagnostics(fake: FakeServerFactory) -> None:
         await client.models.list(provider_id="anthropic")
     error = excinfo.value
     assert "Timed out waiting for models_response" in str(error)
+    assert error.code == TIMEOUT_CODE
     assert error.diagnostics is not None
     assert error.diagnostics["operation"] == "models_response"
     assert error.diagnostics["provider_id"] == "anthropic"

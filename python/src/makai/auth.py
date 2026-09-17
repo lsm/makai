@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 from ._diagnostics import TimeoutContext, build_diagnostics, format_timeout_message
 from ._ids import new_ulid
 from ._wire import build_stream_envelope, payload_of
-from .errors import MakaiAuthError, MakaiStreamError, is_timeout_error
+from .errors import TIMEOUT_CODE, MakaiAuthError, MakaiStreamError, is_timeout_error
 from .transport import StdioTransport
 from .types import (
     AuthErrorEvent,
@@ -282,6 +282,7 @@ class AuthApi:
                 raise MakaiAuthError(
                     format_timeout_message(context),
                     kind="transport_error",
+                    code=TIMEOUT_CODE,
                     diagnostics=build_diagnostics(context),
                 ) from exc
             raise MakaiAuthError(exc.message, kind="transport_error", code=exc.code) from exc

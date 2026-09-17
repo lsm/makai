@@ -9,7 +9,7 @@ import pytest
 
 from conftest import FakeServerFactory, read_log
 from makai.auth import flatten_auth_event
-from makai.errors import MakaiAuthError
+from makai.errors import TIMEOUT_CODE, MakaiAuthError
 from makai.types import (
     AuthErrorEvent,
     AuthEvent,
@@ -398,6 +398,7 @@ async def test_login_timeout_carries_diagnostics(fake: FakeServerFactory) -> Non
     with pytest.raises(MakaiAuthError) as excinfo:
         await client.auth.login("anthropic")
     assert excinfo.value.kind == "transport_error"
+    assert excinfo.value.code == TIMEOUT_CODE
     assert excinfo.value.diagnostics is not None
     assert excinfo.value.diagnostics["provider_id"] == "anthropic"
 

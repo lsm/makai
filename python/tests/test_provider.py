@@ -11,7 +11,7 @@ import pytest
 
 from makai._wire import number_or
 from conftest import FakeServerFactory, read_log
-from makai.errors import MakaiAuthRequiredError, MakaiProtocolError, MakaiStreamError
+from makai.errors import TIMEOUT_CODE, MakaiAuthRequiredError, MakaiProtocolError, MakaiStreamError
 from makai.types import (
     MessageEnd,
     MessageStart,
@@ -340,6 +340,7 @@ async def test_timeout_carries_diagnostics(fake: FakeServerFactory) -> None:
             model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}]
         )
     assert excinfo.value.kind == "transport_error"
+    assert excinfo.value.code == TIMEOUT_CODE
     assert excinfo.value.diagnostics is not None
     assert excinfo.value.diagnostics["model_ref"] == MODEL_REF
     assert excinfo.value.diagnostics["provider_id"] == "anthropic"

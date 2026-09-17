@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set
 from ._diagnostics import TimeoutContext, build_diagnostics, format_timeout_message
 from ._ids import new_ulid
 from ._wire import build_stream_envelope, payload_of
-from .errors import MakaiProtocolError, MakaiStreamError, is_timeout_error
+from .errors import TIMEOUT_CODE, MakaiProtocolError, MakaiStreamError, is_timeout_error
 from .transport import StdioTransport
 from .types import ListModelsResponse, ModelCapability, ModelDescriptor, ReasoningEffort
 
@@ -209,7 +209,9 @@ def _build_payload(filters: Mapping[str, Any]) -> Dict[str, Any]:
 def _timeout_aware(error: MakaiStreamError, context: TimeoutContext) -> MakaiProtocolError:
     if is_timeout_error(error):
         return MakaiProtocolError(
-            format_timeout_message(context), None, diagnostics=build_diagnostics(context)
+            format_timeout_message(context),
+            TIMEOUT_CODE,
+            diagnostics=build_diagnostics(context),
         )
     return MakaiProtocolError(error.message, error.code)
 

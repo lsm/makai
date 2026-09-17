@@ -13,7 +13,7 @@ import pytest
 from conftest import FakeServerFactory, read_log
 from makai._ids import new_nano_id
 from makai.execution import _probe_stop_sequences, _stop_agent_with_sequence_probe
-from makai.errors import MakaiAuthRequiredError, MakaiStreamError
+from makai.errors import TIMEOUT_CODE, MakaiAuthRequiredError, MakaiStreamError
 from makai.types import (
     AgentEnd,
     AgentStart,
@@ -727,6 +727,7 @@ async def test_timeout_carries_session_diagnostics(fake: FakeServerFactory) -> N
     client = await fake.client({"ack": False}, response_timeout=0.3)
     with pytest.raises(MakaiStreamError) as excinfo:
         await client.agent.run(model_ref=MODEL_REF, messages=[{"role": "user", "content": "hi"}])
+    assert excinfo.value.code == TIMEOUT_CODE
     assert excinfo.value.diagnostics is not None
     assert NANO_ID.match(str(excinfo.value.diagnostics["session_id"]))
     assert excinfo.value.diagnostics["model_ref"] == MODEL_REF
