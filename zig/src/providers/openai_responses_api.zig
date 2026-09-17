@@ -188,8 +188,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     if (context.tools) |tools| {
         if (tools.len > 0) {
-            const supports_tool_strict = is_codex_model or isOpenAIHost(model.base_url) or
-                (if (model.compat) |model_compat| model_compat.supports_strict_mode orelse false else false);
+            const honors_native_caps = is_codex_model or isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model);
+            const model_compat: ai_types.OpenAICompatOptions = model.compat orelse .{};
+            const supports_tool_strict = model_compat.supports_strict_mode orelse honors_native_caps;
             try w.writeKey("tools");
             try w.beginArray();
             for (tools) |tool| {
@@ -2372,6 +2373,38 @@ test "buildRequestBody omits strict tool fields on generic endpoints" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 200000,
         .max_tokens = 16384,
+    };
+    const tools = [_]ai_types.Tool{.{
+        .name = "file_read",
+        .description = "Read a file",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    }};
+    const context: ai_types.Context = .{
+        .messages = &.{},
+        .tools = &tools,
+    };
+
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"file_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\"") == null);
+}
+
+test "buildRequestBody omits strict tool fields when a partial compat block leaves it unset" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5",
+        .api = "openai-responses",
+        .provider = "gateway",
+        .base_url = "https://gateway.example.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+        .compat = .{ .supports_anthropic_cache_ttl = true },
     };
     const tools = [_]ai_types.Tool{.{
         .name = "file_read",

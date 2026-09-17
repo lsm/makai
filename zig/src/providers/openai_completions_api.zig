@@ -30,7 +30,7 @@ const MergedCompat = struct {
 
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
-    const compat = model.compat;
+    const compat: ai_types.OpenAICompatOptions = model.compat orelse .{};
     const is_openai_native = isOpenAIHost(model.base_url);
     const honors_native_caps = is_openai_native or isTransparentOpenAIProxy(model);
     const detected_developer_role = if (honors_native_caps) caps.supports_developer_role else false;
@@ -38,19 +38,19 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
     const detected_max_tokens_field: []const u8 = if (honors_native_caps) caps.max_tokens_field else "max_tokens";
 
     return .{
-        .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
-        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse detected_developer_role else detected_developer_role,
-        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse detected_reasoning_effort else detected_reasoning_effort,
-        .supports_usage_in_streaming = if (compat) |c| c.supports_usage_in_streaming orelse true else true,
-        .max_tokens_field = if (compat) |c| switch (c.max_tokens_field) {
+        .supports_store = compat.supports_store orelse is_openai_native,
+        .supports_developer_role = compat.supports_developer_role orelse detected_developer_role,
+        .supports_reasoning_effort = compat.supports_reasoning_effort orelse detected_reasoning_effort,
+        .supports_usage_in_streaming = compat.supports_usage_in_streaming orelse true,
+        .max_tokens_field = if (compat.max_tokens_field) |field| switch (field) {
             .max_completion_tokens => "max_completion_tokens",
             .max_tokens => "max_tokens",
         } else detected_max_tokens_field,
-        .requires_tool_result_name = if (compat) |c| c.requires_tool_result_name orelse caps.requires_tool_result_name else caps.requires_tool_result_name,
-        .requires_assistant_after_tool_result = if (compat) |c| c.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool else caps.requires_assistant_after_tool,
-        .requires_thinking_as_text = if (compat) |c| c.requires_thinking_as_text orelse caps.requires_thinking_as_text else caps.requires_thinking_as_text,
-        .requires_mistral_tool_ids = if (compat) |c| c.requires_mistral_tool_ids orelse caps.requires_mistral_tool_ids else caps.requires_mistral_tool_ids,
-        .thinking_format = if (compat) |c| switch (c.thinking_format) {
+        .requires_tool_result_name = compat.requires_tool_result_name orelse caps.requires_tool_result_name,
+        .requires_assistant_after_tool_result = compat.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool,
+        .requires_thinking_as_text = compat.requires_thinking_as_text orelse caps.requires_thinking_as_text,
+        .requires_mistral_tool_ids = compat.requires_mistral_tool_ids orelse caps.requires_mistral_tool_ids,
+        .thinking_format = if (compat.thinking_format) |format| switch (format) {
             .openai => .openai,
             .zai => .zai,
             .qwen => .qwen,
@@ -59,7 +59,7 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
             .zai => .zai,
             .qwen => .qwen,
         },
-        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse honors_native_caps else is_openai_native,
+        .supports_strict_mode = compat.supports_strict_mode orelse honors_native_caps,
     };
 }
 
@@ -2518,13 +2518,7 @@ test "a declared capability does not drag OpenAI-native defaults along with it" 
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 128_000,
         .max_tokens = 100,
-        .compat = .{
-            .supports_anthropic_cache_ttl = true,
-            .supports_usage_in_streaming = null,
-            .supports_strict_mode = null,
-            .max_tokens_field = .max_tokens,
-            .thinking_format = .openai,
-        },
+        .compat = .{ .supports_anthropic_cache_ttl = true },
     };
 
     const merged = mergeCompat(model);
@@ -2540,6 +2534,29 @@ test "a declared capability does not drag OpenAI-native defaults along with it" 
     try std.testing.expectEqualStrings(detected.max_tokens_field, merged.max_tokens_field);
     try std.testing.expectEqual(detected.supports_strict_mode, merged.supports_strict_mode);
     try std.testing.expectEqual(detected.supports_usage_in_streaming, merged.supports_usage_in_streaming);
+}
+
+test "a partial compat block keeps the detected thinking format" {
+    const model: ai_types.Model = .{
+        .id = "glm-4.6",
+        .name = "GLM 4.6",
+        .api = "openai-completions",
+        .provider = "gateway",
+        .base_url = "https://api.zukijourney.com/v1",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{ .supports_anthropic_cache_ttl = true },
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(merged.thinking_format == .zai);
+
+    var keyless = model;
+    keyless.compat = null;
+    try std.testing.expectEqual(mergeCompat(keyless).thinking_format, merged.thinking_format);
 }
 
 test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {

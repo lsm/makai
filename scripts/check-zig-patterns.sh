@@ -377,7 +377,6 @@ zig/src/agent/agent.zig|                .data = try self._allocator.dupe(u8, i.d
 zig/src/agent/agent_loop.zig|        .tool_call_id = try allocator.dupe(u8, tool_call.id),
 zig/src/agent/agent_loop.zig|        .tool_call_id = try allocator.dupe(u8, tool_call.id),
 zig/src/agent/provider_protocol_bridge.zig|        .api_key = if (options.api_key) |k| try allocator.dupe(u8, k) else null,
-zig/src/ai_types.zig|                .name = try allocator.dupe(u8, hp.name),
 zig/src/protocol/auth/server.zig|                .id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, definition.id)),
 zig/src/protocol/auth/server.zig|                .prompt_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, prompt_id)),
 zig/src/protocol/auth/server.zig|                .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
