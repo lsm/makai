@@ -513,6 +513,11 @@ fn authProvider(provider: api_registry.ApiProvider) ?oauth_storage.OAuthProvider
     };
 }
 
+fn isVendorOAuthProviderId(provider_id: []const u8) bool {
+    return std.mem.eql(u8, provider_id, "anthropic") or
+        std.mem.eql(u8, provider_id, "openai-codex");
+}
+
 fn streamWithResolvedKey(
     server: *ProtocolServer,
     provider: api_registry.ApiProvider,
@@ -520,20 +525,20 @@ fn streamWithResolvedKey(
     model: ai_types.Model,
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
+    kind: auth_resolver.CredentialKind,
 ) !*event_stream.AssistantMessageEventStream {
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
 
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
-    else
-        blk: {
-            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
-                break :blk null;
-            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
-        };
+    else blk: {
+        loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
+            break :blk null;
+        break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+    };
 
-    const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
+    const resolved = auth_resolver.resolveApiKeyOfKind(server.allocator, storage, provider_id, null, kind) catch |err| switch (err) {
         error.AuthRequired => return provider.stream(model, context, options, server.allocator),
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -567,8 +572,7 @@ fn refreshWithLock(
             };
             server.refresh_lock.complete(provider_id, null, generation, null);
         },
-        .completed_ok => {
-        },
+        .completed_ok => {},
         .completed_err => |err| {
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -591,13 +595,24 @@ fn streamWithRefresh(
     }
 
     if (provider.auth_provider_id) |auth_provider_id| {
-        const is_vendor_oauth = std.mem.eql(u8, auth_provider_id, "anthropic") or
-            std.mem.eql(u8, auth_provider_id, "openai-codex");
-        if (is_vendor_oauth and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+        if (isVendorOAuthProviderId(auth_provider_id) and !std.mem.eql(u8, model.provider, auth_provider_id)) {
+            if (isVendorOAuthProviderId(model.provider)) return error.AuthRequired;
+            return streamWithResolvedKey(server, provider, model.provider, model, context, options, .api_key_only);
+        }
     }
     const provider_id = provider.auth_provider_id orelse model.provider;
+    const claims_vendor_without_vendor_api = provider.auth_provider_id == null and
+        isVendorOAuthProviderId(model.provider);
     const oauth_provider = authProvider(provider) orelse
-        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
+        return streamWithResolvedKey(
+            server,
+            provider,
+            provider_id,
+            model,
+            context,
+            options,
+            if (claims_vendor_without_vendor_api) .api_key_only else .any,
+        );
 
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
@@ -609,7 +624,7 @@ fn streamWithRefresh(
                 break :blk null;
             break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
         } orelse
-            return streamWithResolvedKey(server, provider, provider_id, model, context, options);
+            return streamWithResolvedKey(server, provider, provider_id, model, context, options, .any);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
         const stored_key = storage.getApiKey(provider_id, null) catch |err| switch (err) {
@@ -622,7 +637,7 @@ fn streamWithRefresh(
             defer deinitInjectedApiKey(server.allocator, &resolved_options);
             return provider.stream(model, context, resolved_options, server.allocator);
         }
-        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
+        return streamWithResolvedKey(server, provider, provider_id, model, context, options, .any);
     }
 
     if (storage.credentialsExpired(provider_id)) {
@@ -1819,6 +1834,247 @@ test "pre-call refresh failure returns auth_refresh_failed nack" {
 test "retry refresh failure returns auth_refresh_failed nack" {
     var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000, .fail_refresh = true, .auth_fail_first_call = true };
     try expectAuthRefreshFailedNack(&state);
+}
+
+test "a custom provider on a vendor OAuth api streams with its own key" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "vendor-api",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+        .auth_provider_id = "anthropic",
+        .auth_refresh_fn = authTestRefresh,
+        .auth_get_api_key_fn = authTestGetApiKey,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "gateway"),
+        .{ .api_key = try std.testing.allocator.dupe(u8, "gateway-key") },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "vendor-api";
+    model.provider = "gateway";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("vendor-api").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), state.stream_calls);
+    try std.testing.expectEqualStrings("gateway-key", state.last_api_key[0..state.last_api_key_len]);
+    try std.testing.expectEqual(@as(usize, 0), state.refresh_count);
+}
+
+test "a mismatched vendor provider id never reaches its stored OAuth token" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "vendor-api",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+        .auth_provider_id = "anthropic",
+        .auth_refresh_fn = authTestRefresh,
+        .auth_get_api_key_fn = authTestGetApiKey,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "openai-codex"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "codex-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "codex-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "vendor-api";
+    model.provider = "openai-codex";
+    model.base_url = "https://attacker.test";
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("vendor-api").?, model, testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+}
+
+test "a github-copilot model resolves its stored OAuth token on openai-completions" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "an api without an auth provider id never resolves a vendor OAuth token" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "keyless-api",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "anthropic"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "vendor-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "vendor-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "gateway"),
+        .{ .api_key = try std.testing.allocator.dupe(u8, "gateway-key") },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "keyless-api";
+    model.provider = "anthropic";
+    model.base_url = "https://attacker.test";
+
+    const leaked = try streamWithRefresh(&server, registry.getApiProvider("keyless-api").?, model, testContext(), null);
+    defer {
+        leaked.deinit();
+        std.testing.allocator.destroy(leaked);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.last_api_key_len);
+
+    var ordinary = testModel();
+    ordinary.api = "keyless-api";
+    ordinary.provider = "gateway";
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("keyless-api").?, ordinary, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+    try std.testing.expectEqualStrings("gateway-key", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "a custom provider id never resolves to a stored OAuth token" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "vendor-api",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+        .auth_provider_id = "anthropic",
+        .auth_refresh_fn = authTestRefresh,
+        .auth_get_api_key_fn = authTestGetApiKey,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "gateway"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gateway-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "gateway-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "vendor-api";
+    model.provider = "gateway";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("vendor-api").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), state.stream_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.last_api_key_len);
 }
 
 test "stored api_key used when provider has OAuth hook but storage has non-OAuth entry" {

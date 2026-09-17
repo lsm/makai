@@ -5,6 +5,7 @@ const ai_types = @import("ai_types");
 const oauth_storage = @import("oauth/storage");
 const codex_oauth = @import("oauth/openai_codex");
 const anthropic_oauth = @import("oauth/anthropic");
+const custom_providers = @import("custom_providers");
 
 const openai_codex_provider_id = "openai-codex";
 const openai_codex_api_id = "openai-codex-responses";
@@ -86,7 +87,10 @@ fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadM
         if (codex_refresh_error) |err| return err;
     }
 
-    const lists = [_]*[]ai_types.Model{ &codex_models, &kimi_models, &anthropic_models };
+    var custom_models = try loadCustomModels(allocator, storage, mode);
+    defer deinitModels(allocator, custom_models);
+
+    const lists = [_]*[]ai_types.Model{ &codex_models, &kimi_models, &anthropic_models, &custom_models };
     var total: usize = 0;
     for (lists) |list| total += list.len;
     const models = try allocator.alloc(ai_types.Model, total);
@@ -98,6 +102,237 @@ fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadM
         list.* = &.{};
     }
     return models;
+}
+
+var test_custom_providers_config: ?[]const u8 = null;
+var test_custom_discovery_ids: ?[]const []const u8 = null;
+
+fn loadCustomModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage, mode: CatalogLoadMode) ![]ai_types.Model {
+    const providers = if (builtin.is_test)
+        try custom_providers.parse(allocator, test_custom_providers_config orelse return emptyModels(allocator))
+    else
+        custom_providers.load(allocator, custom_providers.max_config_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return emptyModels(allocator),
+        };
+    defer custom_providers.deinitProviders(allocator, providers);
+
+    var models = std.ArrayList(ai_types.Model).empty;
+    errdefer {
+        for (models.items) |*model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+
+    for (providers) |*provider| {
+        try appendCustomProviderModels(allocator, &models, provider, storage, mode);
+    }
+    return models.toOwnedSlice(allocator);
+}
+
+fn appendCustomProviderModels(
+    allocator: std.mem.Allocator,
+    models: *std.ArrayList(ai_types.Model),
+    provider: *const custom_providers.CustomProvider,
+    storage: ?*oauth_storage.AuthStorage,
+    mode: CatalogLoadMode,
+) !void {
+    const discovered = try discoverCustomModelIds(allocator, provider, storage, mode);
+    defer if (discovered) |ids| freeModelIds(allocator, ids);
+
+    if (discovered) |ids| {
+        for (ids) |id| {
+            if (!provider.allows(id)) continue;
+            const spec = provider.specFor(id);
+            const display = if (spec) |found| found.name else id;
+            var model = try customModel(allocator, provider, id, display, spec);
+            errdefer model.deinit(allocator);
+            try models.append(allocator, model);
+        }
+        return;
+    }
+
+    for (provider.models) |spec| {
+        var model = try customModel(allocator, provider, spec.id, spec.name, spec);
+        errdefer model.deinit(allocator);
+        try models.append(allocator, model);
+    }
+}
+
+fn customModel(
+    allocator: std.mem.Allocator,
+    provider: *const custom_providers.CustomProvider,
+    id_text: []const u8,
+    name_text: []const u8,
+    spec: ?custom_providers.ModelSpec,
+) !ai_types.Model {
+    const id = try allocator.dupe(u8, id_text);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, name_text);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, provider.api);
+    errdefer allocator.free(api);
+    const provider_id = try allocator.dupe(u8, provider.id);
+    errdefer allocator.free(provider_id);
+    const base_url = try allocator.dupe(u8, provider.base_url);
+    errdefer allocator.free(base_url);
+
+    const input = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(input);
+    input[0] = try allocator.dupe(u8, "text");
+    errdefer allocator.free(input[0]);
+
+    var header_list = std.ArrayList(ai_types.HeaderPair).empty;
+    errdefer {
+        for (header_list.items) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+        header_list.deinit(allocator);
+    }
+    for (provider.headers) |header| {
+        const header_name = try allocator.dupe(u8, header.name);
+        errdefer allocator.free(header_name);
+        const header_value = try allocator.dupe(u8, header.value);
+        errdefer allocator.free(header_value);
+        try header_list.append(allocator, .{ .name = header_name, .value = header_value });
+    }
+    const headers: ?[]ai_types.HeaderPair = if (provider.headers.len > 0)
+        try header_list.toOwnedSlice(allocator)
+    else
+        null;
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider_id,
+        .base_url = base_url,
+        .reasoning = provider.reasoning,
+        .input = input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = if (spec) |found| (found.context_window orelse provider.context_window) else provider.context_window,
+        .max_tokens = if (spec) |found| (found.max_tokens orelse provider.max_tokens) else provider.max_tokens,
+        .headers = headers,
+        .compat = provider.compat,
+        .is_owned = true,
+    };
+}
+
+fn freeModelIds(allocator: std.mem.Allocator, ids: [][]const u8) void {
+    for (ids) |id| allocator.free(id);
+    allocator.free(ids);
+}
+
+fn customCatalogName(allocator: std.mem.Allocator, provider_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "custom-{s}.json", .{provider_id});
+}
+
+fn customModelsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/v1/models", .{base_url});
+}
+
+fn discoverCustomModelIds(
+    allocator: std.mem.Allocator,
+    provider: *const custom_providers.CustomProvider,
+    storage: ?*oauth_storage.AuthStorage,
+    mode: CatalogLoadMode,
+) !?[][]const u8 {
+    if (builtin.is_test) {
+        const ids = test_custom_discovery_ids orelse return null;
+        const out = try allocator.alloc([]const u8, ids.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |value| allocator.free(value);
+            allocator.free(out);
+        }
+        for (ids, 0..) |id, i| {
+            out[i] = try allocator.dupe(u8, id);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    const name = try customCatalogName(allocator, provider.id);
+    defer allocator.free(name);
+
+    if (mode == .allow_cache) {
+        if (try loadCachedModelIds(allocator, name, anthropic_catalog_max_age_ms)) |ids| return ids;
+        return loadCachedModelIds(allocator, name, null);
+    }
+
+    const token = customCredential(allocator, provider, storage);
+    defer if (token) |value| secureFree(allocator, value);
+
+    if (fetchCustomModelsCatalog(allocator, provider, token)) |body| {
+        defer allocator.free(body);
+        if (parseModelIds(allocator, body)) |ids| {
+            if (ids.len > 0) {
+                saveMakaiCatalog(allocator, name, body) catch {};
+                return ids;
+            }
+            freeModelIds(allocator, ids);
+        } else |_| {}
+    } else |_| {}
+
+    return loadCachedModelIds(allocator, name, null);
+}
+
+fn loadCachedModelIds(allocator: std.mem.Allocator, name: []const u8, max_age_ms: ?i64) !?[][]const u8 {
+    const path = makaiCatalogPath(allocator, name) catch return null;
+    defer allocator.free(path);
+    if (max_age_ms) |max_age| {
+        const modified = compat.fs.modifiedMillis(compat.fs.getCwd(), path) catch return null;
+        if (!catalogIsFresh(modified, compat.time.nowMillis(), max_age)) return null;
+    }
+    const data = compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), path, max_catalog_bytes) catch return null;
+    defer allocator.free(data);
+    const ids = parseModelIds(allocator, data) catch return null;
+    if (ids.len > 0) return ids;
+    freeModelIds(allocator, ids);
+    return null;
+}
+
+fn customCredential(
+    allocator: std.mem.Allocator,
+    provider: *const custom_providers.CustomProvider,
+    storage: ?*oauth_storage.AuthStorage,
+) ?[]const u8 {
+    if (storage) |stored| {
+        if (stored.providers.get(provider.id)) |auth| {
+            switch (auth) {
+                .api_key => |key| return allocator.dupe(u8, key) catch null,
+                .oauth => |value| return allocator.dupe(u8, value.access) catch null,
+            }
+        }
+    }
+    if (provider.env_key) |env_name| {
+        if (compat.getEnvVarOwned(allocator, env_name)) |value| {
+            if (value.len > 0) return value;
+            allocator.free(value);
+        } else |_| {}
+    }
+    return null;
+}
+
+fn parseModelIds(allocator: std.mem.Allocator, data: []const u8) ![][]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidModelCatalog;
+    const list = parsed.value.object.get("data") orelse return error.InvalidModelCatalog;
+    if (list != .array) return error.InvalidModelCatalog;
+
+    var ids = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+    for (list.array.items) |item| {
+        if (item != .object) continue;
+        const id = objectString(&item.object, "id") orelse continue;
+        if (id.len == 0) continue;
+        try ids.append(allocator, try allocator.dupe(u8, id));
+    }
+    return ids.toOwnedSlice(allocator);
 }
 
 fn loadKimiModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage) ![]ai_types.Model {
@@ -358,6 +593,61 @@ fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) 
         .extra_headers = headers.items,
         .accept_encoding = "identity",
     });
+    defer req.deinit();
+
+    try compat.http.sendBodilessRequest(&req);
+
+    var head_buf: [4096]u8 = undefined;
+    var response = try compat.http.receiveResponse(&req, &head_buf);
+
+    var transfer_buf: [4096]u8 = undefined;
+    const reader = compat.http.responseReader(&response, &transfer_buf);
+    const body = try compat.http.allocRemainingResponse(allocator, reader, max_catalog_bytes);
+    errdefer allocator.free(body);
+
+    if (response.head.status != .ok) return error.ModelCatalogFetchFailed;
+    return body;
+}
+
+fn fetchCustomModelsCatalog(
+    allocator: std.mem.Allocator,
+    provider: *const custom_providers.CustomProvider,
+    token: ?[]const u8,
+) ![]u8 {
+    const url = try customModelsUrl(allocator, provider.base_url);
+    defer allocator.free(url);
+    const uri = try std.Uri.parse(url);
+
+    var client = compat.http.HttpClient.init(allocator);
+    defer client.deinit();
+
+    var environ_map = compat.createEnvMap(allocator) catch null;
+    defer if (environ_map) |*map| map.deinit();
+    if (environ_map) |*map| {
+        client.initDefaultProxies(allocator, map) catch {};
+    }
+
+    var bearer: ?[]u8 = null;
+    defer if (bearer) |value| secureFree(allocator, value);
+
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
+    if (token) |value| {
+        if (std.mem.eql(u8, provider.api, "anthropic-messages")) {
+            try headers.append(allocator, .{ .name = "x-api-key", .value = value });
+            try headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" });
+        } else {
+            bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{value});
+            try headers.append(allocator, .{ .name = "authorization", .value = bearer.? });
+        }
+    }
+    for (provider.headers) |header| {
+        if (compat.http.headerPresent(headers.items, header.name)) continue;
+        try headers.append(allocator, .{ .name = header.name, .value = header.value });
+    }
+
+    var req = try client.openRequest(.GET, uri, .{ .extra_headers = headers.items, .accept_encoding = "identity" });
     defer req.deinit();
 
     try compat.http.sendBodilessRequest(&req);
@@ -935,6 +1225,112 @@ test "parseAnthropicModels maps the models endpoint into owned Anthropic models"
     try std.testing.expectEqual(@as(u32, 32_000), models[1].max_tokens);
     try std.testing.expectEqual(@as(f64, 0), models[2].cost.input);
     try std.testing.expect(models[2].reasoning);
+}
+
+const custom_gateway_config =
+    \\{"providers":[{"id":"gateway","name":"Gateway","api":"anthropic-messages",
+    \\ "base_url":"https://gw.test/anthropic/v1",
+    \\ "headers":{"X-Tenant":"acme"},
+    \\ "reasoning":true,
+    \\ "models":[{"id":"claude-x","name":"Claude X","context_window":250000,"max_tokens":40000},"claude-y"],
+    \\ "capabilities":{"cache_ttl":true}}]}
+;
+
+const custom_two_provider_config =
+    \\{"providers":[
+    \\ {"id":"aaa","base_url":"https://aaa.test","models":["keep-a"]},
+    \\ {"id":"zzz","base_url":"https://zzz.test","models":["keep-z"]}
+    \\]}
+;
+
+test "discovery result is filtered per provider and never falls back to the declared list" {
+    test_custom_providers_config = custom_two_provider_config;
+    test_custom_discovery_ids = &[_][]const u8{ "keep-a", "keep-z", "noisy" };
+    defer {
+        test_custom_providers_config = null;
+        test_custom_discovery_ids = null;
+    }
+
+    const models = try loadCustomModels(std.testing.allocator, null, .allow_cache);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("keep-a", models[0].id);
+    try std.testing.expectEqualStrings("aaa", models[0].provider);
+    try std.testing.expectEqualStrings("keep-z", models[1].id);
+    try std.testing.expectEqualStrings("zzz", models[1].provider);
+}
+
+test "a provider whose discovery is fully filtered contributes nothing regardless of file order" {
+    const orders = [_][]const u8{
+        \\{"providers":[
+        \\ {"id":"empty","base_url":"https://empty.test","models":["absent"]},
+        \\ {"id":"full","base_url":"https://full.test","models":["present"]}
+        \\]}
+        ,
+        \\{"providers":[
+        \\ {"id":"full","base_url":"https://full.test","models":["present"]},
+        \\ {"id":"empty","base_url":"https://empty.test","models":["absent"]}
+        \\]}
+        ,
+    };
+    test_custom_discovery_ids = &[_][]const u8{"present"};
+    defer test_custom_discovery_ids = null;
+
+    for (orders) |config| {
+        test_custom_providers_config = config;
+        defer test_custom_providers_config = null;
+
+        const models = try loadCustomModels(std.testing.allocator, null, .allow_cache);
+        defer deinitModels(std.testing.allocator, models);
+
+        try std.testing.expectEqual(@as(usize, 1), models.len);
+        try std.testing.expectEqualStrings("present", models[0].id);
+        try std.testing.expectEqualStrings("full", models[0].provider);
+    }
+}
+
+test "loadProductionModels includes models from a declared custom provider" {
+    test_custom_providers_config = custom_gateway_config;
+    defer test_custom_providers_config = null;
+
+    const models = try loadProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+
+    const first = models[0];
+    try std.testing.expectEqualStrings("claude-x", first.id);
+    try std.testing.expectEqualStrings("Claude X", first.name);
+    try std.testing.expectEqualStrings("gateway", first.provider);
+    try std.testing.expectEqualStrings("anthropic-messages", first.api);
+    try std.testing.expectEqualStrings("https://gw.test/anthropic", first.base_url);
+    try std.testing.expectEqual(@as(u32, 250000), first.context_window);
+    try std.testing.expectEqual(@as(u32, 40000), first.max_tokens);
+    try std.testing.expect(first.reasoning);
+    try std.testing.expectEqual(@as(?bool, true), first.compat.?.supports_anthropic_cache_ttl);
+    try std.testing.expectEqual(@as(usize, 1), first.headers.?.len);
+    try std.testing.expectEqualStrings("X-Tenant", first.headers.?[0].name);
+    try std.testing.expectEqualStrings("acme", first.headers.?[0].value);
+
+    const second = models[1];
+    try std.testing.expectEqualStrings("claude-y", second.id);
+    try std.testing.expectEqualStrings("claude-y", second.name);
+    try std.testing.expectEqual(@as(u32, 128_000), second.context_window);
+    try std.testing.expectEqual(@as(u32, 8_192), second.max_tokens);
+}
+
+fn customCatalogProbe(allocator: std.mem.Allocator) !void {
+    test_custom_providers_config = custom_gateway_config;
+    defer test_custom_providers_config = null;
+    const models = try loadCustomModels(allocator, null, .allow_cache);
+    defer deinitModels(allocator, models);
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+}
+
+test "custom catalog models free every allocation when one fails midway" {
+    try customCatalogProbe(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, customCatalogProbe, .{});
 }
 
 test "loadProductionModels includes the Anthropic static list when forced" {

@@ -187,6 +187,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const custom_providers_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/custom_providers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "provider_base_url", .module = provider_base_url_mod },
+        },
+    });
+    const custom_providers_test = b.addTest(.{ .root_module = custom_providers_mod });
+
     const auth_resolver_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/utils/auth_resolver.zig"),
         .target = target,
@@ -194,6 +206,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "custom_providers", .module = custom_providers_mod },
         },
     });
 
@@ -1015,6 +1028,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "custom_providers", .module = custom_providers_mod },
         },
     });
 
@@ -1047,6 +1061,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
             .{ .name = "tui_login", .module = tui_login_mod },
+            .{ .name = "custom_providers", .module = custom_providers_mod },
             .{ .name = "model_catalog", .module = model_catalog_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
             .{ .name = "tui_theme", .module = tui_theme_mod },
@@ -1669,6 +1684,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(counting_allocator_test).step);
     test_step.dependOn(&b.addRunArtifact(bench_compare_test).step);
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
+    test_step.dependOn(&b.addRunArtifact(custom_providers_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_step.dependOn(&b.addRunArtifact(compat_test).step);
@@ -1780,6 +1796,7 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(ai_types_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(custom_providers_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(compat_test).step);
