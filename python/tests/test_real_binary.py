@@ -26,7 +26,7 @@ import os
 import pytest
 
 from conftest import process_alive
-from makai._wire import build_stream_envelope
+from makai._wire import build_stream_envelope, payload_of
 from makai.client import MakaiClient
 from makai.errors import MakaiProtocolError, MakaiStreamError
 from makai.transport import StdioTransport
@@ -117,24 +117,28 @@ async def test_concurrent_requests_do_not_cross_talk(real_binary: str) -> None:
         await client.close()
 
 
-async def test_unknown_envelope_type_is_silently_ignored(real_binary: str) -> None:
-    """A well-formed envelope with an unrecognised ``type`` gets no reply.
+async def test_unknown_envelope_type_draws_a_correlated_nack(real_binary: str) -> None:
+    """A well-formed envelope with an unrecognised ``type`` is refused, not ignored.
 
-    Verified against the runtime: only a *malformed* or ambiguous frame draws
-    the host-level ``unknown_envelope`` error (see the next test). A caller
-    that invents a frame type therefore just times out, which is why every
-    request path here has a bounded timeout.
+    The runtime used to drop it in silence, so a caller could not tell a
+    rejected request from a slow one and could only wait out its timeout. It
+    now answers a routable ``nack`` correlated by ``in_reply_to``, which is why
+    the route receives it instead of expiring. Contrast the next test: input
+    too malformed to carry a route draws the unroutable ``unknown_envelope``
+    error frame and is counted as dropped.
     """
     transport = await open_transport(real_binary)
     try:
         async with transport.route(stream_id="01ARZ3NDEKTSV4RRFFQ69G5FAV") as route:
-            await transport.send(
-                build_stream_envelope(
-                    "definitely_not_a_real_envelope", "01ARZ3NDEKTSV4RRFFQ69G5FAV", {}
-                )
+            envelope = build_stream_envelope(
+                "definitely_not_a_real_envelope", "01ARZ3NDEKTSV4RRFFQ69G5FAV", {}
             )
-            with pytest.raises(MakaiStreamError, match="timed out"):
-                await route.next_frame(2.0)
+            await transport.send(envelope)
+            frame = await route.next_frame(2.0)
+
+        assert frame["type"] == "nack"
+        assert frame["in_reply_to"] == envelope["message_id"]
+        assert payload_of(frame)["error_code"] == "invalid_request"
         assert transport.dropped_frames == 0
     finally:
         await transport.close()
