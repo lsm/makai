@@ -41,15 +41,21 @@ tmp/
 
 # TUI PTY harness output (scripts/tui-pty-driver.py)
 tui-pty-out/
-scripts/__pycache__/
 
-# Python SDK (python/)
+# Python bytecode and test/type caches
+scripts/__pycache__/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# Python SDK (python/)
 .venv/
 venv/
 *.egg-info/
 python/build/
 python/dist/
+
+# Rust build cache
+rust/target/
