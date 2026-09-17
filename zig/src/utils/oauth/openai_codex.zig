@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const compat = @import("compat");
 const http = compat.http;
@@ -466,8 +465,6 @@ fn exchangeTokens(body: []const u8, content_type: []const u8, allocator: std.mem
         .accept_encoding = "identity",
     });
     defer request.deinit();
-
-    request.headers.accept_encoding = .omit;
 
     try http.sendRequest(&request, body);
 

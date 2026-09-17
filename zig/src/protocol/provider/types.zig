@@ -55,31 +55,14 @@ const ULID_ENCODE = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn ulidDecode(c: u8) ?u5 {
     return switch (c) {
-        '0', 'O', 'o' => 0,
-        '1', 'I', 'i', 'L', 'l' => 1,
-        '2'...'9' => @intCast(c - '0'),
-        'A', 'a' => 10,
-        'B', 'b' => 11,
-        'C', 'c' => 12,
-        'D', 'd' => 13,
-        'E', 'e' => 14,
-        'F', 'f' => 15,
-        'G', 'g' => 16,
-        'H', 'h' => 17,
-        'J', 'j' => 18,
-        'K', 'k' => 19,
-        'M', 'm' => 20,
-        'N', 'n' => 21,
-        'P', 'p' => 22,
-        'Q', 'q' => 23,
-        'R', 'r' => 24,
-        'S', 's' => 25,
-        'T', 't' => 26,
-        'V', 'v' => 27,
-        'W', 'w' => 28,
-        'X', 'x' => 29,
-        'Y', 'y' => 30,
-        'Z', 'z' => 31,
+        '0'...'9' => @intCast(c - '0'),
+        'A'...'H' => @intCast(c - 'A' + 10),
+        'J' => 18,
+        'K' => 19,
+        'M' => 20,
+        'N' => 21,
+        'P'...'T' => @intCast(c - 'P' + 22),
+        'V'...'Z' => @intCast(c - 'V' + 27),
         else => null,
     };
 }
@@ -147,6 +130,31 @@ pub fn parseUlid(str: []const u8) ?Ulid {
         }
     }
     return ulid;
+}
+
+test "parseUlid accepts only canonical uppercase Crockford" {
+    const canonical = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    try std.testing.expect(parseUlid(canonical) != null);
+
+    try std.testing.expect(parseUlid("01arz3ndektsv4rrffq69g5fav") == null);
+    try std.testing.expect(parseUlid("01ARZ3NDEKTSV4RRFFQ69G5FAv") == null);
+
+    try std.testing.expect(parseUlid("O1ARZ3NDEKTSV4RRFFQ69G5FAV") == null);
+    try std.testing.expect(parseUlid("0IARZ3NDEKTSV4RRFFQ69G5FAV") == null);
+    try std.testing.expect(parseUlid("0LARZ3NDEKTSV4RRFFQ69G5FAV") == null);
+    try std.testing.expect(parseUlid("01ARZ3NDEKTSV4RRFFQ69G5FAU") == null);
+}
+
+test "parseUlid round-trips every canonical character" {
+    const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    for (alphabet) |c| {
+        var buf: [26]u8 = [_]u8{'0'} ** 26;
+        buf[25] = c;
+        const parsed = parseUlid(&buf) orelse return error.TestExpectedCanonicalAccepted;
+        var rendered: [26]u8 = undefined;
+        const out = ulidToBuffer(parsed, &rendered);
+        try std.testing.expectEqual(c, out[25]);
+    }
 }
 
 pub const Envelope = struct {
@@ -484,7 +492,7 @@ test "parseUlid returns null for invalid strings" {
 
     try std.testing.expect(parseUlid("8ZZZZZZZZZZZZZZZZZZZZZZZZZ") == null);
 
-    try std.testing.expect(parseUlid("0I8D2PF2DBSQQZWQ5TK1V58CGG") != null);
+    try std.testing.expect(parseUlid("0I8D2PF2DBSQQZWQ5TK1V58CGG") == null);
 
     try std.testing.expect(parseUlid("") == null);
 }
