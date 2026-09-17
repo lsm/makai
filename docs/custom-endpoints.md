@@ -197,8 +197,27 @@ so claiming `provider: "openai-codex"` on `anthropic-messages` cannot pull the
 stored Codex token. Otherwise it resolves the credential for that id under an
 api-key-only rule that skips OAuth entries entirely. A custom provider's
 credential is always a stored API key or an environment variable, so the rule
-costs it nothing, and no OAuth access token can leave through this path whatever
-id the request claims.
+costs it nothing, and the `anthropic` and `openai-codex` OAuth tokens cannot be
+resolved under a borrowed identity.
+
+**What these rules do not do**, stated plainly because the boundary is narrower
+than it looks. They stop a stored OAuth token being resolved under a *different*
+provider's identity. They do not constrain where a provider's *own* token is
+sent, because `base_url` arrives in the request and legitimate proxy setups
+depend on that; the `MAKAI_BASE_URL` and per-provider overrides exist for exactly
+that reason. So a request naming `anthropic` on `anthropic-messages`, or
+`github-copilot` on `openai-completions`, still reaches its own credential with
+whatever `base_url` it supplies.
+
+`github-copilot` is the sharpest case and cannot be fixed by widening the vendor
+set. Copilot is stored as an OAuth credential and its models genuinely run on
+`openai-completions`, an API that declares no `auth_provider_id`, so the
+legitimate request and the exfiltrating one are the same request with a different
+`base_url`. Adding `github-copilot` to the refused set makes Copilot resolve no
+credential at all, which a test in `protocol/provider/server.zig` pins. Binding a
+vendor credential to an allowed origin is the fix that would close this, and it
+is a separate change with its own decision about how proxy overrides stay
+usable.
 
 The third rule covers the wire formats that have no vendor of their own. Only
 `anthropic-messages` and `openai-codex-responses` declare an `auth_provider_id`;

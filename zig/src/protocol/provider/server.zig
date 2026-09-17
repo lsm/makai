@@ -1927,6 +1927,50 @@ test "a mismatched vendor provider id never reaches its stored OAuth token" {
     try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
 }
 
+test "a github-copilot model resolves its stored OAuth token on openai-completions" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
+}
+
 test "an api without an auth provider id never resolves a vendor OAuth token" {
     var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
     auth_test_state = &state;
