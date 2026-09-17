@@ -1,62 +1,13 @@
-## Summary
+## What changed and why
 
-- Phase/Sub-phase:
-- Linked issue:
-- Scope statement (what is in / out):
+<!-- 2-4 sentences, then bullets. Skip the design essay; that belongs in the commit body. -->
 
-## Spec Alignment (Required)
+## Notes for reviewers
 
-- Clauses implemented:
-  - [ ] `docs/v1-sdk-agent-provider-spec.md §...`
-  - [ ] `docs/ts-sdk-chat-integration-plan.md §...`
-  - [ ] `DESIGN.md §...`
-- If behavior changed, docs updated in same PR:
-  - [ ] Yes
+<!-- Risk, migration, anything you want pushed back on. Delete if there's nothing. -->
 
-## Traceability Matrix (Required)
-
-- Updated rows in `docs/implementation-traceability-matrix.md`:
-  - [ ] Row ID(s):
-- Row status now:
-  - [ ] `in progress`
-  - [ ] `done`
-
-## Backward Compatibility (Required)
-
-- Compatibility impact:
-  - [ ] Backward-compatible (no existing behavior changed)
-  - [ ] Behavior changed (documented below)
-- If behavior changed, migration notes provided:
-  - [ ] Yes
-- Notes:
-  - [ ] `...`
-
-## Tests (Required)
-
-- Unit tests:
-  - [ ] Added/updated
-- Integration tests:
-  - [ ] Added/updated
-- Protocol contract tests:
-  - [ ] Added/updated
-- Concurrency/race tests (if applicable):
-  - [ ] Added/updated
-- Commands run (paste outputs or summaries):
-  - [ ] `...`
-
-## External Review Rounds (Required)
-
-| Round | Reviewer | P0 | P1 | P2 | P3 | Resolution commit(s) | Status |
-|---|---|---:|---:|---:|---:|---|---|
-| 1 | | | | | | | |
-| 2 | | | | | | | |
-
-- [ ] At least 2 external rounds completed
-- [ ] No unresolved P0/P1 findings
-
-## Merge Checklist (Required)
-
-- [ ] Scope stays within single phase/sub-phase
-- [ ] No unresolved blocking review findings
-- [ ] CI green
-- [ ] Matrix updated
+<!--
+V1 implementation PRs (scoped in docs/review-process.md §2) carry extra
+requirements: §7 lists the artifacts this description must include, §6 the exit
+criteria for merge.
+-->
