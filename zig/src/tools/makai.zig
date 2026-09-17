@@ -412,8 +412,7 @@ const ActiveAgentRun = struct {
 
     fn deinit(self: *ActiveAgentRun, allocator: std.mem.Allocator) void {
         self.cancel();
-        self.stream.deinit();
-        allocator.destroy(self.stream);
+        if (!self.stream.deinitAndDestroy()) return;
         self.context.deinit();
         allocator.destroy(self.context);
         self.model.deinit(allocator);
@@ -714,8 +713,7 @@ const StdioProtocolLoop = struct {
         const stream = try agent_loop.agentLoop(self.allocator, prepared.prompts, context, config);
         var stream_owned_by_run = false;
         errdefer if (!stream_owned_by_run) {
-            stream.deinit();
-            self.allocator.destroy(stream);
+            _ = stream.deinitAndDestroy();
         };
 
         var run = ActiveAgentRun{
@@ -2501,10 +2499,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const stream = try protocol.stream(model, context, .{
         .api_key = api_key_copy,
     }, allocator);
-    defer {
-        stream.deinit();
-        allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     perr("[print] stream created, polling events...\n");
 
@@ -2578,10 +2573,7 @@ fn runPrintAgentLoop(
         .thinking_level = .low,
         .max_iterations = 1,
     });
-    defer {
-        stream.deinit();
-        allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     var event_count: usize = 0;
     while (stream.wait()) |event| {

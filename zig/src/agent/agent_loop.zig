@@ -825,10 +825,7 @@ fn streamAssistantResponse(
         options,
         allocator,
     );
-    defer {
-        provider_stream.deinit();
-        allocator.destroy(provider_stream);
-    }
+    defer _ = provider_stream.deinitAndDestroy();
 
     var final_message: ?ai_types.AssistantMessage = null;
     var message_started = false;

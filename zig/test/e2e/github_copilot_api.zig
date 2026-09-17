@@ -45,10 +45,7 @@ test "github_copilot e2e: basic text generation" {
         .max_tokens = 50,
         .temperature = 0.0,
     }, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     while (!stream.isDone()) {
         _ = stream.poll();
@@ -107,10 +104,7 @@ test "github_copilot e2e: streaming events sequence" {
         .api_key = ai_types.OwnedSlice(u8).initBorrowed(creds.copilot_token),
         .max_tokens = 50,
     }, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     var saw_start = false;
     var saw_text_delta = false;

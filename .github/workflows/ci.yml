@@ -190,6 +190,55 @@ jobs:
         run: go test -race ./...
 
   # =============================================================================
+  rust-sdk:
+    name: Rust SDK
+    needs: [unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build makai binary for Rust SDK E2E
+        working-directory: .
+        run: zig build install --prefix /tmp/makai-rs
+
+      - name: Run Rust SDK unit + E2E tests
+        env:
+          MAKAI_BINARY_PATH: /tmp/makai-rs/bin/makai
+        run: cargo test --all-features
+
+  # =============================================================================
   # Python SDK (python/)
   #
   # Mirrors ts-sdk-e2e: build the runtime, point MAKAI_BINARY_PATH at it, and
