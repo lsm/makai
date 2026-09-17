@@ -147,7 +147,9 @@ pub const ToolProtocolServer = struct {
                     if (prefix) |p| {
                         if (!std.mem.startsWith(u8, tool.name, p)) continue;
                     }
-                    try metas.append(allocator, try toolMetadataFromAgentTool(allocator, tool));
+                    var meta = try toolMetadataFromAgentTool(allocator, tool);
+                    errdefer deinitToolMetadata(&meta, allocator);
+                    try metas.append(allocator, meta);
                 }
                 return self.nextEnvelope(env.message_id, .{ .tool_list_response = .{ .tools = try metas.toOwnedSlice(allocator) } });
             },
@@ -171,6 +173,14 @@ pub const ToolProtocolClient = struct {
         args_json: []const u8,
         allocator: std.mem.Allocator,
     ) !tool_types.Envelope {
+        const owned_tool_call_id = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(owned_tool_call_id);
+
+        const owned_tool_name = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(owned_tool_name);
+
+        const owned_args_json = try allocator.dupe(u8, args_json);
+
         self.sequence += 1;
         return .{
             .server_id = self.server_id,
@@ -179,9 +189,9 @@ pub const ToolProtocolClient = struct {
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .tool_execute = .{
                 .execution_id = tool_types.generateUlid(),
-                .tool_call_id = try allocator.dupe(u8, tool_call_id),
-                .tool_name = try allocator.dupe(u8, tool_name),
-                .args_json = try allocator.dupe(u8, args_json),
+                .tool_call_id = owned_tool_call_id,
+                .tool_name = owned_tool_name,
+                .args_json = owned_args_json,
             } },
         };
     }
@@ -434,13 +444,27 @@ fn cloneArtifactsToTool(allocator: std.mem.Allocator, artifacts: []const ai_type
         allocator.free(cloned);
     }
     for (artifacts, 0..) |artifact, i| {
+        const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+        errdefer allocator.free(artifact_id);
+
+        const uri: ?[]u8 = if (artifact.getUri()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (uri) |v| allocator.free(v);
+
+        const mime_type: ?[]u8 = if (artifact.getMimeType()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (mime_type) |v| allocator.free(v);
+
+        const sha256: ?[]u8 = if (artifact.getSha256()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (sha256) |v| allocator.free(v);
+
+        const description: ?[]u8 = if (artifact.getDescription()) |v| try allocator.dupe(u8, v) else null;
+
         cloned[i] = .{
-            .artifact_id = try allocator.dupe(u8, artifact.artifact_id),
-            .uri = if (artifact.getUri()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .mime_type = if (artifact.getMimeType()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .artifact_id = artifact_id,
+            .uri = if (uri) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .mime_type = if (mime_type) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
             .byte_size = artifact.byte_size,
-            .sha256 = if (artifact.getSha256()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .description = if (artifact.getDescription()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .sha256 = if (sha256) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .description = if (description) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
         };
         initialized += 1;
     }
@@ -455,13 +479,27 @@ fn cloneArtifactsToAgent(allocator: std.mem.Allocator, artifacts: []const tool_t
         allocator.free(cloned);
     }
     for (artifacts, 0..) |artifact, i| {
+        const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+        errdefer allocator.free(artifact_id);
+
+        const uri: ?[]u8 = if (artifact.getUri()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (uri) |v| allocator.free(v);
+
+        const mime_type: ?[]u8 = if (artifact.getMimeType()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (mime_type) |v| allocator.free(v);
+
+        const sha256: ?[]u8 = if (artifact.getSha256()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (sha256) |v| allocator.free(v);
+
+        const description: ?[]u8 = if (artifact.getDescription()) |v| try allocator.dupe(u8, v) else null;
+
         cloned[i] = .{
-            .artifact_id = try allocator.dupe(u8, artifact.artifact_id),
-            .uri = if (artifact.getUri()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .mime_type = if (artifact.getMimeType()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .artifact_id = artifact_id,
+            .uri = if (uri) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .mime_type = if (mime_type) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
             .byte_size = artifact.byte_size,
-            .sha256 = if (artifact.getSha256()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .description = if (artifact.getDescription()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .sha256 = if (sha256) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .description = if (description) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
         };
         initialized += 1;
     }
@@ -469,11 +507,22 @@ fn cloneArtifactsToAgent(allocator: std.mem.Allocator, artifacts: []const tool_t
 }
 
 fn toolMetadataFromAgentTool(allocator: std.mem.Allocator, tool: agent_types.AgentTool) !tool_types.ToolMetadata {
+    const name = try allocator.dupe(u8, tool.name);
+    errdefer allocator.free(name);
+
+    const description = try allocator.dupe(u8, tool.description);
+    errdefer allocator.free(description);
+
+    const parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json);
+    errdefer allocator.free(parameters_schema_json);
+
+    const version = try allocator.dupe(u8, "1.0.0");
+
     return .{
-        .name = try allocator.dupe(u8, tool.name),
-        .description = try allocator.dupe(u8, tool.description),
-        .parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json),
-        .version = try allocator.dupe(u8, "1.0.0"),
+        .name = name,
+        .description = description,
+        .parameters_schema_json = parameters_schema_json,
+        .version = version,
     };
 }
 
@@ -636,4 +685,166 @@ test "in-process tool protocol round-trip stays near direct call" {
 
     _ = direct_ms;
     try std.testing.expect(proto_ms <= 100);
+}
+
+fn cloneArtifactsToToolProbe(allocator: std.mem.Allocator) !void {
+    const artifacts = [_]ai_types.ArtifactReference{
+        .{
+            .artifact_id = "art-one",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/one.txt"),
+            .mime_type = OwnedSlice(u8).initBorrowed("text/plain"),
+            .byte_size = 11,
+            .sha256 = OwnedSlice(u8).initBorrowed("1111111111111111"),
+            .description = OwnedSlice(u8).initBorrowed("first artifact"),
+        },
+        .{
+            .artifact_id = "art-two",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/two.json"),
+            .mime_type = OwnedSlice(u8).initBorrowed("application/json"),
+            .byte_size = 22,
+            .sha256 = OwnedSlice(u8).initBorrowed("2222222222222222"),
+            .description = OwnedSlice(u8).initBorrowed("second artifact"),
+        },
+    };
+
+    const cloned = try cloneArtifactsToTool(allocator, &artifacts);
+    for (cloned) |*artifact| artifact.deinit(allocator);
+    allocator.free(cloned);
+}
+
+test "cloneArtifactsToTool survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneArtifactsToToolProbe, .{});
+}
+
+fn cloneArtifactsToAgentProbe(allocator: std.mem.Allocator) !void {
+    const artifacts = [_]tool_types.ArtifactReference{
+        .{
+            .artifact_id = "art-one",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/one.txt"),
+            .mime_type = OwnedSlice(u8).initBorrowed("text/plain"),
+            .byte_size = 11,
+            .sha256 = OwnedSlice(u8).initBorrowed("1111111111111111"),
+            .description = OwnedSlice(u8).initBorrowed("first artifact"),
+        },
+        .{
+            .artifact_id = "art-two",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/two.json"),
+            .mime_type = OwnedSlice(u8).initBorrowed("application/json"),
+            .byte_size = 22,
+            .sha256 = OwnedSlice(u8).initBorrowed("2222222222222222"),
+            .description = OwnedSlice(u8).initBorrowed("second artifact"),
+        },
+    };
+
+    const cloned = try cloneArtifactsToAgent(allocator, &artifacts);
+    for (cloned) |*artifact| artifact.deinit(allocator);
+    allocator.free(cloned);
+}
+
+test "cloneArtifactsToAgent survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneArtifactsToAgentProbe, .{});
+}
+
+fn toolMetadataFromAgentToolProbe(allocator: std.mem.Allocator) !void {
+    const stub = struct {
+        fn execute(
+            tool_call_id: []const u8,
+            args_json: []const u8,
+            cancel_token: ?ai_types.CancelToken,
+            on_update_ctx: ?*anyopaque,
+            on_update: ?agent_types.ToolUpdateCallback,
+            tool_allocator: std.mem.Allocator,
+        ) anyerror!agent_types.AgentToolResult {
+            _ = tool_call_id;
+            _ = args_json;
+            _ = cancel_token;
+            _ = on_update_ctx;
+            _ = on_update;
+            _ = tool_allocator;
+            return .{};
+        }
+    };
+
+    const tool = agent_types.AgentTool{
+        .label = "Shell",
+        .name = "shell_execute",
+        .description = "Run a shell command in the workspace and return its output",
+        .parameters_schema_json =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        ,
+        .execute = stub.execute,
+    };
+
+    var meta = try toolMetadataFromAgentTool(allocator, tool);
+    deinitToolMetadata(&meta, allocator);
+}
+
+test "toolMetadataFromAgentTool survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolMetadataFromAgentToolProbe, .{});
+}
+
+fn toolListHandoffProbe(allocator: std.mem.Allocator) !void {
+    const stub = struct {
+        fn execute(
+            tool_call_id: []const u8,
+            args_json: []const u8,
+            cancel_token: ?ai_types.CancelToken,
+            on_update_ctx: ?*anyopaque,
+            on_update: ?agent_types.ToolUpdateCallback,
+            tool_allocator: std.mem.Allocator,
+        ) anyerror!agent_types.AgentToolResult {
+            _ = tool_call_id;
+            _ = args_json;
+            _ = cancel_token;
+            _ = on_update_ctx;
+            _ = on_update;
+            _ = tool_allocator;
+            return .{};
+        }
+    };
+
+    const schema =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    ;
+
+    var server = ToolProtocolServer.init(allocator);
+    defer server.deinit();
+
+    try server.registerTools(&[_]agent_types.AgentTool{
+        .{ .label = "Shell", .name = "shell_execute", .description = "Run a shell command", .parameters_schema_json = schema, .execute = stub.execute },
+        .{ .label = "Read", .name = "file_read", .description = "Read a file from the workspace", .parameters_schema_json = schema, .execute = stub.execute },
+        .{ .label = "Search", .name = "search_files", .description = "Search the workspace for a pattern", .parameters_schema_json = schema, .execute = stub.execute },
+    });
+
+    const request = tool_types.Envelope{
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_list = .{} },
+    };
+
+    var response = (try ToolProtocolServer.handleClientEnvelope(@ptrCast(&server), request, allocator)).?;
+    response.deinit(allocator);
+}
+
+test "tool_list handoff to metas.append survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolListHandoffProbe, .{});
+}
+
+fn nextExecuteEnvelopeProbe(allocator: std.mem.Allocator) !void {
+    var client = ToolProtocolClient.init();
+
+    var envelope = try client.nextExecuteEnvelope(
+        "call-0123456789",
+        "shell_execute",
+        \\{"command":"ls -la /workspace"}
+    ,
+        allocator,
+    );
+    envelope.deinit(allocator);
+}
+
+test "nextExecuteEnvelope survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nextExecuteEnvelopeProbe, .{});
 }
