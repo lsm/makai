@@ -97,6 +97,15 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
     map.deinit();
 }
 
+fn allowsAnonymous(model: ai_types.Model) bool {
+    if (!model.allows_anonymous) return false;
+    const vendors = [_][]const u8{ "openai", "deepseek", "openai-codex", "azure" };
+    for (vendors) |vendor| {
+        if (std.mem.eql(u8, model.provider, vendor)) return false;
+    }
+    return true;
+}
+
 fn envApiKey(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_id, "deepseek")) {
         return compat.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
@@ -846,14 +855,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
-    headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
-        allocator.free(auth);
-        allocator.free(url);
-        ctx.deinit();
-        stream.completeWithError("oom headers");
-        stream.markThreadDone();
-        return;
-    };
+    if (api_key.len > 0) {
+        headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
+            allocator.free(auth);
+            allocator.free(url);
+            ctx.deinit();
+            stream.completeWithError("oom headers");
+            stream.markThreadDone();
+            return;
+        };
+    }
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         allocator.free(auth);
         allocator.free(url);
@@ -1545,9 +1556,14 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const env = envApiKey(allocator, model.provider);
-        if (env) |k| break :blk @constCast(k);
+        if (o.getApiKey()) |k| {
+            if (k.len > 0) break :blk try allocator.dupe(u8, k);
+        }
+        if (envApiKey(allocator, model.provider)) |k| {
+            if (k.len > 0) break :blk @constCast(k);
+            allocator.free(k);
+        }
+        if (allowsAnonymous(model)) break :blk try allocator.dupe(u8, "");
         return error.MissingApiKey;
     };
     errdefer allocator.free(api_key);
@@ -1671,6 +1687,32 @@ pub fn registerOpenAICodexResponsesApiProvider(registry: *api_registry.ApiRegist
         .auth_refresh_fn = refreshOpenAICodexCredentials,
         .auth_get_api_key_fn = getOpenAICodexApiKey,
     }, null);
+}
+
+test "anonymous streaming is opt-in and never applies to an openai vendor id" {
+    const base: ai_types.Model = .{
+        .id = "m",
+        .name = "M",
+        .api = "openai-responses",
+        .provider = "gateway",
+        .base_url = "https://gw.test",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(!allowsAnonymous(base));
+
+    var opted = base;
+    opted.allows_anonymous = true;
+    try std.testing.expect(allowsAnonymous(opted));
+
+    for ([_][]const u8{ "openai", "deepseek", "openai-codex", "azure" }) |vendor_id| {
+        var vendor = opted;
+        vendor.provider = vendor_id;
+        try std.testing.expect(!allowsAnonymous(vendor));
+    }
 }
 
 test "OpenAI Codex provider registers OAuth hooks" {

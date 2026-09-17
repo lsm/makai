@@ -79,6 +79,15 @@ fn isOpenAIHost(base_url: []const u8) bool {
         (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
 }
 
+fn allowsAnonymous(model: ai_types.Model) bool {
+    if (!model.allows_anonymous) return false;
+    const vendors = [_][]const u8{ "openai", "deepseek", "kimi", "github-copilot" };
+    for (vendors) |vendor| {
+        if (std.mem.eql(u8, model.provider, vendor)) return false;
+    }
+    return true;
+}
+
 fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_id, "deepseek")) {
         return compat_mod.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
@@ -1083,12 +1092,14 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
-    headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
-        ctx.deinit();
-        stream.completeWithError("oom headers");
-        stream.markThreadDone();
-        return;
-    };
+    if (api_key.len > 0) {
+        headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
+            ctx.deinit();
+            stream.completeWithError("oom headers");
+            stream.markThreadDone();
+            return;
+        };
+    }
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         ctx.deinit();
         stream.completeWithError("oom headers");
@@ -1744,9 +1755,16 @@ pub fn streamOpenAICompletions(
 
     var key_owned: ?[]const u8 = null;
     const api_key = blk: {
-        if (resolved.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        if (resolved.getApiKey()) |k| {
+            if (k.len > 0) break :blk try allocator.dupe(u8, k);
+        }
         key_owned = envApiKeyForProvider(allocator, model.provider);
-        if (key_owned) |k| break :blk k;
+        if (key_owned) |k| {
+            if (k.len > 0) break :blk k;
+            allocator.free(k);
+            key_owned = null;
+        }
+        if (allowsAnonymous(model)) break :blk try allocator.dupe(u8, "");
         return error.MissingApiKey;
     };
     errdefer allocator.free(api_key);
@@ -1841,6 +1859,32 @@ pub fn registerOpenAICompletionsApiProvider(registry: *api_registry.ApiRegistry)
         .stream = streamOpenAICompletions,
         .stream_simple = streamSimpleOpenAICompletions,
     }, null);
+}
+
+test "anonymous streaming is opt-in and never applies to an openai vendor id" {
+    const base: ai_types.Model = .{
+        .id = "m",
+        .name = "M",
+        .api = "openai-completions",
+        .provider = "gateway",
+        .base_url = "https://gw.test",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(!allowsAnonymous(base));
+
+    var opted = base;
+    opted.allows_anonymous = true;
+    try std.testing.expect(allowsAnonymous(opted));
+
+    for ([_][]const u8{ "openai", "deepseek", "kimi", "github-copilot" }) |vendor_id| {
+        var vendor = opted;
+        vendor.provider = vendor_id;
+        try std.testing.expect(!allowsAnonymous(vendor));
+    }
 }
 
 test "buildRequestBody includes stream_options and tools without memory leak" {

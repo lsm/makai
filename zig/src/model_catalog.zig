@@ -327,6 +327,7 @@ fn customModel(
         .max_tokens = if (spec) |found| (found.max_tokens orelse provider.max_tokens) else provider.max_tokens,
         .headers = headers,
         .compat = provider.compat,
+        .allows_anonymous = provider.auth_none,
         .is_owned = true,
     };
 }
@@ -1372,6 +1373,25 @@ test "discovery result is filtered per provider and never falls back to the decl
     try std.testing.expectEqualStrings("aaa", models[0].provider);
     try std.testing.expectEqualStrings("keep-z", models[1].id);
     try std.testing.expectEqualStrings("zzz", models[1].provider);
+}
+
+test "auth none reaches the model as allows_anonymous" {
+    test_custom_providers_config =
+        \\{"providers":[
+        \\ {"id":"local","base_url":"http://localhost:8000/v1","models":["m"],"auth":"none"},
+        \\ {"id":"gw","base_url":"https://gw.test","models":["m"],"auth":{"env":"GW_KEY"}}
+        \\]}
+    ;
+    defer test_custom_providers_config = null;
+
+    const models = try loadCustomModels(std.testing.allocator, null, .allow_cache);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("local", models[0].provider);
+    try std.testing.expect(models[0].allows_anonymous);
+    try std.testing.expectEqualStrings("gw", models[1].provider);
+    try std.testing.expect(!models[1].allows_anonymous);
 }
 
 test "github copilot models come from the persisted login list" {

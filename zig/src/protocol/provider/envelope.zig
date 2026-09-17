@@ -191,6 +191,7 @@ fn serializeModel(
     try w.writeStringField("provider", model.provider);
     try w.writeStringField("base_url", model.base_url);
     try w.writeBoolField("reasoning", model.reasoning);
+    if (model.allows_anonymous) try w.writeBoolField("allows_anonymous", true);
 
     try w.writeKey("input");
     try w.beginArray();
@@ -793,6 +794,7 @@ fn deserializeModel(
             if (value != .object) return error.InvalidUserContent;
             break :blk try deserializeOpenAICompatOptions(try fields.asObject(value));
         } else null,
+        .allows_anonymous = if (obj.get("allows_anonymous")) |value| try valueAsBool(value) else false,
         .is_owned = true,
     };
 }
@@ -2002,6 +2004,52 @@ test "stream_request round trips model metadata" {
     try std.testing.expect(decoded.payload.stream_request.options != null);
     try std.testing.expect(decoded.payload.stream_request.options.?.headers != null);
     try std.testing.expectEqualStrings("ChatGPT-Account-ID", decoded.payload.stream_request.options.?.headers.?[1].name);
+}
+
+test "allows_anonymous round trips and defaults off when the field is absent" {
+    const allocator = std.testing.allocator;
+
+    const input = [_][]const u8{"text"};
+    const base = ai_types.Model{
+        .id = "m",
+        .name = "M",
+        .api = "openai-completions",
+        .provider = "local",
+        .base_url = "http://localhost:8000/v1",
+        .reasoning = false,
+        .input = &input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8_192,
+        .max_tokens = 1_024,
+    };
+
+    for ([_]bool{ true, false }) |anonymous| {
+        var model = base;
+        model.allows_anonymous = anonymous;
+
+        var envelope = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = 1708234567890,
+            .payload = .{ .stream_request = .{
+                .model = model,
+                .context = ai_types.Context{ .messages = &.{} },
+                .options = null,
+                .include_partial = false,
+            } },
+        };
+
+        const json = try serializeEnvelope(envelope, allocator);
+        defer allocator.free(json);
+        envelope.deinit(allocator);
+
+        try std.testing.expectEqual(anonymous, std.mem.find(u8, json, "\"allows_anonymous\":true") != null);
+
+        var decoded = try deserializeEnvelope(json, allocator);
+        defer decoded.deinit(allocator);
+        try std.testing.expectEqual(anonymous, decoded.payload.stream_request.model.allows_anonymous);
+    }
 }
 
 test "stream_request rejects oversized model integer fields" {
