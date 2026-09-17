@@ -234,11 +234,14 @@ const ThreadCtx = struct {
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer ctx.deinit();
+    const done_stream = ctx.stream;
+    defer {
+        ctx.deinit();
+        done_stream.markThreadDone();
+    }
 
     if (ctx.cancel_token) |ct| {
         if (ct.isCancelled()) {
-            ctx.stream.markThreadDone();
             ctx.stream.completeWithError("request cancelled");
             return;
         }
@@ -248,14 +251,12 @@ fn runThread(ctx: *ThreadCtx) void {
     defer client.deinit();
 
     const url = std.fmt.allocPrint(ctx.allocator, "{s}/openai/v1/responses", .{ctx.base_url}) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("oom url");
         return;
     };
     defer ctx.allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("invalid URL");
         return;
     };
@@ -263,30 +264,25 @@ fn runThread(ctx: *ThreadCtx) void {
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(ctx.allocator);
     headers.append(ctx.allocator, .{ .name = "api-key", .value = ctx.api_key }) catch {
-        ctx.stream.markThreadDone();
         return ctx.stream.completeWithError("oom headers");
     };
     headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" }) catch {
-        ctx.stream.markThreadDone();
         return ctx.stream.completeWithError("oom headers");
     };
 
     var req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("request failed");
         return;
     };
     defer req.deinit();
 
     compat.http.sendRequest(&req, ctx.body) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("send failed");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
     var response = compat.http.receiveResponse(&req, &head_buf) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("receive failed");
         return;
     };
@@ -302,7 +298,6 @@ fn runThread(ctx: *ThreadCtx) void {
             std.debug.print("Error body: {s}\n", .{eb});
         }
 
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("azure request failed");
         return;
     }
@@ -332,21 +327,18 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         const n = compat.http.readResponse(reader, &read_buf) catch {
-            ctx.stream.markThreadDone();
             ctx.stream.completeWithError("read failed");
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch |err| {
-            ctx.stream.markThreadDone();
             ctx.stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 
         for (events) |ev| {
             parseEvent(ev.data, &text, &usage, &stop_reason, ctx.allocator) catch {
-                ctx.stream.markThreadDone();
                 ctx.stream.completeWithError("event parse failed");
                 return;
             };
@@ -356,13 +348,11 @@ fn runThread(ctx: *ThreadCtx) void {
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
 
     var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("oom result");
         return;
     };
     content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
         ctx.allocator.free(content);
-        ctx.stream.markThreadDone();
         ctx.stream.completeWithError("oom text");
         return;
     } } };
@@ -370,15 +360,12 @@ fn runThread(ctx: *ThreadCtx) void {
     const out = ai_types.AssistantMessage{
         .content = content,
         .api = ctx.allocator.dupe(u8, ctx.model.api) catch {
-            ctx.stream.markThreadDone();
             return ctx.stream.completeWithError("oom");
         },
         .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch {
-            ctx.stream.markThreadDone();
             return ctx.stream.completeWithError("oom");
         },
         .model = ctx.allocator.dupe(u8, ctx.model.id) catch {
-            ctx.stream.markThreadDone();
             return ctx.stream.completeWithError("oom");
         },
         .usage = usage,
@@ -387,7 +374,6 @@ fn runThread(ctx: *ThreadCtx) void {
         .is_owned = true,
     };
 
-    ctx.stream.markThreadDone();
     ctx.stream.complete(out);
 }
 

@@ -594,7 +594,6 @@ fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) 
         .accept_encoding = "identity",
     });
     defer req.deinit();
-    req.headers.accept_encoding = .omit;
 
     try compat.http.sendBodilessRequest(&req);
 
@@ -960,7 +959,6 @@ fn fetchCodexModelsCatalog(
         .accept_encoding = "identity",
     });
     defer req.deinit();
-    req.headers.accept_encoding = .omit;
 
     try compat.http.sendBodilessRequest(&req);
 
