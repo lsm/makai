@@ -1486,8 +1486,8 @@ fn runThread(ctx: *ThreadCtx) void {
                                 content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
                                     allocator.free(text_copy);
                                     ctx.deinit();
-                                    stream.markThreadDone();
                                     stream.completeWithError("oom text");
+                                    stream.markThreadDone();
                                     return;
                                 };
 
@@ -1512,8 +1512,8 @@ fn runThread(ctx: *ThreadCtx) void {
                                     allocator.free(thinking_copy);
                                     if (sig_copy) |sig| allocator.free(sig);
                                     ctx.deinit();
-                                    stream.markThreadDone();
                                     stream.completeWithError("oom thinking");
+                                    stream.markThreadDone();
                                     return;
                                 };
 
@@ -1525,8 +1525,8 @@ fn runThread(ctx: *ThreadCtx) void {
                                         var orphan = tool_call;
                                         ai_types.deinitToolCall(allocator, &orphan);
                                         ctx.deinit();
-                                        stream.markThreadDone();
                                         stream.completeWithError("oom tool call");
+                                        stream.markThreadDone();
                                         return;
                                     };
 
@@ -1638,8 +1638,8 @@ fn runThread(ctx: *ThreadCtx) void {
         content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
             allocator.free(text_copy);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom text");
+            stream.markThreadDone();
             return;
         };
     }
