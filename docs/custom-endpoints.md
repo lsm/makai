@@ -45,7 +45,7 @@ the built-in ones.
 | `base_url` | yes | Endpoint origin. A trailing `/v1` is stripped; see Base URLs below. |
 | `api` | no | `openai-completions` (default), `openai-responses` or `anthropic-messages`. |
 | `name` | no | Display name; defaults to the id. |
-| `auth` | no | Either `{ "env": "VAR" }` to read the key from an environment variable, or the string `"none"` to send no credential at all. Any other value is rejected. |
+| `auth` | no | Either `{ "env": "VAR" }` naming a non-empty environment variable, or the string `"none"` to send no credential at all. Anything else is a load error, including an object with no `env`, a non-string `env`, an empty `env`, and any other string. Omitting `auth` is fine and means the key comes from the keychain. |
 | `headers` | no | Extra request headers, as a flat object of strings. |
 | `models` | no | Allowlist and fallback list; strings, or objects with `id`, `name`, `context_window`, `max_tokens`. |
 | `capabilities` | no | Overrides for what the endpoint supports; see below. |
@@ -89,6 +89,12 @@ The keychain is checked first. A provider with neither source still appears in
 the providers raise `MissingApiKey` before a request leaves the process when no
 key resolves. That default is deliberate, so that forgetting to log in fails
 loudly instead of quietly sending an unauthenticated request.
+
+An `auth` block that is present must be one of the two valid shapes. A typo such
+as `{ "environment": "KEY" }`, or a `{ "env": 5 }`, used to parse as "no key" and
+surface much later as a confusing `MissingApiKey`; both are now load errors. A
+load error disables **all** custom providers until the file parses, and the TUI
+prints a startup row naming the file and the error rather than failing silently.
 
 A server that wants no credential at all, such as a local llama.cpp, vLLM or
 LM Studio, says so with `"auth": "none"`. It is an opt-in and nothing else

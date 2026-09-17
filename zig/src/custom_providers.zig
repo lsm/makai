@@ -193,9 +193,10 @@ fn parseProvider(allocator: std.mem.Allocator, obj: *const std.json.ObjectMap) !
                 provider.auth_none = true;
             },
             .object => {
-                if (objectString(&auth_value.object, "env")) |env_name| {
-                    if (env_name.len > 0) provider.env_key = try allocator.dupe(u8, env_name);
-                }
+                const env_name = objectString(&auth_value.object, "env") orelse
+                    return ConfigError.InvalidAuthMode;
+                if (env_name.len == 0) return ConfigError.InvalidAuthMode;
+                provider.env_key = try allocator.dupe(u8, env_name);
             },
             else => return ConfigError.InvalidAuthMode,
         }
@@ -545,6 +546,18 @@ test "custom providers reject malformed entries" {
         , .want = ConfigError.InvalidAuthMode },
         .{ .data =
         \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":true}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"env":5}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"env":""}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"environment":"K"}}]}
         , .want = ConfigError.InvalidAuthMode },
     };
 
