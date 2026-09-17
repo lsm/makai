@@ -6335,7 +6335,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--oap")) {
-        try runOapMode(allocator, args[2..], stdin, stdout, stderr);
+        runOapMode(allocator, args[2..], stdin, stdout, stderr) catch |err| {
+            if (err == error.MalformedLine or err == error.UnaddressableEnvelope) std.process.exit(1);
+            return err;
+        };
         return;
     }
 
@@ -6655,7 +6658,18 @@ fn runOapMode(
 
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
-            try oap.handleLine(line);
+            oap.handleLine(line) catch |err| switch (err) {
+                error.MalformedLine, error.UnaddressableEnvelope => {
+                    _ = try writeOapOutbound(stdout, allocator, &oap);
+                    const message = if (err == error.MalformedLine)
+                        OAP_MALFORMED_LINE_MESSAGE
+                    else
+                        OAP_UNADDRESSABLE_ENVELOPE_MESSAGE;
+                    try compat.stdio.writeAll(stderr, message);
+                    return err;
+                },
+                else => return err,
+            };
             did_work = true;
         }
 
@@ -6707,6 +6721,8 @@ fn runOapMode(
 }
 
 const OAP_EOF_MESSAGE = "the makai host reached end of input before the run settled";
+const OAP_MALFORMED_LINE_MESSAGE = "makai --oap: stdin carried a line that is not an OAP envelope or control frame; the stream's framing is in doubt and the endpoint will not resynchronise\n";
+const OAP_UNADDRESSABLE_ENVELOPE_MESSAGE = "makai --oap: stdin carried an envelope with no id; every response this binding defines is correlated by in_reply_to, so no refusal could be addressed to it\n";
 
 fn pumpOapIntents(
     allocator: std.mem.Allocator,

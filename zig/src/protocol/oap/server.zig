@@ -3,6 +3,7 @@ const compat = @import("compat");
 const protocol_types = @import("protocol_types");
 const oap_types = @import("oap_types");
 const oap_envelope = @import("oap_envelope");
+const json_writer = @import("json_writer");
 const model_ref = @import("model_ref");
 
 pub const ENDPOINT_ID = "makai.agent-control";
@@ -276,15 +277,60 @@ pub const Server = struct {
     }
 
     pub fn handleLine(self: *Self, line: []const u8) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.MalformedLine;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.MalformedLine;
+
+        if (parsed.value.object.get("protocol") == null) {
+            const control = parsed.value.object.get("control") orelse return error.MalformedLine;
+            if (control != .string) return error.MalformedLine;
+            const id = blk: {
+                const value = parsed.value.object.get("id") orelse break :blk null;
+                if (value != .string) break :blk null;
+                break :blk value.string;
+            };
+            try self.pushUnsupportedControl(control.string, id);
+            return;
+        }
+
+        const declared_id = blk: {
+            const value = parsed.value.object.get("id") orelse break :blk null;
+            if (value != .string) break :blk null;
+            if (value.string.len == 0) break :blk null;
+            break :blk value.string;
+        } orelse return error.UnaddressableEnvelope;
+
         var env = oap_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-            try self.emitDecodeError(err);
+            try self.emitDecodeError(err, declared_id);
             return;
         };
         defer env.deinit(self.allocator);
         try self.handleEnvelope(env);
     }
 
-    fn emitDecodeError(self: *Self, err: anyerror) !void {
+    fn pushUnsupportedControl(self: *Self, control: []const u8, id: ?[]const u8) !void {
+        const name = try std.fmt.allocPrint(self.allocator, "{s}.error", .{control});
+        defer self.allocator.free(name);
+
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+        try w.beginObject();
+        try w.writeStringField("control", name);
+        if (id) |value| try w.writeStringField("id", value);
+        try w.writeStringField("code", "unsupported_control");
+        try w.writeStringField("message", "this endpoint implements no transport controls");
+        try w.endObject();
+
+        const line = try self.allocator.dupe(u8, buffer.items);
+        errdefer self.allocator.free(line);
+        try self.outbound.append(self.allocator, line);
+    }
+
+    fn emitDecodeError(self: *Self, err: anyerror, in_reply_to: ?[]const u8) !void {
         const message = switch (err) {
             oap_envelope.DecodeError.ProtocolMismatch => "envelope protocol is not open-agent-protocol",
             oap_envelope.DecodeError.VersionMismatch => "envelope version is not 0.1",
@@ -298,7 +344,7 @@ pub const Server = struct {
             oap_envelope.DecodeError.UnknownEnvelopeType => .unsupported_feature,
             else => .invalid_request,
         };
-        try self.pushError(null, null, null, code, message, &.{});
+        try self.pushError(in_reply_to, null, null, code, message, &.{});
     }
 
     pub fn handleEnvelope(self: *Self, env: oap_types.Envelope) !void {
@@ -2503,15 +2549,13 @@ test "envelope and payload session_id must agree" {
     try std.testing.expectEqual(oap_types.ErrorCode.invalid_request, reply.payload.error_response.code);
 }
 
-test "a malformed inbound line answers with a typed error rather than crashing" {
+test "an undecodable envelope answers with a typed error rather than crashing" {
     const allocator = std.testing.allocator;
     var server = try Server.init(allocator, .{});
     defer server.deinit();
 
-    try server.handleLine("{not json");
-    var first = try nextEnvelope(&server, allocator);
-    defer first.deinit(allocator);
-    try std.testing.expectEqual(oap_types.ErrorCode.invalid_request, first.payload.error_response.code);
+    try std.testing.expectError(error.MalformedLine, server.handleLine("{not json"));
+    try std.testing.expect(server.popOutbound() == null);
 
     try server.handleLine(
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_types.PROFILE ++
@@ -2596,4 +2640,88 @@ test "a message boundary starts a new portable assistant message id" {
     ));
     try std.testing.expectEqual(@as(u64, 2), first.sequence.?);
     try std.testing.expectEqual(@as(u64, 3), second.sequence.?);
+}
+
+test "an unrecognised control frame is answered rather than ignored" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try server.handleLine("{\"control\":\"replay\",\"id\":\"r1\",\"session_id\":\"s1\",\"after\":0}");
+
+    const line = server.popOutbound() orelse return error.TestExpectedControlAnswer;
+    defer allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"control\":\"replay.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"id\":\"r1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"code\":\"unsupported_control\"") != null);
+}
+
+test "a control frame without an id is still answered" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try server.handleLine("{\"control\":\"rewind\"}");
+
+    const line = server.popOutbound() orelse return error.TestExpectedControlAnswer;
+    defer allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"control\":\"rewind.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"id\"") == null);
+}
+
+fn unsupportedControlProbe(allocator: std.mem.Allocator) !void {
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try server.handleLine("{\"control\":\"replay\",\"id\":\"r1\"}");
+    drainOutbound(&server, allocator);
+}
+
+test "an unsupported control answer survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, unsupportedControlProbe, .{});
+}
+
+test "a line that is not json is a framing defect rather than an error response" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try std.testing.expectError(error.MalformedLine, server.handleLine("this is not an envelope"));
+    try std.testing.expect(server.popOutbound() == null);
+}
+
+test "a json object that is neither envelope nor control is a framing defect" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try std.testing.expectError(error.MalformedLine, server.handleLine("{\"hello\":\"world\"}"));
+    try std.testing.expect(server.popOutbound() == null);
+}
+
+test "a declared envelope that fails to decode answers a correlated error response" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try server.handleLine("{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"id\":\"req-7\"}");
+
+    const line = server.popOutbound() orelse return error.TestExpectedErrorResponse;
+    defer allocator.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "error.response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"in_reply_to\":\"req-7\"") != null);
+}
+
+test "a declared envelope carrying no id is fatal because nothing could address a refusal" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try std.testing.expectError(
+        error.UnaddressableEnvelope,
+        server.handleLine("{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\"}"),
+    );
+    try std.testing.expect(server.popOutbound() == null);
 }
