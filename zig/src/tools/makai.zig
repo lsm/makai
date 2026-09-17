@@ -4969,10 +4969,9 @@ test "a pending result publication keeps the session non-admissible until the re
 test "a stream completed without an outcome settles with a typed failure instead of hanging" {
     const allocator = std.testing.allocator;
 
-    var failing = std.testing.FailingAllocator.init(allocator, .{});
     var registry = api_registry.ApiRegistry.init(allocator);
     defer registry.deinit();
-    var stdio_loop = StdioProtocolLoop.initForTesting(failing.allocator(), &registry);
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
     var outbound = std.ArrayList([]const u8).empty;
@@ -4988,11 +4987,10 @@ test "a stream completed without an outcome settles with a typed failure instead
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
-    failing.fail_index = failing.alloc_index;
-    run.stream.completeWithError("lost outcome");
-    failing.fail_index = std.math.maxInt(usize);
+    run.stream.completeWithoutOutcomeForTesting();
     try std.testing.expect(run.stream.isDone());
     try std.testing.expect(run.stream.getError() == null);
+    try std.testing.expect(run.stream.getResult() == null);
 
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);

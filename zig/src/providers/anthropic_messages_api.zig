@@ -1306,7 +1306,10 @@ fn runThread(ctx: *ThreadCtx) void {
     defer tc_tracker.deinit();
 
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
-    defer content_blocks.deinit(allocator);
+    defer {
+        ai_types.deinitAssistantContentElements(allocator, content_blocks.items);
+        content_blocks.deinit(allocator);
+    }
     var current_text = std.ArrayList(u8).empty;
     defer current_text.deinit(allocator);
     var current_thinking = std.ArrayList(u8).empty;
@@ -1330,7 +1333,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     const partial_start = createPartialMessage(model);
-    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
+    _ = stream.pushBlocking(.{ .start = .{ .partial = partial_start } });
 
     while (true) {
         if (ping_interval > 0) {
@@ -1408,23 +1411,23 @@ fn runThread(ctx: *ThreadCtx) void {
                         .text => {
                             current_text.clearRetainingCapacity();
                             const partial = createPartialMessage(model);
-                            stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                            _ = stream.pushBlocking(.{ .text_start = .{ .content_index = content_idx, .partial = partial } });
                         },
                         .thinking => {
                             current_thinking.clearRetainingCapacity();
                             current_thinking_signature.clearRetainingCapacity();
                             const partial = createPartialMessage(model);
-                            stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                            _ = stream.pushBlocking(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } });
                         },
                         .tool_use => {
                             _ = tc_tracker.startCall(cbs.index, content_idx, cbs.tool_id, cbs.tool_name) catch {};
 
-                            stream.push(.{ .toolcall_start = .{
+                            _ = stream.pushBlocking(.{ .toolcall_start = .{
                                 .content_index = content_idx,
                                 .id = cbs.tool_id,
                                 .name = cbs.tool_name,
                                 .partial = createPartialMessage(model),
-                            } }) catch {};
+                            } });
                         },
                     }
 
@@ -1437,12 +1440,12 @@ fn runThread(ctx: *ThreadCtx) void {
                         switch (cbd.delta) {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
-                                stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
+                                _ = stream.pushBlocking(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } });
                                 pending_delta_frees.append(allocator, txt) catch allocator.free(txt);
                             },
                             .thinking => |thk| {
                                 current_thinking.appendSlice(allocator, thk) catch {};
-                                stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
+                                _ = stream.pushBlocking(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } });
                                 pending_delta_frees.append(allocator, thk) catch allocator.free(thk);
                             },
                             .signature => |sig| {
@@ -1453,11 +1456,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                 tc_tracker.appendDelta(cbd.index, json_delta) catch {};
 
                                 if (tc_tracker.getContentIndex(cbd.index)) |content_idx| {
-                                    stream.push(.{ .toolcall_delta = .{
+                                    _ = stream.pushBlocking(.{ .toolcall_delta = .{
                                         .content_index = content_idx,
                                         .delta = json_delta,
                                         .partial = createPartialMessage(model),
-                                    } }) catch {};
+                                    } });
                                 }
                                 pending_delta_frees.append(allocator, json_delta) catch allocator.free(json_delta);
                             },
@@ -1480,9 +1483,15 @@ fn runThread(ctx: *ThreadCtx) void {
                                     stream.markThreadDone();
                                     return;
                                 };
-                                content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
+                                content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
+                                    allocator.free(text_copy);
+                                    ctx.deinit();
+                                    stream.markThreadDone();
+                                    stream.completeWithError("oom text");
+                                    return;
+                                };
 
-                                stream.push(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } }) catch {};
+                                _ = stream.pushBlocking(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } });
                             },
                             .thinking => {
                                 const thinking_copy = allocator.dupe(u8, current_thinking.items) catch {
@@ -1499,26 +1508,79 @@ fn runThread(ctx: *ThreadCtx) void {
                                 content_blocks.append(allocator, .{ .thinking = .{
                                     .thinking = thinking_copy,
                                     .thinking_signature = sig_copy,
-                                } }) catch {};
+                                } }) catch {
+                                    allocator.free(thinking_copy);
+                                    if (sig_copy) |sig| allocator.free(sig);
+                                    ctx.deinit();
+                                    stream.markThreadDone();
+                                    stream.completeWithError("oom thinking");
+                                    return;
+                                };
 
-                                stream.push(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } }) catch {};
+                                _ = stream.pushBlocking(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } });
                             },
                             .tool_use => {
                                 if (tc_tracker.completeCall(cbs.index, allocator)) |tool_call| {
-                                    content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {};
-
-                                    const event_tc = ai_types.ToolCall{
-                                        .id = allocator.dupe(u8, tool_call.id) catch tool_call.id,
-                                        .name = allocator.dupe(u8, tool_call.name) catch tool_call.name,
-                                        .arguments_json = if (tool_call.arguments_json.len > 0) allocator.dupe(u8, tool_call.arguments_json) catch tool_call.arguments_json else "",
-                                        .thought_signature = if (tool_call.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
+                                    content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {
+                                        var orphan = tool_call;
+                                        ai_types.deinitToolCall(allocator, &orphan);
+                                        ctx.deinit();
+                                        stream.markThreadDone();
+                                        stream.completeWithError("oom tool call");
+                                        return;
                                     };
 
-                                    stream.push(.{ .toolcall_end = .{
-                                        .content_index = content_blocks.items.len - 1,
-                                        .tool_call = event_tc,
-                                        .partial = createPartialMessage(model),
-                                    } }) catch {};
+                                    const event_tc: ?ai_types.ToolCall = blk: {
+                                        const id = allocator.dupe(u8, tool_call.id) catch break :blk null;
+                                        const name = allocator.dupe(u8, tool_call.name) catch {
+                                            allocator.free(id);
+                                            break :blk null;
+                                        };
+                                        const args = if (tool_call.arguments_json.len > 0)
+                                            allocator.dupe(u8, tool_call.arguments_json) catch {
+                                                allocator.free(id);
+                                                allocator.free(name);
+                                                break :blk null;
+                                            }
+                                        else
+                                            "";
+                                        const sig = if (tool_call.thought_signature) |s|
+                                            allocator.dupe(u8, s) catch {
+                                                allocator.free(id);
+                                                allocator.free(name);
+                                                if (args.len > 0) allocator.free(args);
+                                                break :blk null;
+                                            }
+                                        else
+                                            null;
+                                        break :blk ai_types.ToolCall{
+                                            .id = id,
+                                            .name = name,
+                                            .arguments_json = args,
+                                            .thought_signature = sig,
+                                        };
+                                    };
+
+                                    if (event_tc) |tc| {
+                                        const queued = stream.pushBlocking(.{ .toolcall_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .tool_call = tc,
+                                            .partial = createPartialMessage(model),
+                                        } });
+                                        if (queued) {
+                                            pending_delta_frees.append(allocator, tc.id) catch allocator.free(tc.id);
+                                            pending_delta_frees.append(allocator, tc.name) catch allocator.free(tc.name);
+                                            if (tc.arguments_json.len > 0) {
+                                                pending_delta_frees.append(allocator, tc.arguments_json) catch allocator.free(tc.arguments_json);
+                                            }
+                                            if (tc.thought_signature) |sig| {
+                                                pending_delta_frees.append(allocator, sig) catch allocator.free(sig);
+                                            }
+                                        } else {
+                                            var orphan_event_tc = tc;
+                                            ai_types.deinitToolCall(allocator, &orphan_event_tc);
+                                        }
+                                    }
                                 }
                             },
                         }
@@ -1573,7 +1635,13 @@ fn runThread(ctx: *ThreadCtx) void {
             stream.markThreadDone();
             return;
         };
-        content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
+        content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
+            allocator.free(text_copy);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom text");
+            return;
+        };
     }
 
     if (content_blocks.items.len == 0) {

@@ -237,6 +237,7 @@ pub const ProtocolServer = struct {
         include_partial: bool = false,
         max_streams: usize = 100,
         stream_timeout_ms: u64 = 300_000,
+        provider_join_timeout_ms: u64 = 30_000,
         supports_model_catalog: bool = true,
         enable_static_catalog_fallback: bool = true,
         dynamic_catalog_fetcher: ?DynamicCatalogFetchFn = null,
@@ -504,6 +505,15 @@ fn injectServerOptions(
     return resolved;
 }
 
+fn injectCompleteOptions(
+    options: ?ai_types.StreamOptions,
+    cancel_token: ai_types.CancelToken,
+) ai_types.StreamOptions {
+    var resolved = options orelse ai_types.StreamOptions{};
+    resolved.cancel_token = cancel_token;
+    return resolved;
+}
+
 fn authProvider(provider: api_registry.ApiProvider) ?oauth_storage.OAuthProvider {
     const provider_id = provider.auth_provider_id orelse return null;
     return .{
@@ -526,12 +536,11 @@ fn streamWithResolvedKey(
 
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
-    else
-        blk: {
-            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
-                break :blk null;
-            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
-        };
+    else blk: {
+        loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
+            break :blk null;
+        break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+    };
 
     const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
         error.AuthRequired => return provider.stream(model, context, options, server.allocator),
@@ -567,8 +576,7 @@ fn refreshWithLock(
             };
             server.refresh_lock.complete(provider_id, null, generation, null);
         },
-        .completed_ok => {
-        },
+        .completed_ok => {},
         .completed_err => |err| {
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -951,7 +959,14 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
-    const stream = streamWithRefresh(server, provider, effective_model.model, request.context, request.options) catch |err| {
+    const cancelled = try server.allocator.create(std.atomic.Value(bool));
+    cancelled.* = std.atomic.Value(bool).init(false);
+    var cancel_flag_owned = true;
+    defer if (cancel_flag_owned) server.allocator.destroy(cancelled);
+
+    const options_with_cancel = injectCompleteOptions(request.options, .{ .cancelled = cancelled });
+
+    const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             providerErrorMessage(err),
@@ -960,13 +975,30 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         );
     };
     defer {
-        stream.deinit();
-        server.allocator.destroy(stream);
+        cancelled.store(true, .release);
+        if (stream.cancelAndJoinThread(server.options.provider_join_timeout_ms)) {
+            stream.deinit();
+            server.allocator.destroy(stream);
+        } else {
+            cancel_flag_owned = false;
+        }
     }
 
     const timeout_ms = server.options.stream_timeout_ms;
-    if (stream.waitForThread(timeout_ms)) {
-        _ = stream.waitForCompletion(timeout_ms);
+    const timeout_delta: i64 = @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i64))));
+    const deadline = (try compat.time.monotonicMillis()) +| timeout_delta;
+    while (!stream.isDone()) {
+        while (stream.poll()) |event| {
+            stream.releaseEvent(event);
+            if ((try compat.time.monotonicMillis()) >= deadline) break;
+        }
+        if (stream.isDone()) break;
+        if ((try compat.time.monotonicMillis()) >= deadline) break;
+        _ = stream.waitForCompletion(@min(timeout_ms, 50));
+    }
+    while (stream.poll()) |event| {
+        stream.releaseEvent(event);
+        if ((try compat.time.monotonicMillis()) >= deadline) break;
     }
 
     if (stream.getResult()) |result| {
@@ -2590,9 +2622,11 @@ test "handleAbortRequest rejects sequence gap" {
 
 const CancelMockState = struct {
     var received_cancel_token: ?ai_types.CancelToken = null;
+    var received_requires_owned_events: ?bool = null;
 
     fn reset() void {
         received_cancel_token = null;
+        received_requires_owned_events = null;
     }
 };
 
@@ -2607,6 +2641,7 @@ fn cancelCapturingStream(
 
     if (options) |opts| {
         CancelMockState.received_cancel_token = opts.cancel_token;
+        CancelMockState.received_requires_owned_events = opts.requires_owned_stream_events;
     }
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
@@ -2681,6 +2716,7 @@ test "handleStreamRequest injects CancelToken into provider stream options" {
     if (CancelMockState.received_cancel_token) |ct| {
         try std.testing.expect(!ct.isCancelled());
     }
+    try std.testing.expectEqual(@as(?bool, true), CancelMockState.received_requires_owned_events);
 
     const active = server.active_streams.get(stream_id);
     try std.testing.expect(active != null);
@@ -3343,6 +3379,254 @@ fn cancelCapturingStreamSimple(
     });
     s.markThreadDone();
     return s;
+}
+
+const SlowProviderState = struct {
+    var started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var saw_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var ignore_cancel: bool = false;
+    var hold_ms: u64 = 1;
+    var created: ?*event_stream.AssistantMessageEventStream = null;
+    var created_cancel_flag: ?*std.atomic.Value(bool) = null;
+
+    fn reset() void {
+        started.store(false, .release);
+        finished.store(false, .release);
+        saw_cancel.store(false, .release);
+        ignore_cancel = false;
+        hold_ms = 1;
+        created = null;
+        created_cancel_flag = null;
+    }
+};
+
+const SlowProviderCtx = struct {
+    stream: *event_stream.AssistantMessageEventStream,
+    cancel_token: ?ai_types.CancelToken,
+};
+
+fn slowProviderThread(ctx: *SlowProviderCtx) void {
+    const stream = ctx.stream;
+    const cancel_token = ctx.cancel_token;
+    std.heap.page_allocator.destroy(ctx);
+    defer stream.markThreadDone();
+
+    SlowProviderState.started.store(true, .release);
+    const ignore_cancel = SlowProviderState.ignore_cancel;
+    const hold_ms = SlowProviderState.hold_ms;
+    var spins: usize = 0;
+    while (spins < 2000) : (spins += 1) {
+        if (!ignore_cancel) {
+            if (cancel_token) |token| {
+                if (token.isCancelled()) {
+                    SlowProviderState.saw_cancel.store(true, .release);
+                    break;
+                }
+            }
+        } else if (spins >= hold_ms) {
+            break;
+        }
+        compat.time.sleepMs(1);
+    }
+
+    stream.completeWithError("cancelled");
+    SlowProviderState.finished.store(true, .release);
+}
+
+fn slowProviderStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    SlowProviderState.created = s;
+    SlowProviderState.created_cancel_flag = if (options) |opts|
+        if (opts.cancel_token) |token| token.cancelled else null
+    else
+        null;
+
+    const ctx = try std.heap.page_allocator.create(SlowProviderCtx);
+    ctx.* = .{
+        .stream = s,
+        .cancel_token = if (options) |opts| opts.cancel_token else null,
+    };
+    const thread = try std.Thread.spawn(.{}, slowProviderThread, .{ctx});
+    thread.detach();
+    return s;
+}
+
+test "a complete request that outruns its deadline joins the provider thread" {
+    SlowProviderState.reset();
+    defer SlowProviderState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "slow-complete-api",
+        .stream = slowProviderStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    }, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .stream_timeout_ms = 50 });
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .complete_request = .{
+            .model = .{
+                .id = "test-model",
+                .name = "Test Model",
+                .api = "slow-complete-api",
+                .provider = "test",
+                .base_url = "https://api.test.com",
+                .reasoning = false,
+                .input = &.{},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 128000,
+                .max_tokens = 4096,
+            },
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    try std.testing.expect(resp != null);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(SlowProviderState.started.load(.acquire));
+    try std.testing.expect(SlowProviderState.saw_cancel.load(.acquire));
+    try std.testing.expect(SlowProviderState.finished.load(.acquire));
+}
+
+test "a provider that ignores cancellation is abandoned, not freed underneath" {
+    SlowProviderState.reset();
+    defer SlowProviderState.reset();
+    SlowProviderState.ignore_cancel = true;
+    SlowProviderState.hold_ms = 400;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "wedged-complete-api",
+        .stream = slowProviderStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    }, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{
+        .stream_timeout_ms = 50,
+        .provider_join_timeout_ms = 50,
+    });
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .complete_request = .{
+            .model = .{
+                .id = "test-model",
+                .name = "Test Model",
+                .api = "wedged-complete-api",
+                .provider = "test",
+                .base_url = "https://api.test.com",
+                .reasoning = false,
+                .input = &.{},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 128000,
+                .max_tokens = 4096,
+            },
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(SlowProviderState.started.load(.acquire));
+    try std.testing.expect(!SlowProviderState.finished.load(.acquire));
+
+    const abandoned = SlowProviderState.created.?;
+    try std.testing.expect(abandoned.waitForThread(10_000));
+    try std.testing.expect(SlowProviderState.finished.load(.acquire));
+    abandoned.deinit();
+    std.testing.allocator.destroy(abandoned);
+    std.testing.allocator.destroy(SlowProviderState.created_cancel_flag.?);
+}
+
+test "the complete path cancels without forcing owned stream events" {
+    CancelMockState.reset();
+    defer CancelMockState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "complete-options-api",
+        .stream = cancelCapturingStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    }, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .complete_request = .{
+            .model = .{
+                .id = "test-model",
+                .name = "Test Model",
+                .api = "complete-options-api",
+                .provider = "test",
+                .base_url = "https://api.test.com",
+                .reasoning = false,
+                .input = &.{},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 128000,
+                .max_tokens = 4096,
+            },
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    try std.testing.expect(resp != null);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(CancelMockState.received_cancel_token != null);
+    try std.testing.expectEqual(@as(?bool, false), CancelMockState.received_requires_owned_events);
 }
 
 test "handleAbortRequest signals CancelToken so provider stops early" {

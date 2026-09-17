@@ -161,11 +161,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeStringField("model", model.id);
 
     const is_codex_model = isOpenAICodexResponsesModel(model);
-    const supports_openai_reasoning = model.reasoning and (
-        isOpenAIHost(model.base_url) or
+    const supports_openai_reasoning = model.reasoning and (isOpenAIHost(model.base_url) or
         is_codex_model or
-        (if (model.compat) |model_compat| model_compat.supports_reasoning_effort == true else false)
-    );
+        (if (model.compat) |model_compat| model_compat.supports_reasoning_effort == true else false));
     const explicit_system_prompt = context.getSystemPrompt();
     if (is_codex_model) {
         const instructions = explicit_system_prompt orelse default_codex_instructions;
@@ -228,8 +226,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         compat_options.supports_store == true and
             compat_options.supports_developer_role == true and
             compat_options.supports_reasoning_effort == true
-        else
-            false;
+    else
+        false;
     const supports_store = isOpenAIHost(model.base_url) or
         (if (model.compat) |compat_options| compat_options.supports_store == true else false) or
         is_codex_model;
