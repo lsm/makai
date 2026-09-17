@@ -150,18 +150,17 @@ endpoint on your own domain. Anything you declare wins; anything you leave out
 falls back to that guess, so existing providers are unaffected.
 
 That fallback is per key, not per block. Declaring one capability does not opt
-the others into anything: the undeclared keys are seeded with the same generic
-values the guess produces for an endpoint it does not recognise, which is what a
-declared endpoint always is. In particular `max_tokens_field` stays `max_tokens`
-and strict tool schemas stay off unless you ask for them, so declaring
-`cache_ttl` on a gateway cannot quietly start sending `max_completion_tokens`
-and `strict` to an endpoint that implements neither.
+the others into anything: every key you leave out stays genuinely unset and is
+answered by the guess on its own. In particular `max_tokens_field` stays
+`max_tokens` and strict tool schemas stay off for an endpoint the guess does not
+recognise, so declaring `cache_ttl` on a gateway cannot quietly start sending
+`max_completion_tokens` and `strict` to an endpoint that implements neither.
 
-The one case worth knowing: an endpoint that would have been *recognised* by the
-guess gets the generic seed anyway once you declare any capability. That means a
-custom entry pointing at `api.openai.com`, or at a host the guess knows to want
-the `zai` or `qwen` thinking format, should state `max_tokens_field` or
-`thinking_format` explicitly rather than relying on detection.
+An endpoint the guess *does* recognise keeps what it detects, for the keys you
+did not declare. A custom entry pointing at a host the guess knows to want the
+`zai` or `qwen` thinking format still gets that format, and declaring an
+unrelated capability no longer resets it. Declare a key explicitly when you want
+to override the guess, not to protect the rest of the block from it.
 
 | Key | Effect |
 | --- | --- |
@@ -174,6 +173,12 @@ the `zai` or `qwen` thinking format, should state `max_tokens_field` or
 | `usage_in_streaming` | Reports usage in streaming responses. |
 | `max_tokens_field` | `max_tokens` or `max_completion_tokens`. |
 | `thinking_format` | `openai`, `zai` or `qwen`. |
+
+Every key in the table is optional in the same sense: on the provider protocol,
+an absent capability field means *unset, detect*, never a default value. A
+capability block travelling between an SDK client and a provider server carries
+only the keys that were declared, and the receiving side resolves the rest from
+the model's base URL exactly as if no block had been sent.
 
 ## Headers
 

@@ -218,7 +218,7 @@ test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
     const compat_options = MockCapture.compat_options orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(?bool, true), compat_options.supports_store);
     try testing.expectEqual(@as(?bool, true), compat_options.supports_developer_role);
-    try testing.expectEqual(@as(@TypeOf(compat_options.max_tokens_field), .max_completion_tokens), compat_options.max_tokens_field);
+    try testing.expect(compat_options.max_tokens_field.? == .max_completion_tokens);
 }
 
 test "stdio protocol stream defaults catalog-issued codex and kimi refs" {

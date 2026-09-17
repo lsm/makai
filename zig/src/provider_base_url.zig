@@ -288,7 +288,7 @@ test "transparent proxy compat preserves vendor token-limit fields" {
     const deepseek = transparentProxyCompatForFlags("deepseek", .{ .deepseek_proxy = true });
     try std.testing.expect(deepseek != null);
     try std.testing.expectEqual(@as(?bool, true), deepseek.?.requires_thinking_as_text);
-    try std.testing.expectEqual(@as(@TypeOf(deepseek.?.max_tokens_field), .max_tokens), deepseek.?.max_tokens_field);
+    try std.testing.expect(deepseek.?.max_tokens_field.? == .max_tokens);
     try std.testing.expectEqual(@as(?bool, false), deepseek.?.supports_strict_mode);
 
     const deepseek_global = transparentProxyCompatForFlags("deepseek", .{
@@ -297,13 +297,13 @@ test "transparent proxy compat preserves vendor token-limit fields" {
         .deepseek_proxy = false,
     });
     try std.testing.expect(deepseek_global != null);
-    try std.testing.expectEqual(@as(@TypeOf(deepseek_global.?.max_tokens_field), .max_tokens), deepseek_global.?.max_tokens_field);
+    try std.testing.expect(deepseek_global.?.max_tokens_field.? == .max_tokens);
 
     try std.testing.expect(transparentProxyCompatForFlags("deepseek", .{}) == null);
 
     const openai = transparentProxyCompatForFlags("openai", .{ .openai_proxy = true });
     try std.testing.expect(openai != null);
-    try std.testing.expectEqual(@as(@TypeOf(openai.?.max_tokens_field), .max_completion_tokens), openai.?.max_tokens_field);
+    try std.testing.expect(openai.?.max_tokens_field.? == .max_completion_tokens);
 }
 
 test "baseUrlWithOverrides resolves production catalog pairs" {
