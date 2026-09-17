@@ -252,6 +252,7 @@ pub const ProtocolServer = struct {
         partial_state: partial_serializer.PartialState,
         started_at: i64,
         cancelled: ?*std.atomic.Value(bool) = null,
+        owns_cancel_flag: bool = true,
     };
 
     pub const DynamicCatalogFetchFn = *const fn (
@@ -316,6 +317,7 @@ pub const ProtocolServer = struct {
         released.partial_state.deinit();
         if (released.cancelled) |c| c.store(true, .release);
         if (!self.releaseProviderStream(released.event_stream, self.options.provider_join_timeout_ms)) return;
+        if (!released.owns_cancel_flag) return;
         if (released.cancelled) |c| self.allocator.destroy(c);
     }
 
@@ -880,7 +882,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     if (!stream.owns_events) {
         cancelled.store(true, .release);
         stream.wait_for_thread_on_deinit = true;
-        if (server.releaseProviderStream(stream, server.options.provider_join_timeout_ms)) {
+        if (server.releaseProviderStream(stream, server.options.provider_join_timeout_ms) and !server.provider_thread_abandoned) {
             server.allocator.destroy(cancelled);
         }
         return try envelope.createNack(
@@ -899,6 +901,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .partial_state = partial_serializer.PartialState.init(server.allocator),
         .started_at = compat.time.nowMillis(),
         .cancelled = cancelled,
+        .owns_cancel_flag = !server.provider_thread_abandoned,
     };
 
     try server.active_streams.put(stream_id, active_stream);
@@ -1018,7 +1021,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     };
     defer {
         cancelled.store(true, .release);
-        if (!server.releaseProviderStream(stream, server.options.provider_join_timeout_ms)) {
+        if (!server.releaseProviderStream(stream, server.options.provider_join_timeout_ms) or server.provider_thread_abandoned) {
             cancel_flag_owned = false;
         }
     }
