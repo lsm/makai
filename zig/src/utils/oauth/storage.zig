@@ -1307,10 +1307,8 @@ test "oauth_storage_saveToFile_does_not_require_directory_iteration" {
     const makai_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
     defer std.testing.allocator.free(makai_path);
     try compat.fs.createDir(compat.fs.getCwd(), makai_path);
-    var makai_dir = try std.Io.Dir.cwd().openDir(defaultIo(), makai_path, .{});
-    defer makai_dir.close(defaultIo());
-    try makai_dir.setPermissions(defaultIo(), @enumFromInt(0o300));
-    defer makai_dir.setPermissions(defaultIo(), @enumFromInt(0o700)) catch {};
+    try compat.fs.getCwd().setFilePermissions(defaultIo(), makai_path, @enumFromInt(0o300), .{});
+    defer compat.fs.getCwd().setFilePermissions(defaultIo(), makai_path, @enumFromInt(0o700), .{}) catch {};
 
     var storage = AuthStorage{
         .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
