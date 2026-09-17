@@ -4,6 +4,7 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
+const error_detail = @import("provider_error_detail");
 const json_writer = @import("json_writer");
 const tool_call_tracker = @import("tool_call_tracker");
 const sanitize = @import("sanitize");
@@ -1030,15 +1031,21 @@ fn runThread(ctx: *ThreadCtx) void {
         const error_body = compat.http.allocRemainingResponse(allocator, error_reader, 8192) catch null;
         defer if (error_body) |eb| allocator.free(eb);
 
-        std.debug.print("OpenAI Responses API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), model.name });
-        if (error_body) |eb| {
-            std.debug.print("Error body: {s}\n", .{eb});
-        }
+        const detail = if (error_body) |eb| error_detail.describe(allocator, eb) catch null else null;
+        defer if (detail) |text| allocator.free(text);
+
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const error_msg = std.fmt.allocPrint(allocator, "{s} request failed: HTTP {d}{s}", .{
+            model.provider,
+            status_code,
+            detail orelse "",
+        }) catch "responses request failed";
+        defer if (!std.mem.eql(u8, error_msg, "responses request failed")) allocator.free(error_msg);
 
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.completeWithError("responses request failed");
+        stream.completeWithError(error_msg);
         stream.markThreadDone();
         return;
     }
