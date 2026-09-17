@@ -25,25 +25,33 @@ A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, 
 `makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
 (project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
 
-### macOS: the Keychain can block a non-interactive run
+### macOS: the Keychain, non-interactive runs, and test isolation
 
-On macOS, credential storage is Keychain-first. Reading an **existing** `com.makai.auth` item
-whose access list does not authorize the running binary raises an authorization prompt, and in a
-non-interactive shell that prompt never surfaces: the read does not fail, it blocks. `makai auth
-providers --json` hangs; the same command with the service overridden returns in well under a
-second.
+On macOS, credential storage is Keychain-first, and the two directions behave differently.
 
-This needs an item that is already there. On a machine with no `com.makai.auth` item,
-`SecKeychainFindGenericPassword` returns `errSecItemNotFound`, `AuthStorage.loadDefault` falls
-back to the auth file, and the command returns normally — so a clean CI runner does not reproduce
-it. Access lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts
-again; the macOS artifacts this repo publishes are plain `zig build install` output and are
-unsigned too, so they behave the same way. Only a Developer-ID-signed build, keyed by team ID,
-escapes it.
+**Reads fail fast.** Every read path runs under `SecKeychainSetUserInteractionAllowed(0)`, so a
+binary the `com.makai.auth` item's access list does not authorize gets `errSecInteractionNotAllowed`
+rather than an authorization prompt, and `AuthStorage.loadDefault` falls back to `~/.makai/auth.json`.
+That fallback goes through `loadFromFile`, **not** `loadFromFileWithSaveFn`, so a background token
+refresh cannot re-save and re-arm the prompt. The degradation is silent by design: the run continues
+with whatever the file holds, which may be nothing. Reads also tell contention apart from refusal —
+the keychain mutex is taken with a bounded retry, and a holder that outlasts the budget yields a
+distinct `busy` result instead of being reported as `needs_interaction`, so an interactive write
+mid-prompt no longer makes a concurrent read look like an authorization failure.
 
-Symptom to recognise: the runtime prints `ready` and then goes silent on the first request that
-touches credentials, with no error and no timeout of its own. Bound any such invocation with an
-external timeout so a hang is visible rather than silent.
+**Writes still prompt.** `macos_keychain.write` takes the mutex blocking and leaves interaction
+enabled, so persisting credentials from an unauthorized binary raises the prompt — and in a
+non-interactive shell that prompt never surfaces, so the write blocks rather than failing. Access
+lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again; the
+macOS artifacts this repo publishes are plain `zig build install` output and are unsigned too. Only
+a Developer-ID-signed build, keyed by team ID, escapes it. Bound any invocation that may persist
+credentials with an external timeout so a hang is visible rather than silent.
+
+Reads blocked the same way before #315, which is why older notes describe `makai auth providers
+--json` printing `ready` and then going silent on the first credential-touching request. That
+symptom is gone. A machine with no `com.makai.auth` item never reproduced it either —
+`SecKeychainFindGenericPassword` returns `errSecItemNotFound` and the load falls back to the file —
+so a clean CI runner was never a useful test of it.
 
 ```bash
 export MAKAI_KEYCHAIN_SERVICE="makai-test-$(uuidgen)"
@@ -60,8 +68,8 @@ Four limits:
    `loadDefault` falls back to that file, so a supposedly isolated run can still consume real
    tokens. Redirect `HOME` as well if it may hold live credentials.
 2. **It does not isolate the Codex CLI import**, which reads the fixed `Codex Auth` service. That
-   import runs on `loadDefault` paths — `makai auth providers` among them — and can trigger the
-   same invisible prompt. It does **not** run on `loadDefaultStoredOnly`, which passes
+   import runs on `loadDefault` paths — `makai auth providers` among them — and reads a service the
+   override does not cover. It does **not** run on `loadDefaultStoredOnly`, which passes
    `import_codex = false` and serves provider credential resolution, TUI login-status refreshes and
    stored Kimi lookup.
 3. **A unique service accumulates credential items.** Anything that persists credentials writes one
@@ -70,8 +78,9 @@ Four limits:
    its only delete path is the legacy `auth.json` migration. Clean up on every exit path with
    `security delete-generic-password -s "$MAKAI_KEYCHAIN_SERVICE"`.
 4. **The real-binary SDK tests cannot pass on macOS as written.** With or without the override,
-   `loadDefault` attaches the Keychain save callback when the service has no item, so login writes
-   go to the Keychain rather than the temporary `HOME`'s `auth.json` and the login assertions in
+   `loadDefault` attaches the Keychain save callback when the service has no item (the `.not_found`
+   branch, which the read-side fail-fast change does not touch), so login writes go to the Keychain
+   rather than the temporary `HOME`'s `auth.json` and the login assertions in
    `typescript/test/makai_binary_smoke.test.ts` and `typescript/test/demo_server.test.ts` fail on
    `ENOENT`. There is no switch that forces file-backed storage — `shouldUseKeychain()` is
    hardcoded to macOS non-test builds. Run those on Linux.
@@ -95,14 +104,14 @@ Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml
 
 `tools/*` tests have their own matrix-covered group, **`test-unit-tools`**; none of the `agent-*` subgroups contains them. All eleven tool artifacts are wired there, and `test_unit_agent_step` pulls that step in rather than re-listing its members. So a new `tools/*` test goes into `test_unit_tools_step` (plus `test`).
 
-The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`.
+The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`. `oauth/storage.zig` was the worst case: it had a module but no `addTest` at all, so its thirteen tests ran nowhere and silently rotted past compiling against Zig 0.16 until `oauth_storage_test` was wired into both steps. A module without a test artifact is invisible to this invariant, so check that the `addTest` exists, not just that a group references it.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
 zig build test-unit-transport     # transport, stdio, sse, websocket, in_process, transport_retry
 zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
-zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
+zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, storage, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
 zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport
 zig build test-unit-tools         # all 11 tools/*: common, process_runner, artifact, shell, file, edit, hashline, search, workspace, mcp_bridge, registry
@@ -306,7 +315,7 @@ Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completion
 
 `zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (10 ratified `CommandKind`s — help, model, login, provider, status, resume, permissions, clear, abort, quit — exposed as 12 accepted names, since `/sessions` aliases `/resume` and `/perm` aliases `/permissions`), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
 
-`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS; unsigned dev builds get one keychain prompt per new binary because access lists bind to the code hash (signed releases are keyed by team ID). Never move credentials to a plain file. `MAKAI_KEYCHAIN_SERVICE` isolates keychain items in local runs. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
+`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS: reads fail fast and fall back to `auth.json`, writes still prompt, and `MAKAI_KEYCHAIN_SERVICE` isolates items in local runs — see the macOS Keychain section above for the mechanism and the four limits of that override. Never move credentials to a plain file. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
 
 ## Zig Conventions
 
