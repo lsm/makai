@@ -7,6 +7,8 @@ const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const redirect_uri = "https://console.anthropic.com/oauth/code/callback";
 const scopes = "org:create_api_key%20user:profile%20user:inference";
 const auth_url_base = "https://claude.ai/oauth/authorize";
+pub const oauth_request_timeout_ms: u64 = 30_000;
+
 const token_url = "https://console.anthropic.com/v1/oauth/token";
 
 pub const Credentials = struct {
@@ -256,51 +258,24 @@ fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, alloc
 }
 
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
-    var environ_map = compat.createEnvMap(allocator) catch null;
-    defer if (environ_map) |*map| map.deinit();
-    if (environ_map) |*map| {
-        client.initDefaultProxies(allocator, map) catch |err| blk: {
-            std.debug.print("Warning: Failed to initialize HTTP proxy: {}\n", .{err});
-            break :blk;
-        };
-    }
-
-    const uri = try std.Uri.parse(token_url);
-
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
 
-    var request = try client.openRequest(.POST, uri, .{
+    var fetched = http.fetch(allocator, token_url, .{
+        .method = .POST,
         .extra_headers = headers.items,
+        .body = body,
         .accept_encoding = "identity",
-    });
-    defer request.deinit();
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch return error.OAuthFailed;
+    defer fetched.deinit(allocator);
 
-    try http.sendRequest(&request, body);
+    if (fetched.status != 200) return error.OAuthFailed;
 
-    var header_buffer: [4096]u8 = undefined;
-    var response = try http.receiveResponse(&request, &header_buffer);
-
-    if (response.head.status != .ok) {
-        var buffer: [4096]u8 = undefined;
-        const reader = http.responseReader(&response, &buffer);
-        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
-        defer allocator.free(error_body);
-        std.debug.print("Token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
-        return error.OAuthFailed;
-    }
-
-    var response_buffer: [8192]u8 = undefined;
-    const reader = http.responseReader(&response, &response_buffer);
-    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
-    defer allocator.free(response_body);
-
-    return try parseTokenResponse(response_body, allocator);
+    return try parseTokenResponse(fetched.body, allocator);
 }
 
 test "parseAuthFromManualInput - hash fragment with state" {
