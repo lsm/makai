@@ -640,7 +640,7 @@ test "EventStream handles event batch processing" {
     try testing.expect(event_str.isDone());
 }
 
-test "Envelope defaults version to 1 when not specified" {
+test "Envelope rejects a frame with no version" {
     const allocator = testing.allocator;
 
     const json_without_version =
@@ -654,10 +654,7 @@ test "Envelope defaults version to 1 when not specified" {
         \\}
     ;
 
-    var parsed = try envelope.deserializeEnvelope(json_without_version, allocator);
-    defer parsed.deinit(allocator);
-
-    try testing.expectEqual(@as(u8, 1), parsed.version);
+    try testing.expectError(error.MissingField, envelope.deserializeEnvelope(json_without_version, allocator));
 }
 
 test "Envelope preserves explicit version" {

@@ -3,6 +3,7 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
+const error_detail = @import("provider_error_detail");
 const json_writer = @import("json_writer");
 const github_copilot = @import("github_copilot");
 const tool_call_tracker = @import("tool_call_tracker");
@@ -1306,13 +1307,15 @@ fn runThread(ctx: *ThreadCtx) void {
         const error_body = compat_mod.http.allocRemainingResponse(allocator, error_reader, 8192) catch null;
         defer if (error_body) |eb| allocator.free(eb);
 
-        std.debug.print("OpenAI API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), model.name });
-        if (error_body) |eb| {
-            std.debug.print("Error body: {s}\n", .{eb});
-        }
+        const detail = if (error_body) |eb| error_detail.describe(allocator, eb) catch null else null;
+        defer if (detail) |text| allocator.free(text);
 
         const status_code: u16 = @intFromEnum(response.head.status);
-        const error_msg = std.fmt.allocPrint(allocator, "openai request failed: status={d}", .{status_code}) catch "openai request failed";
+        const error_msg = std.fmt.allocPrint(allocator, "{s} request failed: HTTP {d}{s}", .{
+            model.provider,
+            status_code,
+            detail orelse "",
+        }) catch "openai request failed";
         defer if (!std.mem.eql(u8, error_msg, "openai request failed")) allocator.free(error_msg);
 
         ctx.deinit();
