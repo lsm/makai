@@ -110,17 +110,17 @@ fn prepareAuthDirectory(cwd: std.Io.Dir, dir_path: []const u8) !void {
 }
 
 fn atomicSaveCredentials(cwd: std.Io.Dir, dir_path: []const u8, file_path: []const u8, data: []const u8, allocator: std.mem.Allocator) !void {
-    var auth_dir = try cwd.openDir(defaultIo(), dir_path, .{});
-    defer auth_dir.close(defaultIo());
-
     const tmp_name = try std.fmt.allocPrint(allocator, "{s}{d}.{x}", .{ auth_temp_prefix, compat.time.nowMillis(), compat.random.int(u64) });
     defer allocator.free(tmp_name);
 
+    const tmp_path = try std.fs.path.join(allocator, &.{ dir_path, tmp_name });
+    defer allocator.free(tmp_path);
+
     var cleanup_tmp = false;
-    defer if (cleanup_tmp) auth_dir.deleteFile(defaultIo(), tmp_name) catch {};
+    defer if (cleanup_tmp) cwd.deleteFile(defaultIo(), tmp_path) catch {};
 
     {
-        var file = try auth_dir.createFile(defaultIo(), tmp_name, .{ .exclusive = true, .truncate = false, .permissions = credential_file_permissions });
+        var file = try cwd.createFile(defaultIo(), tmp_path, .{ .exclusive = true, .truncate = false, .permissions = credential_file_permissions });
         cleanup_tmp = true;
         defer file.close(defaultIo());
         try file.writeStreamingAll(defaultIo(), data);
@@ -131,7 +131,7 @@ fn atomicSaveCredentials(cwd: std.Io.Dir, dir_path: []const u8, file_path: []con
         };
     }
 
-    try auth_dir.rename(tmp_name, auth_dir, auth_file_name, defaultIo());
+    try cwd.rename(tmp_path, cwd, file_path, defaultIo());
     cleanup_tmp = false;
 
     var final_file = try compat.fs.openFile(cwd, file_path, .{ .mode = .write_only });
@@ -1291,7 +1291,7 @@ test "oauth_storage_saveToFile_replaces_existing_file_without_requiring_temp_cle
     try std.testing.expectEqualStrings("active-writer", active_content);
 }
 
-const save_opens_auth_directory_handle = true;
+const save_opens_auth_directory_handle = false;
 
 test "oauth_storage_saveToFile_does_not_require_directory_iteration" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
