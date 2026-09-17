@@ -277,7 +277,8 @@ pub const Server = struct {
     }
 
     pub fn handleLine(self: *Self, line: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             return error.MalformedLine;
         };
         defer parsed.deinit();
@@ -315,7 +316,7 @@ pub const Server = struct {
         defer self.allocator.free(name);
 
         var buffer = std.ArrayList(u8).empty;
-        errdefer buffer.deinit(self.allocator);
+        defer buffer.deinit(self.allocator);
         var w = json_writer.JsonWriter.init(&buffer, self.allocator);
         try w.beginObject();
         try w.writeStringField("control", name);
@@ -325,7 +326,6 @@ pub const Server = struct {
         try w.endObject();
 
         const line = try self.allocator.dupe(u8, buffer.items);
-        buffer.deinit(self.allocator);
         errdefer self.allocator.free(line);
         try self.outbound.append(self.allocator, line);
     }
@@ -2669,6 +2669,18 @@ test "a control frame without an id is still answered" {
 
     try std.testing.expect(std.mem.indexOf(u8, line, "\"control\":\"rewind.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"id\"") == null);
+}
+
+fn unsupportedControlProbe(allocator: std.mem.Allocator) !void {
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try server.handleLine("{\"control\":\"replay\",\"id\":\"r1\"}");
+    drainOutbound(&server, allocator);
+}
+
+test "an unsupported control answer survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, unsupportedControlProbe, .{});
 }
 
 test "a line that is not json is a framing defect rather than an error response" {
