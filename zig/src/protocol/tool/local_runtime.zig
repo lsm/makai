@@ -173,6 +173,14 @@ pub const ToolProtocolClient = struct {
         args_json: []const u8,
         allocator: std.mem.Allocator,
     ) !tool_types.Envelope {
+        const owned_tool_call_id = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(owned_tool_call_id);
+
+        const owned_tool_name = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(owned_tool_name);
+
+        const owned_args_json = try allocator.dupe(u8, args_json);
+
         self.sequence += 1;
         return .{
             .server_id = self.server_id,
@@ -181,9 +189,9 @@ pub const ToolProtocolClient = struct {
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .tool_execute = .{
                 .execution_id = tool_types.generateUlid(),
-                .tool_call_id = try allocator.dupe(u8, tool_call_id),
-                .tool_name = try allocator.dupe(u8, tool_name),
-                .args_json = try allocator.dupe(u8, args_json),
+                .tool_call_id = owned_tool_call_id,
+                .tool_name = owned_tool_name,
+                .args_json = owned_args_json,
             } },
         };
     }
@@ -822,4 +830,21 @@ fn toolListHandoffProbe(allocator: std.mem.Allocator) !void {
 
 test "tool_list handoff to metas.append survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, toolListHandoffProbe, .{});
+}
+
+fn nextExecuteEnvelopeProbe(allocator: std.mem.Allocator) !void {
+    var client = ToolProtocolClient.init();
+
+    var envelope = try client.nextExecuteEnvelope(
+        "call-0123456789",
+        "shell_execute",
+        \\{"command":"ls -la /workspace"}
+    ,
+        allocator,
+    );
+    envelope.deinit(allocator);
+}
+
+test "nextExecuteEnvelope survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nextExecuteEnvelopeProbe, .{});
 }

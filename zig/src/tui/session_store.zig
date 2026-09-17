@@ -924,20 +924,34 @@ fn assistantTextMessage(allocator: std.mem.Allocator, text: []const u8, stop_rea
 }
 
 fn assistantTextMessageWithMeta(allocator: std.mem.Allocator, meta: SessionMetadata, text: []const u8, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
+    const owned_text = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned_text);
+
     const content = try allocator.alloc(ai_types.AssistantContent, 1);
     errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    content[0] = .{ .text = .{ .text = owned_text } };
+
     return assistantMessage(allocator, meta, content, stop_reason);
 }
 
 fn assistantToolCallMessage(allocator: std.mem.Allocator, meta: SessionMetadata, id: []const u8, name: []const u8, args_json: []const u8) !ai_types.AssistantMessage {
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+
+    const owned_args_json = try allocator.dupe(u8, args_json);
+    errdefer allocator.free(owned_args_json);
+
     const content = try allocator.alloc(ai_types.AssistantContent, 1);
     errdefer allocator.free(content);
     content[0] = .{ .tool_call = .{
-        .id = try allocator.dupe(u8, id),
-        .name = try allocator.dupe(u8, name),
-        .arguments_json = try allocator.dupe(u8, args_json),
+        .id = owned_id,
+        .name = owned_name,
+        .arguments_json = owned_args_json,
     } };
+
     return assistantMessage(allocator, meta, content, .tool_use);
 }
 
@@ -1599,4 +1613,30 @@ fn parseUserContentPartProbe(allocator: std.mem.Allocator) !void {
 
 test "parseUserContentPart survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseUserContentPartProbe, .{});
+}
+
+fn assistantMessageBuildersProbe(allocator: std.mem.Allocator) !void {
+    const meta = SessionMetadata{
+        .session_id = @constCast("session-0123456789012"),
+        .model = @constCast("claude-sonnet-4-5"),
+        .provider = @constCast("anthropic"),
+        .last_active = 1_700_000_000_000,
+    };
+
+    var text_message = try assistantTextMessageWithMeta(allocator, meta, "assistant answer text", .stop);
+    ai_types.deinitAssistantMessageOwned(allocator, &text_message);
+
+    var tool_message = try assistantToolCallMessage(
+        allocator,
+        meta,
+        "call-0123456789",
+        "shell_execute",
+        \\{"command":"ls"}
+        ,
+    );
+    ai_types.deinitAssistantMessageOwned(allocator, &tool_message);
+}
+
+test "assistant message builders survive an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, assistantMessageBuildersProbe, .{});
 }
