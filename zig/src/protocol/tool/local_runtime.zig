@@ -434,13 +434,27 @@ fn cloneArtifactsToTool(allocator: std.mem.Allocator, artifacts: []const ai_type
         allocator.free(cloned);
     }
     for (artifacts, 0..) |artifact, i| {
+        const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+        errdefer allocator.free(artifact_id);
+
+        const uri: ?[]u8 = if (artifact.getUri()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (uri) |v| allocator.free(v);
+
+        const mime_type: ?[]u8 = if (artifact.getMimeType()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (mime_type) |v| allocator.free(v);
+
+        const sha256: ?[]u8 = if (artifact.getSha256()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (sha256) |v| allocator.free(v);
+
+        const description: ?[]u8 = if (artifact.getDescription()) |v| try allocator.dupe(u8, v) else null;
+
         cloned[i] = .{
-            .artifact_id = try allocator.dupe(u8, artifact.artifact_id),
-            .uri = if (artifact.getUri()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .mime_type = if (artifact.getMimeType()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .artifact_id = artifact_id,
+            .uri = if (uri) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .mime_type = if (mime_type) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
             .byte_size = artifact.byte_size,
-            .sha256 = if (artifact.getSha256()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .description = if (artifact.getDescription()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .sha256 = if (sha256) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .description = if (description) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
         };
         initialized += 1;
     }
@@ -455,13 +469,27 @@ fn cloneArtifactsToAgent(allocator: std.mem.Allocator, artifacts: []const tool_t
         allocator.free(cloned);
     }
     for (artifacts, 0..) |artifact, i| {
+        const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+        errdefer allocator.free(artifact_id);
+
+        const uri: ?[]u8 = if (artifact.getUri()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (uri) |v| allocator.free(v);
+
+        const mime_type: ?[]u8 = if (artifact.getMimeType()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (mime_type) |v| allocator.free(v);
+
+        const sha256: ?[]u8 = if (artifact.getSha256()) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (sha256) |v| allocator.free(v);
+
+        const description: ?[]u8 = if (artifact.getDescription()) |v| try allocator.dupe(u8, v) else null;
+
         cloned[i] = .{
-            .artifact_id = try allocator.dupe(u8, artifact.artifact_id),
-            .uri = if (artifact.getUri()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .mime_type = if (artifact.getMimeType()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .artifact_id = artifact_id,
+            .uri = if (uri) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .mime_type = if (mime_type) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
             .byte_size = artifact.byte_size,
-            .sha256 = if (artifact.getSha256()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
-            .description = if (artifact.getDescription()) |v| OwnedSlice(u8).initOwned(try allocator.dupe(u8, v)) else OwnedSlice(u8).initBorrowed(""),
+            .sha256 = if (sha256) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
+            .description = if (description) |v| OwnedSlice(u8).initOwned(v) else OwnedSlice(u8).initBorrowed(""),
         };
         initialized += 1;
     }
@@ -636,4 +664,62 @@ test "in-process tool protocol round-trip stays near direct call" {
 
     _ = direct_ms;
     try std.testing.expect(proto_ms <= 100);
+}
+
+fn cloneArtifactsToToolProbe(allocator: std.mem.Allocator) !void {
+    const artifacts = [_]ai_types.ArtifactReference{
+        .{
+            .artifact_id = "art-one",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/one.txt"),
+            .mime_type = OwnedSlice(u8).initBorrowed("text/plain"),
+            .byte_size = 11,
+            .sha256 = OwnedSlice(u8).initBorrowed("1111111111111111"),
+            .description = OwnedSlice(u8).initBorrowed("first artifact"),
+        },
+        .{
+            .artifact_id = "art-two",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/two.json"),
+            .mime_type = OwnedSlice(u8).initBorrowed("application/json"),
+            .byte_size = 22,
+            .sha256 = OwnedSlice(u8).initBorrowed("2222222222222222"),
+            .description = OwnedSlice(u8).initBorrowed("second artifact"),
+        },
+    };
+
+    const cloned = try cloneArtifactsToTool(allocator, &artifacts);
+    for (cloned) |*artifact| artifact.deinit(allocator);
+    allocator.free(cloned);
+}
+
+test "cloneArtifactsToTool survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneArtifactsToToolProbe, .{});
+}
+
+fn cloneArtifactsToAgentProbe(allocator: std.mem.Allocator) !void {
+    const artifacts = [_]tool_types.ArtifactReference{
+        .{
+            .artifact_id = "art-one",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/one.txt"),
+            .mime_type = OwnedSlice(u8).initBorrowed("text/plain"),
+            .byte_size = 11,
+            .sha256 = OwnedSlice(u8).initBorrowed("1111111111111111"),
+            .description = OwnedSlice(u8).initBorrowed("first artifact"),
+        },
+        .{
+            .artifact_id = "art-two",
+            .uri = OwnedSlice(u8).initBorrowed("file:///tmp/two.json"),
+            .mime_type = OwnedSlice(u8).initBorrowed("application/json"),
+            .byte_size = 22,
+            .sha256 = OwnedSlice(u8).initBorrowed("2222222222222222"),
+            .description = OwnedSlice(u8).initBorrowed("second artifact"),
+        },
+    };
+
+    const cloned = try cloneArtifactsToAgent(allocator, &artifacts);
+    for (cloned) |*artifact| artifact.deinit(allocator);
+    allocator.free(cloned);
+}
+
+test "cloneArtifactsToAgent survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneArtifactsToAgentProbe, .{});
 }

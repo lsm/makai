@@ -752,13 +752,28 @@ fn parseArtifacts(allocator: std.mem.Allocator, json: []const u8) ![]ai_types.Ar
             .object => |o| o,
             else => return error.InvalidMessage,
         };
+
+        const artifact_id = try allocator.dupe(u8, stringField(obj, "artifact_id") orelse "");
+        errdefer allocator.free(artifact_id);
+
+        const uri = try allocator.dupe(u8, stringField(obj, "uri") orelse "");
+        errdefer allocator.free(uri);
+
+        const mime_type = try allocator.dupe(u8, stringField(obj, "mime_type") orelse "");
+        errdefer allocator.free(mime_type);
+
+        const sha256 = try allocator.dupe(u8, stringField(obj, "sha256") orelse "");
+        errdefer allocator.free(sha256);
+
+        const description = try allocator.dupe(u8, stringField(obj, "description") orelse "");
+
         artifacts[i] = .{
-            .artifact_id = try allocator.dupe(u8, stringField(obj, "artifact_id") orelse ""),
-            .uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "uri") orelse "")),
-            .mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "mime_type") orelse "")),
+            .artifact_id = artifact_id,
+            .uri = OwnedSlice(u8).initOwned(uri),
+            .mime_type = OwnedSlice(u8).initOwned(mime_type),
             .byte_size = uintField(obj, "byte_size"),
-            .sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "sha256") orelse "")),
-            .description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "description") orelse "")),
+            .sha256 = OwnedSlice(u8).initOwned(sha256),
+            .description = OwnedSlice(u8).initOwned(description),
         };
         initialized += 1;
     }
@@ -1306,4 +1321,19 @@ test "JSONL byte cap counts consumed delimiters" {
     defer replay.deinit(std.testing.allocator);
     var ctx = LoadLineContext{ .allocator = std.testing.allocator, .loaded = &loaded, .replay = &replay };
     try std.testing.expectError(error.StreamTooLong, readJsonlRecords(std.testing.allocator, path, 1, &ctx, loadLine));
+}
+
+fn parseArtifactsProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\[{"artifact_id":"art-one","uri":"file:///tmp/one.txt","mime_type":"text/plain","byte_size":11,"sha256":"1111111111111111","description":"first artifact"},
+        \\ {"artifact_id":"art-two","uri":"file:///tmp/two.json","mime_type":"application/json","byte_size":22,"sha256":"2222222222222222","description":"second artifact"}]
+    ;
+
+    const artifacts = try parseArtifacts(allocator, json);
+    for (artifacts) |*artifact| artifact.deinit(allocator);
+    allocator.free(artifacts);
+}
+
+test "parseArtifacts survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseArtifactsProbe, .{});
 }
