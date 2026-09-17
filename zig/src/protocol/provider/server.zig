@@ -261,17 +261,34 @@ pub const ProtocolServer = struct {
         };
     }
 
+    fn releaseProviderStream(
+        allocator: std.mem.Allocator,
+        stream: *event_stream.AssistantMessageEventStream,
+        join_timeout_ms: u64,
+    ) bool {
+        if (!stream.cancelAndJoinThread(join_timeout_ms)) {
+            stream.abandoned.store(true, .release);
+            return false;
+        }
+        stream.wait_for_thread_on_deinit = false;
+        stream.deinit();
+        allocator.destroy(stream);
+        return true;
+    }
+
+    fn releaseStream(self: *ProtocolServer, active_stream: ActiveStream) void {
+        var released = active_stream;
+        released.partial_state.deinit();
+        if (released.cancelled) |c| c.store(true, .release);
+        if (!releaseProviderStream(self.allocator, released.event_stream, self.options.provider_join_timeout_ms)) return;
+        if (released.cancelled) |c| self.allocator.destroy(c);
+    }
+
     pub fn deinit(self: *ProtocolServer) void {
         self.refresh_lock.deinit();
         var iter = self.active_streams.iterator();
         while (iter.next()) |entry| {
-            var active_stream = entry.value_ptr.*;
-            active_stream.partial_state.deinit();
-            active_stream.event_stream.deinit();
-            self.allocator.destroy(active_stream.event_stream);
-            if (active_stream.cancelled) |c| {
-                self.allocator.destroy(c);
-            }
+            self.releaseStream(entry.value_ptr.*);
         }
         self.active_streams.deinit();
         self.sequence_counters.deinit();
@@ -281,13 +298,8 @@ pub const ProtocolServer = struct {
         }
         self.outbox.deinit(self.allocator);
 
-        for (self.pending_cleanup.items) |*stream| {
-            stream.partial_state.deinit();
-            stream.event_stream.deinit();
-            self.allocator.destroy(stream.event_stream);
-            if (stream.cancelled) |c| {
-                self.allocator.destroy(c);
-            }
+        for (self.pending_cleanup.items) |stream| {
+            self.releaseStream(stream);
         }
         self.pending_cleanup.deinit(self.allocator);
 
@@ -383,13 +395,7 @@ pub const ProtocolServer = struct {
             const next = node.next;
 
             if (self.active_streams.fetchRemove(stream_id)) |removed| {
-                var partial = removed.value.partial_state;
-                partial.deinit();
-                removed.value.event_stream.deinit();
-                self.allocator.destroy(removed.value.event_stream);
-                if (removed.value.cancelled) |c| {
-                    self.allocator.destroy(c);
-                }
+                self.releaseStream(removed.value);
             }
             _ = self.sequence_counters.remove(stream_id);
             _ = self.expected_sequences.remove(stream_id);
@@ -400,13 +406,7 @@ pub const ProtocolServer = struct {
 
         for (overflow.items) |stream_id| {
             if (self.active_streams.fetchRemove(stream_id)) |removed| {
-                var partial = removed.value.partial_state;
-                partial.deinit();
-                removed.value.event_stream.deinit();
-                self.allocator.destroy(removed.value.event_stream);
-                if (removed.value.cancelled) |c| {
-                    self.allocator.destroy(c);
-                }
+                self.releaseStream(removed.value);
             }
             _ = self.sequence_counters.remove(stream_id);
             _ = self.expected_sequences.remove(stream_id);
@@ -414,13 +414,8 @@ pub const ProtocolServer = struct {
 
         var cleanup_list = self.pending_cleanup;
         self.pending_cleanup = std.ArrayList(ActiveStream).empty;
-        for (cleanup_list.items) |*stream| {
-            stream.partial_state.deinit();
-            stream.event_stream.deinit();
-            self.allocator.destroy(stream.event_stream);
-            if (stream.cancelled) |c| {
-                self.allocator.destroy(c);
-            }
+        for (cleanup_list.items) |stream| {
+            self.releaseStream(stream);
         }
         cleanup_list.deinit(self.allocator);
     }
@@ -678,8 +673,7 @@ fn streamWithRefresh(
 
     server.allocator.free(api_key_opt.?);
     api_key_opt = null;
-    stream.deinit();
-    server.allocator.destroy(stream);
+    _ = ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms);
 
     refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -700,8 +694,7 @@ fn streamWithRefresh(
         if (retry_stream.getError()) |retry_err_msg| {
             const retry_auth_failure = if (provider.is_auth_failure) |detector| detector(retry_err_msg) else defaultAuthFailureDetector(retry_err_msg);
             if (retry_auth_failure) {
-                retry_stream.deinit();
-                server.allocator.destroy(retry_stream);
+                _ = ProtocolServer.releaseProviderStream(server.allocator, retry_stream, server.options.provider_join_timeout_ms);
                 return error.AuthRequired;
             }
         }
@@ -851,9 +844,9 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     if (!stream.owns_events) {
         cancelled.store(true, .release);
         stream.wait_for_thread_on_deinit = true;
-        stream.deinit();
-        server.allocator.destroy(stream);
-        server.allocator.destroy(cancelled);
+        if (ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms)) {
+            server.allocator.destroy(cancelled);
+        }
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             "Provider returned borrowed events for protocol streaming",
@@ -904,13 +897,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         removed.value.event_stream.completeWithError(reason);
 
         server.pending_cleanup.append(server.allocator, removed.value) catch {
-            var partial = removed.value.partial_state;
-            partial.deinit();
-            removed.value.event_stream.deinit();
-            server.allocator.destroy(removed.value.event_stream);
-            if (removed.value.cancelled) |c| {
-                server.allocator.destroy(c);
-            }
+            server.releaseStream(removed.value);
         };
 
         const seq = server.nextSequence(request.target_stream_id);
@@ -993,10 +980,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     };
     defer {
         cancelled.store(true, .release);
-        if (stream.cancelAndJoinThread(server.options.provider_join_timeout_ms)) {
-            stream.deinit();
-            server.allocator.destroy(stream);
-        } else {
+        if (!ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms)) {
             cancel_flag_owned = false;
         }
     }
@@ -3772,6 +3756,146 @@ test "a complete request that outruns its deadline joins the provider thread" {
     try std.testing.expect(SlowProviderState.started.load(.acquire));
     try std.testing.expect(SlowProviderState.saw_cancel.load(.acquire));
     try std.testing.expect(SlowProviderState.finished.load(.acquire));
+}
+
+const WedgedProviderState = struct {
+    var gate: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var push_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var pushed: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
+    var created: ?*event_stream.AssistantMessageEventStream = null;
+    var created_cancel_flag: ?*std.atomic.Value(bool) = null;
+
+    fn reset() void {
+        gate.store(false, .release);
+        started.store(false, .release);
+        push_returned.store(false, .release);
+        pushed.store(true, .release);
+        created = null;
+        created_cancel_flag = null;
+    }
+};
+
+fn wedgedProviderThread(ctx: *SlowProviderCtx) void {
+    const stream = ctx.stream;
+    std.heap.page_allocator.destroy(ctx);
+
+    WedgedProviderState.started.store(true, .release);
+    while (!WedgedProviderState.gate.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "wedged-stream-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+    };
+    WedgedProviderState.pushed.store(stream.pushBlocking(.{ .start = .{ .partial = partial } }), .release);
+    WedgedProviderState.push_returned.store(true, .release);
+
+    stream.completeWithError("wedged provider finished");
+    stream.markThreadDone();
+}
+
+fn wedgedProviderStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    s.wait_for_thread_on_deinit = true;
+
+    WedgedProviderState.created = s;
+    WedgedProviderState.created_cancel_flag = if (options) |opts|
+        if (opts.cancel_token) |token| token.cancelled else null
+    else
+        null;
+
+    const ctx = try std.heap.page_allocator.create(SlowProviderCtx);
+    ctx.* = .{
+        .stream = s,
+        .cancel_token = if (options) |opts| opts.cancel_token else null,
+    };
+    const thread = try std.Thread.spawn(.{}, wedgedProviderThread, .{ctx});
+    thread.detach();
+    return s;
+}
+
+test "server teardown abandons a stream whose provider thread has not reached the stream yet" {
+    WedgedProviderState.reset();
+    defer WedgedProviderState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "wedged-stream-api",
+        .stream = wedgedProviderStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    }, null);
+
+    const stream_id = protocol_types.generateUlid();
+
+    {
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .provider_join_timeout_ms = 20 });
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = stream_id,
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = .{
+                    .id = "test-model",
+                    .name = "Test Model",
+                    .api = "wedged-stream-api",
+                    .provider = "test-provider",
+                    .base_url = "https://api.test.com",
+                    .reasoning = false,
+                    .input = &.{},
+                    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                    .context_window = 128000,
+                    .max_tokens = 4096,
+                },
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        try std.testing.expect(WedgedProviderState.started.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    }
+
+    const abandoned = WedgedProviderState.created.?;
+    try std.testing.expect(abandoned.wasAbandoned());
+
+    WedgedProviderState.gate.store(true, .release);
+    try std.testing.expect(abandoned.waitForThread(10_000));
+    try std.testing.expect(WedgedProviderState.push_returned.load(.acquire));
+    try std.testing.expect(!WedgedProviderState.pushed.load(.acquire));
+
+    abandoned.wait_for_thread_on_deinit = false;
+    try std.testing.expect(abandoned.deinitAndDestroy());
+    std.testing.allocator.destroy(WedgedProviderState.created_cancel_flag.?);
 }
 
 test "a provider that ignores cancellation is abandoned, not freed underneath" {
