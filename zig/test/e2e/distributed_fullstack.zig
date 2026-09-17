@@ -299,8 +299,7 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
         .api_key = "test-key",
     });
     defer {
-        stream.deinit();
-        allocator.destroy(stream);
+        _ = stream.deinitAndDestroy();
     }
 
     var saw_tool_execution_start = false;
