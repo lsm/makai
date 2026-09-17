@@ -770,14 +770,29 @@ fn modelsTestDelegate(
 
     for (test_ctx.response_models, 0..) |model, idx| {
         const capabilities = try allocator.alloc(agent_types.ModelCapability, 1);
+        errdefer allocator.free(capabilities);
         capabilities[0] = .chat;
 
+        const model_ref = try allocator.dupe(u8, model.model_ref);
+        errdefer allocator.free(model_ref);
+
+        const model_id = try allocator.dupe(u8, model.model_id);
+        errdefer allocator.free(model_id);
+
+        const display_name = try allocator.dupe(u8, model.display_name);
+        errdefer allocator.free(display_name);
+
+        const provider_id = try allocator.dupe(u8, model.provider_id);
+        errdefer allocator.free(provider_id);
+
+        const api = try allocator.dupe(u8, model.api);
+
         descriptors[idx] = .{
-            .model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model.model_ref)),
-            .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model.model_id)),
-            .display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model.display_name)),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model.provider_id)),
-            .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, model.api)),
+            .model_ref = OwnedSlice(u8).initOwned(model_ref),
+            .model_id = OwnedSlice(u8).initOwned(model_id),
+            .display_name = OwnedSlice(u8).initOwned(display_name),
+            .provider_id = OwnedSlice(u8).initOwned(provider_id),
+            .api = OwnedSlice(u8).initOwned(api),
             .auth_status = .authenticated,
             .lifecycle = .stable,
             .capabilities = OwnedSlice(agent_types.ModelCapability).initOwned(capabilities),
@@ -1511,4 +1526,38 @@ test "AgentProtocolServer idleness ignores wall-clock adjustments" {
     session.updated_at += 200 * 365 * 24 * 60 * 60 * 1_000;
     try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(anchor + 101, &evicted));
     try std.testing.expect(!server.hasSession(sid));
+}
+
+fn modelsTestDelegateProbe(allocator: std.mem.Allocator) !void {
+    var ctx = ModelsTestCtx{
+        .response_models = &.{
+            .{
+                .model_ref = "anthropic/anthropic-messages@claude-sonnet-4-5",
+                .model_id = "claude-sonnet-4-5",
+                .display_name = "Claude Sonnet 4.5",
+                .provider_id = "anthropic",
+                .api = "anthropic-messages",
+                .source = .dynamic,
+            },
+            .{
+                .model_ref = "openai/openai-responses@gpt-5",
+                .model_id = "gpt-5",
+                .display_name = "GPT-5",
+                .provider_id = "openai",
+                .api = "openai-responses",
+                .source = .static_fallback,
+            },
+        },
+        .fetched_at_ms = 1_700_000_000_000,
+        .cache_max_age_ms = 300_000,
+    };
+
+    var response = try modelsTestDelegate(@ptrCast(&ctx), allocator, .{
+        .provider_id = OwnedSlice(u8).initBorrowed("anthropic"),
+    });
+    response.deinit(allocator);
+}
+
+test "modelsTestDelegate survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, modelsTestDelegateProbe, .{});
 }

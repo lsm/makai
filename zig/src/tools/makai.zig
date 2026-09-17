@@ -99,6 +99,7 @@ const RuntimeErrorCode = enum {
     dispatch_error,
     unknown_envelope,
     runtime_error,
+    input_stream_error,
 };
 
 const AgentRunOptions = struct {
@@ -2183,6 +2184,7 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
     defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
 
     const stdin_stream = stdin_handle.getStream();
+    var reported_input_stream_error = false;
     var outbound_lines = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound_lines);
@@ -2213,6 +2215,14 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
         }
 
         if (stdin_stream.isDone() and !stdin_stream.hasPending()) stdio_loop.markStdinDisconnected();
+
+        if (!reported_input_stream_error) {
+            if (stdin_stream.getError()) |input_error| {
+                reported_input_stream_error = true;
+                try emitRuntimeError(stdout, allocator, .input_stream_error, input_error);
+                did_work = true;
+            }
+        }
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
             try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
@@ -2254,6 +2264,12 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
         };
         if (!dispatched) {
             try emitRuntimeError(stdout, allocator, .unknown_envelope, "unrecognized or ambiguous stdio envelope");
+        }
+    }
+    if (!reported_input_stream_error) {
+        if (stdin_stream.getError()) |input_error| {
+            reported_input_stream_error = true;
+            try emitRuntimeError(stdout, allocator, .input_stream_error, input_error);
         }
     }
     _ = stdio_loop.pumpBackground() catch |err| blk: {
@@ -6311,7 +6327,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--stdio")) {
-        try runStdioMode(allocator, stdin, stdout);
+        runStdioMode(allocator, stdin, stdout) catch |err| switch (err) {
+            error.BrokenPipe => return,
+            else => return err,
+        };
         return;
     }
 

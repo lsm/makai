@@ -78,8 +78,77 @@ pub fn getBaseUrlFromToken(token: []const u8, allocator: std.mem.Allocator) ?[]c
     return std.fmt.allocPrint(allocator, "https://{s}", .{proxy_host}) catch null;
 }
 
+pub fn isSafeProviderDataValue(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) return false;
+    }
+    return true;
+}
+
+pub fn buildProviderData(
+    allocator: std.mem.Allocator,
+    enterprise_url: ?[]const u8,
+    base_url: ?[]const u8,
+    models: ?[]const []const u8,
+) !?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+    var wrote_any = false;
+
+    if (enterprise_url) |url| {
+        if (isSafeProviderDataValue(url)) {
+            try out.appendSlice(allocator, "\"enterpriseUrl\":\"");
+            try out.appendSlice(allocator, url);
+            try out.append(allocator, '"');
+            wrote_any = true;
+        }
+    }
+
+    if (base_url) |url| {
+        if (isSafeProviderDataValue(url)) {
+            if (wrote_any) try out.append(allocator, ',');
+            try out.appendSlice(allocator, "\"baseUrl\":\"");
+            try out.appendSlice(allocator, url);
+            try out.append(allocator, '"');
+            wrote_any = true;
+        }
+    }
+
+    if (models) |list| {
+        var written: usize = 0;
+        for (list) |id| {
+            if (!isSafeProviderDataValue(id)) continue;
+            if (written == 0) {
+                if (wrote_any) try out.append(allocator, ',');
+                try out.appendSlice(allocator, "\"models\":[");
+            } else {
+                try out.append(allocator, ',');
+            }
+            try out.append(allocator, '"');
+            try out.appendSlice(allocator, id);
+            try out.append(allocator, '"');
+            written += 1;
+        }
+        if (written > 0) {
+            try out.append(allocator, ']');
+            wrote_any = true;
+        }
+    }
+
+    if (!wrote_any) {
+        out.deinit(allocator);
+        return null;
+    }
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
+
+pub const DEFAULT_BASE_URL = "https://api.individual.githubcopilot.com";
+
 pub fn getDefaultBaseUrl(allocator: std.mem.Allocator) []const u8 {
-    return std.fmt.allocPrint(allocator, "https://api.individual.githubcopilot.com", .{}) catch "https://api.individual.githubcopilot.com";
+    return std.fmt.allocPrint(allocator, DEFAULT_BASE_URL, .{}) catch DEFAULT_BASE_URL;
 }
 
 pub fn enableModel(
@@ -185,13 +254,15 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
             else
                 null;
 
-            const provider_data = if (enterprise_url) |url| blk: {
-                defer allocator.free(url);
-                break :blk try std.fmt.allocPrint(allocator, "{{\"enterpriseUrl\":\"{s}\"}}", .{url});
-            } else null;
+            defer if (enterprise_url) |url| allocator.free(url);
 
-            const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
+            const resolved_base_url = base_url orelse DEFAULT_BASE_URL;
             const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
+
+            const provider_data = try buildProviderData(allocator, enterprise_url, resolved_base_url, enabled_models);
+
+            const result_base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null;
+            errdefer if (result_base_url) |value| allocator.free(value);
 
             if (base_url) |bu| allocator.free(bu);
 
@@ -201,7 +272,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
                 .expires = compat.time.nowMillis() + (3600 * 1000),
                 .provider_data = provider_data,
                 .enabled_models = enabled_models,
-                .base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null,
+                .base_url = result_base_url,
             };
         }
 
@@ -238,8 +309,16 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
 
     const base_url = getBaseUrlFromToken(copilot_token, allocator);
 
-    const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
+    const resolved_base_url = base_url orelse DEFAULT_BASE_URL;
     const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
+
+    const enterprise_url = if (std.mem.eql(u8, github_domain, "github.com"))
+        null
+    else
+        try std.fmt.allocPrint(allocator, "https://{s}", .{github_domain});
+    defer if (enterprise_url) |url| allocator.free(url);
+
+    const provider_data = try buildProviderData(allocator, enterprise_url, resolved_base_url, enabled_models);
 
     const result_base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null;
 
@@ -249,7 +328,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
         .refresh = try allocator.dupe(u8, credentials.refresh),
         .access = copilot_token,
         .expires = compat.time.nowMillis() + (3600 * 1000),
-        .provider_data = if (credentials.provider_data) |data| try allocator.dupe(u8, data) else null,
+        .provider_data = provider_data,
         .enabled_models = enabled_models,
         .base_url = result_base_url,
     };
@@ -724,4 +803,46 @@ test "buildCopilotDynamicHeaders - includes Copilot-Vision-Request when has_imag
     try testing.expectEqual(@as(usize, 3), headers.len);
     try testing.expectEqualStrings("Copilot-Vision-Request", headers[2].name);
     try testing.expectEqualStrings("true", headers[2].value);
+}
+
+test "buildProviderData emits enterprise url, base url and models in a stable order" {
+    const testing = std.testing;
+    const models = [_][]const u8{ "gpt-5", "claude-sonnet-4" };
+    const data = (try buildProviderData(testing.allocator, "https://gh.acme.com", "https://api.acme.githubcopilot.com", &models)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings(
+        "{\"enterpriseUrl\":\"https://gh.acme.com\",\"baseUrl\":\"https://api.acme.githubcopilot.com\",\"models\":[\"gpt-5\",\"claude-sonnet-4\"]}",
+        data,
+    );
+
+    const domain = if (std.mem.find(u8, data, "enterpriseUrl")) |_| blk: {
+        const idx = std.mem.find(u8, data, "https://").?;
+        const start = idx + 8;
+        const end = std.mem.findScalar(u8, data[start..], '"').?;
+        break :blk data[start .. start + end];
+    } else "github.com";
+    try testing.expectEqualStrings("gh.acme.com", domain);
+}
+
+test "buildProviderData omits absent parts and returns null when nothing is left" {
+    const testing = std.testing;
+    const models = [_][]const u8{"gpt-5"};
+    const only_models = (try buildProviderData(testing.allocator, null, null, &models)).?;
+    defer testing.allocator.free(only_models);
+    try testing.expectEqualStrings("{\"models\":[\"gpt-5\"]}", only_models);
+
+    try testing.expect(try buildProviderData(testing.allocator, null, null, null) == null);
+    try testing.expect(try buildProviderData(testing.allocator, null, null, &[_][]const u8{}) == null);
+}
+
+test "buildProviderData drops values that would break the json" {
+    const testing = std.testing;
+    const models = [_][]const u8{ "ok-model", "bad\"quote", "bad\\slash" };
+    const data = (try buildProviderData(testing.allocator, null, null, &models)).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("{\"models\":[\"ok-model\"]}", data);
+
+    try testing.expect(!isSafeProviderDataValue("has\"quote"));
+    try testing.expect(!isSafeProviderDataValue(""));
+    try testing.expect(isSafeProviderDataValue("gpt-5.1-codex-max"));
 }
