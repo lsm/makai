@@ -3,23 +3,20 @@ const compat = @import("compat");
 const protocol_server = @import("protocol_server");
 const protocol_client = @import("protocol_client");
 const envelope = @import("protocol_envelope");
+const api_registry = @import("api_registry");
+const fields = @import("envelope_fields");
 const in_process = @import("transports/in_process");
-
-fn undecodableReason(err: anyerror) []const u8 {
-    return switch (err) {
-        error.InputTooLong => "input field exceeds maximum allowed length",
-        error.MissingField => "envelope is missing a required field",
-        error.InvalidFieldType => "envelope field has the wrong JSON type",
-        error.FieldOutOfRange => "envelope field is outside its allowed range",
-        error.InvalidUlid => "envelope id is not a valid ULID",
-        else => "envelope could not be decoded",
-    };
-}
 
 const ProtocolServer = protocol_server.ProtocolServer;
 const ProtocolClient = protocol_client.ProtocolClient;
 const protocol_types = envelope.protocol_types;
 const PipeTransport = in_process.SerializedPipe;
+
+fn ulidFieldOrZero(obj: std.json.ObjectMap, field: []const u8) protocol_types.Ulid {
+    const value = fields.optionalString(obj, field) catch return std.mem.zeroes(protocol_types.Ulid);
+    const text = value orelse return std.mem.zeroes(protocol_types.Ulid);
+    return protocol_types.parseUlid(text) orelse std.mem.zeroes(protocol_types.Ulid);
+}
 
 pub const ProviderProtocolRuntime = struct {
     server: *ProtocolServer,
@@ -184,7 +181,8 @@ pub const ProviderProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                self.sendNackForUndecodableInput(line, undecodableReason(err)) catch {};
+                if (fields.shouldAnswerDecodeError(err)) self.sendNackForRejectedInput(line, fields.rejectionReason(err)) catch {};
+
                 continue;
             };
             defer env.deinit(self.allocator);
@@ -203,31 +201,19 @@ pub const ProviderProtocolRuntime = struct {
         }
     }
 
-    fn sendNackForUndecodableInput(self: *Self, raw_json: []const u8, reason: []const u8) !void {
+    fn sendNackForRejectedInput(self: *Self, raw_json: []const u8, reason: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
         defer parsed.deinit();
 
-        if (parsed.value != .object) return;
-        const obj = parsed.value.object;
+        const obj = fields.rootObject(parsed.value) catch return;
 
-        const stream_id_str = obj.get("stream_id") orelse return;
-        if (stream_id_str != .string) return;
-        const stream_id = protocol_types.parseUlid(stream_id_str.string) orelse return;
-
-        const message_id_str = obj.get("message_id") orelse return;
-        if (message_id_str != .string) return;
-        const message_id = protocol_types.parseUlid(message_id_str.string) orelse return;
-
-        const sequence: u64 = blk: {
-            const raw = obj.get("sequence") orelse break :blk 0;
-            if (raw != .integer or raw.integer <= 0) break :blk 0;
-            break :blk std.math.cast(u64, raw.integer) orelse 0;
-        };
+        const stream_id = ulidFieldOrZero(obj, "stream_id");
+        const message_id = ulidFieldOrZero(obj, "message_id");
 
         const dummy_envelope = protocol_types.Envelope{
             .stream_id = stream_id,
             .message_id = message_id,
-            .sequence = sequence,
+            .sequence = 0,
             .timestamp = compat.time.nowMillis(),
             .payload = .ping,
         };
@@ -344,5 +330,133 @@ test "server message pump backpressures global and per-stream delivery" {
         try std.testing.expectEqual(pipe.to_client.items.len, pipe.to_client_read_pos);
         const final_event = destination.poll().?;
         try std.testing.expect(final_event == .keepalive);
+    }
+}
+
+fn readServerReply(pipe: *PipeTransport, allocator: std.mem.Allocator) !?[]const u8 {
+    var receiver = pipe.clientReceiver();
+    return receiver.readLine(allocator);
+}
+
+test "provider runtime nacks malformed inbound envelopes instead of dropping them" {
+    const allocator = std.testing.allocator;
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(allocator, &registry, .{});
+    defer server.deinit();
+
+    var pipe = in_process.createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    const malformed = [_][]const u8{
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{"model":{"base_url":"","id":"m","provider":"anthropic","api":"anthropic-messages","name":"m"},"context":{"messages":[{"role":"user","content":"hi"}]}}}
+        ,
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"context":{"messages":[]}}}
+        ,
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"not-a-ulid","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+    };
+
+    for (malformed) |line| {
+        var client_sender = pipe.clientSender();
+        try client_sender.write(line);
+        try client_sender.flush();
+
+        var runtime = ProviderProtocolRuntime{
+            .server = &server,
+            .pipe = &pipe,
+            .allocator = allocator,
+        };
+        try runtime.pumpClientMessages();
+
+        const reply = (try readServerReply(&pipe, allocator)) orelse return error.NoNackEmitted;
+        defer allocator.free(reply);
+
+        var parsed = try envelope.deserializeEnvelope(reply, allocator);
+        defer parsed.deinit(allocator);
+        try std.testing.expect(parsed.payload == .nack);
+        try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, parsed.payload.nack.error_code.?);
+        try std.testing.expect(parsed.payload.nack.reason.slice().len > 0);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), server.active_streams.count());
+}
+
+test "provider runtime keeps serving well-formed envelopes after a malformed one" {
+    const allocator = std.testing.allocator;
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(allocator, &registry, .{});
+    defer server.deinit();
+
+    var pipe = in_process.createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    const bad =
+        \\{"type":"complete_request","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+    ;
+    const good_ping =
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M2","message_id":"01M2MYK69FX2M3DY769FEHK3M3","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+
+    var client_sender = pipe.clientSender();
+    try client_sender.write(bad);
+    try client_sender.write(good_ping);
+    try client_sender.flush();
+
+    var runtime = ProviderProtocolRuntime{
+        .server = &server,
+        .pipe = &pipe,
+        .allocator = allocator,
+    };
+    try runtime.pumpClientMessages();
+
+    const first = (try readServerReply(&pipe, allocator)) orelse return error.NoNackEmitted;
+    defer allocator.free(first);
+    var nack = try envelope.deserializeEnvelope(first, allocator);
+    defer nack.deinit(allocator);
+    try std.testing.expect(nack.payload == .nack);
+
+    const second = (try readServerReply(&pipe, allocator)) orelse return error.NoPongEmitted;
+    defer allocator.free(second);
+    var pong = try envelope.deserializeEnvelope(second, allocator);
+    defer pong.deinit(allocator);
+    try std.testing.expect(pong.payload == .pong);
+}
+
+test "provider runtime stays silent on a well-formed envelope with an unrecognized type" {
+    const allocator = std.testing.allocator;
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(allocator, &registry, .{});
+    defer server.deinit();
+
+    var pipe = in_process.createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    const unknown_type =
+        \\{"type":"definitely_not_a_real_envelope","stream_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+
+    var client_sender = pipe.clientSender();
+    try client_sender.write(unknown_type);
+    try client_sender.flush();
+
+    var runtime = ProviderProtocolRuntime{
+        .server = &server,
+        .pipe = &pipe,
+        .allocator = allocator,
+    };
+    try runtime.pumpClientMessages();
+
+    const reply = try readServerReply(&pipe, allocator);
+    if (reply) |line| {
+        defer allocator.free(line);
+        return error.UnexpectedReplyToUnknownType;
     }
 }

@@ -1,9 +1,9 @@
 const std = @import("std");
 const compat = @import("compat");
 const tool_types = @import("tool_types");
+const fields = @import("envelope_fields");
 const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
-const jf = @import("json_field");
 
 pub const protocol_types = tool_types;
 
@@ -250,18 +250,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = try jf.asObject(parsed.value);
-    const type_str = try jf.requireString(root, "type");
-    const server_id = try parseUlidRequired(try jf.requireString(root, "server_id"));
-    const message_id = try parseUlidRequired(try jf.requireString(root, "message_id"));
-    const sequence = try jf.requireUnsigned(u64, root, "sequence");
-    const timestamp = try jf.requireInteger(root, "timestamp");
-    const version = try jf.unsignedOr(u8, root, "version", 1);
+    const root = try fields.rootObject(parsed.value);
+    const type_str = try fields.requiredString(root, "type");
+    const server_id = try parseUlidRequired(try fields.requiredString(root, "server_id"));
+    const message_id = try parseUlidRequired(try fields.requiredString(root, "message_id"));
+    const sequence = try fields.requiredInt(u64, root, "sequence");
+    const timestamp = try fields.requiredInteger(root, "timestamp");
+    const version = try fields.requiredInt(u8, root, "version");
 
     var in_reply_to: ?tool_types.Ulid = null;
-    if (try jf.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
+    if (try fields.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
 
-    const payload_obj = try jf.requireObject(root, "payload");
+    const payload_obj = try fields.requiredObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -279,72 +279,17 @@ fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
     return tool_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
-fn parseJsonString(value: std.json.Value) ![]const u8 {
-    return switch (value) {
-        .string => |s| s,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseJsonArray(value: std.json.Value) !std.json.Array {
-    return switch (value) {
-        .array => |a| a,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseJsonObject(value: std.json.Value) !std.json.ObjectMap {
-    return switch (value) {
-        .object => |o| o,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseJsonBool(value: std.json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseRequiredJsonString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return parseJsonString(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonArray(obj: std.json.ObjectMap, key: []const u8) !std.json.Array {
-    return parseJsonArray(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonObject(obj: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
-    return parseJsonObject(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonBool(obj: std.json.ObjectMap, key: []const u8) !bool {
-    return parseJsonBool(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
-    return switch (value) {
-        .integer => |n| std.math.cast(T, n) orelse error.InvalidPayloadType,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseOptionalUnsignedJsonInteger(comptime T: type, value: ?std.json.Value) !?T {
-    return if (value) |v| try parseUnsignedJsonInteger(T, v) else null;
-}
-
 fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
     var artifact = tool_types.ArtifactReference{
-        .artifact_id = try allocator.dupe(u8, try parseRequiredJsonString(obj, "artifact_id")),
+        .artifact_id = try allocator.dupe(u8, try fields.requiredString(obj, "artifact_id")),
     };
     errdefer artifact.deinit(allocator);
 
-    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("byte_size")) |v| artifact.byte_size = try parseUnsignedJsonInteger(u64, v);
-    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+    if (try fields.optionalString(obj, "uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+    if (try fields.optionalString(obj, "mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+    if (try fields.optionalIntValue(u64, obj.get("byte_size"))) |v| artifact.byte_size = v;
+    if (try fields.optionalString(obj, "sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+    if (try fields.optionalString(obj, "description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
 
     return artifact;
 }
@@ -358,7 +303,7 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
     }
 
     for (array.items, 0..) |item, i| {
-        artifacts[i] = try deserializeArtifactReference(try parseJsonObject(item), allocator);
+        artifacts[i] = try deserializeArtifactReference(try fields.asObject(item), allocator);
         initialized += 1;
     }
 
@@ -367,107 +312,94 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
     if (std.mem.eql(u8, type_str, "tool_register")) {
-        const tool = try deserializeToolMetadata(try jf.requireObject(payload, "tool"), allocator);
+        const tool = try deserializeToolMetadata(try fields.requiredObject(payload, "tool"), allocator);
+        errdefer freeToolMetadata(allocator, tool);
         var req = tool_types.ToolRegisterRequest{ .tool = tool };
-        if (try jf.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_register = req };
     }
     if (std.mem.eql(u8, type_str, "tool_registered")) {
         return .{ .tool_registered = .{
-            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
-            .registered_at = try jf.requireInteger(payload, "registered_at"),
+            .tool_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_id")),
+            .registered_at = try fields.requiredInteger(payload, "registered_at"),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregister")) {
         return .{ .tool_unregister = .{
-            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
+            .tool_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregistered")) {
         return .{ .tool_unregistered = .{
-            .tool_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_id")),
+            .tool_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = tool_types.ToolListRequest{};
-        if (try jf.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        if (try jf.optionalBool(payload, "supports_streaming")) |v| req.supports_streaming = v;
+        if (try fields.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (payload.get("supports_streaming")) |v| req.supports_streaming = try fields.asBool(v);
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = try jf.requireArray(payload, "tools");
+        const tools_arr = try fields.requiredArray(payload, "tools");
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
-        var filled: usize = 0;
+        var initialized: usize = 0;
         errdefer {
-            for (tools[0..filled]) |tool| {
-                allocator.free(tool.name);
-                allocator.free(tool.description);
-                allocator.free(tool.parameters_schema_json);
-                allocator.free(tool.version);
-                if (tool.required_permissions) |perms| {
-                    for (perms) |p| allocator.free(p);
-                    allocator.free(perms);
-                }
-            }
+            for (tools[0..initialized]) |tool| freeToolMetadata(allocator, tool);
             allocator.free(tools);
         }
         for (tools_arr.items, 0..) |t, i| {
-            tools[i] = try deserializeToolMetadata(try jf.elementAsObject(t), allocator);
-            filled = i + 1;
+            tools[i] = try deserializeToolMetadata(try fields.asObject(t), allocator);
+            initialized = i + 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
-        const args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json"));
+        const args_json = try allocator.dupe(u8, try fields.requiredString(payload, "args_json"));
         errdefer allocator.free(args_json);
         try validateJson(args_json, allocator);
 
-        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        const execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id"));
+        const tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
         errdefer allocator.free(tool_call_id);
-        const tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name"));
+        const tool_name = try allocator.dupe(u8, try fields.requiredString(payload, "tool_name"));
         errdefer allocator.free(tool_name);
-
         var req = tool_types.ToolExecuteRequest{
             .execution_id = execution_id,
             .tool_call_id = tool_call_id,
             .tool_name = tool_name,
             .args_json = args_json,
         };
-        errdefer req.stream_callback_url.deinit(allocator);
-        if (try jf.optionalUnsigned(u32, payload, "timeout_ms")) |v| req.timeout_ms = v;
-        if (try jf.optionalString(payload, "stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalIntValue(u32, payload.get("timeout_ms"))) |v| req.timeout_ms = v;
+        if (try fields.optionalString(payload, "stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_stream")) {
-        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
-        errdefer allocator.free(tool_call_id);
-        const partial_result_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_result_json"));
+        const stream_execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id"));
+        const stream_tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
+        errdefer allocator.free(stream_tool_call_id);
+        const partial_result_json = try allocator.dupe(u8, try fields.requiredString(payload, "partial_result_json"));
         errdefer allocator.free(partial_result_json);
-
         var update = tool_types.ToolStreamUpdate{
-            .execution_id = execution_id,
-            .tool_call_id = tool_call_id,
+            .execution_id = stream_execution_id,
+            .tool_call_id = stream_tool_call_id,
             .partial_result_json = partial_result_json,
         };
-        errdefer update.status.deinit(allocator);
-        if (try jf.optionalUnsigned(u8, payload, "progress")) |v| update.progress = v;
-        if (try jf.optionalString(payload, "status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalIntValue(u8, payload.get("progress"))) |v| update.progress = v;
+        if (try fields.optionalString(payload, "status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_stream = update };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
-        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
-        errdefer allocator.free(tool_call_id);
-        const result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json"));
+        const result_execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id"));
+        const is_error = try fields.optionalBool(payload, "is_error", false);
+        const duration_ms = try fields.requiredInt(u32, payload, "duration_ms");
+        const result_tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
+        errdefer allocator.free(result_tool_call_id);
+        const result_json = try allocator.dupe(u8, try fields.requiredString(payload, "result_json"));
         errdefer allocator.free(result_json);
-        const is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false;
-        const duration_ms = try jf.requireUnsigned(u32, payload, "duration_ms");
-
         var result = tool_types.ToolExecuteResult{
-            .execution_id = execution_id,
-            .tool_call_id = tool_call_id,
+            .execution_id = result_execution_id,
+            .tool_call_id = result_tool_call_id,
             .result_json = result_json,
             .is_error = is_error,
             .duration_ms = duration_ms,
@@ -477,76 +409,81 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             result.details_json.deinit(allocator);
             result.artifacts.deinit(allocator);
         }
-        if (try jf.optionalString(payload, "error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        if (try jf.optionalString(payload, "details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try parseJsonArray(v), allocator));
+        if (try fields.optionalString(payload, "error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try fields.asArray(v), allocator));
         return .{ .tool_result = result };
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
         var req = tool_types.ToolCancelRequest{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id")),
         };
-        if (try jf.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_cancel = req };
     }
     if (std.mem.eql(u8, type_str, "tool_cancelled")) {
         return .{ .tool_cancelled = .{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_error")) {
-        const execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id"));
-        const code = std.meta.stringToEnum(tool_types.ToolErrorCode, try jf.requireString(payload, "code")) orelse return error.InvalidPayloadType;
-        const message = try allocator.dupe(u8, try jf.requireString(payload, "message"));
+        const error_execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id"));
+        const error_code = std.meta.stringToEnum(tool_types.ToolErrorCode, try fields.requiredString(payload, "code")) orelse return error.InvalidPayloadType;
+        const error_message = try allocator.dupe(u8, try fields.requiredString(payload, "message"));
         return .{ .tool_error = .{
-            .execution_id = execution_id,
-            .code = code,
-            .message = message,
+            .execution_id = error_execution_id,
+            .code = error_code,
+            .message = error_message,
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status")) {
         return .{ .tool_status = .{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
+            .execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status_response")) {
+        const status_execution_id = try parseUlidRequired(try fields.requiredString(payload, "execution_id"));
+        const status_name = try fields.requiredString(payload, "tool_name");
+        const status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, try fields.requiredString(payload, "status")) orelse return error.InvalidPayloadType;
+        const started_at = try fields.requiredInteger(payload, "started_at");
+        const completed_at = try fields.optionalInteger(payload, "completed_at");
         return .{ .tool_status_response = .{
-            .execution_id = try parseUlidRequired(try jf.requireString(payload, "execution_id")),
-            .tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name")),
-            .status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, try jf.requireString(payload, "status")) orelse return error.InvalidPayloadType,
-            .started_at = try jf.requireInteger(payload, "started_at"),
-            .completed_at = if (try jf.optionalInteger(payload, "completed_at")) |v| v else null,
+            .execution_id = status_execution_id,
+            .tool_name = try allocator.dupe(u8, status_name),
+            .status = status,
+            .started_at = started_at,
+            .completed_at = completed_at,
         } };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieve")) {
         var req = tool_types.ArtifactRetrieveRequest{
-            .artifact_id = try allocator.dupe(u8, try parseRequiredJsonString(payload, "artifact_id")),
+            .artifact_id = try allocator.dupe(u8, try fields.requiredString(payload, "artifact_id")),
         };
         errdefer allocator.free(req.artifact_id);
 
-        req.byte_offset = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_offset"));
-        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        req.byte_offset = try fields.optionalIntValue(u64, payload.get("byte_offset"));
+        req.byte_limit = try fields.optionalIntValue(u64, payload.get("byte_limit"));
         return .{ .artifact_retrieve = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieved")) {
         var res = tool_types.ArtifactRetrieveResponse{
-            .artifact = try deserializeArtifactReference(try parseRequiredJsonObject(payload, "artifact"), allocator),
+            .artifact = try deserializeArtifactReference(try fields.requiredObject(payload, "artifact"), allocator),
         };
         errdefer res.deinit(allocator);
-        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(v)));
         return .{ .artifact_retrieved = res };
     }
     if (std.mem.eql(u8, type_str, "artifact_search")) {
         var req = tool_types.ArtifactSearchRequest{
-            .query = try allocator.dupe(u8, try parseRequiredJsonString(payload, "query")),
+            .query = try allocator.dupe(u8, try fields.requiredString(payload, "query")),
         };
         errdefer allocator.free(req.query);
 
-        req.limit = try parseOptionalUnsignedJsonInteger(u32, payload.get("limit"));
+        req.limit = try fields.optionalIntValue(u32, payload.get("limit"));
         return .{ .artifact_search = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_search_result")) {
-        const values = try parseRequiredJsonArray(payload, "results");
+        const values = try fields.requiredArray(payload, "results");
         const results = try allocator.alloc(tool_types.ArtifactSearchResult, values.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -554,13 +491,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             allocator.free(results);
         }
         for (values.items, 0..) |item, i| {
-            const obj = try parseJsonObject(item);
+            const obj = try fields.asObject(item);
             results[i] = blk: {
                 var result = tool_types.ArtifactSearchResult{
-                    .artifact = try deserializeArtifactReference(try parseRequiredJsonObject(obj, "artifact"), allocator),
+                    .artifact = try deserializeArtifactReference(try fields.requiredObject(obj, "artifact"), allocator),
                 };
                 errdefer result.deinit(allocator);
-                if (obj.get("snippet")) |v| result.snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+                if (try fields.optionalString(obj, "snippet")) |v| result.snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
                 if (obj.get("score")) |v| result.score = switch (v) {
                     .float => |f| @floatCast(f),
                     .integer => |n| @floatFromInt(n),
@@ -573,18 +510,18 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .artifact_search_result = .{ .results = results } };
     }
     if (std.mem.eql(u8, type_str, "hashline_read")) {
-        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try fields.asBool(v) else false;
         var req = tool_types.HashlineReadRequest{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try fields.requiredString(payload, "path")),
             .feature_enabled = feature_enabled,
         };
         errdefer allocator.free(req.path);
 
-        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        req.byte_limit = try fields.optionalIntValue(u64, payload.get("byte_limit"));
         return .{ .hashline_read = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_read_result")) {
-        const values = try parseRequiredJsonArray(payload, "lines");
+        const values = try fields.requiredArray(payload, "lines");
         const lines = try allocator.alloc(tool_types.HashlineLine, values.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -592,12 +529,12 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             allocator.free(lines);
         }
         for (values.items, 0..) |item, i| {
-            const obj = try parseJsonObject(item);
+            const obj = try fields.asObject(item);
             lines[i] = blk: {
-                const line = try parseUnsignedJsonInteger(u32, obj.get("line") orelse return error.InvalidPayloadType);
-                const hash = try allocator.dupe(u8, try parseRequiredJsonString(obj, "hash"));
+                const line = try fields.asInt(u32, obj.get("line") orelse return error.InvalidPayloadType);
+                const hash = try allocator.dupe(u8, try fields.requiredString(obj, "hash"));
                 errdefer allocator.free(hash);
-                const text = try allocator.dupe(u8, try parseRequiredJsonString(obj, "text"));
+                const text = try allocator.dupe(u8, try fields.requiredString(obj, "text"));
                 errdefer allocator.free(text);
                 break :blk .{
                     .line = line,
@@ -608,14 +545,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             initialized += 1;
         }
         return .{ .hashline_read_result = .{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try fields.requiredString(payload, "path")),
             .lines = lines,
         } };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit")) {
-        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try fields.asBool(v) else false;
         var req = tool_types.HashlineEditRequest{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try fields.requiredString(payload, "path")),
             .operation = undefined,
             .start_line = undefined,
             .start_hash = "",
@@ -628,79 +565,83 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             req.end_hash.deinit(allocator);
             req.replacement.deinit(allocator);
         }
-        req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, try parseRequiredJsonString(payload, "operation")) orelse return error.InvalidPayloadType;
-        req.start_line = try parseUnsignedJsonInteger(u32, payload.get("start_line") orelse return error.InvalidPayloadType);
-        req.start_hash = try allocator.dupe(u8, try parseRequiredJsonString(payload, "start_hash"));
+        req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, try fields.requiredString(payload, "operation")) orelse return error.InvalidPayloadType;
+        req.start_line = try fields.asInt(u32, payload.get("start_line") orelse return error.InvalidPayloadType);
+        req.start_hash = try allocator.dupe(u8, try fields.requiredString(payload, "start_hash"));
         owns_start_hash = true;
-        if (payload.get("end_line")) |v| req.end_line = try parseUnsignedJsonInteger(u32, v);
-        if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-        if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+        if (payload.get("end_line")) |v| req.end_line = try fields.asInt(u32, v);
+        if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(v)));
+        if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(v)));
         return .{ .hashline_edit = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit_result")) {
-        const applied = try parseRequiredJsonBool(payload, "applied");
+        const applied = try fields.requiredBool(payload, "applied");
         var res = tool_types.HashlineEditResponse{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try fields.requiredString(payload, "path")),
             .applied = applied,
         };
         errdefer res.deinit(allocator);
-        if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(try parseJsonObject(v), allocator);
+        if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(try fields.asObject(v), allocator);
         return .{ .hashline_edit_result = res };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
     if (std.mem.eql(u8, type_str, "pong")) {
         return .{ .pong = .{
-            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "ping_id"))),
+            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "ping_id"))),
         } };
     }
     if (std.mem.eql(u8, type_str, "goodbye")) {
         var goodbye = tool_types.Goodbye{};
-        if (try jf.optionalString(payload, "reason")) |v| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "reason")) |v| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .goodbye = goodbye };
     }
 
     return error.InvalidPayloadType;
 }
 
+fn freeToolMetadata(allocator: std.mem.Allocator, tool: tool_types.ToolMetadata) void {
+    allocator.free(tool.name);
+    allocator.free(tool.description);
+    allocator.free(tool.parameters_schema_json);
+    allocator.free(tool.version);
+    if (tool.required_permissions) |perms| {
+        for (perms) |p| allocator.free(p);
+        allocator.free(perms);
+    }
+}
+
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
     var required_permissions: ?[]const []const u8 = null;
     var permissions_filled: usize = 0;
-    errdefer if (required_permissions) |permissions| {
-        for (permissions[0..permissions_filled]) |permission| allocator.free(permission);
-        allocator.free(permissions);
+    errdefer if (required_permissions) |perms| {
+        for (perms[0..permissions_filled]) |p| allocator.free(p);
+        allocator.free(perms);
     };
-    if (try jf.optionalArray(obj, "required_permissions")) |permissions_arr| {
+    if (try fields.optionalArray(obj, "required_permissions")) |permissions_arr| {
         const permissions = try allocator.alloc([]const u8, permissions_arr.items.len);
         required_permissions = permissions;
         for (permissions_arr.items, 0..) |permission, i| {
-            permissions[i] = try allocator.dupe(u8, try jf.elementAsString(permission));
+            permissions[i] = try allocator.dupe(u8, try fields.asString(permission));
             permissions_filled = i + 1;
         }
     }
 
-    const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
-    errdefer allocator.free(name);
-    const description = try allocator.dupe(u8, try jf.requireString(obj, "description"));
-    errdefer allocator.free(description);
-    const parameters_schema_json = try allocator.dupe(u8, try jf.requireString(obj, "parameters_schema_json"));
-    errdefer allocator.free(parameters_schema_json);
-    const version = if (try jf.optionalString(obj, "version")) |v|
-        try allocator.dupe(u8, v)
-    else
-        try allocator.dupe(u8, "1.0.0");
-    errdefer allocator.free(version);
-    const supports_streaming = if (try jf.optionalBool(obj, "supports_streaming")) |v| v else false;
-    const estimated_duration_ms = try jf.optionalUnsigned(u32, obj, "estimated_duration_ms");
-    const is_destructive = try jf.boolOr(obj, "is_destructive", false);
-
+    const meta_name = try allocator.dupe(u8, try fields.requiredString(obj, "name"));
+    errdefer allocator.free(meta_name);
+    const meta_description = try allocator.dupe(u8, try fields.requiredString(obj, "description"));
+    errdefer allocator.free(meta_description);
+    const meta_schema = try allocator.dupe(u8, try fields.requiredString(obj, "parameters_schema_json"));
+    errdefer allocator.free(meta_schema);
+    const meta_version = try allocator.dupe(u8, try fields.optionalString(obj, "version") orelse "1.0.0");
+    errdefer allocator.free(meta_version);
     return .{
-        .name = name,
-        .description = description,
-        .parameters_schema_json = parameters_schema_json,
-        .version = version,
-        .supports_streaming = supports_streaming,
-        .estimated_duration_ms = estimated_duration_ms,
-        .is_destructive = is_destructive,
+        .name = meta_name,
+        .description = meta_description,
+        .parameters_schema_json = meta_schema,
+        .version = meta_version,
+        .supports_streaming = try fields.optionalBool(obj, "supports_streaming", false),
+        .estimated_duration_ms = try fields.optionalIntValue(u32, obj.get("estimated_duration_ms")),
+        .is_destructive = try fields.optionalBool(obj, "is_destructive", false),
         .required_permissions = required_permissions,
     };
 }
@@ -795,26 +736,6 @@ test "tool envelope negative malformed args" {
         "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{bad json\"}}";
 
     try std.testing.expectError(error.InvalidArgumentsJson, deserializeEnvelope(json, allocator));
-}
-
-test "tool envelope rejects out-of-range numeric payload fields" {
-    const allocator = std.testing.allocator;
-
-    const negative_timeout =
-        "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{}\",\"timeout_ms\":-1}}";
-    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_timeout, allocator));
-
-    const oversized_timeout =
-        "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{}\",\"timeout_ms\":4294967296}}";
-    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_timeout, allocator));
-
-    const oversized_progress =
-        "{\"type\":\"tool_stream\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"partial_result_json\":\"{}\",\"progress\":256}}";
-    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_progress, allocator));
-
-    const oversized_duration =
-        "{\"type\":\"tool_list_response\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"tools\":[{\"name\":\"grep\",\"description\":\"Search text\",\"parameters_schema_json\":\"{}\",\"is_destructive\":false,\"estimated_duration_ms\":4294967296}]}}";
-    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_duration, allocator));
 }
 
 test "tool envelope negative timeout error" {
@@ -945,8 +866,8 @@ test "tool envelope rejects negative artifact retrieve byte ranges" {
     const negative_limit =
         "{\"type\":\"artifact_retrieve\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact_id\":\"artifact-1\",\"byte_limit\":-1}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_offset, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_limit, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_offset, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_limit, allocator));
 }
 
 test "tool envelope rejects malformed hashline edit without leaks" {
@@ -963,10 +884,10 @@ test "tool envelope rejects malformed hashline edit without leaks" {
         "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"a1b2\",\"feature_enabled\":\"yes\"}}";
 
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(invalid_operation, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_start_line, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_end_hash, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_replacement, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_start_line, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_end_hash, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_replacement, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_bool_feature_enabled, allocator));
 }
 
 test "tool envelope rejects malformed artifact references without leaks" {
@@ -980,10 +901,10 @@ test "tool envelope rejects malformed artifact references without leaks" {
     const non_string_content_json =
         "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\"},\"content_json\":42}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_artifact_id, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_byte_size, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_uri, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_content_json, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_artifact_id, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_byte_size, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_uri, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_content_json, allocator));
 }
 
 test "tool envelope rejects non-array tool result artifacts without leaks" {
@@ -991,7 +912,7 @@ test "tool envelope rejects non-array tool result artifacts without leaks" {
     const json =
         "{\"type\":\"tool_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"result_json\":\"{}\",\"duration_ms\":1,\"artifacts\":\"not-array\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(json, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(json, allocator));
 }
 
 test "tool envelope rejects remaining negative unsigned fields without leaks" {
@@ -1003,9 +924,9 @@ test "tool envelope rejects remaining negative unsigned fields without leaks" {
     const negative_result_line =
         "{\"type\":\"hashline_read_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"lines\":[{\"line\":-1,\"hash\":\"abc\",\"text\":\"bad\"}]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_search_limit, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_read_limit, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_result_line, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_search_limit, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_read_limit, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_result_line, allocator));
 }
 
 test "tool envelope rejects malformed artifact search results without leaks" {
@@ -1017,9 +938,9 @@ test "tool envelope rejects malformed artifact search results without leaks" {
     const non_object_result =
         "{\"type\":\"artifact_search_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"results\":[42]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_artifact, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_artifact, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_result, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_artifact, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_object_artifact, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_object_result, allocator));
 }
 
 test "tool envelope rejects malformed hashline read results without leaks" {
@@ -1031,9 +952,9 @@ test "tool envelope rejects malformed hashline read results without leaks" {
     const non_string_text =
         "{\"type\":\"hashline_read_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"lines\":[{\"line\":1,\"hash\":\"abc\",\"text\":42}]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_line, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_hash, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_text, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_object_line, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_hash, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_string_text, allocator));
 }
 
 test "tool envelope rejects malformed hashline read request feature flag without leaks" {
@@ -1041,7 +962,7 @@ test "tool envelope rejects malformed hashline read request feature flag without
     const non_bool_feature_enabled =
         "{\"type\":\"hashline_read\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"feature_enabled\":\"yes\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_bool_feature_enabled, allocator));
 }
 
 test "tool envelope rejects malformed hashline edit results without leaks" {
@@ -1051,6 +972,126 @@ test "tool envelope rejects malformed hashline edit results without leaks" {
     const non_bool_applied =
         "{\"type\":\"hashline_edit_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"applied\":\"yes\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_applied, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_applied, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_applied, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(non_bool_applied, allocator));
+}
+
+test "tool envelope rejects missing required root fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "tool envelope rejects wrong-typed and out-of-range root fields" {
+    const allocator = std.testing.allocator;
+    const wrong_typed = [_][]const u8{
+        \\{"type":7,"server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":7,"message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":7,"sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":"1","version":1,"payload":{}}
+        ,
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
+        ,
+    };
+    for (wrong_typed) |json| {
+        try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(json, allocator));
+    }
+
+    const negative_sequence =
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":-1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const oversized_version =
+        \\{"type":"ping","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":99999,"payload":{}}
+    ;
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_sequence, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_version, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("[1,2,3]", allocator));
+}
+
+test "tool envelope rejects malformed execute payloads without leaking" {
+    const allocator = std.testing.allocator;
+    const execute_missing_tool_name =
+        \\{"type":"tool_execute","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"args_json":"{}","execution_id":"01M2MYK69FX2M3DY769FEHK3M2","tool_call_id":"c"}}
+    ;
+    const register_missing_tool =
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const register_tool_not_object =
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool":"t"}}
+    ;
+    const result_missing_duration =
+        \\{"type":"tool_result","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"execution_id":"01M2MYK69FX2M3DY769FEHK3M2","tool_call_id":"c","result_json":"{}"}}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(execute_missing_tool_name, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(register_missing_tool, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(register_tool_not_object, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(result_missing_duration, allocator));
+}
+
+fn toolRegisterProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool":{"name":"grep","description":"search","parameters_schema_json":"{}","version":"2.0.0","required_permissions":["read","shell"]},"callback_url":"https://example.test/cb"}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "tool_register survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolRegisterProbe, .{});
+}
+
+fn toolListResponseProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},{"name":"edit","description":"write","parameters_schema_json":"{}","required_permissions":["write"]}]}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "tool_list_response survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolListResponseProbe, .{});
+}
+
+test "a malformed tool entry after a good one is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},{"name":"edit"}]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}"},7]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}","required_permissions":7}]}}
+        ,
+        \\{"type":"tool_list_response","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"grep","description":"search","parameters_schema_json":"{}","required_permissions":[7]}]}}
+        ,
+        \\{"type":"tool_register","server_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool":{"name":"grep","description":"search","parameters_schema_json":"{}"},"callback_url":7}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }

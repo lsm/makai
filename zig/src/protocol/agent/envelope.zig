@@ -1,10 +1,10 @@
 const std = @import("std");
 const compat = @import("compat");
 const agent_types = @import("agent_types");
+const fields = @import("envelope_fields");
 const json_writer = @import("json_writer");
 const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
-const jf = @import("json_field");
 
 pub const protocol_types = agent_types;
 
@@ -224,18 +224,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = try jf.asObject(parsed.value);
-    const type_str = try jf.requireString(root, "type");
-    const session_id = parseSessionIdOrError(try jf.requireString(root, "session_id")) orelse return error.InvalidSessionId;
-    const message_id = try parseUlidRequired(try jf.requireString(root, "message_id"));
-    const sequence = try jf.requireUnsigned(u64, root, "sequence");
-    const timestamp = try jf.requireInteger(root, "timestamp");
-    const version = try jf.unsignedOr(u8, root, "version", 1);
+    const root = try fields.rootObject(parsed.value);
+    const type_str = try fields.requiredString(root, "type");
+    const session_id = parseSessionIdOrError(try fields.requiredString(root, "session_id")) orelse return error.InvalidSessionId;
+    const message_id = try parseUlidRequired(try fields.requiredString(root, "message_id"));
+    const sequence = try fields.requiredInt(u64, root, "sequence");
+    const timestamp = try fields.requiredInteger(root, "timestamp");
+    const version = try fields.requiredInt(u8, root, "version");
 
     var in_reply_to: ?agent_types.Ulid = null;
-    if (try jf.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
+    if (try fields.optionalString(root, "in_reply_to")) |v| in_reply_to = try parseUlidRequired(v);
 
-    const payload_obj = try jf.requireObject(root, "payload");
+    const payload_obj = try fields.requiredObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -263,70 +263,80 @@ fn parseSessionIdOrError(str: []const u8) ?agent_types.SessionId {
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
     if (std.mem.eql(u8, type_str, "agent_start")) {
-        const config = try allocator.dupe(u8, try jf.requireString(payload, "config_json"));
-        var result = agent_types.AgentStartRequest{ .config_json = config };
-        errdefer {
-            allocator.free(config);
-            result.system_prompt.deinit(allocator);
+        const config = try allocator.dupe(u8, try fields.requiredString(payload, "config_json"));
+        errdefer allocator.free(config);
+
+        var system_prompt = OwnedSlice(u8).initBorrowed("");
+        errdefer system_prompt.deinit(allocator);
+        if (try fields.optionalString(payload, "system_prompt")) |v| {
+            system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         }
-        if (try jf.optionalString(payload, "system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        if (try jf.optionalString(payload, "session_id")) |v| {
+
+        var result = agent_types.AgentStartRequest{
+            .config_json = config,
+            .system_prompt = system_prompt,
+        };
+        if (try fields.optionalString(payload, "session_id")) |v| {
             result.session_id = try parseSessionIdRequired(v);
-        } else if (try jf.optionalString(payload, "resume_session_id")) |v| {
+        } else if (try fields.optionalString(payload, "resume_session_id")) |v| {
             result.session_id = try parseSessionIdRequired(v);
         }
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
-        const msg = try allocator.dupe(u8, try jf.requireString(payload, "message_json"));
-        var req = agent_types.AgentMessageRequest{
-            .session_id = undefined,
-            .message_json = msg,
-        };
-        errdefer {
-            allocator.free(msg);
-            req.options_json.deinit(allocator);
+        const msg = try allocator.dupe(u8, try fields.requiredString(payload, "message_json"));
+        errdefer allocator.free(msg);
+        const session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id"));
+
+        var options_json = OwnedSlice(u8).initBorrowed("");
+        if (try fields.optionalString(payload, "options_json")) |v| {
+            options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         }
-        req.session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id"));
-        if (try jf.optionalString(payload, "options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
-        return .{ .agent_message = req };
+
+        return .{ .agent_message = .{
+            .session_id = session_id,
+            .message_json = msg,
+            .options_json = options_json,
+        } };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
-        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) };
-        if (try jf.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")) };
+        if (try fields.optionalString(payload, "reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_stop = req };
     }
     if (std.mem.eql(u8, type_str, "agent_status")) {
-        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) } };
+        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")) } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = agent_types.ToolListRequest{};
-        if (try jf.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "agent_started")) {
-        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) } };
+        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")) } };
     }
-    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, try jf.requireString(payload, "event_json")) };
-    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, try jf.requireString(payload, "result_json")) };
+    if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, try fields.requiredString(payload, "event_json")) };
+    if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, try fields.requiredString(payload, "result_json")) };
     if (std.mem.eql(u8, type_str, "agent_stopped")) {
-        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id")) };
-        if (try jf.optionalString(payload, "reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id")) };
+        if (try fields.optionalString(payload, "reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .agent_stopped = stopped };
     }
     if (std.mem.eql(u8, type_str, "agent_error")) {
-        const code = std.meta.stringToEnum(agent_types.AgentErrorCode, try jf.requireString(payload, "code")) orelse .internal_error;
-        const message = try allocator.dupe(u8, try jf.requireString(payload, "message"));
-        return .{ .agent_error = .{ .code = code, .message = message } };
+        const code = std.meta.stringToEnum(agent_types.AgentErrorCode, try fields.requiredString(payload, "code")) orelse .internal_error;
+        const message = try allocator.dupe(u8, try fields.requiredString(payload, "message"));
+        return .{ .agent_error = .{
+            .code = code,
+            .message = message,
+        } };
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
-        const session_id = try parseSessionIdRequired(try jf.requireString(payload, "session_id"));
-        const status = std.meta.stringToEnum(agent_types.AgentStatus, try jf.requireString(payload, "status")) orelse .@"error";
-        const model = try allocator.dupe(u8, try jf.requireString(payload, "model"));
-        errdefer allocator.free(model);
-        const message_count = try jf.requireUnsigned(u32, payload, "message_count");
-        const created_at = try jf.requireInteger(payload, "created_at");
-        const updated_at = try jf.requireInteger(payload, "updated_at");
+        const session_id = try parseSessionIdRequired(try fields.requiredString(payload, "session_id"));
+        const status = std.meta.stringToEnum(agent_types.AgentStatus, try fields.requiredString(payload, "status")) orelse .@"error";
+        const message_count = try fields.requiredInt(u32, payload, "message_count");
+        const created_at = try fields.requiredInteger(payload, "created_at");
+        const updated_at = try fields.requiredInteger(payload, "updated_at");
+        const model = try allocator.dupe(u8, try fields.requiredString(payload, "model"));
         return .{ .session_info = .{
             .session_id = session_id,
             .status = status,
@@ -337,11 +347,11 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = try jf.requireArray(payload, "tools");
+        const tools_arr = try fields.requiredArray(payload, "tools");
         const tools = try allocator.alloc(agent_types.ToolDefinition, tools_arr.items.len);
-        var filled: usize = 0;
+        var initialized: usize = 0;
         errdefer {
-            for (tools[0..filled]) |tool| {
+            for (tools[0..initialized]) |tool| {
                 allocator.free(tool.name);
                 allocator.free(tool.description);
                 allocator.free(tool.parameters_schema_json);
@@ -349,74 +359,73 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             allocator.free(tools);
         }
         for (tools_arr.items, 0..) |t, i| {
-            const entry = try jf.elementAsObject(t);
-            const name = try allocator.dupe(u8, try jf.requireString(entry, "name"));
+            const tool_obj = try fields.asObject(t);
+            const name = try allocator.dupe(u8, try fields.requiredString(tool_obj, "name"));
             errdefer allocator.free(name);
-            const description = try allocator.dupe(u8, try jf.requireString(entry, "description"));
+            const description = try allocator.dupe(u8, try fields.requiredString(tool_obj, "description"));
             errdefer allocator.free(description);
-            const schema = try allocator.dupe(u8, try jf.requireString(entry, "parameters_schema_json"));
+            const parameters_schema_json = try allocator.dupe(u8, try fields.requiredString(tool_obj, "parameters_schema_json"));
             tools[i] = .{
                 .name = name,
                 .description = description,
-                .parameters_schema_json = schema,
+                .parameters_schema_json = parameters_schema_json,
             };
-            filled = i + 1;
+            initialized += 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        const tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
         errdefer allocator.free(tool_call_id);
-        const tool_name = try allocator.dupe(u8, try jf.requireString(payload, "tool_name"));
+        const tool_name = try allocator.dupe(u8, try fields.requiredString(payload, "tool_name"));
         errdefer allocator.free(tool_name);
-        const args_json = try allocator.dupe(u8, try jf.requireString(payload, "args_json"));
+        const args_json = try allocator.dupe(u8, try fields.requiredString(payload, "args_json"));
         errdefer allocator.free(args_json);
         var req = agent_types.ToolExecuteRequest{
             .tool_call_id = tool_call_id,
             .tool_name = tool_name,
             .args_json = args_json,
         };
-        if (try jf.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        const tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
         errdefer allocator.free(tool_call_id);
-        const result_json = try allocator.dupe(u8, try jf.requireString(payload, "result_json"));
+        const result_json = try allocator.dupe(u8, try fields.requiredString(payload, "result_json"));
         errdefer allocator.free(result_json);
-        const is_error = if (try jf.optionalBool(payload, "is_error")) |v| v else false;
         var res = agent_types.ToolExecuteResponse{
             .tool_call_id = tool_call_id,
             .result_json = result_json,
-            .is_error = is_error,
+            .is_error = try fields.optionalBool(payload, "is_error", false),
         };
-        if (try jf.optionalString(payload, "details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "details_json")) |v| res.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_result = res };
     }
     if (std.mem.eql(u8, type_str, "tool_streaming")) {
-        const tool_call_id = try allocator.dupe(u8, try jf.requireString(payload, "tool_call_id"));
+        const tool_call_id = try allocator.dupe(u8, try fields.requiredString(payload, "tool_call_id"));
         errdefer allocator.free(tool_call_id);
-        const partial_json = try allocator.dupe(u8, try jf.requireString(payload, "partial_json"));
+        const partial_json = try allocator.dupe(u8, try fields.requiredString(payload, "partial_json"));
         return .{ .tool_streaming = .{
             .tool_call_id = tool_call_id,
             .partial_json = partial_json,
         } };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
-    if (std.mem.eql(u8, type_str, "pong")) return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "ping_id"))) } };
+    if (std.mem.eql(u8, type_str, "pong")) return .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "ping_id"))) } };
     if (std.mem.eql(u8, type_str, "goodbye")) {
         var g = agent_types.Goodbye{};
-        if (try jf.optionalString(payload, "reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try fields.optionalString(payload, "reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .goodbye = g };
     }
     if (std.mem.eql(u8, type_str, "ack")) {
-        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(try jf.requireString(payload, "acknowledged_id")) } };
+        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(try fields.requiredString(payload, "acknowledged_id")) } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
-        const rejected_id = try parseUlidRequired(try jf.requireString(payload, "rejected_id"));
-        var reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "reason")));
+        const rejected_id = try parseUlidRequired(try fields.requiredString(payload, "rejected_id"));
+        var reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "reason")));
         errdefer reason.deinit(allocator);
-        const error_code = if (try jf.optionalString(payload, "error_code")) |v|
+        const error_code = if (try fields.optionalString(payload, "error_code")) |v|
             std.meta.stringToEnum(agent_types.ErrorCode, v)
         else
             null;
@@ -440,7 +449,7 @@ fn deserializeModelsRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsRequest {
-    const provider_id = if (try jf.optionalString(obj, "provider_id")) |value|
+    const provider_id = if (try fields.optionalString(obj, "provider_id")) |value|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
@@ -449,7 +458,7 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const api = if (try jf.optionalString(obj, "api")) |value|
+    const api = if (try fields.optionalString(obj, "api")) |value|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
@@ -458,7 +467,7 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const model_id = if (try jf.optionalString(obj, "model_id")) |value|
+    const model_id = if (try fields.optionalString(obj, "model_id")) |value|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
@@ -467,8 +476,8 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const include_deprecated = if (try jf.optionalBool(obj, "include_deprecated")) |value| value else false;
-    const include_login_required = try jf.boolOr(obj, "include_login_required", true);
+    const include_deprecated = try fields.optionalBool(obj, "include_deprecated", false);
+    const include_login_required = try fields.optionalBool(obj, "include_login_required", true);
 
     return .{
         .provider_id = provider_id,
@@ -483,9 +492,9 @@ fn deserializeModelsResponse(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !agent_types.ModelsResponse {
-    const fetched_at_ms = try jf.requireInteger(obj, "fetched_at_ms");
-    const cache_max_age_ms: u64 = try jf.requireUnsigned(u64, obj, "cache_max_age_ms");
-    const models_array = try jf.requireArray(obj, "models");
+    const fetched_at_ms = try fields.requiredInteger(obj, "fetched_at_ms");
+    const cache_max_age_ms = try fields.requiredInt(u64, obj, "cache_max_age_ms");
+    const models_array = try fields.requiredArray(obj, "models");
 
     const descriptors = try allocator.alloc(model_catalog_types.ModelDescriptor, models_array.items.len);
     var allocated_count: usize = 0;
@@ -495,7 +504,7 @@ fn deserializeModelsResponse(
     }
 
     for (models_array.items, 0..) |item, idx| {
-        descriptors[idx] = try deserializeModelDescriptor(try jf.elementAsObject(item), allocator);
+        descriptors[idx] = try deserializeModelDescriptor(try fields.asObject(item), allocator);
         allocated_count += 1;
     }
 
@@ -510,37 +519,37 @@ fn deserializeModelDescriptor(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !model_catalog_types.ModelDescriptor {
-    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_ref")));
+    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "model_ref")));
     errdefer {
         var mutable = model_ref;
         mutable.deinit(allocator);
     }
 
-    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "model_id")));
+    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "model_id")));
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
     }
 
-    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "display_name")));
+    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "display_name")));
     errdefer {
         var mutable = display_name;
         mutable.deinit(allocator);
     }
 
-    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "provider_id")));
+    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "provider_id")));
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
     }
 
-    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(obj, "api")));
+    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(obj, "api")));
     errdefer {
         var mutable = api;
         mutable.deinit(allocator);
     }
 
-    const base_url = if (try jf.optionalString(obj, "base_url")) |value|
+    const base_url = if (try fields.optionalString(obj, "base_url")) |value|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
     else
         OwnedSlice(u8).initBorrowed("");
@@ -549,33 +558,26 @@ fn deserializeModelDescriptor(
         mutable.deinit(allocator);
     }
 
-    const capabilities_array = try jf.requireArray(obj, "capabilities");
+    const capabilities_array = try fields.requiredArray(obj, "capabilities");
     const capabilities = try allocator.alloc(model_catalog_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = try parseModelCapability(try jf.elementAsString(item));
+        capabilities[idx] = try parseModelCapability(try fields.asString(item));
     }
 
-    const auth_status = parseAuthStatus(try jf.requireString(obj, "auth_status"));
-    const lifecycle = try parseModelLifecycle(try jf.requireString(obj, "lifecycle"));
-    const source = try parseModelSource(try jf.requireString(obj, "source"));
-    const context_window = try jf.optionalUnsigned(u32, obj, "context_window");
-    const max_output_tokens = try jf.optionalUnsigned(u32, obj, "max_output_tokens");
-    const reasoning_default = if (try jf.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null;
-
     var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
-    if (try jf.optionalObject(obj, "metadata")) |metadata_value| {
-        const metadata_obj = metadata_value;
-        const metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
-        var metadata_count: usize = 0;
-        errdefer {
-            for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
-            allocator.free(metadata_items);
-        }
+    var metadata_items: []model_catalog_types.MetadataEntry = &.{};
+    var metadata_count: usize = 0;
+    errdefer {
+        for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
+        allocator.free(metadata_items);
+    }
+    if (try fields.optionalObject(obj, "metadata")) |metadata_obj| {
+        metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
-            const value_text = try jf.elementAsString(entry.value_ptr.*);
+            const value_text = try fields.asString(entry.value_ptr.*);
 
             const key = try allocator.dupe(u8, entry.key_ptr.*);
             errdefer allocator.free(key);
@@ -598,13 +600,13 @@ fn deserializeModelDescriptor(
         .provider_id = provider_id,
         .api = api,
         .base_url = base_url,
-        .auth_status = auth_status,
-        .lifecycle = lifecycle,
+        .auth_status = parseAuthStatus(try fields.requiredString(obj, "auth_status")),
+        .lifecycle = try parseModelLifecycle(try fields.requiredString(obj, "lifecycle")),
         .capabilities = OwnedSlice(model_catalog_types.ModelCapability).initOwned(capabilities),
-        .source = source,
-        .context_window = context_window,
-        .max_output_tokens = max_output_tokens,
-        .reasoning_default = reasoning_default,
+        .source = try parseModelSource(try fields.requiredString(obj, "source")),
+        .context_window = try fields.optionalIntValue(u32, obj.get("context_window")),
+        .max_output_tokens = try fields.optionalIntValue(u32, obj.get("max_output_tokens")),
+        .reasoning_default = if (try fields.optionalString(obj, "reasoning_default")) |value| try parseReasoningLevel(value) else null,
         .metadata = metadata,
     };
 }
@@ -664,28 +666,6 @@ test "deserializeEnvelope rejects invalid ulid" {
     );
     defer allocator.free(bad);
     try std.testing.expectError(error.InvalidUlid, deserializeEnvelope(bad, allocator));
-}
-
-test "agent_start failure after config_json frees duplicated fields" {
-    const allocator = std.testing.allocator;
-    const sid = "000000000000000000000";
-    const mid = "00000000000000000000000002";
-
-    const bad_session = try std.fmt.allocPrint(
-        allocator,
-        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{\\\"max_turns\\\":4}}\",\"session_id\":\"not-a-nanoid\"}}}}",
-        .{ sid, mid },
-    );
-    defer allocator.free(bad_session);
-    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad_session, allocator));
-
-    const bad_session_with_prompt = try std.fmt.allocPrint(
-        allocator,
-        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{\\\"max_turns\\\":4}}\",\"system_prompt\":\"be brief\",\"session_id\":\"not-a-nanoid\"}}}}",
-        .{ sid, mid },
-    );
-    defer allocator.free(bad_session_with_prompt);
-    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad_session_with_prompt, allocator));
 }
 
 test "deserializeEnvelope rejects unknown payload type" {
@@ -748,9 +728,9 @@ test "agent_start payload serializes the id under session_id plus the legacy ali
 
     var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed_json.deinit();
-    const payload = try jf.requireObject(parsed_json.value.object, "payload");
-    try std.testing.expectEqualStrings(&sid, try jf.requireString(payload, "session_id"));
-    try std.testing.expectEqualStrings(&sid, try jf.requireString(payload, "resume_session_id"));
+    const payload = try fields.requiredObject(try fields.asObject(parsed_json.value), "payload");
+    try std.testing.expectEqualStrings(&sid, try fields.requiredString(payload, "session_id"));
+    try std.testing.expectEqualStrings(&sid, try fields.requiredString(payload, "resume_session_id"));
 
     var parsed = try deserializeEnvelope(json, allocator);
     defer parsed.deinit(allocator);
@@ -944,6 +924,139 @@ test "agent envelope roundtrip for ack and nack" {
         parsed_nack.payload.nack.reason.slice(),
     );
     try std.testing.expectEqual(agent_types.ErrorCode.not_implemented, parsed_nack.payload.nack.error_code.?);
+}
+
+test "agent envelope rejects missing required root fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "agent envelope rejects wrong-typed root fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":7,"session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":7,"message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":7,"sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":"1","version":1,"payload":{}}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
+        ,
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"in_reply_to":7,"payload":{}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "agent envelope rejects out-of-range root numbers and non-object documents" {
+    const allocator = std.testing.allocator;
+    const negative_sequence =
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":-1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const oversized_version =
+        \\{"type":"ping","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":99999,"payload":{}}
+    ;
+
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_sequence, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(oversized_version, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("[1,2,3]", allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("null", allocator));
+}
+
+test "agent envelope rejects malformed payload fields without leaking" {
+    const allocator = std.testing.allocator;
+    const start_missing_config =
+        \\{"type":"agent_start","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const message_missing_json =
+        \\{"type":"agent_message","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"session_id":"V1StGXR8Z5jdHi6BmyT0a"}}
+    ;
+    const message_wrong_typed_json =
+        \\{"type":"agent_message","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"session_id":"V1StGXR8Z5jdHi6BmyT0a","message_json":7}}
+    ;
+    const tool_list_missing_description =
+        \\{"type":"tool_list_response","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":[{"name":"t"}]}}
+    ;
+    const tool_list_not_array =
+        \\{"type":"tool_list_response","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tools":{}}}
+    ;
+    const tool_execute_missing_args =
+        \\{"type":"tool_execute","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"tool_call_id":"c","tool_name":"t"}}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(start_missing_config, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(message_missing_json, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(message_wrong_typed_json, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(tool_list_missing_description, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(tool_list_not_array, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(tool_execute_missing_args, allocator));
+}
+
+test "a wrong-typed optional after an owned field is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","system_prompt":7}}
+        ,
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","system_prompt":"hi","session_id":"too-short"}}
+        ,
+        \\{"type":"agent_start","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"config_json":"{}","resume_session_id":"too-short"}}
+        ,
+        \\{"type":"agent_message","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":2,"timestamp":1,"version":1,"payload":{"message_json":"{}","session_id":"too-short"}}
+        ,
+        \\{"type":"agent_message","session_id":"Abcdefghijklmnopqrstu","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":2,"timestamp":1,"version":1,"payload":{"message_json":"{}","session_id":"Abcdefghijklmnopqrstu","options_json":7}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
+}
+
+test "agent model descriptor frees metadata when a trailing field is malformed" {
+    const allocator = std.testing.allocator;
+    const base = "{\"type\":\"models_response\",\"session_id\":\"V1StGXR8Z5jdHi6BmyT0a\",\"message_id\":\"01M2MYK69FX2M3DY769FEHK3M1\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"fetched_at_ms\":1,\"cache_max_age_ms\":1,\"models\":[{\"model_ref\":\"p/a@m\",\"model_id\":\"m\",\"display_name\":\"d\",\"provider_id\":\"p\",\"api\":\"a\",\"capabilities\":[\"chat\"],\"metadata\":{\"one\":\"1\",\"two\":\"2\"},";
+
+    const missing_auth_status = base ++ "\"lifecycle\":\"stable\",\"source\":\"dynamic\"}]}}";
+    const missing_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"source\":\"dynamic\"}]}}";
+    const bad_lifecycle = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"nope\",\"source\":\"dynamic\"}]}}";
+    const missing_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\"}]}}";
+    const bad_source = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"nope\"}]}}";
+    const bad_context_window = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"context_window\":-1}]}}";
+    const bad_reasoning_default = base ++ "\"auth_status\":\"authenticated\",\"lifecycle\":\"stable\",\"source\":\"dynamic\",\"reasoning_default\":\"nope\"}]}}";
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_auth_status, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_lifecycle, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_lifecycle, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_source, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_source, allocator));
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(bad_context_window, allocator));
+    try std.testing.expectError(error.InvalidEnumValue, deserializeEnvelope(bad_reasoning_default, allocator));
 }
 
 test "agent models_response rejects a non-string metadata value without leaking the key" {

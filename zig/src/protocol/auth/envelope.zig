@@ -1,9 +1,9 @@
 const std = @import("std");
 const compat = @import("compat");
 const auth_types = @import("auth_types");
+const fields = @import("envelope_fields");
 const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
-const jf = @import("json_field");
 
 pub const protocol_types = auth_types;
 
@@ -186,20 +186,20 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !auth
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = try jf.asObject(parsed.value);
-    const type_str = try jf.requireString(root, "type");
-    const stream_id = try parseUlidRequired(try jf.requireString(root, "stream_id"));
-    const message_id = try parseUlidRequired(try jf.requireString(root, "message_id"));
-    const sequence = try jf.requireUnsigned(u64, root, "sequence");
-    const timestamp = try jf.requireInteger(root, "timestamp");
-    const version = try jf.unsignedOr(u8, root, "version", 1);
+    const root = try fields.rootObject(parsed.value);
+    const type_str = try fields.requiredString(root, "type");
+    const stream_id = try parseUlidRequired(try fields.requiredString(root, "stream_id"));
+    const message_id = try parseUlidRequired(try fields.requiredString(root, "message_id"));
+    const sequence = try fields.requiredInt(u64, root, "sequence");
+    const timestamp = try fields.requiredInteger(root, "timestamp");
+    const version = try fields.requiredInt(u8, root, "version");
 
     var in_reply_to: ?auth_types.Ulid = null;
-    if (try jf.optionalString(root, "in_reply_to")) |value| {
+    if (try fields.optionalString(root, "in_reply_to")) |value| {
         in_reply_to = try parseUlidRequired(value);
     }
 
-    const payload = try deserializePayload(type_str, try jf.requireObject(root, "payload"), allocator);
+    const payload = try deserializePayload(type_str, try fields.requiredObject(root, "payload"), allocator);
 
     return .{
         .version = version,
@@ -223,15 +223,15 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "auth_login_start")) {
         return .{ .auth_login_start = .{
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "provider_id"))),
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "provider_id"))),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "auth_prompt_response")) {
-        const flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id"));
-        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "prompt_id")));
+        const flow_id = try parseUlidRequired(try fields.requiredString(payload, "flow_id"));
+        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "prompt_id")));
         errdefer prompt_id.deinit(allocator);
-        const answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "answer")));
+        const answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "answer")));
         return .{ .auth_prompt_response = .{
             .flow_id = flow_id,
             .prompt_id = prompt_id,
@@ -241,23 +241,25 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "auth_cancel")) {
         return .{ .auth_cancel = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id")),
+            .flow_id = try parseUlidRequired(try fields.requiredString(payload, "flow_id")),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "ack")) {
         return .{ .ack = .{
-            .acknowledged_id = try parseUlidRequired(try jf.requireString(payload, "acknowledged_id")),
+            .acknowledged_id = try parseUlidRequired(try fields.requiredString(payload, "acknowledged_id")),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "nack")) {
+        const rejected_id = try parseUlidRequired(try fields.requiredString(payload, "rejected_id"));
         var nack = auth_types.Nack{
-            .rejected_id = try parseUlidRequired(try jf.requireString(payload, "rejected_id")),
-            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "reason"))),
+            .rejected_id = rejected_id,
+            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "reason"))),
         };
+        errdefer nack.deinit(allocator);
 
-        if (try jf.optionalString(payload, "error_code")) |error_code| {
+        if (try fields.optionalString(payload, "error_code")) |error_code| {
             nack.error_code = std.meta.stringToEnum(auth_types.ErrorCode, error_code) orelse .invalid_request;
         }
 
@@ -278,23 +280,26 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         }
 
         for (providers_value.array.items, 0..) |provider_value, i| {
-            if (provider_value != .object) return error.InvalidPayloadType;
-            const provider_obj = try jf.elementAsObject(provider_value);
+            const provider_obj = try fields.asObject(provider_value);
 
-            var info = auth_types.AuthProviderInfo{
-                .id = OwnedSlice(u8).initBorrowed(""),
-                .name = OwnedSlice(u8).initBorrowed(""),
-                .auth_status = .unknown,
-            };
-            errdefer info.deinit(allocator);
-            info.id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "id")));
-            info.name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(provider_obj, "name")));
-            info.auth_status = std.meta.stringToEnum(auth_types.AuthStatus, try jf.requireString(provider_obj, "auth_status")) orelse .unknown;
-            if (try jf.optionalString(provider_obj, "last_error")) |last_error| {
-                info.last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, last_error));
+            var id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(provider_obj, "id")));
+            errdefer id.deinit(allocator);
+            var name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(provider_obj, "name")));
+            errdefer name.deinit(allocator);
+            const auth_status = std.meta.stringToEnum(auth_types.AuthStatus, try fields.requiredString(provider_obj, "auth_status")) orelse .unknown;
+
+            var last_error = OwnedSlice(u8).initBorrowed("");
+            if (try fields.optionalString(provider_obj, "last_error")) |value| {
+                last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
             }
-            providers[i] = info;
-            initialized += 1;
+
+            providers[i] = .{
+                .id = id,
+                .name = name,
+                .auth_status = auth_status,
+                .last_error = last_error,
+            };
+            initialized = i + 1;
         }
 
         return .{ .auth_providers_response = .{
@@ -307,10 +312,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "auth_login_result")) {
-        const flow_id = try parseUlidRequired(try jf.requireString(payload, "flow_id"));
-        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "provider_id")));
+        const flow_id = try parseUlidRequired(try fields.requiredString(payload, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const status = std.meta.stringToEnum(auth_types.AuthLoginStatus, try jf.requireString(payload, "status")) orelse .failed;
+        const status = std.meta.stringToEnum(auth_types.AuthLoginStatus, try fields.requiredString(payload, "status")) orelse .failed;
         return .{ .auth_login_result = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
@@ -324,13 +329,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "pong")) {
         return .{ .pong = .{
-            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(payload, "ping_id"))),
+            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(payload, "ping_id"))),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "goodbye")) {
         var goodbye = auth_types.Goodbye{};
-        if (try jf.optionalString(payload, "reason")) |reason| {
+        if (try fields.optionalString(payload, "reason")) |reason| {
             goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, reason));
         }
         return .{ .goodbye = goodbye };
@@ -340,15 +345,17 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 }
 
 fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocator) !auth_types.AuthEvent {
-    if (try jf.optionalObject(payload, "auth_url")) |auth_url| {
-        const flow_id = try parseUlidRequired(try jf.requireString(auth_url, "flow_id"));
-        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "provider_id")));
+    if (payload.get("auth_url")) |auth_url_value| {
+        const auth_url = try fields.asObject(auth_url_value);
+
+        const flow_id = try parseUlidRequired(try fields.requiredString(auth_url, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(auth_url, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        var url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(auth_url, "url")));
+        var url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(auth_url, "url")));
         errdefer url.deinit(allocator);
 
         var instructions = OwnedSlice(u8).initBorrowed("");
-        if (try jf.optionalString(auth_url, "instructions")) |value| {
+        if (try fields.optionalString(auth_url, "instructions")) |value| {
             instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
 
@@ -360,15 +367,16 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         } };
     }
 
-    if (try jf.optionalObject(payload, "prompt")) |prompt| {
-        const flow_id = try parseUlidRequired(try jf.requireString(prompt, "flow_id"));
-        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "prompt_id")));
+    if (payload.get("prompt")) |prompt_value| {
+        const prompt = try fields.asObject(prompt_value);
+        const flow_id = try parseUlidRequired(try fields.requiredString(prompt, "flow_id"));
+        var prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(prompt, "prompt_id")));
         errdefer prompt_id.deinit(allocator);
-        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "provider_id")));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(prompt, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(prompt, "message")));
+        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(prompt, "message")));
         errdefer message.deinit(allocator);
-        const allow_empty = if (try jf.optionalBool(prompt, "allow_empty")) |value| value else false;
+        const allow_empty = try fields.optionalBool(prompt, "allow_empty", false);
         return .{ .prompt = .{
             .flow_id = flow_id,
             .prompt_id = prompt_id,
@@ -378,11 +386,12 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         } };
     }
 
-    if (try jf.optionalObject(payload, "progress")) |progress| {
-        const flow_id = try parseUlidRequired(try jf.requireString(progress, "flow_id"));
-        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "provider_id")));
+    if (payload.get("progress")) |progress_value| {
+        const progress = try fields.asObject(progress_value);
+        const flow_id = try parseUlidRequired(try fields.requiredString(progress, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(progress, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(progress, "message")));
+        const message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(progress, "message")));
         return .{ .progress = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
@@ -390,30 +399,33 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         } };
     }
 
-    if (try jf.optionalObject(payload, "success")) |success| {
+    if (payload.get("success")) |success_value| {
+        const success = try fields.asObject(success_value);
         return .{ .success = .{
-            .flow_id = try parseUlidRequired(try jf.requireString(success, "flow_id")),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(success, "provider_id"))),
+            .flow_id = try parseUlidRequired(try fields.requiredString(success, "flow_id")),
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(success, "provider_id"))),
         } };
     }
 
-    if (try jf.optionalObject(payload, "error")) |event_error| {
-        const flow_id = try parseUlidRequired(try jf.requireString(event_error, "flow_id"));
-        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "provider_id")));
+    if (payload.get("error")) |error_value| {
+        const event_error = try fields.asObject(error_value);
+
+        const flow_id = try parseUlidRequired(try fields.requiredString(event_error, "flow_id"));
+        var provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(event_error, "provider_id")));
         errdefer provider_id.deinit(allocator);
-        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.requireString(event_error, "message")));
+        var message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.requiredString(event_error, "message")));
         errdefer message.deinit(allocator);
 
         var code = OwnedSlice(u8).initBorrowed("");
-        if (try jf.optionalString(event_error, "code")) |value| {
+        if (try fields.optionalString(event_error, "code")) |value| {
             code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
 
         return .{ .@"error" = .{
             .flow_id = flow_id,
             .provider_id = provider_id,
-            .code = code,
             .message = message,
+            .code = code,
         } };
     }
 
@@ -458,9 +470,113 @@ test "auth envelope rejects unknown payload type" {
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(bad, allocator));
 }
 
-test "auth_providers_response rejects a half-built entry without touching uninitialized slots" {
+test "auth envelope rejects missing required root fields" {
     const allocator = std.testing.allocator;
-    const bad =
-        "{\"type\":\"auth_providers_response\",\"stream_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"providers\":[{\"id\":\"anthropic\"},{\"id\":\"openai\",\"name\":\"OpenAI\",\"auth_status\":\"logged_in\"}]}}";
-    try std.testing.expectError(error.MissingField, deserializeEnvelope(bad, allocator));
+    const cases = [_][]const u8{
+        \\{"stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
+    }
+}
+
+test "auth envelope rejects wrong-typed and out-of-range root fields" {
+    const allocator = std.testing.allocator;
+    const wrong_typed = [_][]const u8{
+        \\{"type":7,"stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":7,"message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":7,"sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":"1","timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":"1","version":1,"payload":{}}
+        ,
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
+        ,
+    };
+    for (wrong_typed) |json| {
+        try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(json, allocator));
+    }
+
+    const negative_sequence =
+        \\{"type":"ping","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":-1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    try std.testing.expectError(error.FieldOutOfRange, deserializeEnvelope(negative_sequence, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope("[1,2,3]", allocator));
+}
+
+test "auth envelope rejects malformed payload fields without leaking" {
+    const allocator = std.testing.allocator;
+    const login_missing_provider =
+        \\{"type":"auth_login_start","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+    const prompt_response_missing_answer =
+        \\{"type":"auth_prompt_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","prompt_id":"p"}}
+    ;
+    const providers_missing_name =
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic"}]}}
+    ;
+    const event_url_wrong_typed =
+        \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"auth_url":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","url":7}}}
+    ;
+
+    const event_instructions_wrong_typed =
+        \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"auth_url":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","url":"https://example.test/login","instructions":7}}}
+    ;
+    const event_error_code_wrong_typed =
+        \\{"type":"auth_event","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"error":{"flow_id":"01M2MYK69FX2M3DY769FEHK3M2","provider_id":"anthropic","message":"denied","code":7}}}
+    ;
+
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(login_missing_provider, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(prompt_response_missing_answer, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(providers_missing_name, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_url_wrong_typed, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_instructions_wrong_typed, allocator));
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(event_error_code_wrong_typed, allocator));
+}
+
+fn authProvidersResponseProbe(allocator: std.mem.Allocator) !void {
+    const json =
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated","last_error":"none"},{"id":"openai","name":"OpenAI","auth_status":"unknown","last_error":"expired"}]}}
+    ;
+    var parsed = try deserializeEnvelope(json, allocator);
+    parsed.deinit(allocator);
+}
+
+test "auth_providers_response survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, authProvidersResponseProbe, .{});
+}
+
+test "a malformed provider entry after a good one is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai"}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai","name":7,"auth_status":"unknown"}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},{"id":"openai","name":"OpenAI","auth_status":"unknown","last_error":7}]}}
+        ,
+        \\{"type":"auth_providers_response","stream_id":"01M2MYK69FX2M3DY769FEHK3M0","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{"providers":[{"id":"anthropic","name":"Anthropic","auth_status":"authenticated"},7]}}
+        ,
+    };
+
+    for (cases) |json| {
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }

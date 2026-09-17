@@ -21,6 +21,7 @@ pub const Ulid = [16]u8;
 pub const SESSION_ID_LENGTH: usize = 21;
 pub const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 pub const SessionId = [SESSION_ID_LENGTH]u8;
+pub const PLACEHOLDER_SESSION_ID: SessionId = [_]u8{'0'} ** SESSION_ID_LENGTH;
 
 fn generateSessionIdWithRandomInt(random_int_range_less_than: fn (comptime type, usize) usize) SessionId {
     var session_id: SessionId = undefined;
