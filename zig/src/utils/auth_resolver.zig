@@ -1,7 +1,8 @@
-
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
 const storage_mod = @import("oauth/storage");
+const custom_providers = @import("custom_providers");
 
 pub const AuthStorage = storage_mod.AuthStorage;
 pub const ProviderAuth = storage_mod.ProviderAuth;
@@ -19,11 +20,26 @@ pub const ResolvedKey = struct {
     }
 };
 
+pub const CredentialKind = enum {
+    any,
+    api_key_only,
+};
+
 pub fn resolveApiKey(
     allocator: std.mem.Allocator,
     auth_storage: ?*AuthStorage,
     provider_id: []const u8,
     provided_api_key: ?[]const u8,
+) AuthResolveError!ResolvedKey {
+    return resolveApiKeyOfKind(allocator, auth_storage, provider_id, provided_api_key, .any);
+}
+
+pub fn resolveApiKeyOfKind(
+    allocator: std.mem.Allocator,
+    auth_storage: ?*AuthStorage,
+    provider_id: []const u8,
+    provided_api_key: ?[]const u8,
+    kind: CredentialKind,
 ) AuthResolveError!ResolvedKey {
     if (provided_api_key) |k| {
         if (k.len > 0) {
@@ -32,19 +48,53 @@ pub fn resolveApiKey(
         }
     }
 
-    const storage = auth_storage orelse return error.AuthRequired;
-    const auth = storage.providers.get(provider_id) orelse return error.AuthRequired;
-
-    switch (auth) {
-        .api_key => |key| {
-            const dup = try allocator.dupe(u8, key);
-            return .{ .api_key = dup };
-        },
-        .oauth => |creds| {
-            const dup = try allocator.dupe(u8, creds.access);
-            return .{ .api_key = dup };
-        },
+    if (auth_storage) |storage| {
+        if (storage.providers.get(provider_id)) |auth| {
+            switch (auth) {
+                .api_key => |key| {
+                    const dup = try allocator.dupe(u8, key);
+                    return .{ .api_key = dup };
+                },
+                .oauth => |creds| {
+                    if (kind == .any) {
+                        const dup = try allocator.dupe(u8, creds.access);
+                        return .{ .api_key = dup };
+                    }
+                },
+            }
+        }
     }
+
+    if (try customProviderEnvKey(allocator, provider_id)) |key| return .{ .api_key = key };
+    return error.AuthRequired;
+}
+
+fn customProviderEnvKey(allocator: std.mem.Allocator, provider_id: []const u8) std.mem.Allocator.Error!?[]u8 {
+    if (builtin.is_test) return null;
+    const providers = custom_providers.load(allocator, custom_providers.max_config_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer custom_providers.deinitProviders(allocator, providers);
+    return envKeyForProvider(allocator, providers, provider_id);
+}
+
+pub fn envKeyForProvider(
+    allocator: std.mem.Allocator,
+    providers: []const custom_providers.CustomProvider,
+    provider_id: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    for (providers) |provider| {
+        if (!std.mem.eql(u8, provider.id, provider_id)) continue;
+        const env_name = provider.env_key orelse return null;
+        const value = compat.getEnvVarOwned(allocator, env_name) catch return null;
+        if (value.len == 0) {
+            allocator.free(value);
+            return null;
+        }
+        return value;
+    }
+    return null;
 }
 
 const testing = std.testing;
@@ -117,6 +167,42 @@ test "resolveApiKey - loads oauth access token from storage by provider_id" {
     try testing.expectEqualStrings("oauth-access", resolved.api_key);
 }
 
+test "resolveApiKeyOfKind - api_key_only refuses a stored oauth token" {
+    var storage = makeStorage(testing.allocator);
+    defer storage.deinit();
+
+    const provider_id = try testing.allocator.dupe(u8, "openai-codex");
+    const refresh = try testing.allocator.dupe(u8, "refresh-token");
+    const access = try testing.allocator.dupe(u8, "oauth-access");
+    try storage.providers.put(provider_id, .{ .oauth = .{
+        .refresh = refresh,
+        .access = access,
+        .expires = compat.time.nowMillis() + 3_600_000,
+    } });
+
+    try testing.expectError(
+        error.AuthRequired,
+        resolveApiKeyOfKind(testing.allocator, &storage, "openai-codex", null, .api_key_only),
+    );
+
+    var any = try resolveApiKeyOfKind(testing.allocator, &storage, "openai-codex", null, .any);
+    defer any.deinit(testing.allocator);
+    try testing.expectEqualStrings("oauth-access", any.api_key);
+}
+
+test "resolveApiKeyOfKind - api_key_only still returns a stored api key" {
+    var storage = makeStorage(testing.allocator);
+    defer storage.deinit();
+
+    const provider_id = try testing.allocator.dupe(u8, "gateway");
+    const stored = try testing.allocator.dupe(u8, "gateway-key");
+    try storage.providers.put(provider_id, .{ .api_key = stored });
+
+    var resolved = try resolveApiKeyOfKind(testing.allocator, &storage, "gateway", null, .api_key_only);
+    defer resolved.deinit(testing.allocator);
+    try testing.expectEqualStrings("gateway-key", resolved.api_key);
+}
+
 test "resolveApiKey - missing storage and no key returns AuthRequired" {
     try testing.expectError(
         error.AuthRequired,
@@ -153,4 +239,17 @@ test "resolveApiKey - empty key with no storage returns AuthRequired" {
         error.AuthRequired,
         resolveApiKey(testing.allocator, null, "anthropic", ""),
     );
+}
+
+test "envKeyForProvider reads the declared variable and ignores other providers" {
+    const providers = [_]custom_providers.CustomProvider{
+        .{ .id = "gateway", .name = "Gateway", .api = "openai-completions", .base_url = "https://gw.test", .env_key = "MAKAI_TEST_GATEWAY_KEY" },
+        .{ .id = "keyless", .name = "Keyless", .api = "openai-completions", .base_url = "http://localhost:8000" },
+    };
+
+    try testing.expect(try envKeyForProvider(testing.allocator, &providers, "absent") == null);
+    try testing.expect(try envKeyForProvider(testing.allocator, &providers, "keyless") == null);
+
+    const unset = try envKeyForProvider(testing.allocator, &providers, "gateway");
+    if (unset) |value| testing.allocator.free(value);
 }

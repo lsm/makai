@@ -4,6 +4,7 @@ const ai_types = @import("ai_types");
 pub fn EventStream(comptime T: type, comptime R: type) type {
     return struct {
         const Self = @This();
+        pub const DEINIT_THREAD_JOIN_TIMEOUT_MS = 120_000;
         const RING_BUFFER_SIZE = 1024;
         const RING_BUFFER_MASK = RING_BUFFER_SIZE - 1;
         pub const usable_capacity = RING_BUFFER_SIZE - 1;
@@ -15,6 +16,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         result: ?R = null,
         completed: std.atomic.Value(bool),
         err_msg: ?[]const u8 = null,
+        err_msg_static: bool = false,
         mutex: std.Io.Mutex = .init,
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
@@ -38,6 +40,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .thread_done = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
             };
+        }
+
+        pub fn releaseEvent(self: *Self, event: T) void {
+            var ev = event;
+            self.deinitGenericEvent(&ev);
         }
 
         fn deinitResultValue(self: *Self, result: *R) void {
@@ -103,12 +110,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return std.Io.Timestamp.now(defaultIo(), .boot).toNanoseconds();
         }
 
+        pub fn cancelAndJoinThread(self: *Self, timeout_ms: u64) bool {
+            self.completed.store(true, .release);
+            _ = self.futex.fetchAdd(1, .release);
+            self.wake(std.math.maxInt(u32));
+            return self.waitForThread(timeout_ms);
+        }
+
         pub fn deinit(self: *Self) void {
             if (self.wait_for_thread_on_deinit) {
-                self.completed.store(true, .release);
-                _ = self.futex.fetchAdd(1, .release);
-                self.wake(std.math.maxInt(u32));
-                _ = self.waitForThread(120_000);
+                _ = self.cancelAndJoinThread(DEINIT_THREAD_JOIN_TIMEOUT_MS);
             }
 
             while (self.poll()) |event| {
@@ -121,7 +132,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
 
             if (self.err_msg) |msg| {
-                self.allocator.free(msg);
+                if (!self.err_msg_static) self.allocator.free(msg);
             }
 
             self.* = undefined;
@@ -210,11 +221,27 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defer self.mutex.unlock(defaultIo());
 
             if (self.err_msg) |old| {
-                self.allocator.free(old);
+                if (!self.err_msg_static) self.allocator.free(old);
                 self.err_msg = null;
+                self.err_msg_static = false;
             }
 
-            self.err_msg = self.allocator.dupe(u8, msg) catch null;
+            self.err_msg = self.allocator.dupe(u8, msg) catch blk: {
+                self.err_msg_static = true;
+                break :blk "out of memory";
+            };
+            self.completed.store(true, .release);
+
+            _ = self.futex.fetchAdd(1, .release);
+            self.wake(std.math.maxInt(u32));
+        }
+
+        pub fn completeWithoutOutcomeForTesting(self: *Self) void {
+            if (!@import("builtin").is_test) @compileError("completeWithoutOutcomeForTesting is test-only");
+
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
+
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);
@@ -454,6 +481,36 @@ test "EventStream error" {
 
     try std.testing.expect(stream.isDone());
     try std.testing.expectEqualStrings("test error", stream.getError().?);
+}
+
+test "EventStream keeps a retrievable error when the allocator cannot duplicate the message" {
+    const TestStream = EventStream(u32, bool);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var stream = TestStream.init(failing.allocator());
+    defer stream.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    stream.completeWithError("oom final content");
+    failing.fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(stream.isDone());
+    try std.testing.expect(stream.getResult() == null);
+    try std.testing.expectEqualStrings("out of memory", stream.getError().?);
+}
+
+test "EventStream replaces a static oom error with an owned message" {
+    const TestStream = EventStream(u32, bool);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var stream = TestStream.init(failing.allocator());
+    defer stream.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    stream.completeWithError("oom final content");
+    failing.fail_index = std.math.maxInt(usize);
+
+    stream.completeWithError("later real error");
+
+    try std.testing.expectEqualStrings("later real error", stream.getError().?);
 }
 
 test "EventStream pollBatch" {
@@ -765,6 +822,56 @@ test "AssistantMessageStream owned events: consumer frees each polled event" {
         polled += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), polled);
+
+    var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("ok", result.content[0].text.text);
+
+    stream.deinit();
+}
+
+test "AssistantMessageStream owned events: releaseEvent frees polled events" {
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+    stream.owns_events = true;
+    stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "owned copy",
+        .partial = partial,
+    } });
+
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    var polled: usize = 0;
+    while (stream.wait()) |event| {
+        stream.releaseEvent(event);
+        polled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), polled);
 
     var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
     defer result.deinit(allocator);

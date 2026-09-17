@@ -11,6 +11,7 @@ pub const SessionId = provider_types.SessionId;
 pub const generateSessionId = provider_types.generateSessionId;
 pub const sessionIdToString = provider_types.sessionIdToString;
 pub const parseSessionId = provider_types.parseSessionId;
+pub const PLACEHOLDER_SESSION_ID = provider_types.PLACEHOLDER_SESSION_ID;
 
 pub const Ack = provider_types.Ack;
 pub const Nack = provider_types.Nack;

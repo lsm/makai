@@ -357,6 +357,8 @@ required_files=(
   "zig/src/agent/agent.zig"
   "zig/src/protocol/provider/client.zig"
   "zig/src/protocol/provider/server.zig"
+  "zig/src/protocol/oap/server.zig"
+  "zig/src/protocol/oap/bridge.zig"
   "zig/src/tool_call_tracker.zig"
   "zig/src/streaming_json.zig"
   "zig/src/providers/sse_parser.zig"
@@ -369,5 +371,17 @@ for file in "${required_files[@]}"; do
     exit 1
   fi
 done
+
+echo "[patterns] checking providers do not drop stream events..."
+dropped_events="$(grep -n '\.push(' zig/src/providers/*.zig | grep -v 'keepalive' || true)"
+if [[ -n "$dropped_events" ]]; then
+  echo "[patterns] provider uses push() for a non-keepalive event:" >&2
+  echo "$dropped_events" >&2
+  echo "[patterns] push() returns QueueFull when a slow consumer fills the ring, and providers" >&2
+  echo "[patterns] historically discarded that error, silently losing streamed content while the" >&2
+  echo "[patterns] final message stayed complete. Use pushBlocking() for every semantic event;" >&2
+  echo "[patterns] only keepalive may be dropped, because it is advisory." >&2
+  exit 1
+fi
 
 echo "[patterns] ok"

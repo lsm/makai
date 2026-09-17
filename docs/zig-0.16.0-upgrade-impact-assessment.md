@@ -4,6 +4,13 @@ Date: 2026-05-07
 Scope: Makai `zig/` codebase (`zig/src/**`, `zig/test/**`, `zig/build.zig`, `zig/build.zig.zon`)  
 Target release: Zig 0.16.0, released 2026-04-14, “Juicy Main”
 
+> **Note (added with the dead-code deletion in this repository's `chore: delete
+> never-compiled AWS, Bedrock, Google OAuth, and login programs` change):** this
+> document is a point-in-time record and its inventories are left verbatim. Two
+> paths it names no longer exist, having been deleted as never-compiled dead code:
+> `zig/src/utils/oauth/google.zig` and `zig/src/utils/oauth/callback_server.zig`.
+> Their entries below are historical.
+
 ## Summary verdict
 
 Upgrading Makai from Zig 0.15.2 to Zig 0.16.0 is feasible, but it is **not a small version bump**. Zig 0.16.0 moves blocking and nondeterministic standard-library APIs behind the new `std.Io` interface and also changes container, filesystem, networking, process, time, entropy, formatting, and synchronization APIs. Makai uses many of those areas directly.
