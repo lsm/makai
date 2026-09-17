@@ -34,6 +34,7 @@ pub const ConfigError = error{
     MissingBaseUrl,
     InvalidBaseUrl,
     UnsupportedApi,
+    InvalidAuthMode,
 };
 
 pub const ModelSpec = struct {
@@ -55,6 +56,7 @@ pub const CustomProvider = struct {
     api: []const u8,
     base_url: []const u8,
     env_key: ?[]const u8 = null,
+    auth_none: bool = false,
     headers: []const ai_types.HeaderPair = &.{},
     models: []const ModelSpec = &.{},
     compat: ?ai_types.OpenAICompatOptions = null,
@@ -184,9 +186,19 @@ fn parseProvider(allocator: std.mem.Allocator, obj: *const std.json.ObjectMap) !
     provider.base_url = try allocator.dupe(u8, base_trimmed);
     errdefer allocator.free(provider.base_url);
 
-    if (objectObject(obj, "auth")) |auth| {
-        if (objectString(auth, "env")) |env_name| {
-            if (env_name.len > 0) provider.env_key = try allocator.dupe(u8, env_name);
+    if (obj.getPtr("auth")) |auth_value| {
+        switch (auth_value.*) {
+            .string => |mode| {
+                if (!std.mem.eql(u8, mode, "none")) return ConfigError.InvalidAuthMode;
+                provider.auth_none = true;
+            },
+            .object => {
+                const env_name = objectString(&auth_value.object, "env") orelse
+                    return ConfigError.InvalidAuthMode;
+                if (env_name.len == 0) return ConfigError.InvalidAuthMode;
+                provider.env_key = try allocator.dupe(u8, env_name);
+            },
+            else => return ConfigError.InvalidAuthMode,
         }
     }
     errdefer if (provider.env_key) |key| allocator.free(key);
@@ -529,11 +541,52 @@ test "custom providers reject malformed entries" {
         .{ .data =
         \\{"providers":[{"id":"ok","base_url":"https://x.test","models":[12]}]}
         , .want = ConfigError.InvalidConfig },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":"anonymous"}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":true}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"env":5}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"env":""}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{}}]}
+        , .want = ConfigError.InvalidAuthMode },
+        .{ .data =
+        \\{"providers":[{"id":"ok","base_url":"https://x.test","auth":{"environment":"K"}}]}
+        , .want = ConfigError.InvalidAuthMode },
     };
 
     for (cases) |case| {
         try testing.expectError(case.want, parse(testing.allocator, case.data));
     }
+}
+
+test "auth none is an explicit opt-in and stays off otherwise" {
+    var keyless = try parseOne(testing.allocator,
+        \\{"providers":[{"id":"local","base_url":"http://localhost:8000/v1","auth":"none"}]}
+    );
+    defer keyless.deinit(testing.allocator);
+    try testing.expect(keyless.auth_none);
+    try testing.expect(keyless.env_key == null);
+
+    var env_keyed = try parseOne(testing.allocator,
+        \\{"providers":[{"id":"gw","base_url":"https://gw.test","auth":{"env":"GW_KEY"}}]}
+    );
+    defer env_keyed.deinit(testing.allocator);
+    try testing.expect(!env_keyed.auth_none);
+    try testing.expectEqualStrings("GW_KEY", env_keyed.env_key.?);
+
+    var silent = try parseOne(testing.allocator,
+        \\{"providers":[{"id":"gw","base_url":"https://gw.test"}]}
+    );
+    defer silent.deinit(testing.allocator);
+    try testing.expect(!silent.auth_none);
+    try testing.expect(silent.env_key == null);
 }
 
 test "custom providers tolerate an absent or empty providers array" {
