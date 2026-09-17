@@ -624,14 +624,14 @@ pub const OpenAICompatOptions = struct {
     supports_store: ?bool = null,
     supports_developer_role: ?bool = null,
     supports_reasoning_effort: ?bool = null,
-    supports_usage_in_streaming: ?bool = true,
-    max_tokens_field: enum { max_completion_tokens, max_tokens } = .max_completion_tokens,
+    supports_usage_in_streaming: ?bool = null,
+    max_tokens_field: ?enum { max_completion_tokens, max_tokens } = null,
     requires_tool_result_name: ?bool = null,
     requires_assistant_after_tool_result: ?bool = null,
     requires_thinking_as_text: ?bool = null,
     requires_mistral_tool_ids: ?bool = null,
-    thinking_format: enum { openai, zai, qwen } = .openai,
-    supports_strict_mode: ?bool = true,
+    thinking_format: ?enum { openai, zai, qwen } = null,
+    supports_strict_mode: ?bool = null,
     supports_anthropic_cache_ttl: ?bool = null,
 };
 
@@ -1560,14 +1560,14 @@ test "OpenAICompatOptions defaults are correct" {
     try std.testing.expect(compat.supports_store == null);
     try std.testing.expect(compat.supports_developer_role == null);
     try std.testing.expect(compat.supports_reasoning_effort == null);
-    try std.testing.expect(compat.supports_usage_in_streaming == true);
-    try std.testing.expectEqual(@as(@TypeOf(compat.max_tokens_field), .max_completion_tokens), compat.max_tokens_field);
+    try std.testing.expect(compat.supports_usage_in_streaming == null);
+    try std.testing.expect(compat.max_tokens_field == null);
     try std.testing.expect(compat.requires_tool_result_name == null);
     try std.testing.expect(compat.requires_assistant_after_tool_result == null);
     try std.testing.expect(compat.requires_thinking_as_text == null);
     try std.testing.expect(compat.requires_mistral_tool_ids == null);
-    try std.testing.expectEqual(@as(@TypeOf(compat.thinking_format), .openai), compat.thinking_format);
-    try std.testing.expect(compat.supports_strict_mode == true);
+    try std.testing.expect(compat.thinking_format == null);
+    try std.testing.expect(compat.supports_strict_mode == null);
 }
 
 test "Model with compat options" {
@@ -1591,8 +1591,8 @@ test "Model with compat options" {
 
     try std.testing.expect(model.compat != null);
     try std.testing.expect(!model.compat.?.supports_store.?);
-    try std.testing.expectEqual(@as(@TypeOf(model.compat.?.max_tokens_field), .max_tokens), model.compat.?.max_tokens_field);
-    try std.testing.expectEqual(@as(@TypeOf(model.compat.?.thinking_format), .zai), model.compat.?.thinking_format);
+    try std.testing.expect(model.compat.?.max_tokens_field.? == .max_tokens);
+    try std.testing.expect(model.compat.?.thinking_format.? == .zai);
 }
 
 test "RoutingPreferences defaults are correct" {

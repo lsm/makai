@@ -6,8 +6,8 @@ const fields = @import("envelope_fields");
 const json_writer = @import("json_writer");
 const transport = @import("transport");
 
-const OpenAICompatMaxTokensField = @TypeOf((ai_types.OpenAICompatOptions{}).max_tokens_field);
-const OpenAICompatThinkingFormat = @TypeOf((ai_types.OpenAICompatOptions{}).thinking_format);
+const OpenAICompatMaxTokensField = @typeInfo(@TypeOf((ai_types.OpenAICompatOptions{}).max_tokens_field)).optional.child;
+const OpenAICompatThinkingFormat = @typeInfo(@TypeOf((ai_types.OpenAICompatOptions{}).thinking_format)).optional.child;
 
 pub fn serializeEnvelope(
     envelope: protocol_types.Envelope,
@@ -259,6 +259,16 @@ fn serializeOptionalBoolField(
     }
 }
 
+fn serializeOptionalTagField(
+    w: *json_writer.JsonWriter,
+    field: []const u8,
+    value: anytype,
+) !void {
+    if (value) |unwrapped| {
+        try w.writeStringField(field, @tagName(unwrapped));
+    }
+}
+
 fn serializeOpenAICompatOptions(
     w: *json_writer.JsonWriter,
     compat_options: ai_types.OpenAICompatOptions,
@@ -269,12 +279,12 @@ fn serializeOpenAICompatOptions(
     try serializeOptionalBoolField(w, "supports_developer_role", compat_options.supports_developer_role);
     try serializeOptionalBoolField(w, "supports_reasoning_effort", compat_options.supports_reasoning_effort);
     try serializeOptionalBoolField(w, "supports_usage_in_streaming", compat_options.supports_usage_in_streaming);
-    try w.writeStringField("max_tokens_field", @tagName(compat_options.max_tokens_field));
+    try serializeOptionalTagField(w, "max_tokens_field", compat_options.max_tokens_field);
     try serializeOptionalBoolField(w, "requires_tool_result_name", compat_options.requires_tool_result_name);
     try serializeOptionalBoolField(w, "requires_assistant_after_tool_result", compat_options.requires_assistant_after_tool_result);
     try serializeOptionalBoolField(w, "requires_thinking_as_text", compat_options.requires_thinking_as_text);
     try serializeOptionalBoolField(w, "requires_mistral_tool_ids", compat_options.requires_mistral_tool_ids);
-    try w.writeStringField("thinking_format", @tagName(compat_options.thinking_format));
+    try serializeOptionalTagField(w, "thinking_format", compat_options.thinking_format);
     try serializeOptionalBoolField(w, "supports_strict_mode", compat_options.supports_strict_mode);
     try serializeOptionalBoolField(w, "supports_anthropic_cache_ttl", compat_options.supports_anthropic_cache_ttl);
     try w.endObject();
@@ -950,7 +960,7 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
         .max_tokens_field = if (obj.get("max_tokens_field")) |value| blk: {
             if (value != .string) return error.InvalidUserContent;
             break :blk try parseMaxTokensField(try fields.asString(value));
-        } else .max_completion_tokens,
+        } else null,
         .requires_tool_result_name = try optionalBool(obj, "requires_tool_result_name"),
         .requires_assistant_after_tool_result = try optionalBool(obj, "requires_assistant_after_tool_result"),
         .requires_thinking_as_text = try optionalBool(obj, "requires_thinking_as_text"),
@@ -958,7 +968,7 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
         .thinking_format = if (obj.get("thinking_format")) |value| blk: {
             if (value != .string) return error.InvalidUserContent;
             break :blk try parseThinkingFormat(try fields.asString(value));
-        } else .openai,
+        } else null,
         .supports_strict_mode = try optionalBool(obj, "supports_strict_mode"),
         .supports_anthropic_cache_ttl = try optionalBool(obj, "supports_anthropic_cache_ttl"),
     };
@@ -1999,11 +2009,63 @@ test "stream_request round trips model metadata" {
     try std.testing.expectEqualStrings("0.135.0", decoded_model.headers.?[0].value);
     try std.testing.expect(decoded_model.compat != null);
     try std.testing.expectEqual(@as(?bool, false), decoded_model.compat.?.supports_store);
-    try std.testing.expectEqual(@as(@TypeOf(decoded_model.compat.?.max_tokens_field), .max_tokens), decoded_model.compat.?.max_tokens_field);
-    try std.testing.expectEqual(@as(@TypeOf(decoded_model.compat.?.thinking_format), .zai), decoded_model.compat.?.thinking_format);
+    try std.testing.expect(decoded_model.compat.?.max_tokens_field.? == .max_tokens);
+    try std.testing.expect(decoded_model.compat.?.thinking_format.? == .zai);
     try std.testing.expect(decoded.payload.stream_request.options != null);
     try std.testing.expect(decoded.payload.stream_request.options.?.headers != null);
     try std.testing.expectEqualStrings("ChatGPT-Account-ID", decoded.payload.stream_request.options.?.headers.?[1].name);
+}
+
+test "unset compat enums are omitted on the wire and decode back as unset" {
+    const allocator = std.testing.allocator;
+
+    const input = [_][]const u8{"text"};
+    const model = ai_types.Model{
+        .id = "gateway-model",
+        .name = "Gateway Model",
+        .api = "openai-completions",
+        .provider = "gateway",
+        .base_url = "https://gw.internal",
+        .reasoning = false,
+        .input = &input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 4096,
+        .compat = .{ .supports_anthropic_cache_ttl = true },
+    };
+
+    const context = ai_types.Context{ .messages = &.{} };
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 1708234567890,
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = context,
+            .options = null,
+            .include_partial = false,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+    envelope.deinit(allocator);
+
+    try std.testing.expect(std.mem.find(u8, json, "max_tokens_field") == null);
+    try std.testing.expect(std.mem.find(u8, json, "thinking_format") == null);
+    try std.testing.expect(std.mem.find(u8, json, "supports_strict_mode") == null);
+    try std.testing.expect(std.mem.find(u8, json, "supports_usage_in_streaming") == null);
+
+    var decoded = try deserializeEnvelope(json, allocator);
+    defer decoded.deinit(allocator);
+
+    const decoded_compat = decoded.payload.stream_request.model.compat.?;
+    try std.testing.expectEqual(@as(?bool, true), decoded_compat.supports_anthropic_cache_ttl);
+    try std.testing.expect(decoded_compat.max_tokens_field == null);
+    try std.testing.expect(decoded_compat.thinking_format == null);
+    try std.testing.expect(decoded_compat.supports_strict_mode == null);
+    try std.testing.expect(decoded_compat.supports_usage_in_streaming == null);
 }
 
 test "allows_anonymous round trips and defaults off when the field is absent" {
