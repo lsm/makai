@@ -140,7 +140,7 @@ pub const ToolProtocolServer = struct {
                 const prefix = req.getPrefix();
                 var metas = std.ArrayList(tool_types.ToolMetadata).empty;
                 errdefer {
-                    for (metas.items) |*meta| deinitToolMetadata(meta, allocator);
+                    for (metas.items) |*meta| meta.deinit(allocator);
                     metas.deinit(allocator);
                 }
                 for (self.tools.items) |tool| {
@@ -469,23 +469,19 @@ fn cloneArtifactsToAgent(allocator: std.mem.Allocator, artifacts: []const tool_t
 }
 
 fn toolMetadataFromAgentTool(allocator: std.mem.Allocator, tool: agent_types.AgentTool) !tool_types.ToolMetadata {
+    const name = try allocator.dupe(u8, tool.name);
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, tool.description);
+    errdefer allocator.free(description);
+    const parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json);
+    errdefer allocator.free(parameters_schema_json);
+
     return .{
-        .name = try allocator.dupe(u8, tool.name),
-        .description = try allocator.dupe(u8, tool.description),
-        .parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json),
+        .name = name,
+        .description = description,
+        .parameters_schema_json = parameters_schema_json,
         .version = try allocator.dupe(u8, "1.0.0"),
     };
-}
-
-fn deinitToolMetadata(meta: *tool_types.ToolMetadata, allocator: std.mem.Allocator) void {
-    allocator.free(meta.name);
-    allocator.free(meta.description);
-    allocator.free(meta.parameters_schema_json);
-    allocator.free(meta.version);
-    if (meta.required_permissions) |perms| {
-        for (perms) |perm| allocator.free(perm);
-        allocator.free(perms);
-    }
 }
 
 test "tool protocol server wraps shell_execute and returns correct result" {
