@@ -46,6 +46,11 @@ fn anthropicIsAuthFailure(err_msg: []const u8) bool {
         std.ascii.indexOfIgnoreCase(err_msg, "invalid api key") != null;
 }
 
+fn allowsAnonymous(model: ai_types.Model) bool {
+    if (!model.allows_anonymous) return false;
+    return !std.mem.eql(u8, model.provider, "anthropic");
+}
+
 fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, provider_id, "anthropic")) return null;
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
@@ -1047,7 +1052,9 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8, mode
 
     const is_oauth = isOAuthToken(api_key);
 
-    if (is_oauth) {
+    if (api_key.len == 0) {
+        try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
+    } else if (is_oauth) {
         out.auth_header = try buildBearerAuthValue(allocator, api_key);
         try out.headers.append(allocator, .{ .name = "authorization", .value = out.auth_header.? });
         try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
@@ -1750,9 +1757,14 @@ pub fn streamAnthropicMessages(
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const env = envApiKeyForProvider(allocator, model.provider);
-        if (env) |k| break :blk @constCast(k);
+        if (o.getApiKey()) |k| {
+            if (k.len > 0) break :blk try allocator.dupe(u8, k);
+        }
+        if (envApiKeyForProvider(allocator, model.provider)) |k| {
+            if (k.len > 0) break :blk @constCast(k);
+            allocator.free(k);
+        }
+        if (allowsAnonymous(model)) break :blk try allocator.dupe(u8, "");
         return error.MissingApiKey;
     };
     errdefer allocator.free(api_key);
@@ -1861,6 +1873,43 @@ fn anthropicErrorDetail(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
         return try std.fmt.allocPrint(allocator, " ({s}: {s})", .{ kind.?.string, message.string });
     }
     return try std.fmt.allocPrint(allocator, " ({s})", .{message.string});
+}
+
+test "anonymous streaming is opt-in and never applies to the anthropic vendor id" {
+    const base: ai_types.Model = .{
+        .id = "m",
+        .name = "M",
+        .api = "anthropic-messages",
+        .provider = "gateway",
+        .base_url = "https://gw.test",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(!allowsAnonymous(base));
+
+    var opted = base;
+    opted.allows_anonymous = true;
+    try std.testing.expect(allowsAnonymous(opted));
+
+    var vendor = opted;
+    vendor.provider = "anthropic";
+    try std.testing.expect(!allowsAnonymous(vendor));
+}
+
+test "anthropic headers carry no credential when the key is empty" {
+    var out = try buildAnthropicHeaders(std.testing.allocator, "", null);
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expect(!compat.http.headerPresent(out.headers.items, "x-api-key"));
+    try std.testing.expect(!compat.http.headerPresent(out.headers.items, "authorization"));
+    try std.testing.expect(compat.http.headerPresent(out.headers.items, "anthropic-version"));
+    try std.testing.expect(compat.http.headerPresent(out.headers.items, "content-type"));
+
+    var keyed = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-plain", null);
+    defer keyed.deinit(std.testing.allocator);
+    try std.testing.expect(compat.http.headerPresent(keyed.headers.items, "x-api-key"));
 }
 
 test "buildUrlWithSuffix does not double a suffix already present" {

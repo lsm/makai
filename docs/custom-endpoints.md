@@ -31,7 +31,7 @@ the built-in ones.
       "id": "local",
       "api": "openai-completions",
       "base_url": "http://localhost:8000/v1",
-      "auth": { "env": "LOCAL_API_KEY" }
+      "auth": "none"
     }
   ]
 }
@@ -45,7 +45,7 @@ the built-in ones.
 | `base_url` | yes | Endpoint origin. A trailing `/v1` is stripped; see Base URLs below. |
 | `api` | no | `openai-completions` (default), `openai-responses` or `anthropic-messages`. |
 | `name` | no | Display name; defaults to the id. |
-| `auth.env` | no | Environment variable to read the key from. |
+| `auth` | no | Either `{ "env": "VAR" }` to read the key from an environment variable, or the string `"none"` to send no credential at all. Any other value is rejected. |
 | `headers` | no | Extra request headers, as a flat object of strings. |
 | `models` | no | Allowlist and fallback list; strings, or objects with `id`, `name`, `context_window`, `max_tokens`. |
 | `capabilities` | no | Overrides for what the endpoint supports; see below. |
@@ -85,13 +85,16 @@ and a 404, since the OpenAI request builder concatenates without checking.
   the value never enters the file.
 
 The keychain is checked first. A provider with neither source still appears in
-`/model` and still lists its models, but it cannot complete a turn: both
-providers raise `MissingApiKey` before a request leaves the process when no key
-resolves. A local llama.cpp or vLLM that ignores authentication entirely
-therefore still needs `auth.env` naming a variable that holds any non-empty
-value, which the server is free to discard. See The Anthropic wire format and
-vendor credentials below for why, and for the follow-up that would remove the
-requirement.
+`/model` and still lists its models, but by default it cannot complete a turn:
+the providers raise `MissingApiKey` before a request leaves the process when no
+key resolves. That default is deliberate, so that forgetting to log in fails
+loudly instead of quietly sending an unauthenticated request.
+
+A server that wants no credential at all, such as a local llama.cpp, vLLM or
+LM Studio, says so with `"auth": "none"`. It is an opt-in and nothing else
+implies it: an absent `auth` block still means "a key is required and none was
+found". A provider that declares it still prefers a real key when one resolves,
+from the keychain or from a request, and only falls back to sending nothing.
 
 `/login` with no argument shows the built-in providers. Custom providers are
 reached by naming them, `/login gateway`, and only if they are declared in the
@@ -118,8 +121,8 @@ available here.
 The fetch happens off that path. A successful `/login <id>` refreshes every
 catalog, which is what populates the cache the first time, and a refresh
 requests `<base_url>/v1/models`, writes the cache, and falls back to the cached
-copy however old when it fails. An endpoint whose key comes from `auth.env` has no
-login step, so it serves its declared `models` list until some other login
+copy however old when it fails. An endpoint keyed from `auth` rather than the keychain has
+no login step, so it serves its declared `models` list until some other login
 triggers a refresh.
 
 The declared list is a fallback **only** when discovery produced nothing at all.
@@ -182,12 +185,19 @@ case: it authenticates with its own key, resolved from the keychain under its id
 or from its declared environment variable, and the vendor token is never
 consulted.
 
-A provider with no credential at all is **not** supported on these wire formats.
-Both the OpenAI and the Anthropic provider return `MissingApiKey` when neither
-the request nor their own environment variable supplies a key, so a keyless
-local server needs an `env_key` naming a variable (its value may be a dummy the
-server ignores) or a key stored by `/login <id>`. Letting a declared endpoint be
-genuinely keyless is a follow-up, not something this feature does today.
+A provider that declares `"auth": "none"` sends no credential: no
+`Authorization` header on the OpenAI formats, no `x-api-key` on the Anthropic
+one. The rest of the request is unchanged, so `anthropic-version` and
+`content-type` still go out.
+
+The opt-in cannot be turned against a vendor. It is carried on the model as
+`allows_anonymous`, and each provider refuses to honour it for the vendor ids it
+serves: `anthropic` on the Anthropic format, and `openai`, `deepseek`, `kimi`,
+`github-copilot`, `openai-codex` and `azure` on the OpenAI ones. A declared
+provider can never hold one of those ids anyway, since they are reserved, so the
+check only matters for a request arriving over the protocol. Honouring it there
+would cost nothing more than an unauthenticated request to a URL the caller
+already chose, but refusing keeps the vendor paths uniformly credentialed.
 
 Three rules keep those apart, because `base_url` arrives from the request and the
 server does not police where a model points. When a request names a vendor wire

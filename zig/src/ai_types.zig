@@ -653,6 +653,7 @@ pub const Model = struct {
     max_tokens: u32,
     headers: ?[]const HeaderPair = null,
     compat: ?OpenAICompatOptions = null,
+    allows_anonymous: bool = false,
     is_owned: bool = false,
 
     pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
@@ -1277,6 +1278,7 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
         .max_tokens = model.max_tokens,
         .headers = headers,
         .compat = model.compat,
+        .allows_anonymous = model.allows_anonymous,
         .is_owned = true,
     };
 }
