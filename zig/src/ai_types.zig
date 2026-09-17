@@ -1239,22 +1239,38 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
     errdefer allocator.free(base_url);
 
     const input = try allocator.alloc([]const u8, model.input.len);
-    errdefer allocator.free(input);
-    for (model.input, 0..) |inp, i| {
-        errdefer for (input[0..i]) |in| allocator.free(in);
-        input[i] = try allocator.dupe(u8, inp);
+    var input_filled: usize = 0;
+    errdefer {
+        for (input[0..input_filled]) |in| allocator.free(in);
+        allocator.free(input);
+    }
+    for (model.input) |inp| {
+        input[input_filled] = try allocator.dupe(u8, inp);
+        input_filled += 1;
     }
 
     var headers: ?[]HeaderPair = null;
     if (model.headers) |h| {
-        headers = try allocator.alloc(HeaderPair, h.len);
-        errdefer if (headers) |hs| allocator.free(hs);
-        for (h, 0..) |hp, i| {
-            headers.?[i] = .{
-                .name = try allocator.dupe(u8, hp.name),
-                .value = try allocator.dupe(u8, hp.value),
-            };
+        const pairs = try allocator.alloc(HeaderPair, h.len);
+        var filled: usize = 0;
+        errdefer {
+            for (pairs[0..filled]) |*hp| {
+                allocator.free(hp.name);
+                allocator.free(hp.value);
+            }
+            allocator.free(pairs);
         }
+
+        for (h) |hp| {
+            const pair_name = try allocator.dupe(u8, hp.name);
+            errdefer allocator.free(pair_name);
+            const pair_value = try allocator.dupe(u8, hp.value);
+
+            pairs[filled] = .{ .name = pair_name, .value = pair_value };
+            filled += 1;
+        }
+
+        headers = pairs;
     }
     errdefer if (headers) |hs| {
         for (hs) |*hp| {
@@ -1582,4 +1598,37 @@ test "RoutingPreferences defaults are correct" {
 
     try std.testing.expect(prefs.only == null);
     try std.testing.expect(prefs.order == null);
+}
+
+test "cloneModel frees duped header pairs when a later allocation fails" {
+    const allocator = std.testing.allocator;
+
+    const headers = [_]HeaderPair{
+        .{ .name = "x-one", .value = "first" },
+        .{ .name = "x-two", .value = "second" },
+        .{ .name = "x-three", .value = "third" },
+    };
+
+    const model = Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "openai-completions",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .headers = &headers,
+    };
+
+    const Case = struct {
+        fn run(failing: std.mem.Allocator, source: Model) !void {
+            var cloned = try cloneModel(failing, source);
+            cloned.deinit(failing);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{model});
 }
