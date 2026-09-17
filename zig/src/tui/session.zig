@@ -182,36 +182,80 @@ pub const TuiEvent = union(enum) {
             .tool_call_delta => |*p| p.delta = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.delta.slice())),
             .provider_event => |*p| p.event_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.event_json.slice())),
             .message_end => |*p| {
-                p.text = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.text.slice()));
-                p.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.content_json.slice()));
-                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
-                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
-                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
-                p.tool_calls_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_calls_json.slice()));
-                p.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.details_json.slice()));
-                p.artifacts_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.artifacts_json.slice()));
+                const text = try allocator.dupe(u8, p.text.slice());
+                errdefer allocator.free(text);
+                const content_json = try allocator.dupe(u8, p.content_json.slice());
+                errdefer allocator.free(content_json);
+                const tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice());
+                errdefer allocator.free(tool_call_id);
+                const tool_name = try allocator.dupe(u8, p.tool_name.slice());
+                errdefer allocator.free(tool_name);
+                const args_json = try allocator.dupe(u8, p.args_json.slice());
+                errdefer allocator.free(args_json);
+                const tool_calls_json = try allocator.dupe(u8, p.tool_calls_json.slice());
+                errdefer allocator.free(tool_calls_json);
+                const details_json = try allocator.dupe(u8, p.details_json.slice());
+                errdefer allocator.free(details_json);
+                const artifacts_json = try allocator.dupe(u8, p.artifacts_json.slice());
+
+                p.text = OwnedSlice(u8).initOwned(text);
+                p.content_json = OwnedSlice(u8).initOwned(content_json);
+                p.tool_call_id = OwnedSlice(u8).initOwned(tool_call_id);
+                p.tool_name = OwnedSlice(u8).initOwned(tool_name);
+                p.args_json = OwnedSlice(u8).initOwned(args_json);
+                p.tool_calls_json = OwnedSlice(u8).initOwned(tool_calls_json);
+                p.details_json = OwnedSlice(u8).initOwned(details_json);
+                p.artifacts_json = OwnedSlice(u8).initOwned(artifacts_json);
             },
             .tool_approval_requested => |*p| {
-                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
-                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
-                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+                const tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice());
+                errdefer allocator.free(tool_call_id);
+                const tool_name = try allocator.dupe(u8, p.tool_name.slice());
+                errdefer allocator.free(tool_name);
+                const args_json = try allocator.dupe(u8, p.args_json.slice());
+
+                p.tool_call_id = OwnedSlice(u8).initOwned(tool_call_id);
+                p.tool_name = OwnedSlice(u8).initOwned(tool_name);
+                p.args_json = OwnedSlice(u8).initOwned(args_json);
             },
             .tool_execution_start => |*p| {
-                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
-                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
-                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+                const tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice());
+                errdefer allocator.free(tool_call_id);
+                const tool_name = try allocator.dupe(u8, p.tool_name.slice());
+                errdefer allocator.free(tool_name);
+                const args_json = try allocator.dupe(u8, p.args_json.slice());
+
+                p.tool_call_id = OwnedSlice(u8).initOwned(tool_call_id);
+                p.tool_name = OwnedSlice(u8).initOwned(tool_name);
+                p.args_json = OwnedSlice(u8).initOwned(args_json);
             },
             .tool_execution_update => |*p| {
-                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
-                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
-                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
-                p.partial_result_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.partial_result_json.slice()));
+                const tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice());
+                errdefer allocator.free(tool_call_id);
+                const tool_name = try allocator.dupe(u8, p.tool_name.slice());
+                errdefer allocator.free(tool_name);
+                const args_json = try allocator.dupe(u8, p.args_json.slice());
+                errdefer allocator.free(args_json);
+                const partial_result_json = try allocator.dupe(u8, p.partial_result_json.slice());
+
+                p.tool_call_id = OwnedSlice(u8).initOwned(tool_call_id);
+                p.tool_name = OwnedSlice(u8).initOwned(tool_name);
+                p.args_json = OwnedSlice(u8).initOwned(args_json);
+                p.partial_result_json = OwnedSlice(u8).initOwned(partial_result_json);
             },
             .tool_execution_end => |*p| {
-                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
-                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
-                p.result_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.result_json.slice()));
-                p.artifact_refs = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.artifact_refs.slice()));
+                const tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice());
+                errdefer allocator.free(tool_call_id);
+                const tool_name = try allocator.dupe(u8, p.tool_name.slice());
+                errdefer allocator.free(tool_name);
+                const result_json = try allocator.dupe(u8, p.result_json.slice());
+                errdefer allocator.free(result_json);
+                const artifact_refs = try allocator.dupe(u8, p.artifact_refs.slice());
+
+                p.tool_call_id = OwnedSlice(u8).initOwned(tool_call_id);
+                p.tool_name = OwnedSlice(u8).initOwned(tool_name);
+                p.result_json = OwnedSlice(u8).initOwned(result_json);
+                p.artifact_refs = OwnedSlice(u8).initOwned(artifact_refs);
             },
             .system_warning => |*p| p.message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.message.slice())),
             .@"error" => |*p| p.message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.message.slice())),
@@ -376,4 +420,54 @@ test "TuiEvent deinit handles owned strings" {
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "hello")),
     } };
     event.deinit(std.testing.allocator);
+}
+
+fn cloneProbe(allocator: std.mem.Allocator) !void {
+    const events = [_]TuiEvent{
+        .{ .message_end = .{
+            .role = .assistant,
+            .text = OwnedSlice(u8).initBorrowed("final answer text"),
+            .content_json = OwnedSlice(u8).initBorrowed("[{\"type\":\"text\"}]"),
+            .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+            .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+            .args_json = OwnedSlice(u8).initBorrowed("{\"command\":\"ls\"}"),
+            .tool_calls_json = OwnedSlice(u8).initBorrowed("[]"),
+            .details_json = OwnedSlice(u8).initBorrowed("{\"ok\":true}"),
+            .artifacts_json = OwnedSlice(u8).initBorrowed("[]"),
+            .stop_reason = .stop,
+            .is_error = false,
+        } },
+        .{ .tool_approval_requested = .{
+            .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+            .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+            .args_json = OwnedSlice(u8).initBorrowed("{\"command\":\"ls\"}"),
+        } },
+        .{ .tool_execution_start = .{
+            .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+            .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+            .args_json = OwnedSlice(u8).initBorrowed("{\"command\":\"ls\"}"),
+        } },
+        .{ .tool_execution_update = .{
+            .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+            .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+            .args_json = OwnedSlice(u8).initBorrowed("{\"command\":\"ls\"}"),
+            .partial_result_json = OwnedSlice(u8).initBorrowed("{\"stdout\":\"part\"}"),
+        } },
+        .{ .tool_execution_end = .{
+            .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+            .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+            .result_json = OwnedSlice(u8).initBorrowed("{\"stdout\":\"done\"}"),
+            .is_error = false,
+            .artifact_refs = OwnedSlice(u8).initBorrowed("art-one,art-two"),
+        } },
+    };
+
+    for (events) |event| {
+        var copy = try event.clone(allocator);
+        copy.deinit(allocator);
+    }
+}
+
+test "TuiEvent.clone survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneProbe, .{});
 }

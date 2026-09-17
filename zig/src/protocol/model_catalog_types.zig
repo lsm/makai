@@ -132,9 +132,13 @@ pub fn cloneModelDescriptor(
         }
 
         for (src_entries, 0..) |entry, idx| {
+            const key = try allocator.dupe(u8, entry.key.slice());
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, entry.value.slice());
+
             copied_entries[idx] = .{
-                .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key.slice())),
-                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value.slice())),
+                .key = OwnedSlice(u8).initOwned(key),
+                .value = OwnedSlice(u8).initOwned(value),
             };
             copied_count += 1;
         }
@@ -197,4 +201,49 @@ test "cloneModelDescriptor duplicates nested owned fields" {
     try std.testing.expectEqualStrings(original.model_id.slice(), cloned.model_id.slice());
     try std.testing.expectEqualStrings("tier", cloned.metadata.?.slice()[0].key.slice());
     try std.testing.expectEqualStrings("standard", cloned.metadata.?.slice()[0].value.slice());
+}
+
+test "cloneModelDescriptor frees the metadata key when a later allocation fails" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(ModelCapability, 2);
+    capabilities[0] = .chat;
+    capabilities[1] = .streaming;
+
+    const metadata = try allocator.alloc(MetadataEntry, 2);
+    metadata[0] = .{
+        .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "tier")),
+        .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "standard")),
+    };
+    metadata[1] = .{
+        .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "region")),
+        .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "us-east-1")),
+    };
+
+    var original = ModelDescriptor{
+        .model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude-sonnet-4-5")),
+        .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+        .display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .base_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "https://api.anthropic.com")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = OwnedSlice(ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+        .reasoning_default = .medium,
+        .metadata = OwnedSlice(MetadataEntry).initOwned(metadata),
+    };
+    defer original.deinit(allocator);
+
+    const Case = struct {
+        fn run(failing: std.mem.Allocator, descriptor: ModelDescriptor) !void {
+            var cloned = try cloneModelDescriptor(failing, descriptor);
+            cloned.deinit(failing);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{original});
 }

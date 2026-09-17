@@ -1340,6 +1340,40 @@ server eviction (rule 6), and holds no transcript and no persistence.
    MUST scope sessions to their owning connection (rule 2) and evict on disconnect
    (beyond the idle TTL of rule 6; per-connection ownership is not built yet).
 
+8. Tool provisioning scope `[planned]`: the tool catalogue a run may call is
+   session-scoped, declared once by `agent_start`. `[current]` the host resolves it
+   per message — `parseAgentTools` reads `tools` from the `agent_message` payload
+   and consults the `agent_start` `config_json` only when the message omits the key
+   — so the wire permits a caller to vary the catalogue between messages on one
+   session. No consumer does. Every makai client writes the same list into BOTH
+   payloads from a single request object and always emits the key (an empty array
+   when there are none), so the message value unconditionally shadows the config
+   and the session-scoped field has never been read by any consumer. All three SDKs
+   in tree — TypeScript (`execution_client.ts:876,887`), Go (`agent.go:127,398`) and
+   Python (`execution.py:1010,1029`) — are one-shot (`agent_start`, one
+   `agent_message`, `agent_stop`) and expose no session handle through which a
+   second catalogue could be supplied; the unmerged Rust client (#309) matches
+   them. The override
+   is therefore unexercised capability whose only observable effect is a silent
+   failure mode: a caller that declares tools on `agent_start` and sends
+   `"tools": []` on `agent_message` receives no tools and no error. `[planned]`
+   clients MUST declare the catalogue in the `agent_start` config and MUST stop
+   emitting `tools` in the `agent_message` payload; a host that still receives the
+   key MUST reject the message at admission when its value differs from the
+   session's catalogue, and MAY accept it as a redundant restatement when it does
+   not. Rejecting only the divergent case converts the silent failure into a
+   correlated validation `agent_error` (§13.4.1) while remaining compatible with
+   every client that exists today, precisely because they all restate the same
+   value. This narrowing is justified by the silent failure alone and is not
+   contingent on any OAP unit graduating. Reversal condition: it is sufficient only
+   while makai owns every consumer. The host already accepts repeated
+   `agent_message` on one session (rule 3) — the native OAP bridge's per-session
+   sequence counter exercises that path — so the protocol supports per-submit
+   provisioning and only the SDKs decline to use it. A persistent-session API with
+   steering messages reopens the question and MUST revisit this rule rather than
+   route around it. Ledger row: [`docs/oap-alignment.md`](oap-alignment.md),
+   "control-layer-provided tools".
+
 ### 13.3 Frame Routing (Normative)
 
 1. Request-correlated delivery `[current — #201]`: a reply frame carrying
