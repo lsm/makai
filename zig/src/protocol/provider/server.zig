@@ -601,8 +601,18 @@ fn streamWithRefresh(
         }
     }
     const provider_id = provider.auth_provider_id orelse model.provider;
+    const claims_vendor_without_vendor_api = provider.auth_provider_id == null and
+        isVendorOAuthProviderId(model.provider);
     const oauth_provider = authProvider(provider) orelse
-        return streamWithResolvedKey(server, provider, provider_id, model, context, options, .any);
+        return streamWithResolvedKey(
+            server,
+            provider,
+            provider_id,
+            model,
+            context,
+            options,
+            if (claims_vendor_without_vendor_api) .api_key_only else .any,
+        );
 
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
@@ -1915,6 +1925,64 @@ test "a mismatched vendor provider id never reaches its stored OAuth token" {
         streamWithRefresh(&server, registry.getApiProvider("vendor-api").?, model, testContext(), null),
     );
     try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+}
+
+test "an api without an auth provider id never resolves a vendor OAuth token" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "keyless-api",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "anthropic"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "vendor-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "vendor-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "gateway"),
+        .{ .api_key = try std.testing.allocator.dupe(u8, "gateway-key") },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "keyless-api";
+    model.provider = "anthropic";
+    model.base_url = "https://attacker.test";
+
+    const leaked = try streamWithRefresh(&server, registry.getApiProvider("keyless-api").?, model, testContext(), null);
+    defer {
+        leaked.deinit();
+        std.testing.allocator.destroy(leaked);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.last_api_key_len);
+
+    var ordinary = testModel();
+    ordinary.api = "keyless-api";
+    ordinary.provider = "gateway";
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("keyless-api").?, ordinary, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+    try std.testing.expectEqualStrings("gateway-key", state.last_api_key[0..state.last_api_key_len]);
 }
 
 test "a custom provider id never resolves to a stored OAuth token" {

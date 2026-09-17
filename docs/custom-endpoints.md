@@ -182,7 +182,7 @@ local server needs an `env_key` naming a variable (its value may be a dummy the
 server ignores) or a key stored by `/login <id>`. Letting a declared endpoint be
 genuinely keyless is a follow-up, not something this feature does today.
 
-Two rules keep those apart, because `base_url` arrives from the request and the
+Three rules keep those apart, because `base_url` arrives from the request and the
 server does not police where a model points. When a request names a vendor wire
 format (`anthropic-messages`, `openai-codex-responses`) but a different
 `provider`, the server refuses outright if that `provider` is itself a vendor id,
@@ -192,6 +192,17 @@ api-key-only rule that skips OAuth entries entirely. A custom provider's
 credential is always a stored API key or an environment variable, so the rule
 costs it nothing, and no OAuth access token can leave through this path whatever
 id the request claims.
+
+The third rule covers the wire formats that have no vendor of their own. Only
+`anthropic-messages` and `openai-codex-responses` declare an `auth_provider_id`;
+the other six registered APIs leave it null, so the credential is resolved under
+whatever id the request's `provider` field claims. That id used to be honoured
+for OAuth entries as well, which meant a request naming `openai-completions`
+with `provider: "anthropic"` and any `base_url` resolved the stored Anthropic
+OAuth token and sent it there, bypassing the first two rules entirely. A request
+claiming a vendor id on an API that is not that vendor's now resolves under the
+same api-key-only rule, so the token stays put and an ordinary custom provider
+with a stored key is unaffected.
 
 Each provider's own environment fallback is scoped the same way. When the server
 resolves nothing it still calls the provider without a key, and the provider then
