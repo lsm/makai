@@ -1497,14 +1497,22 @@ fn deserializeMessage(
 
     if (std.mem.eql(u8, role, "tool")) {
         const tool_call_id = try allocator.dupe(u8, try jf.requireString(obj, "tool_call_id"));
+        errdefer allocator.free(tool_call_id);
         const tool_name = try allocator.dupe(u8, try jf.requireString(obj, "tool_name"));
+        errdefer allocator.free(tool_name);
         const timestamp: i64 = if (try jf.optionalInteger(obj, "timestamp")) |ts| ts else 0;
         const is_error = if (try jf.optionalBool(obj, "is_error")) |ie| ie else false;
 
         const content_arr = if (try jf.optionalArray(obj, "content")) |c| c else return error.MissingContent;
         const content = try allocator.alloc(ai_types.UserContentPart, content_arr.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (content[0..filled]) |*part| part.deinit(allocator);
+            allocator.free(content);
+        }
         for (content_arr.items, 0..) |item, i| {
             content[i] = try deserializeUserContentPart(try jf.elementAsObject(item), allocator);
+            filled = i + 1;
         }
 
         const details_json = if (try jf.optionalString(obj, "details_json")) |dj|
@@ -1533,8 +1541,14 @@ fn deserializeUserContent(
         .string => |s| return .{ .text = try allocator.dupe(u8, s) },
         .array => |arr| {
             const parts = try allocator.alloc(ai_types.UserContentPart, arr.items.len);
+            var filled: usize = 0;
+            errdefer {
+                for (parts[0..filled]) |*part| part.deinit(allocator);
+                allocator.free(parts);
+            }
             for (arr.items, 0..) |item, i| {
                 parts[i] = try deserializeUserContentPart(try jf.elementAsObject(item), allocator);
+                filled = i + 1;
             }
             return .{ .parts = parts };
         },
@@ -1550,6 +1564,7 @@ fn deserializeUserContentPart(
 
     if (std.mem.eql(u8, type_str, "text")) {
         const text = try allocator.dupe(u8, try jf.requireString(obj, "text"));
+        errdefer allocator.free(text);
         const text_signature = if (try jf.optionalString(obj, "text_signature")) |sig|
             try allocator.dupe(u8, sig)
         else
@@ -1559,6 +1574,7 @@ fn deserializeUserContentPart(
 
     if (std.mem.eql(u8, type_str, "image")) {
         const data = try allocator.dupe(u8, try jf.requireString(obj, "data"));
+        errdefer allocator.free(data);
         const mime_type = try allocator.dupe(u8, try jf.requireString(obj, "mime_type"));
         return .{ .image = .{ .data = data, .mime_type = mime_type } };
     }
@@ -1571,7 +1587,9 @@ fn deserializeTool(
     allocator: std.mem.Allocator,
 ) !ai_types.Tool {
     const name = try allocator.dupe(u8, try jf.requireString(obj, "name"));
+    errdefer allocator.free(name);
     const description = try allocator.dupe(u8, try jf.requireString(obj, "description"));
+    errdefer allocator.free(description);
 
     const schema_json = if (obj.get("parameters_schema_json")) |schema| switch (schema) {
         .string => |s| try allocator.dupe(u8, s),
@@ -3243,4 +3261,36 @@ test "deserializeEnvelope accepts stream_request with model id at exactly 512 ch
     defer env.deinit(allocator);
     try std.testing.expect(env.payload == .stream_request);
     try std.testing.expectEqualStrings(exact_id, env.payload.stream_request.model.id);
+}
+
+test "malformed message content is rejected without leaking the partial message" {
+    const allocator = std.testing.allocator;
+
+    const contexts = [_][]const u8{
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"ok"},{"type":"text"}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"ok","text_signature":7}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"image","data":"aGk="}]}]}
+        ,
+        \\{"messages":[{"role":"tool","tool_call_id":"c","tool_name":"t","content":[{"type":"text","text":"ok"},{"type":"text"}]}]}
+        ,
+        \\{"messages":[{"role":"tool","tool_call_id":"c","tool_name":"t","content":[{"type":"text","text":"ok"}],"details_json":7}]}
+        ,
+        \\{"messages":[],"tools":[{"name":"t"}]}
+        ,
+    };
+
+    for (contexts) |context| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"stream_request\",\"stream_id\":\"014D2PF2DBSQQZXQ5TK1V58CGG\"," ++
+                "\"message_id\":\"0J6HB7H6NWVVRFXX5TK1V58CGG\",\"sequence\":1,\"timestamp\":1," ++
+                "\"version\":1,\"payload\":{{\"model\":{{\"id\":\"m\",\"name\":\"n\",\"api\":\"a\"," ++
+                "\"provider\":\"p\",\"base_url\":\"\"}},\"context\":{s}}}}}",
+            .{context},
+        );
+        defer allocator.free(json);
+        try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
+    }
 }
