@@ -159,19 +159,11 @@ pub fn enableModel(
     model_id: []const u8,
     base_url: []const u8,
 ) !bool {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = try std.fmt.allocPrint(allocator, "{s}/models/{s}/policy", .{ base_url, model_id });
     defer allocator.free(url);
 
-    const uri = try std.Uri.parse(url);
-
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth_header);
-
-    var body_buffer = "{\"state\": \"enabled\"}".*;
-    const body = body_buffer[0..];
 
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
@@ -180,17 +172,16 @@ pub fn enableModel(
     try headers.append(allocator, .{ .name = "openai-intent", .value = "chat-policy" });
     try headers.append(allocator, .{ .name = "x-interaction-type", .value = "chat-policy" });
 
-    var request = try client.openRequest(.POST, uri, .{
+    var fetched = http.fetch(allocator, url, .{
+        .method = .POST,
         .extra_headers = headers.items,
-    });
-    defer request.deinit();
+        .body = "{\"state\": \"enabled\"}",
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch return false;
+    defer fetched.deinit(allocator);
 
-    try http.sendRequest(&request, body);
-
-    var header_buffer: [4096]u8 = undefined;
-    const response = try http.receiveResponse(&request, &header_buffer);
-
-    return response.head.status == .ok;
+    return fetched.status == 200;
 }
 
 pub fn enableAllModels(

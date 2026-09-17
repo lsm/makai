@@ -703,10 +703,7 @@ fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) 
     }) catch return error.ModelCatalogFetchFailed;
     errdefer fetched.deinit(allocator);
 
-    if (fetched.status != 200) {
-        fetched.deinit(allocator);
-        return error.ModelCatalogFetchFailed;
-    }
+    if (fetched.status != 200) return error.ModelCatalogFetchFailed;
     return fetched.body;
 }
 
