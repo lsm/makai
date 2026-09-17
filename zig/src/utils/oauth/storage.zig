@@ -328,6 +328,15 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
 
         fn begin(interaction: ?u8) KeychainScope {
             keychain_mutex.lockUncancelable(defaultIo());
+            return applyInteraction(interaction);
+        }
+
+        fn tryBegin(interaction: ?u8) ?KeychainScope {
+            if (!keychain_mutex.tryLock()) return null;
+            return applyInteraction(interaction);
+        }
+
+        fn applyInteraction(interaction: ?u8) KeychainScope {
             const override = interaction orelse return .{ .restore = null };
             var previous: u8 = 1;
             if (SecKeychainGetUserInteractionAllowed(&previous) != errSecSuccess) previous = 1;
@@ -407,7 +416,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
     }
 
     fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
-        const scope = KeychainScope.begin(0);
+        const scope = KeychainScope.tryBegin(0) orelse return error.KeychainNeedsInteraction;
         defer scope.end();
         return findServiceAccount(allocator, service, account);
     }
@@ -540,7 +549,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         const service = try keychainServiceName(allocator);
         defer allocator.free(service);
 
-        const scope = KeychainScope.begin(0);
+        const scope = KeychainScope.tryBegin(0) orelse return error.KeychainNeedsInteraction;
         defer scope.end();
 
         if (try findServiceAccount(allocator, service, keychain_shared_account)) |content| return content;
@@ -785,12 +794,12 @@ pub const AuthStorage = struct {
                     try maybeImportCodexCliCredentials(&loaded);
                     return loaded;
                 },
-                .not_found, .unavailable => {
+                .not_found => {
                     var storage = try loadFromFileWithSaveFn(allocator, keychain_save_fn);
                     try maybeImportCodexCliCredentials(&storage);
                     return storage;
                 },
-                .needs_interaction => {
+                .unavailable, .needs_interaction => {
                     var storage = try loadFromFile(allocator);
                     try maybeImportCodexCliCredentials(&storage);
                     return storage;
@@ -807,8 +816,8 @@ pub const AuthStorage = struct {
         if (shouldUseKeychain()) {
             switch (try loadFromKeychainWithCodexImport(allocator, false)) {
                 .found => |storage| return storage,
-                .not_found, .unavailable => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
-                .needs_interaction => return try loadFromFile(allocator),
+                .not_found => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
+                .unavailable, .needs_interaction => return try loadFromFile(allocator),
             }
         }
 
