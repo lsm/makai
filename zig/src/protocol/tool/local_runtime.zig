@@ -140,15 +140,15 @@ pub const ToolProtocolServer = struct {
                 const prefix = req.getPrefix();
                 var metas = std.ArrayList(tool_types.ToolMetadata).empty;
                 errdefer {
-                    for (metas.items) |*meta| deinitToolMetadata(meta, allocator);
+                    for (metas.items) |*meta| meta.deinit(allocator);
                     metas.deinit(allocator);
                 }
                 for (self.tools.items) |tool| {
                     if (prefix) |p| {
                         if (!std.mem.startsWith(u8, tool.name, p)) continue;
                     }
-                    var meta = try toolMetadataFromAgentTool(allocator, tool);
-                    errdefer deinitToolMetadata(&meta, allocator);
+                    const meta = try toolMetadataFromAgentTool(allocator, tool);
+                    errdefer meta.deinit(allocator);
                     try metas.append(allocator, meta);
                 }
                 return self.nextEnvelope(env.message_id, .{ .tool_list_response = .{ .tools = try metas.toOwnedSlice(allocator) } });
@@ -526,17 +526,6 @@ fn toolMetadataFromAgentTool(allocator: std.mem.Allocator, tool: agent_types.Age
     };
 }
 
-fn deinitToolMetadata(meta: *tool_types.ToolMetadata, allocator: std.mem.Allocator) void {
-    allocator.free(meta.name);
-    allocator.free(meta.description);
-    allocator.free(meta.parameters_schema_json);
-    allocator.free(meta.version);
-    if (meta.required_permissions) |perms| {
-        for (perms) |perm| allocator.free(perm);
-        allocator.free(perms);
-    }
-}
-
 test "tool protocol server wraps shell_execute and returns correct result" {
     const allocator = std.testing.allocator;
     const callbacks = struct {
@@ -775,8 +764,8 @@ fn toolMetadataFromAgentToolProbe(allocator: std.mem.Allocator) !void {
         .execute = stub.execute,
     };
 
-    var meta = try toolMetadataFromAgentTool(allocator, tool);
-    deinitToolMetadata(&meta, allocator);
+    const meta = try toolMetadataFromAgentTool(allocator, tool);
+    meta.deinit(allocator);
 }
 
 test "toolMetadataFromAgentTool survives an allocation failure at every step" {

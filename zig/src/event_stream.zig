@@ -5,6 +5,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
     return struct {
         const Self = @This();
         pub const DEINIT_THREAD_JOIN_TIMEOUT_MS = 120_000;
+        pub const THREAD_DONE_POLL_INTERVAL_MS = 5;
         const RING_BUFFER_SIZE = 1024;
         const RING_BUFFER_MASK = RING_BUFFER_SIZE - 1;
         pub const usable_capacity = RING_BUFFER_SIZE - 1;
@@ -20,8 +21,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         mutex: std.Io.Mutex = .init,
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
+        abandoned: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
         wait_for_thread_on_deinit: bool = false,
+        join_timeout_ms: u64 = DEINIT_THREAD_JOIN_TIMEOUT_MS,
         owns_events: bool = false,
         clone_event_fn: ?*const fn (std.mem.Allocator, T) error{OutOfMemory}!T = null,
 
@@ -38,6 +41,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .completed = std.atomic.Value(bool).init(false),
                 .futex = std.atomic.Value(u32).init(0),
                 .thread_done = std.atomic.Value(bool).init(false),
+                .abandoned = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
             };
         }
@@ -117,9 +121,26 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return self.waitForThread(timeout_ms);
         }
 
+        pub fn wasAbandoned(self: *Self) bool {
+            return self.abandoned.load(.acquire);
+        }
+
+        pub fn deinitAndDestroy(self: *Self) bool {
+            const allocator = self.allocator;
+            if (self.wait_for_thread_on_deinit and !self.cancelAndJoinThread(self.join_timeout_ms)) {
+                self.abandoned.store(true, .release);
+                return false;
+            }
+            self.wait_for_thread_on_deinit = false;
+            self.deinit();
+            allocator.destroy(self);
+            return true;
+        }
+
         pub fn deinit(self: *Self) void {
-            if (self.wait_for_thread_on_deinit) {
-                _ = self.cancelAndJoinThread(DEINIT_THREAD_JOIN_TIMEOUT_MS);
+            if (self.wait_for_thread_on_deinit and !self.cancelAndJoinThread(self.join_timeout_ms)) {
+                self.abandoned.store(true, .release);
+                return;
             }
 
             while (self.poll()) |event| {
@@ -249,9 +270,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn markThreadDone(self: *Self) void {
-            self.thread_done.store(true, .release);
             _ = self.futex.fetchAdd(1, .release);
             self.wake(std.math.maxInt(u32));
+            self.thread_done.store(true, .release);
         }
 
         pub fn waitForThread(self: *Self, timeout_ms: u64) bool {
@@ -268,7 +289,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
                 const remaining_ns = timeout_ns - elapsed;
                 const remaining_ms = @as(u64, @intCast(@divFloor(remaining_ns, 1_000_000)));
-                const remaining_max_ms = @min(remaining_ms, std.math.maxInt(u32));
+                const remaining_max_ms = @min(@min(remaining_ms, std.math.maxInt(u32)), THREAD_DONE_POLL_INTERVAL_MS);
 
                 self.waitTimeoutMs(futex_value, remaining_max_ms);
 
@@ -941,6 +962,86 @@ test "EventStream deinit unblocks producer waiting in pushBlocking" {
 
     try std.testing.expect(returned.load(.acquire));
     try std.testing.expect(!ok.load(.acquire));
+}
+
+const StalledProducerCtx = struct {
+    stream: *EventStream(u32, bool),
+    gate: *std.atomic.Value(bool),
+    push_returned: *std.atomic.Value(bool),
+    pushed: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) void {
+        while (!self.gate.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+        self.pushed.store(self.stream.pushBlocking(7), .release);
+        self.push_returned.store(true, .release);
+        self.stream.markThreadDone();
+    }
+};
+
+test "EventStream deinit abandons the stream instead of freeing under a live producer" {
+    const TestStream = EventStream(u32, bool);
+    const stream = try std.testing.allocator.create(TestStream);
+    stream.* = TestStream.init(std.testing.allocator);
+    stream.wait_for_thread_on_deinit = true;
+    stream.join_timeout_ms = 20;
+
+    var gate = std.atomic.Value(bool).init(false);
+    var push_returned = std.atomic.Value(bool).init(false);
+    var pushed = std.atomic.Value(bool).init(true);
+    var ctx = StalledProducerCtx{
+        .stream = stream,
+        .gate = &gate,
+        .push_returned = &push_returned,
+        .pushed = &pushed,
+    };
+
+    const thread = try std.Thread.spawn(.{}, StalledProducerCtx.run, .{&ctx});
+    thread.detach();
+
+    stream.deinit();
+    try std.testing.expect(stream.wasAbandoned());
+
+    gate.store(true, .release);
+    try std.testing.expect(stream.waitForThread(10_000));
+    try std.testing.expect(push_returned.load(.acquire));
+    try std.testing.expect(!pushed.load(.acquire));
+
+    stream.wait_for_thread_on_deinit = false;
+    stream.deinit();
+    std.testing.allocator.destroy(stream);
+}
+
+test "EventStream deinitAndDestroy reports abandonment rather than freeing" {
+    const TestStream = EventStream(u32, bool);
+    const stream = try std.testing.allocator.create(TestStream);
+    stream.* = TestStream.init(std.testing.allocator);
+    stream.wait_for_thread_on_deinit = true;
+    stream.join_timeout_ms = 20;
+
+    var gate = std.atomic.Value(bool).init(false);
+    var push_returned = std.atomic.Value(bool).init(false);
+    var pushed = std.atomic.Value(bool).init(true);
+    var ctx = StalledProducerCtx{
+        .stream = stream,
+        .gate = &gate,
+        .push_returned = &push_returned,
+        .pushed = &pushed,
+    };
+
+    const thread = try std.Thread.spawn(.{}, StalledProducerCtx.run, .{&ctx});
+    thread.detach();
+
+    try std.testing.expect(!stream.deinitAndDestroy());
+    try std.testing.expect(stream.wasAbandoned());
+
+    gate.store(true, .release);
+    try std.testing.expect(stream.waitForThread(10_000));
+    try std.testing.expect(push_returned.load(.acquire));
+
+    stream.wait_for_thread_on_deinit = false;
+    try std.testing.expect(stream.deinitAndDestroy());
 }
 
 test "EventStream ring buffer wrap-around preserves order" {

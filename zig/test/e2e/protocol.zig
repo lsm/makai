@@ -544,8 +544,7 @@ test "Mock receiver provides pre-loaded data" {
     var r = mock_receiver.receiver();
     const stream = try r.receiveStream(allocator);
     defer {
-        stream.deinit();
-        allocator.destroy(stream);
+        _ = stream.deinitAndDestroy();
     }
 
     if (stream.wait()) |chunk| {

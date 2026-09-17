@@ -1,0 +1,58 @@
+[package]
+name = "makai"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Rust SDK for the Makai streaming AI runtime, spoken over the `makai --stdio` protocol"
+repository = "https://github.com/lsm/makai"
+license = "MIT"
+readme = "README.md"
+keywords = ["ai", "llm", "streaming", "agent", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+
+[features]
+default = []
+# Enables downloading the runtime binary from `MAKAI_BINARY_URL` / `binary_url`.
+# Without it a configured URL is only usable when the checksum-verified file is
+# already present in the cache directory.
+download = ["dep:reqwest"]
+
+[dependencies]
+async-stream = "0.3"
+futures-core = "0.3"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+
+[dependencies.reqwest]
+version = "0.12"
+optional = true
+default-features = false
+features = ["rustls-tls"]
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+
+# Protocol fake used by the integration tests. It is a standalone `makai --stdio`
+# look-alike, so downstream crates can point `MakaiClient` at it to test their own
+# code without a real runtime or provider credentials.
+[[bin]]
+name = "makai-protocol-fake"
+path = "src/bin/protocol_fake.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

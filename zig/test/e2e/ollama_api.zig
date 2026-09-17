@@ -83,10 +83,7 @@ test "ollama e2e: basic text generation (new api)" {
         .max_tokens = 48,
         .temperature = 0.0,
     }, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     while (!stream.isDone()) {
         _ = stream.poll();

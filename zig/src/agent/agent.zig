@@ -885,8 +885,7 @@ pub const Agent = struct {
             try agent_loop.agentLoopContinue(self._allocator, &context, config);
 
         defer {
-            stream.deinit();
-            self._allocator.destroy(stream);
+            _ = stream.deinitAndDestroy();
         }
 
         while (stream.wait()) |event| {

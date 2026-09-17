@@ -30,6 +30,17 @@ pub const ToolMetadata = struct {
     estimated_duration_ms: ?u32 = null,
     is_destructive: bool = false,
     required_permissions: ?[]const []const u8 = null,
+
+    pub fn deinit(self: *const ToolMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.description);
+        allocator.free(self.parameters_schema_json);
+        allocator.free(self.version);
+        if (self.required_permissions) |permissions| {
+            for (permissions) |permission| allocator.free(permission);
+            allocator.free(permissions);
+        }
+    }
 };
 
 pub const ToolRegisterRequest = struct {
@@ -347,15 +358,7 @@ pub const Payload = union(enum) {
     pub fn deinit(self: *Payload, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .tool_register => |*req| {
-                const tool = req.tool;
-                allocator.free(tool.name);
-                allocator.free(tool.description);
-                allocator.free(tool.parameters_schema_json);
-                allocator.free(tool.version);
-                if (tool.required_permissions) |perms| {
-                    for (perms) |p| allocator.free(p);
-                    allocator.free(perms);
-                }
+                req.tool.deinit(allocator);
                 req.callback_url.deinit(allocator);
             },
             .tool_registered => |*res| allocator.free(res.tool_id),
@@ -363,16 +366,7 @@ pub const Payload = union(enum) {
             .tool_unregistered => |*res| allocator.free(res.tool_id),
             .tool_list => |*req| req.prefix.deinit(allocator),
             .tool_list_response => |*res| {
-                for (res.tools) |*tool| {
-                    allocator.free(tool.name);
-                    allocator.free(tool.description);
-                    allocator.free(tool.parameters_schema_json);
-                    allocator.free(tool.version);
-                    if (tool.required_permissions) |perms| {
-                        for (perms) |p| allocator.free(p);
-                        allocator.free(perms);
-                    }
-                }
+                for (res.tools) |*tool| tool.deinit(allocator);
                 allocator.free(res.tools);
             },
             .tool_execute => |*req| {
