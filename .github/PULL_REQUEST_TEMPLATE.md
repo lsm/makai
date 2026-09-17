@@ -7,7 +7,7 @@
 <!-- Risk, migration, anything you want pushed back on. Delete if there's nothing. -->
 
 <!--
-V1 implementation PRs (docs/review-process.md §2) additionally need: linked spec
-clauses, an updated row in docs/implementation-traceability-matrix.md, and the
-external review rounds log. Everything else is out of scope for that process.
+V1 implementation PRs (scoped in docs/review-process.md §2) carry extra
+requirements: §7 lists the artifacts this description must include, §6 the exit
+criteria for merge.
 -->
