@@ -1345,9 +1345,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
    session. No consumer does. Every makai client writes the same list into BOTH
    payloads from a single request object and always emits the key (an empty array
    when there are none), so the message value unconditionally shadows the config
-   and the session-scoped field has never been read by any consumer; the four SDKs
-   are one-shot (`agent_start`, one `agent_message`, `agent_stop`) and expose no
-   session handle through which a second catalogue could be supplied. The override
+   and the session-scoped field has never been read by any consumer. All three SDKs
+   in tree — TypeScript (`execution_client.ts:876,887`), Go (`agent.go:127,398`) and
+   Python (`execution.py:1010,1029`) — are one-shot (`agent_start`, one
+   `agent_message`, `agent_stop`) and expose no session handle through which a
+   second catalogue could be supplied; the unmerged Rust client (#309) matches
+   them. The override
    is therefore unexercised capability whose only observable effect is a silent
    failure mode: a caller that declares tools on `agent_start` and sends
    `"tools": []` on `agent_message` receives no tools and no error. `[planned]`
