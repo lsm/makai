@@ -45,8 +45,8 @@ pub fn complete(
         allocator.destroy(s);
     }
 
-    while (!s.isDone()) {
-        defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
+    while (s.wait()) |event| {
+        s.releaseEvent(event);
     }
 
     const result = s.getResult() orelse return error.NoResult;
@@ -66,8 +66,8 @@ pub fn completeSimple(
         allocator.destroy(s);
     }
 
-    while (!s.isDone()) {
-        defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
+    while (s.wait()) |event| {
+        s.releaseEvent(event);
     }
 
     const result = s.getResult() orelse return error.NoResult;

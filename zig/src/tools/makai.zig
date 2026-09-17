@@ -25,6 +25,8 @@ const stdio = @import("stdio");
 const tui_app = @import("tui_app");
 const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
+const oap_server = @import("oap_server");
+const oap_bridge = @import("oap_bridge");
 
 pub const VERSION = "0.0.1";
 
@@ -2293,6 +2295,7 @@ fn printUsage(file: std.Io.File) !void {
         \\Usage:
         \\  makai --version
         \\  makai --stdio
+        \\  makai --oap [--model <model-ref>]
         \\  makai --tui
         \\  makai -p [--agent] [--storage] [--model <id>] "<prompt>"
         \\  makai auth providers [--json]
@@ -2301,6 +2304,7 @@ fn printUsage(file: std.Io.File) !void {
         \\Commands:
         \\  --version        Print binary version
         \\  --stdio          Start stdio mode
+        \\  --oap            Start native Open Agent Protocol mode (JSONL over stdio)
         \\  --tui            Start terminal UI shell
         \\  -p               Non-interactive print mode: stream a prompt using
         \\                   stored credentials and print every event to stdout.
@@ -4985,10 +4989,9 @@ test "a pending result publication keeps the session non-admissible until the re
 test "a stream completed without an outcome settles with a typed failure instead of hanging" {
     const allocator = std.testing.allocator;
 
-    var failing = std.testing.FailingAllocator.init(allocator, .{});
     var registry = api_registry.ApiRegistry.init(allocator);
     defer registry.deinit();
-    var stdio_loop = StdioProtocolLoop.initForTesting(failing.allocator(), &registry);
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
     var outbound = std.ArrayList([]const u8).empty;
@@ -5004,11 +5007,10 @@ test "a stream completed without an outcome settles with a typed failure instead
     const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
 
     const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
-    failing.fail_index = failing.alloc_index;
-    run.stream.completeWithError("lost outcome");
-    failing.fail_index = std.math.maxInt(usize);
+    run.stream.completeWithoutOutcomeForTesting();
     try std.testing.expect(run.stream.isDone());
     try std.testing.expect(run.stream.getError() == null);
+    try std.testing.expect(run.stream.getResult() == null);
 
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(&outbound);
@@ -6340,6 +6342,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "--oap")) {
+        try runOapMode(allocator, args[2..], stdin, stdout, stderr);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "--tui")) {
         try runTui(allocator, init.io);
         return;
@@ -6554,4 +6561,273 @@ test "print mode short-circuits on --tui-runtime with its prompt" {
     );
     try std.testing.expect(std.meta.activeTag(missing_error) == .missing_option_value);
     try std.testing.expectEqualStrings("--tui-runtime", missing_error.missing_option_value);
+}
+const OapModeArgs = struct {
+    default_model_id: ?[]const u8 = null,
+};
+
+const OapArgError = struct {
+    unknown_option: ?[]const u8 = null,
+    missing_option_value: ?[]const u8 = null,
+    unexpected_positional: ?[]const u8 = null,
+};
+
+fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeArgs {
+    var parsed = OapModeArgs{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--model")) {
+            if (index + 1 >= args.len or std.mem.startsWith(u8, args[index + 1], "--")) {
+                arg_error.missing_option_value = "--model";
+                return error.InvalidArgument;
+            }
+            index += 1;
+            parsed.default_model_id = args[index];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            arg_error.unknown_option = arg;
+            return error.InvalidArgument;
+        }
+        arg_error.unexpected_positional = arg;
+        return error.InvalidArgument;
+    }
+    return parsed;
+}
+
+fn runOapMode(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+) !void {
+    var arg_error = OapArgError{};
+    const parsed = parseOapModeArgs(args, &arg_error) catch |err| {
+        if (arg_error.unknown_option) |option| {
+            var buf: [256]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "unknown --oap option: {s}\n\n", .{option});
+            try compat.stdio.writeAll(stderr, msg);
+        } else if (arg_error.missing_option_value) |option| {
+            var buf: [256]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "{s} requires a value\n\n", .{option});
+            try compat.stdio.writeAll(stderr, msg);
+        } else if (arg_error.unexpected_positional) |value| {
+            var buf: [256]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "--oap takes no positional argument: {s}\n\n", .{value});
+            try compat.stdio.writeAll(stderr, msg);
+        }
+        try printUsage(stderr);
+        return err;
+    };
+
+    const env_model = try provider_base_url.envOwnedOrNull(allocator, "MAKAI_OAP_MODEL");
+    defer if (env_model) |value| allocator.free(value);
+    const default_model_id: ?[]const u8 = parsed.default_model_id orelse env_model;
+
+    var stdio_loop = try StdioProtocolLoop.initWithBuiltins(allocator);
+    defer stdio_loop.deinit();
+
+    var oap = try oap_server.Server.init(allocator, .{
+        .endpoint_version = VERSION,
+        .default_model_id = default_model_id,
+    });
+    defer oap.deinit();
+
+    var bridge = oap_bridge.Bridge.init(allocator);
+    defer bridge.deinit();
+
+    var async_receiver = stdio.AsyncStdioReceiver.initWithFile(stdin);
+    var stdin_handle = try async_receiver.receiveStreamWithHandle(allocator);
+    defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
+    const stdin_stream = stdin_handle.getStream();
+
+    var native_lines = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &native_lines);
+        native_lines.deinit(allocator);
+    }
+    var submission_lines = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &submission_lines);
+        submission_lines.deinit(allocator);
+    }
+
+    while (true) {
+        var did_work = false;
+
+        while (stdin_stream.poll()) |chunk| {
+            var mutable_chunk = chunk;
+            defer mutable_chunk.deinit(allocator);
+
+            const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
+            if (line.len == 0) continue;
+            try oap.handleLine(line);
+            did_work = true;
+        }
+
+        while (oap.popEvictedSession()) |evicted| {
+            defer allocator.free(evicted);
+            bridge.forgetSession(evicted);
+            did_work = true;
+        }
+
+        if (try pumpOapIntents(allocator, &oap, &bridge, &stdio_loop, &submission_lines)) did_work = true;
+
+        if (stdin_stream.isDone() and !stdin_stream.hasPending()) {
+            stdio_loop.markStdinDisconnected();
+            if (oap.hasActiveRun()) {
+                if (try bridge.failUnmappedActiveRuns(&oap, OAP_EOF_MESSAGE)) did_work = true;
+            }
+        }
+
+        const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
+            try emitOapRuntimeFailure(&oap, &bridge, @errorName(err));
+            break :blk 0;
+        };
+        if (forwarded > 0) did_work = true;
+
+        const drained = stdio_loop.drainOutbound(&native_lines) catch |err| blk: {
+            try emitOapRuntimeFailure(&oap, &bridge, @errorName(err));
+            break :blk 0;
+        };
+        if (drained > 0 or native_lines.items.len > 0) {
+            for (native_lines.items) |native_line| {
+                try bridge.applyNativeLine(&oap, native_line);
+            }
+            clearOwnedLines(allocator, &native_lines);
+            did_work = true;
+        }
+
+        if (try writeOapOutbound(stdout, allocator, &oap)) did_work = true;
+
+        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams() and
+            !stdio_loop.hasActiveAgentRuns() and !stdio_loop.hasActiveAuthFlows())
+        {
+            break;
+        }
+
+        if (!did_work) compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+
+    _ = try writeOapOutbound(stdout, allocator, &oap);
+}
+
+const OAP_EOF_MESSAGE = "the makai host reached end of input before the run settled";
+
+fn pumpOapIntents(
+    allocator: std.mem.Allocator,
+    oap: *oap_server.Server,
+    bridge: *oap_bridge.Bridge,
+    stdio_loop: *StdioProtocolLoop,
+    submission_lines: *std.ArrayList([]const u8),
+) !bool {
+    var did_work = false;
+
+    while (oap.popPendingSubmission()) |item| {
+        var pending = item;
+        defer pending.deinit(allocator);
+
+        bridge.appendSubmissionLines(pending, submission_lines) catch |err| {
+            clearOwnedLines(allocator, submission_lines);
+            try oap.settleFailed(pending.session_id, .internal_error, @errorName(err));
+            did_work = true;
+            continue;
+        };
+        for (submission_lines.items) |line| {
+            const dispatched = stdio_loop.dispatchInboundLine(line) catch |err| {
+                try oap.settleFailed(pending.session_id, .internal_error, @errorName(err));
+                break;
+            };
+            if (!dispatched) {
+                try oap.settleFailed(
+                    pending.session_id,
+                    .internal_error,
+                    "the native agent host rejected the translated submission",
+                );
+                break;
+            }
+        }
+        clearOwnedLines(allocator, submission_lines);
+        did_work = true;
+    }
+
+    while (oap.popPendingCancel()) |item| {
+        var pending = item;
+        defer pending.deinit(allocator);
+
+        const maybe_line = bridge.cancelLine(pending) catch null;
+        const line = maybe_line orelse continue;
+        defer allocator.free(line);
+        _ = stdio_loop.dispatchInboundLine(line) catch {};
+        did_work = true;
+    }
+
+    return did_work;
+}
+
+fn emitOapRuntimeFailure(
+    oap: *oap_server.Server,
+    bridge: *oap_bridge.Bridge,
+    reason: []const u8,
+) !void {
+    if (!oap.hasActiveRun()) return;
+    try bridge.failActiveRuns(oap, reason);
+}
+
+fn writeOapOutbound(
+    stdout: std.Io.File,
+    allocator: std.mem.Allocator,
+    oap: *oap_server.Server,
+) !bool {
+    var wrote = false;
+    while (oap.popOutbound()) |line| {
+        defer allocator.free(line);
+        try compat.stdio.writeLine(stdout, line);
+        wrote = true;
+    }
+    return wrote;
+}
+
+test "oap mode arguments accept a default model" {
+    var arg_error = OapArgError{};
+    const parsed = try parseOapModeArgs(&[_][]const u8{ "--model", "anthropic/anthropic-messages@claude" }, &arg_error);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@claude", parsed.default_model_id.?);
+}
+
+test "oap mode arguments default to no configured model" {
+    var arg_error = OapArgError{};
+    const parsed = try parseOapModeArgs(&[_][]const u8{}, &arg_error);
+    try std.testing.expect(parsed.default_model_id == null);
+}
+
+test "oap mode rejects unknown options, missing values, and positionals" {
+    var unknown = OapArgError{};
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parseOapModeArgs(&[_][]const u8{"--stdio"}, &unknown),
+    );
+    try std.testing.expectEqualStrings("--stdio", unknown.unknown_option.?);
+
+    var missing = OapArgError{};
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parseOapModeArgs(&[_][]const u8{"--model"}, &missing),
+    );
+    try std.testing.expectEqualStrings("--model", missing.missing_option_value.?);
+
+    var followed = OapArgError{};
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parseOapModeArgs(&[_][]const u8{ "--model", "--other" }, &followed),
+    );
+    try std.testing.expectEqualStrings("--model", followed.missing_option_value.?);
+
+    var positional = OapArgError{};
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parseOapModeArgs(&[_][]const u8{"write a haiku"}, &positional),
+    );
+    try std.testing.expectEqualStrings("write a haiku", positional.unexpected_positional.?);
 }

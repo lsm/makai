@@ -949,15 +949,27 @@ fn parseChunk(
     }
 }
 
+const url_version_prefix = "/v1";
+
+fn effectiveUrlSuffix(trimmed_base: []const u8, suffix: []const u8) []const u8 {
+    if (!std.mem.endsWith(u8, trimmed_base, url_version_prefix)) return suffix;
+    if (!std.mem.startsWith(u8, suffix, url_version_prefix ++ "/")) return suffix;
+    return suffix[url_version_prefix.len..];
+}
+
 fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, suffix)) return allocator.dupe(u8, trimmed);
+    const effective = effectiveUrlSuffix(trimmed, suffix);
+
     var sb = StringBuilder{};
-    sb.count(base_url);
-    sb.count(suffix);
+    sb.count(trimmed);
+    sb.count(effective);
     try sb.allocate(allocator);
     errdefer sb.deinit(allocator);
 
-    _ = sb.append(base_url);
-    _ = sb.append(suffix);
+    _ = sb.append(trimmed);
+    _ = sb.append(effective);
 
     std.debug.assert(sb.len == sb.cap);
     const out = sb.ptr.?[0..sb.cap];
@@ -1130,6 +1142,18 @@ fn runThread(ctx: *ThreadCtx) void {
 
         for (copilot_headers) |h| {
             headers.append(allocator, h) catch {
+                ctx.deinit();
+                stream.completeWithError("oom headers");
+                stream.markThreadDone();
+                return;
+            };
+        }
+    }
+
+    if (model.headers) |model_headers| {
+        for (model_headers) |header| {
+            if (compat_mod.http.headerPresent(headers.items, header.name)) continue;
+            headers.append(allocator, .{ .name = header.name, .value = header.value }) catch {
                 ctx.deinit();
                 stream.completeWithError("oom headers");
                 stream.markThreadDone();
@@ -2435,6 +2459,42 @@ test "mergeCompat keeps custom OpenAI endpoints generic" {
     try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
 }
 
+test "a declared capability does not drag OpenAI-native defaults along with it" {
+    const model: ai_types.Model = .{
+        .id = "gateway-model",
+        .name = "Gateway Model",
+        .api = "openai-completions",
+        .provider = "gateway",
+        .base_url = "https://gw.internal",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_anthropic_cache_ttl = true,
+            .supports_usage_in_streaming = null,
+            .supports_strict_mode = null,
+            .max_tokens_field = .max_tokens,
+            .thinking_format = .openai,
+        },
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+    try std.testing.expect(!merged.supports_strict_mode);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+
+    var keyless = model;
+    keyless.compat = null;
+    const detected = mergeCompat(keyless);
+    try std.testing.expectEqualStrings(detected.max_tokens_field, merged.max_tokens_field);
+    try std.testing.expectEqual(detected.supports_strict_mode, merged.supports_strict_mode);
+    try std.testing.expectEqual(detected.supports_usage_in_streaming, merged.supports_usage_in_streaming);
+}
+
 test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
     const model: ai_types.Model = .{
         .id = "custom-model",
@@ -2783,4 +2843,20 @@ test "streamSimpleOpenAICompletions exits early when pre-cancelled" {
 
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}
+
+test "buildUrlWithSuffix never doubles the version segment" {
+    const cases = [_]struct { base: []const u8, suffix: []const u8, want: []const u8 }{
+        .{ .base = "https://api.openai.com", .suffix = "/v1/chat/completions", .want = "https://api.openai.com/v1/chat/completions" },
+        .{ .base = "https://api.groq.com/openai/v1", .suffix = "/v1/chat/completions", .want = "https://api.groq.com/openai/v1/chat/completions" },
+        .{ .base = "http://localhost:8000/v1/", .suffix = "/v1/chat/completions", .want = "http://localhost:8000/v1/chat/completions" },
+        .{ .base = "https://api.githubcopilot.com", .suffix = "/chat/completions", .want = "https://api.githubcopilot.com/chat/completions" },
+        .{ .base = "https://gw.test/v1", .suffix = "/chat/completions", .want = "https://gw.test/v1/chat/completions" },
+        .{ .base = "https://gw.test/v1/chat/completions", .suffix = "/v1/chat/completions", .want = "https://gw.test/v1/chat/completions" },
+    };
+    for (cases) |case| {
+        const url = try buildUrlWithSuffix(std.testing.allocator, case.base, case.suffix);
+        defer std.testing.allocator.free(url);
+        try std.testing.expectEqualStrings(case.want, url);
+    }
 }

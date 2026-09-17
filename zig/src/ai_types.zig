@@ -360,7 +360,7 @@ pub const AssistantMessage = struct {
     }
 };
 
-pub fn deinitAssistantContent(allocator: std.mem.Allocator, blocks: []AssistantContent) void {
+pub fn deinitAssistantContentElements(allocator: std.mem.Allocator, blocks: []AssistantContent) void {
     for (blocks) |block| {
         switch (block) {
             .text => |t| {
@@ -383,6 +383,10 @@ pub fn deinitAssistantContent(allocator: std.mem.Allocator, blocks: []AssistantC
             },
         }
     }
+}
+
+pub fn deinitAssistantContent(allocator: std.mem.Allocator, blocks: []AssistantContent) void {
+    deinitAssistantContentElements(allocator, blocks);
     allocator.free(blocks);
 }
 
@@ -1506,7 +1510,6 @@ test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
         .timestamp = 0,
     };
     stream.complete(result);
-
 }
 
 test "Usage.calculateCost computes correct dollar costs" {

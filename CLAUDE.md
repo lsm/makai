@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
+Makai is a Zig-first streaming AI runtime plus a TypeScript SDK. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus a native Open Agent Protocol endpoint (`protocol/oap/`), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. The TypeScript SDK (`typescript/`) spawns `makai --stdio` and exposes `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -25,6 +25,69 @@ A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, 
 `makai --tui`), `make test`, `make test-tui`, `make check` (guardrail scripts), `make clean`
 (project `.zig-cache` + `zig-out`) and `make clean-all` (also the global zig cache).
 
+### macOS: the Keychain, non-interactive runs, and test isolation
+
+On macOS, credential storage is Keychain-first, and the two directions behave differently.
+
+**Reads fail fast.** Every read path runs under `SecKeychainSetUserInteractionAllowed(0)`, so a
+binary the `com.makai.auth` item's access list does not authorize gets `errSecInteractionNotAllowed`
+rather than an authorization prompt, and `AuthStorage.loadDefault` falls back to `~/.makai/auth.json`.
+That fallback goes through `loadFromFile`, **not** `loadFromFileWithSaveFn`, so a background token
+refresh cannot re-save and re-arm the prompt. The degradation is silent by design: the run continues
+with whatever the file holds, which may be nothing. Reads also tell contention apart from refusal —
+the keychain mutex is taken with a bounded retry, and a holder that outlasts the budget yields a
+distinct `busy` result instead of being reported as `needs_interaction`, so an interactive write
+mid-prompt no longer makes a concurrent read look like an authorization failure.
+
+**Writes still prompt.** `macos_keychain.write` takes the mutex blocking and leaves interaction
+enabled, so persisting credentials from an unauthorized binary raises the prompt — and in a
+non-interactive shell that prompt never surfaces, so the write blocks rather than failing. Access
+lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again; the
+macOS artifacts this repo publishes are plain `zig build install` output and are unsigned too. Only
+a Developer-ID-signed build, keyed by team ID, escapes it. Bound any invocation that may persist
+credentials with an external timeout so a hang is visible rather than silent.
+
+Reads blocked the same way before #315, which is why older notes describe `makai auth providers
+--json` printing `ready` and then going silent on the first credential-touching request. That
+symptom is gone. A machine with no `com.makai.auth` item never reproduced it either —
+`SecKeychainFindGenericPassword` returns `errSecItemNotFound` and the load falls back to the file —
+so a clean CI runner was never a useful test of it.
+
+```bash
+export MAKAI_KEYCHAIN_SERVICE="makai-test-$(uuidgen)"
+```
+
+This redirects the whole makai store — `keychainServiceName` in `zig/src/utils/oauth/storage.zig`
+picks the service for every makai keychain read and write, not one item. Use a genuinely unique
+name per run: a stable one stops being unused the moment anything writes to it, and `$(date +%s)-$$`
+collides between subshells started in the same second.
+
+Four limits:
+
+1. **It does not isolate `~/.makai/auth.json`.** With no item under the overridden service,
+   `loadDefault` falls back to that file, so a supposedly isolated run can still consume real
+   tokens. Redirect `HOME` as well if it may hold live credentials.
+2. **It does not isolate the Codex CLI import**, which reads the fixed `Codex Auth` service. That
+   import runs on `loadDefault` paths — `makai auth providers` among them — and reads a service the
+   override does not cover. It does **not** run on `loadDefaultStoredOnly`, which passes
+   `import_codex = false` and serves provider credential resolution, TUI login-status refreshes and
+   stored Kimi lookup.
+3. **A unique service accumulates credential items.** Anything that persists credentials writes one
+   there — not just logins: an ordinary request that refreshes an expired token
+   (`streamWithRefresh` → `refreshCredentials` → `persist()`) writes too. makai never deletes them;
+   its only delete path is the legacy `auth.json` migration. Clean up on every exit path with
+   `security delete-generic-password -s "$MAKAI_KEYCHAIN_SERVICE"`.
+4. **The real-binary SDK tests cannot pass on macOS as written.** With or without the override,
+   `loadDefault` attaches the Keychain save callback when the service has no item (the `.not_found`
+   branch, which the read-side fail-fast change does not touch), so login writes go to the Keychain
+   rather than the temporary `HOME`'s `auth.json` and the login assertions in
+   `typescript/test/makai_binary_smoke.test.ts` and `typescript/test/demo_server.test.ts` fail on
+   `ENOENT`. There is no switch that forces file-backed storage — `shouldUseKeychain()` is
+   hardcoded to macOS non-test builds. Run those on Linux.
+
+This does not change where credentials live (see On-disk state below) and is not a reason to move
+them to a file.
+
 ### Print Mode CLI
 
 ```bash
@@ -41,14 +104,14 @@ Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml
 
 `tools/*` tests have their own matrix-covered group, **`test-unit-tools`**; none of the `agent-*` subgroups contains them. All eleven tool artifacts are wired there, and `test_unit_agent_step` pulls that step in rather than re-listing its members. So a new `tools/*` test goes into `test_unit_tools_step` (plus `test`).
 
-The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`.
+The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`. `oauth/storage.zig` was the worst case: it had a module but no `addTest` at all, so its thirteen tests ran nowhere and silently rotted past compiling against Zig 0.16 until `oauth_storage_test` was wired into both steps. A module without a test artifact is invisible to this invariant, so check that the `addTest` exists, not just that a group references it.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
 zig build test-unit-transport     # transport, stdio, sse, websocket, in_process, transport_retry
-zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
+zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, oap types+envelope+server+bridge (incl. the three golden OAP traces), partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
-zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
+zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, storage, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
 zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport
 zig build test-unit-tools         # all 11 tools/*: common, process_runner, artifact, shell, file, edit, hashline, search, workspace, mcp_bridge, registry
@@ -138,7 +201,9 @@ The PTY driver is deterministic: `MAKAI_TUI_FIXTURE` selects a canned reply (see
 │  Local tools (tools/): shell, file, edit, search, workspace, │
 │    artifact, hashline, mcp_bridge, registry, permission      │
 ├──────────────────────────────────────────────────────────────┤
-│  Protocol Layer (protocol/): auth/, provider/, agent/, tool/ │
+│  Protocol Layer (protocol/): auth/, provider/, agent/, tool/,│
+│    oap/ (native Open Agent Protocol endpoint: types, envelope,│
+│    server, bridge; translates to/from the agent protocol)    │
 │    all: types + envelope + runtime. provider/agent add       │
 │    client+server; auth adds server; tool keeps its           │
 │    server/client/pipe inside local_runtime.zig               │
@@ -228,6 +293,7 @@ Passing an explicit `std.mem.Allocator` is the convention, not a guarantee the c
 ```
 makai --version
 makai --stdio                                   # protocol host for the TS SDK (NDJSON frames on stdin/stdout)
+makai --oap [--model <model-ref>]               # native Open Agent Protocol host (OAP JSONL frames on stdin/stdout)
 makai --tui                                     # local-only terminal UI
 makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream one prompt, dump every event
 makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
@@ -244,13 +310,15 @@ On-disk state: **credential storage is platform-dependent.** On macOS the login 
 
 **Adding a transport**: implement `Sender`/`Receiver` from `transport.zig` in `zig/src/transports/<name>.zig`; wire into `build.zig` with the `transport` import and the `test-unit-transport` group.
 
+**Custom endpoints**: users declare OpenAI- and Anthropic-compatible endpoints in `~/.makai/providers.json`, parsed by `zig/src/custom_providers.zig` and turned into models by `loadCustomModels` in `model_catalog.zig`. That file never holds a key: credentials come from the keychain under the provider id (`/login <id>`) or from an environment variable the entry names. A declared `models` list is an allowlist over live `/v1/models` discovery, not just a fallback. `base_url` is normalised to the origin, because `openai_completions_api.buildUrlWithSuffix` concatenates without a double-suffix guard and a pasted `.../v1` would otherwise 404. A `capabilities` block populates `Model.compat`, which both OpenAI providers honor through `mergeCompat`. Capability fallback is per key: `parseCapabilities` seeds undeclared keys with the generic values URL detection yields for an unrecognised host, because the struct's own defaults are OpenAI-native and cannot express unset. Custom providers reach the TUI and CLI only; `models.list` is a separate catalog. See `docs/custom-endpoints.md`.
+
 Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completions`) are separate wire formats; Google Generative uses API keys, and Vertex needs `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`), `GOOGLE_CLOUD_LOCATION`, and an API key from `GOOGLE_API_KEY` or `StreamOptions.api_key` — there is no Application Default Credentials support, and `GOOGLE_APPLICATION_CREDENTIALS` is read and discarded, so an ADC-only setup fails with `error.MissingApiKey`. **Vertex is also not reachable at runtime**: `register_builtins.zig` never imports or registers `google_vertex_api.zig`, so there is no `google-vertex` API in the registry and a request for one fails provider lookup. The module is compiled only as its own test artifact. Registered APIs are exactly: `anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`, `ollama`; Anthropic and Google support `thinking` blocks with `budget_tokens` (Google replays `thoughtSignature`); OpenAI Completions is an owned-event stream (`owns_events == true`). The SDK's `models.list` is served by `handleModelsRequest` in `protocol/provider/server.zig` and falls back to the `STATIC_MODEL_CATALOG` array in that same file — **that** is the array to edit when a model should appear to SDK callers. The separate top-level `model_catalog.zig` loads Codex and Kimi models for the CLI and TUI runtime and does not feed `models.list`. AWS Bedrock is **not** supported and has no implementation in the tree; the unwired stub and the unused SigV4 signing helper were deleted rather than left to rot.
 
 ## TUI
 
 `zig/src/tui/` is built on the vendored `zigzag` framework: `app.zig` (entry, approval waiter, fixture runtime), `runtime.zig` (`TuiRuntime` over the agent loop with local tools and a `PermissionMode` of ask/bypass), `session.zig`/`session_store.zig` (JSONL persistence; a session file may reach `load_max_bytes` = 64 MiB, each record is capped at `max_jsonl_line_bytes` = 8 MiB, and metadata loads read a 1 MiB tail), `state.zig`, `commands.zig` (10 ratified `CommandKind`s — help, model, login, provider, status, resume, permissions, clear, abort, quit — exposed as 12 accepted names, since `/sessions` aliases `/resume` and `/perm` aliases `/permissions`), `views/` (transcript, composer, status_bar, approval, session_picker, menu_picker), `render.zig`, `text.zig`, `theme.zig`. The TUI is local-only (no remote backend). Deterministic tests use `fixture_provider.zig` and `tests/mock_transport.zig`; the PTY harness covers the real terminal path.
 
-`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS; unsigned dev builds get one keychain prompt per new binary because access lists bind to the code hash (signed releases are keyed by team ID). Never move credentials to a plain file. `MAKAI_KEYCHAIN_SERVICE` isolates keychain items in local runs. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
+`makai --tui` is an inline (non-alt-screen) terminal UI on the vendored `zigzag` framework. The renderer contract — cursor-relative live region, `Context.printAbove` for persistent transcript rows, `Context.requestClearScreen`, the app's `inline_history_flushed` cursor and active-entry rules, the visual language, and the key map — is documented in `docs/tui-rendering-model.md`; read it before touching `app.zig` `view`/`update`, the views, or `zig/vendor/zigzag/src/core/program.zig`. Tests that drive `TuiModel.update` must pass a real `zz.Context` (`TestContext` in `app.zig`), and the e2e driver runs in `.inline_history` mode. The TUI owns the terminal: never print to stdout/stderr from TUI code paths (stderr is redirected to `~/.makai/tui-stderr.log` while it runs); append a transcript row instead. Credential storage (`zig/src/utils/oauth/storage.zig`) is keychain-first on macOS: reads fail fast and fall back to `auth.json`, writes still prompt, and `MAKAI_KEYCHAIN_SERVICE` isolates items in local runs — see the macOS Keychain section above for the mechanism and the four limits of that override. Never move credentials to a plain file. The PTY harness (`scripts/tui-pty-driver.py`, Linux only) plus `docs/tui-performance-baseline.md` cover the real binary.
 
 ## Zig Conventions
 
