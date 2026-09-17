@@ -64,10 +64,7 @@ test "openai e2e: chat completions (cheap model)" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed(key), .max_tokens = 48, .temperature = 0.0 }, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     var result = try waitResultOrFail(stream);
     defer ai_types.deinitAssistantMessageOwned(testing.allocator, &result);
@@ -110,10 +107,7 @@ test "openai e2e: responses api (cheap model)" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed(key), .max_tokens = 48, .temperature = 0.0 }, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
+    defer _ = stream.deinitAndDestroy();
 
     var result = try waitResultOrFail(stream);
     defer ai_types.deinitAssistantMessageOwned(testing.allocator, &result);

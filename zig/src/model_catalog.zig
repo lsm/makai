@@ -28,6 +28,8 @@ const anthropic_base_url = "https://api.anthropic.com";
 const anthropic_models_url = "https://api.anthropic.com/v1/models?limit=100";
 const anthropic_env_keys = [_][]const u8{ "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY" };
 const max_catalog_bytes = 2 * 1024 * 1024;
+pub const catalog_fetch_timeout_ms: u64 = 20_000;
+
 const anthropic_catalog_max_age_ms: i64 = 24 * 60 * 60 * 1000;
 const default_codex_client_version = "0.0.0";
 const default_max_output_tokens: u32 = 16_384;
@@ -678,17 +680,6 @@ fn loadCachedAnthropicModels(allocator: std.mem.Allocator, max_age_ms: ?i64) !?[
 }
 
 fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
-    const uri = try std.Uri.parse(anthropic_models_url);
-
-    var client = compat.http.HttpClient.init(allocator);
-    defer client.deinit();
-
-    var environ_map = compat.createEnvMap(allocator) catch null;
-    defer if (environ_map) |*map| map.deinit();
-    if (environ_map) |*map| {
-        client.initDefaultProxies(allocator, map) catch {};
-    }
-
     const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer secureFree(allocator, bearer);
 
@@ -703,24 +694,17 @@ fn fetchAnthropicModelsCatalog(allocator: std.mem.Allocator, token: []const u8) 
         try headers.append(allocator, .{ .name = "x-api-key", .value = token });
     }
 
-    var req = try client.openRequest(.GET, uri, .{
+    var fetched = compat.http.fetch(allocator, anthropic_models_url, .{
+        .method = .GET,
         .extra_headers = headers.items,
         .accept_encoding = "identity",
-    });
-    defer req.deinit();
+        .max_response_bytes = max_catalog_bytes,
+        .timeout_ms = catalog_fetch_timeout_ms,
+    }) catch return error.ModelCatalogFetchFailed;
+    errdefer fetched.deinit(allocator);
 
-    try compat.http.sendBodilessRequest(&req);
-
-    var head_buf: [4096]u8 = undefined;
-    var response = try compat.http.receiveResponse(&req, &head_buf);
-
-    var transfer_buf: [4096]u8 = undefined;
-    const reader = compat.http.responseReader(&response, &transfer_buf);
-    const body = try compat.http.allocRemainingResponse(allocator, reader, max_catalog_bytes);
-    errdefer allocator.free(body);
-
-    if (response.head.status != .ok) return error.ModelCatalogFetchFailed;
-    return body;
+    if (fetched.status != 200) return error.ModelCatalogFetchFailed;
+    return fetched.body;
 }
 
 fn fetchCustomModelsCatalog(
@@ -730,17 +714,6 @@ fn fetchCustomModelsCatalog(
 ) ![]u8 {
     const url = try customModelsUrl(allocator, provider.base_url);
     defer allocator.free(url);
-    const uri = try std.Uri.parse(url);
-
-    var client = compat.http.HttpClient.init(allocator);
-    defer client.deinit();
-
-    var environ_map = compat.createEnvMap(allocator) catch null;
-    defer if (environ_map) |*map| map.deinit();
-    if (environ_map) |*map| {
-        client.initDefaultProxies(allocator, map) catch {};
-    }
-
     var bearer: ?[]u8 = null;
     defer if (bearer) |value| secureFree(allocator, value);
 
@@ -761,20 +734,17 @@ fn fetchCustomModelsCatalog(
         try headers.append(allocator, .{ .name = header.name, .value = header.value });
     }
 
-    var req = try client.openRequest(.GET, uri, .{ .extra_headers = headers.items, .accept_encoding = "identity" });
-    defer req.deinit();
-
-    try compat.http.sendBodilessRequest(&req);
-
-    var head_buf: [4096]u8 = undefined;
-    var response = try compat.http.receiveResponse(&req, &head_buf);
-
-    var transfer_buf: [4096]u8 = undefined;
-    const reader = compat.http.responseReader(&response, &transfer_buf);
-    const body = try compat.http.allocRemainingResponse(allocator, reader, max_catalog_bytes);
+    const fetched = compat.http.fetch(allocator, url, .{
+        .method = .GET,
+        .extra_headers = headers.items,
+        .accept_encoding = "identity",
+        .max_response_bytes = max_catalog_bytes,
+        .timeout_ms = catalog_fetch_timeout_ms,
+    }) catch return error.ModelCatalogFetchFailed;
+    const body = fetched.body;
     errdefer allocator.free(body);
 
-    if (response.head.status != .ok) return error.ModelCatalogFetchFailed;
+    if (fetched.status != 200) return error.ModelCatalogFetchFailed;
     return body;
 }
 
@@ -1045,17 +1015,6 @@ fn fetchCodexModelsCatalog(
     );
     defer allocator.free(url);
 
-    const uri = try std.Uri.parse(url);
-
-    var client = compat.http.HttpClient.init(allocator);
-    defer client.deinit();
-
-    var environ_map = compat.createEnvMap(allocator) catch null;
-    defer if (environ_map) |*map| map.deinit();
-    if (environ_map) |*map| {
-        client.initDefaultProxies(allocator, map) catch {};
-    }
-
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
     defer secureFree(allocator, auth);
 
@@ -1068,23 +1027,17 @@ fn fetchCodexModelsCatalog(
         try headers.append(allocator, .{ .name = "ChatGPT-Account-ID", .value = id });
     }
 
-    var req = try client.openRequest(.GET, uri, .{
+    const fetched = compat.http.fetch(allocator, url, .{
+        .method = .GET,
         .extra_headers = headers.items,
         .accept_encoding = "identity",
-    });
-    defer req.deinit();
-
-    try compat.http.sendBodilessRequest(&req);
-
-    var head_buf: [4096]u8 = undefined;
-    var response = try compat.http.receiveResponse(&req, &head_buf);
-
-    var transfer_buf: [4096]u8 = undefined;
-    const reader = compat.http.responseReader(&response, &transfer_buf);
-    const body = try compat.http.allocRemainingResponse(allocator, reader, max_catalog_bytes);
+        .max_response_bytes = max_catalog_bytes,
+        .timeout_ms = catalog_fetch_timeout_ms,
+    }) catch return error.ModelCatalogFetchFailed;
+    const body = fetched.body;
     errdefer allocator.free(body);
 
-    if (response.head.status != .ok) return error.ModelCatalogFetchFailed;
+    if (fetched.status != 200) return error.ModelCatalogFetchFailed;
     return body;
 }
 

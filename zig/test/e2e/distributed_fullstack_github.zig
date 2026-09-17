@@ -243,8 +243,7 @@ test "distributed fullstack github: agent loop via provider+tool protocols witho
         .max_tokens = 200,
     });
     defer {
-        stream.deinit();
-        allocator.destroy(stream);
+        _ = stream.deinitAndDestroy();
     }
 
     var saw_tool_start = false;
