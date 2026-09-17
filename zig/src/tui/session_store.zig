@@ -722,12 +722,30 @@ fn parseAssistantContent(allocator: std.mem.Allocator, value: std.json.Value) !a
 }
 
 fn parseToolResultFromPayload(allocator: std.mem.Allocator, payload: anytype) !ai_types.ToolResultMessage {
+    const tool_call_id = try allocator.dupe(u8, payload.tool_call_id.slice());
+    errdefer allocator.free(tool_call_id);
+
+    const tool_name = try allocator.dupe(u8, payload.tool_name.slice());
+    errdefer allocator.free(tool_name);
+
+    const content = try parseUserParts(allocator, payload.content_json.slice());
+    errdefer {
+        const mutable_content: []ai_types.UserContentPart = @constCast(content);
+        for (mutable_content) |*part| part.deinit(allocator);
+        allocator.free(content);
+    }
+
+    const details_json = try allocator.dupe(u8, payload.details_json.slice());
+    errdefer allocator.free(details_json);
+
+    const artifacts = try parseArtifacts(allocator, payload.artifacts_json.slice());
+
     return .{
-        .tool_call_id = try allocator.dupe(u8, payload.tool_call_id.slice()),
-        .tool_name = try allocator.dupe(u8, payload.tool_name.slice()),
-        .content = try parseUserParts(allocator, payload.content_json.slice()),
-        .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.details_json.slice())),
-        .artifacts = OwnedSlice(ai_types.ArtifactReference).initOwned(try parseArtifacts(allocator, payload.artifacts_json.slice())),
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = content,
+        .details_json = OwnedSlice(u8).initOwned(details_json),
+        .artifacts = OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
         .is_error = payload.is_error,
         .timestamp = compat.time.nowMillis(),
     };
@@ -1336,4 +1354,28 @@ fn parseArtifactsProbe(allocator: std.mem.Allocator) !void {
 
 test "parseArtifacts survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseArtifactsProbe, .{});
+}
+
+fn parseToolResultFromPayloadProbe(allocator: std.mem.Allocator) !void {
+    const payload = .{
+        .tool_call_id = OwnedSlice(u8).initBorrowed("call-0123456789"),
+        .tool_name = OwnedSlice(u8).initBorrowed("shell_execute"),
+        .content_json = OwnedSlice(u8).initBorrowed(
+            \\[{"type":"text","text":"stdout from the tool"}]
+        ),
+        .details_json = OwnedSlice(u8).initBorrowed(
+            \\{"ok":true,"exit_code":0}
+        ),
+        .artifacts_json = OwnedSlice(u8).initBorrowed(
+            \\[{"artifact_id":"art-one","uri":"file:///tmp/one.txt","mime_type":"text/plain","byte_size":11,"sha256":"1111111111111111","description":"first artifact"}]
+        ),
+        .is_error = false,
+    };
+
+    var message = try parseToolResultFromPayload(allocator, payload);
+    message.deinit(allocator);
+}
+
+test "parseToolResultFromPayload survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolResultFromPayloadProbe, .{});
 }
