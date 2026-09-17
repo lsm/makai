@@ -249,18 +249,18 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const type_str = root.get("type").?.string;
-    const server_id = try parseUlidRequired(root.get("server_id").?.string);
-    const message_id = try parseUlidRequired(root.get("message_id").?.string);
-    const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
-    const timestamp = root.get("timestamp").?.integer;
-    const version = @as(u8, @intCast(root.get("version").?.integer));
+    const root = try asObject(parsed.value);
+    const type_str = try requiredString(root, "type");
+    const server_id = try parseUlidRequired(try requiredString(root, "server_id"));
+    const message_id = try parseUlidRequired(try requiredString(root, "message_id"));
+    const sequence = try requiredBoundedInteger(u64, root, "sequence");
+    const timestamp = try requiredInteger(root, "timestamp");
+    const version: u8 = if (root.get("version")) |v| try asBoundedInteger(u8, v) else 1;
 
     var in_reply_to: ?tool_types.Ulid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
+    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(try asString(v));
 
-    const payload_obj = root.get("payload").?.object;
+    const payload_obj = try requiredObject(root, "payload");
     const payload = try deserializePayload(type_str, payload_obj, allocator);
 
     return .{
@@ -278,72 +278,98 @@ fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
     return tool_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
-fn parseJsonString(value: std.json.Value) ![]const u8 {
+const FieldError = error{ MissingField, InvalidField };
+
+fn asString(value: std.json.Value) FieldError![]const u8 {
     return switch (value) {
         .string => |s| s,
-        else => error.InvalidPayloadType,
+        else => error.InvalidField,
     };
 }
 
-fn parseJsonArray(value: std.json.Value) !std.json.Array {
-    return switch (value) {
-        .array => |a| a,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseJsonObject(value: std.json.Value) !std.json.ObjectMap {
-    return switch (value) {
-        .object => |o| o,
-        else => error.InvalidPayloadType,
-    };
-}
-
-fn parseJsonBool(value: std.json.Value) !bool {
+fn asBool(value: std.json.Value) FieldError!bool {
     return switch (value) {
         .bool => |b| b,
-        else => error.InvalidPayloadType,
+        else => error.InvalidField,
     };
 }
 
-fn parseRequiredJsonString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return parseJsonString(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonArray(obj: std.json.ObjectMap, key: []const u8) !std.json.Array {
-    return parseJsonArray(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonObject(obj: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
-    return parseJsonObject(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseRequiredJsonBool(obj: std.json.ObjectMap, key: []const u8) !bool {
-    return parseJsonBool(obj.get(key) orelse return error.InvalidPayloadType);
-}
-
-fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
+fn asInteger(value: std.json.Value) FieldError!i64 {
     return switch (value) {
-        .integer => |n| std.math.cast(T, n) orelse error.InvalidPayloadType,
-        else => error.InvalidPayloadType,
+        .integer => |n| n,
+        else => error.InvalidField,
     };
 }
 
-fn parseOptionalUnsignedJsonInteger(comptime T: type, value: ?std.json.Value) !?T {
-    return if (value) |v| try parseUnsignedJsonInteger(T, v) else null;
+fn asBoundedInteger(comptime T: type, value: std.json.Value) FieldError!T {
+    return std.math.cast(T, try asInteger(value)) orelse error.InvalidField;
+}
+
+fn asArray(value: std.json.Value) FieldError!std.json.Array {
+    return switch (value) {
+        .array => |a| a,
+        else => error.InvalidField,
+    };
+}
+
+fn asObject(value: std.json.Value) FieldError!std.json.ObjectMap {
+    return switch (value) {
+        .object => |o| o,
+        else => error.InvalidField,
+    };
+}
+
+fn requiredField(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Value {
+    return obj.get(key) orelse error.MissingField;
+}
+
+fn requiredString(obj: std.json.ObjectMap, key: []const u8) FieldError![]const u8 {
+    return asString(try requiredField(obj, key));
+}
+
+fn requiredInteger(obj: std.json.ObjectMap, key: []const u8) FieldError!i64 {
+    return asInteger(try requiredField(obj, key));
+}
+
+fn requiredBoundedInteger(comptime T: type, obj: std.json.ObjectMap, key: []const u8) FieldError!T {
+    return asBoundedInteger(T, try requiredField(obj, key));
+}
+
+fn requiredBool(obj: std.json.ObjectMap, key: []const u8) FieldError!bool {
+    return asBool(try requiredField(obj, key));
+}
+
+fn requiredArray(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Array {
+    return asArray(try requiredField(obj, key));
+}
+
+fn requiredObject(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.ObjectMap {
+    return asObject(try requiredField(obj, key));
+}
+
+fn optionalString(obj: std.json.ObjectMap, key: []const u8) FieldError!?[]const u8 {
+    return if (obj.get(key)) |v| try asString(v) else null;
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8, fallback: bool) FieldError!bool {
+    return if (obj.get(key)) |v| try asBool(v) else fallback;
+}
+
+fn optionalBoundedInteger(comptime T: type, obj: std.json.ObjectMap, key: []const u8) FieldError!?T {
+    return if (obj.get(key)) |v| try asBoundedInteger(T, v) else null;
 }
 
 fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
     var artifact = tool_types.ArtifactReference{
-        .artifact_id = try allocator.dupe(u8, try parseRequiredJsonString(obj, "artifact_id")),
+        .artifact_id = try allocator.dupe(u8, try requiredString(obj, "artifact_id")),
     };
     errdefer artifact.deinit(allocator);
 
-    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("byte_size")) |v| artifact.byte_size = try parseUnsignedJsonInteger(u64, v);
-    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
+    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
+    if (obj.get("byte_size")) |v| artifact.byte_size = try asBoundedInteger(u64, v);
+    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
+    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
 
     return artifact;
 }
@@ -357,7 +383,7 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
     }
 
     for (array.items, 0..) |item, i| {
-        artifacts[i] = try deserializeArtifactReference(try parseJsonObject(item), allocator);
+        artifacts[i] = try deserializeArtifactReference(try asObject(item), allocator);
         initialized += 1;
     }
 
@@ -366,148 +392,201 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
     if (std.mem.eql(u8, type_str, "tool_register")) {
-        const tool = try deserializeToolMetadata(payload.get("tool").?.object, allocator);
+        const tool_obj = try requiredObject(payload, "tool");
+        const callback_url = try optionalString(payload, "callback_url");
+
+        const tool = try deserializeToolMetadata(tool_obj, allocator);
+        errdefer tool.deinit(allocator);
+
         var req = tool_types.ToolRegisterRequest{ .tool = tool };
-        if (payload.get("callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (callback_url) |value| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_register = req };
     }
     if (std.mem.eql(u8, type_str, "tool_registered")) {
+        const tool_id = try requiredString(payload, "tool_id");
+        const registered_at = try requiredInteger(payload, "registered_at");
         return .{ .tool_registered = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
-            .registered_at = payload.get("registered_at").?.integer,
+            .tool_id = try allocator.dupe(u8, tool_id),
+            .registered_at = registered_at,
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregister")) {
         return .{ .tool_unregister = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
+            .tool_id = try allocator.dupe(u8, try requiredString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_unregistered")) {
         return .{ .tool_unregistered = .{
-            .tool_id = try allocator.dupe(u8, payload.get("tool_id").?.string),
+            .tool_id = try allocator.dupe(u8, try requiredString(payload, "tool_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
+        const prefix = try optionalString(payload, "prefix");
         var req = tool_types.ToolListRequest{};
-        if (payload.get("prefix")) |v| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("supports_streaming")) |v| req.supports_streaming = v.bool;
+        if (payload.get("supports_streaming")) |v| req.supports_streaming = try asBool(v);
+        if (prefix) |value| req.prefix = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "tool_list_response")) {
-        const tools_arr = payload.get("tools").?.array;
+        const tools_arr = try requiredArray(payload, "tools");
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tools[0..initialized]) |*tool| tool.deinit(allocator);
+            allocator.free(tools);
+        }
         for (tools_arr.items, 0..) |t, i| {
-            tools[i] = try deserializeToolMetadata(t.object, allocator);
+            tools[i] = try deserializeToolMetadata(try asObject(t), allocator);
+            initialized += 1;
         }
         return .{ .tool_list_response = .{ .tools = tools } };
     }
     if (std.mem.eql(u8, type_str, "tool_execute")) {
-        const args_json = try allocator.dupe(u8, payload.get("args_json").?.string);
+        const execution_id = try parseUlidRequired(try requiredString(payload, "execution_id"));
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const tool_name = try requiredString(payload, "tool_name");
+        const timeout_ms = try optionalBoundedInteger(u32, payload, "timeout_ms");
+        const stream_callback_url = try optionalString(payload, "stream_callback_url");
+
+        const args_json = try allocator.dupe(u8, try requiredString(payload, "args_json"));
         errdefer allocator.free(args_json);
         try validateJson(args_json, allocator);
 
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+        const tool_name_copy = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(tool_name_copy);
+
         var req = tool_types.ToolExecuteRequest{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id_copy,
+            .tool_name = tool_name_copy,
             .args_json = args_json,
+            .timeout_ms = timeout_ms,
         };
-        if (payload.get("timeout_ms")) |v| req.timeout_ms = @as(u32, @intCast(v.integer));
-        if (payload.get("stream_callback_url")) |v| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (stream_callback_url) |value| req.stream_callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_execute = req };
     }
     if (std.mem.eql(u8, type_str, "tool_stream")) {
+        const execution_id = try parseUlidRequired(try requiredString(payload, "execution_id"));
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const partial_result_json = try requiredString(payload, "partial_result_json");
+        const progress = try optionalBoundedInteger(u8, payload, "progress");
+        const status = try optionalString(payload, "status");
+
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+        const partial_result_json_copy = try allocator.dupe(u8, partial_result_json);
+        errdefer allocator.free(partial_result_json_copy);
+
         var update = tool_types.ToolStreamUpdate{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .partial_result_json = try allocator.dupe(u8, payload.get("partial_result_json").?.string),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id_copy,
+            .partial_result_json = partial_result_json_copy,
+            .progress = progress,
         };
-        if (payload.get("progress")) |v| update.progress = @as(u8, @intCast(v.integer));
-        if (payload.get("status")) |v| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (status) |value| update.status = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_stream = update };
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
+        const execution_id = try parseUlidRequired(try requiredString(payload, "execution_id"));
+        const tool_call_id = try requiredString(payload, "tool_call_id");
+        const result_json = try requiredString(payload, "result_json");
+        const is_error = try optionalBool(payload, "is_error", false);
+        const duration_ms = try requiredBoundedInteger(u32, payload, "duration_ms");
+
+        const tool_call_id_copy = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(tool_call_id_copy);
+
         var result = tool_types.ToolExecuteResult{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
-            .result_json = try allocator.dupe(u8, payload.get("result_json").?.string),
-            .is_error = if (payload.get("is_error")) |v| v.bool else false,
-            .duration_ms = @as(u32, @intCast(payload.get("duration_ms").?.integer)),
+            .execution_id = execution_id,
+            .tool_call_id = tool_call_id_copy,
+            .result_json = try allocator.dupe(u8, result_json),
+            .is_error = is_error,
+            .duration_ms = duration_ms,
         };
         errdefer {
-            allocator.free(result.tool_call_id);
             allocator.free(result.result_json);
             result.error_message.deinit(allocator);
             result.details_json.deinit(allocator);
             result.artifacts.deinit(allocator);
         }
-        if (payload.get("error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try parseJsonArray(v), allocator));
+        if (try optionalString(payload, "error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (try optionalString(payload, "details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
+        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try asArray(v), allocator));
         return .{ .tool_result = result };
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
+        const reason = try optionalString(payload, "reason");
         var req = tool_types.ToolCancelRequest{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try requiredString(payload, "execution_id")),
         };
-        if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (reason) |value| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .tool_cancel = req };
     }
     if (std.mem.eql(u8, type_str, "tool_cancelled")) {
         return .{ .tool_cancelled = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try requiredString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_error")) {
+        const execution_id = try parseUlidRequired(try requiredString(payload, "execution_id"));
+        const code = std.meta.stringToEnum(tool_types.ToolErrorCode, try requiredString(payload, "code")) orelse return error.InvalidField;
+        const message = try requiredString(payload, "message");
         return .{ .tool_error = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .code = std.meta.stringToEnum(tool_types.ToolErrorCode, payload.get("code").?.string) orelse return error.InvalidPayloadType,
-            .message = try allocator.dupe(u8, payload.get("message").?.string),
+            .execution_id = execution_id,
+            .code = code,
+            .message = try allocator.dupe(u8, message),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status")) {
         return .{ .tool_status = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(try requiredString(payload, "execution_id")),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status_response")) {
+        const execution_id = try parseUlidRequired(try requiredString(payload, "execution_id"));
+        const tool_name = try requiredString(payload, "tool_name");
+        const status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, try requiredString(payload, "status")) orelse return error.InvalidField;
+        const started_at = try requiredInteger(payload, "started_at");
+        const completed_at: ?i64 = if (payload.get("completed_at")) |v| try asInteger(v) else null;
         return .{ .tool_status_response = .{
-            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
-            .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
-            .status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, payload.get("status").?.string) orelse return error.InvalidPayloadType,
-            .started_at = payload.get("started_at").?.integer,
-            .completed_at = if (payload.get("completed_at")) |v| v.integer else null,
+            .execution_id = execution_id,
+            .tool_name = try allocator.dupe(u8, tool_name),
+            .status = status,
+            .started_at = started_at,
+            .completed_at = completed_at,
         } };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieve")) {
         var req = tool_types.ArtifactRetrieveRequest{
-            .artifact_id = try allocator.dupe(u8, try parseRequiredJsonString(payload, "artifact_id")),
+            .artifact_id = try allocator.dupe(u8, try requiredString(payload, "artifact_id")),
         };
         errdefer allocator.free(req.artifact_id);
 
-        req.byte_offset = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_offset"));
-        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        req.byte_offset = try optionalBoundedInteger(u64, payload, "byte_offset");
+        req.byte_limit = try optionalBoundedInteger(u64, payload, "byte_limit");
         return .{ .artifact_retrieve = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieved")) {
         var res = tool_types.ArtifactRetrieveResponse{
-            .artifact = try deserializeArtifactReference(try parseRequiredJsonObject(payload, "artifact"), allocator),
+            .artifact = try deserializeArtifactReference(try requiredObject(payload, "artifact"), allocator),
         };
         errdefer res.deinit(allocator);
-        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
         return .{ .artifact_retrieved = res };
     }
     if (std.mem.eql(u8, type_str, "artifact_search")) {
         var req = tool_types.ArtifactSearchRequest{
-            .query = try allocator.dupe(u8, try parseRequiredJsonString(payload, "query")),
+            .query = try allocator.dupe(u8, try requiredString(payload, "query")),
         };
         errdefer allocator.free(req.query);
 
-        req.limit = try parseOptionalUnsignedJsonInteger(u32, payload.get("limit"));
+        req.limit = try optionalBoundedInteger(u32, payload, "limit");
         return .{ .artifact_search = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_search_result")) {
-        const values = try parseRequiredJsonArray(payload, "results");
+        const values = try requiredArray(payload, "results");
         const results = try allocator.alloc(tool_types.ArtifactSearchResult, values.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -515,13 +594,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             allocator.free(results);
         }
         for (values.items, 0..) |item, i| {
-            const obj = try parseJsonObject(item);
+            const obj = try asObject(item);
             results[i] = blk: {
                 var result = tool_types.ArtifactSearchResult{
-                    .artifact = try deserializeArtifactReference(try parseRequiredJsonObject(obj, "artifact"), allocator),
+                    .artifact = try deserializeArtifactReference(try requiredObject(obj, "artifact"), allocator),
                 };
                 errdefer result.deinit(allocator);
-                if (obj.get("snippet")) |v| result.snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+                if (obj.get("snippet")) |v| result.snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
                 if (obj.get("score")) |v| result.score = switch (v) {
                     .float => |f| @floatCast(f),
                     .integer => |n| @floatFromInt(n),
@@ -534,18 +613,18 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .artifact_search_result = .{ .results = results } };
     }
     if (std.mem.eql(u8, type_str, "hashline_read")) {
-        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try asBool(v) else false;
         var req = tool_types.HashlineReadRequest{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try requiredString(payload, "path")),
             .feature_enabled = feature_enabled,
         };
         errdefer allocator.free(req.path);
 
-        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        req.byte_limit = try optionalBoundedInteger(u64, payload, "byte_limit");
         return .{ .hashline_read = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_read_result")) {
-        const values = try parseRequiredJsonArray(payload, "lines");
+        const values = try requiredArray(payload, "lines");
         const lines = try allocator.alloc(tool_types.HashlineLine, values.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -553,12 +632,12 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             allocator.free(lines);
         }
         for (values.items, 0..) |item, i| {
-            const obj = try parseJsonObject(item);
+            const obj = try asObject(item);
             lines[i] = blk: {
-                const line = try parseUnsignedJsonInteger(u32, obj.get("line") orelse return error.InvalidPayloadType);
-                const hash = try allocator.dupe(u8, try parseRequiredJsonString(obj, "hash"));
+                const line = try requiredBoundedInteger(u32, obj, "line");
+                const hash = try allocator.dupe(u8, try requiredString(obj, "hash"));
                 errdefer allocator.free(hash);
-                const text = try allocator.dupe(u8, try parseRequiredJsonString(obj, "text"));
+                const text = try allocator.dupe(u8, try requiredString(obj, "text"));
                 errdefer allocator.free(text);
                 break :blk .{
                     .line = line,
@@ -569,14 +648,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             initialized += 1;
         }
         return .{ .hashline_read_result = .{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try requiredString(payload, "path")),
             .lines = lines,
         } };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit")) {
-        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try asBool(v) else false;
         var req = tool_types.HashlineEditRequest{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try requiredString(payload, "path")),
             .operation = undefined,
             .start_line = undefined,
             .start_hash = "",
@@ -589,34 +668,36 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             req.end_hash.deinit(allocator);
             req.replacement.deinit(allocator);
         }
-        req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, try parseRequiredJsonString(payload, "operation")) orelse return error.InvalidPayloadType;
-        req.start_line = try parseUnsignedJsonInteger(u32, payload.get("start_line") orelse return error.InvalidPayloadType);
-        req.start_hash = try allocator.dupe(u8, try parseRequiredJsonString(payload, "start_hash"));
+        req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, try requiredString(payload, "operation")) orelse return error.InvalidField;
+        req.start_line = try requiredBoundedInteger(u32, payload, "start_line");
+        req.start_hash = try allocator.dupe(u8, try requiredString(payload, "start_hash"));
         owns_start_hash = true;
-        if (payload.get("end_line")) |v| req.end_line = try parseUnsignedJsonInteger(u32, v);
-        if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
-        if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+        if (payload.get("end_line")) |v| req.end_line = try asBoundedInteger(u32, v);
+        if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
+        if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try asString(v)));
         return .{ .hashline_edit = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit_result")) {
-        const applied = try parseRequiredJsonBool(payload, "applied");
+        const applied = try requiredBool(payload, "applied");
         var res = tool_types.HashlineEditResponse{
-            .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
+            .path = try allocator.dupe(u8, try requiredString(payload, "path")),
             .applied = applied,
         };
         errdefer res.deinit(allocator);
-        if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(try parseJsonObject(v), allocator);
+        if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(try asObject(v), allocator);
         return .{ .hashline_edit_result = res };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
     if (std.mem.eql(u8, type_str, "pong")) {
+        const ping_id = try requiredString(payload, "ping_id");
         return .{ .pong = .{
-            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("ping_id").?.string)),
+            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, ping_id)),
         } };
     }
     if (std.mem.eql(u8, type_str, "goodbye")) {
+        const reason = try optionalString(payload, "reason");
         var goodbye = tool_types.Goodbye{};
-        if (payload.get("reason")) |v| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (reason) |value| goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         return .{ .goodbye = goodbye };
     }
 
@@ -624,24 +705,49 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 }
 
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
+    const name = try requiredString(obj, "name");
+    const description = try requiredString(obj, "description");
+    const parameters_schema_json = try requiredString(obj, "parameters_schema_json");
+    const version = try optionalString(obj, "version") orelse "1.0.0";
+    const supports_streaming = try optionalBool(obj, "supports_streaming", false);
+    const estimated_duration_ms = try optionalBoundedInteger(u32, obj, "estimated_duration_ms");
+    const is_destructive = try optionalBool(obj, "is_destructive", false);
+
     var required_permissions: ?[]const []const u8 = null;
     if (obj.get("required_permissions")) |permissions_value| {
-        const permissions_arr = permissions_value.array;
+        const permissions_arr = try asArray(permissions_value);
         const permissions = try allocator.alloc([]const u8, permissions_arr.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (permissions[0..initialized]) |permission| allocator.free(permission);
+            allocator.free(permissions);
+        }
         for (permissions_arr.items, 0..) |permission, i| {
-            permissions[i] = try allocator.dupe(u8, permission.string);
+            permissions[i] = try allocator.dupe(u8, try asString(permission));
+            initialized += 1;
         }
         required_permissions = permissions;
     }
+    errdefer if (required_permissions) |permissions| {
+        for (permissions) |permission| allocator.free(permission);
+        allocator.free(permissions);
+    };
+
+    const name_copy = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_copy);
+    const description_copy = try allocator.dupe(u8, description);
+    errdefer allocator.free(description_copy);
+    const parameters_schema_json_copy = try allocator.dupe(u8, parameters_schema_json);
+    errdefer allocator.free(parameters_schema_json_copy);
 
     return .{
-        .name = try allocator.dupe(u8, obj.get("name").?.string),
-        .description = try allocator.dupe(u8, obj.get("description").?.string),
-        .parameters_schema_json = try allocator.dupe(u8, obj.get("parameters_schema_json").?.string),
-        .version = if (obj.get("version")) |v| try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "1.0.0"),
-        .supports_streaming = if (obj.get("supports_streaming")) |v| v.bool else false,
-        .estimated_duration_ms = if (obj.get("estimated_duration_ms")) |v| @as(u32, @intCast(v.integer)) else null,
-        .is_destructive = if (obj.get("is_destructive")) |v| v.bool else false,
+        .name = name_copy,
+        .description = description_copy,
+        .parameters_schema_json = parameters_schema_json_copy,
+        .version = try allocator.dupe(u8, version),
+        .supports_streaming = supports_streaming,
+        .estimated_duration_ms = estimated_duration_ms,
+        .is_destructive = is_destructive,
         .required_permissions = required_permissions,
     };
 }
@@ -866,8 +972,8 @@ test "tool envelope rejects negative artifact retrieve byte ranges" {
     const negative_limit =
         "{\"type\":\"artifact_retrieve\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact_id\":\"artifact-1\",\"byte_limit\":-1}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_offset, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_limit, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_offset, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_limit, allocator));
 }
 
 test "tool envelope rejects malformed hashline edit without leaks" {
@@ -883,11 +989,11 @@ test "tool envelope rejects malformed hashline edit without leaks" {
     const non_bool_feature_enabled =
         "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"a1b2\",\"feature_enabled\":\"yes\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(invalid_operation, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_start_line, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_end_hash, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_replacement, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(invalid_operation, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_start_line, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_end_hash, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_replacement, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_bool_feature_enabled, allocator));
 }
 
 test "tool envelope rejects malformed artifact references without leaks" {
@@ -901,10 +1007,10 @@ test "tool envelope rejects malformed artifact references without leaks" {
     const non_string_content_json =
         "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\"},\"content_json\":42}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_artifact_id, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_byte_size, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_uri, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_content_json, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_artifact_id, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_byte_size, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_uri, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_content_json, allocator));
 }
 
 test "tool envelope rejects non-array tool result artifacts without leaks" {
@@ -912,7 +1018,7 @@ test "tool envelope rejects non-array tool result artifacts without leaks" {
     const json =
         "{\"type\":\"tool_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"result_json\":\"{}\",\"duration_ms\":1,\"artifacts\":\"not-array\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(json, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(json, allocator));
 }
 
 test "tool envelope rejects remaining negative unsigned fields without leaks" {
@@ -924,9 +1030,9 @@ test "tool envelope rejects remaining negative unsigned fields without leaks" {
     const negative_result_line =
         "{\"type\":\"hashline_read_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"lines\":[{\"line\":-1,\"hash\":\"abc\",\"text\":\"bad\"}]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_search_limit, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_read_limit, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_result_line, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_search_limit, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_read_limit, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(negative_result_line, allocator));
 }
 
 test "tool envelope rejects malformed artifact search results without leaks" {
@@ -938,9 +1044,9 @@ test "tool envelope rejects malformed artifact search results without leaks" {
     const non_object_result =
         "{\"type\":\"artifact_search_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"results\":[42]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_artifact, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_artifact, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_result, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_artifact, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_object_artifact, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_object_result, allocator));
 }
 
 test "tool envelope rejects malformed hashline read results without leaks" {
@@ -952,9 +1058,9 @@ test "tool envelope rejects malformed hashline read results without leaks" {
     const non_string_text =
         "{\"type\":\"hashline_read_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"lines\":[{\"line\":1,\"hash\":\"abc\",\"text\":42}]}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_line, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_hash, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_text, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_object_line, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_hash, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_string_text, allocator));
 }
 
 test "tool envelope rejects malformed hashline read request feature flag without leaks" {
@@ -962,7 +1068,7 @@ test "tool envelope rejects malformed hashline read request feature flag without
     const non_bool_feature_enabled =
         "{\"type\":\"hashline_read\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"feature_enabled\":\"yes\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_bool_feature_enabled, allocator));
 }
 
 test "tool envelope rejects malformed hashline edit results without leaks" {
@@ -972,6 +1078,280 @@ test "tool envelope rejects malformed hashline edit results without leaks" {
     const non_bool_applied =
         "{\"type\":\"hashline_edit_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"applied\":\"yes\"}}";
 
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_applied, allocator));
-    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_applied, allocator));
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(missing_applied, allocator));
+    try std.testing.expectError(error.InvalidField, deserializeEnvelope(non_bool_applied, allocator));
+}
+
+const test_server_id = "00000000000000000000000001";
+const test_envelope_message_id = "00000000000000000000000002";
+const test_execution_id = "00000000000000000000000003";
+const valid_tool_metadata_json = "{\"name\":\"n\",\"description\":\"d\",\"parameters_schema_json\":\"{}\"}";
+
+fn expectToolEnvelopeDecodeError(expected: anyerror, json: []const u8) !void {
+    try std.testing.expectError(expected, deserializeEnvelope(json, std.testing.allocator));
+}
+
+fn expectToolPayloadDecodeError(expected: anyerror, type_str: []const u8, payload_json: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"{s}\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{s}}}",
+        .{ type_str, test_server_id, test_envelope_message_id, payload_json },
+    );
+    defer allocator.free(json);
+    try std.testing.expectError(expected, deserializeEnvelope(json, allocator));
+}
+
+test "tool envelope rejects a non-object root" {
+    try expectToolEnvelopeDecodeError(error.InvalidField, "[1,2,3]");
+    try expectToolEnvelopeDecodeError(error.InvalidField, "42");
+    try expectToolEnvelopeDecodeError(error.InvalidField, "\"frame\"");
+}
+
+test "tool envelope rejects a frame with no envelope fields instead of panicking" {
+    try expectToolEnvelopeDecodeError(error.MissingField, "{\"type\":\"tool_execute\"}");
+    try expectToolEnvelopeDecodeError(error.MissingField, "{}");
+}
+
+test "tool envelope rejects a missing or non-string type" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(missing);
+    try expectToolEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":7,\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(non_string);
+    try expectToolEnvelopeDecodeError(error.InvalidField, non_string);
+}
+
+test "tool envelope rejects a missing, non-string or invalid server_id" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_envelope_message_id},
+    );
+    defer allocator.free(missing);
+    try expectToolEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":123,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_envelope_message_id},
+    );
+    defer allocator.free(non_string);
+    try expectToolEnvelopeDecodeError(error.InvalidField, non_string);
+
+    const null_valued = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":null,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_envelope_message_id},
+    );
+    defer allocator.free(null_valued);
+    try expectToolEnvelopeDecodeError(error.InvalidField, null_valued);
+
+    const bad_ulid = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"not-a-ulid\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_envelope_message_id},
+    );
+    defer allocator.free(bad_ulid);
+    try expectToolEnvelopeDecodeError(error.InvalidUlid, bad_ulid);
+}
+
+test "tool envelope rejects a missing or non-string message_id" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_server_id},
+    );
+    defer allocator.free(missing);
+    try expectToolEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":[],\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_server_id},
+    );
+    defer allocator.free(non_string);
+    try expectToolEnvelopeDecodeError(error.InvalidField, non_string);
+}
+
+test "tool envelope rejects a missing, non-integer or out-of-range sequence" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { fragment: []const u8, expected: anyerror }{
+        .{ .fragment = "", .expected = error.MissingField },
+        .{ .fragment = "\"sequence\":\"1\",", .expected = error.InvalidField },
+        .{ .fragment = "\"sequence\":1.5,", .expected = error.InvalidField },
+        .{ .fragment = "\"sequence\":-1,", .expected = error.InvalidField },
+    };
+
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",{s}\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+            .{ test_server_id, test_envelope_message_id, case.fragment },
+        );
+        defer allocator.free(json);
+        try expectToolEnvelopeDecodeError(case.expected, json);
+    }
+}
+
+test "tool envelope rejects a missing timestamp and an out-of-range version" {
+    const allocator = std.testing.allocator;
+
+    const missing_timestamp = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(missing_timestamp);
+    try expectToolEnvelopeDecodeError(error.MissingField, missing_timestamp);
+
+    const oversized_version = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":999,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(oversized_version);
+    try expectToolEnvelopeDecodeError(error.InvalidField, oversized_version);
+}
+
+test "tool envelope defaults version to 1 when the field is absent" {
+    const allocator = std.testing.allocator;
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), parsed.version);
+}
+
+test "tool envelope rejects a missing or non-object payload and a non-string in_reply_to" {
+    const allocator = std.testing.allocator;
+
+    const missing_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(missing_payload);
+    try expectToolEnvelopeDecodeError(error.MissingField, missing_payload);
+
+    const non_object_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":\"{{}}\"}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(non_object_payload);
+    try expectToolEnvelopeDecodeError(error.InvalidField, non_object_payload);
+
+    const non_string_reply = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"server_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"in_reply_to\":false,\"payload\":{{}}}}",
+        .{ test_server_id, test_envelope_message_id },
+    );
+    defer allocator.free(non_string_reply);
+    try expectToolEnvelopeDecodeError(error.InvalidField, non_string_reply);
+}
+
+test "tool envelope rejects missing required fields in the core payloads" {
+    try expectToolPayloadDecodeError(error.MissingField, "tool_register", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_register", "{\"tool\":{\"name\":\"n\"}}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_registered", "{\"tool_id\":\"t\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_unregister", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_unregistered", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_list_response", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_execute", "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_call_id\":\"c\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_stream", "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_call_id\":\"c\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_result", "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_call_id\":\"c\",\"result_json\":\"{}\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_cancel", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_cancelled", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_status", "{}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_error", "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"code\":\"tool_not_found\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "tool_status_response", "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_name\":\"n\",\"status\":\"running\"}");
+    try expectToolPayloadDecodeError(error.MissingField, "pong", "{}");
+}
+
+test "tool envelope rejects wrongly typed fields in the core payloads" {
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_register", "{\"tool\":\"not-an-object\"}");
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_register", "{\"tool\":" ++ valid_tool_metadata_json ++ ",\"callback_url\":5}");
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_registered", "{\"tool_id\":\"t\",\"registered_at\":\"now\"}");
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_list", "{\"supports_streaming\":\"yes\"}");
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_list_response", "{\"tools\":{}}");
+    try expectToolPayloadDecodeError(error.InvalidField, "tool_list_response", "{\"tools\":[\"not-an-object\"]}");
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_result",
+        "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_call_id\":\"c\",\"result_json\":\"{}\",\"duration_ms\":-1}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_error",
+        "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"code\":\"not_a_code\",\"message\":\"m\"}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_status_response",
+        "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_name\":\"n\",\"status\":\"not_a_status\",\"started_at\":1}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_execute",
+        "{\"execution_id\":\"" ++ test_execution_id ++ "\",\"tool_call_id\":\"c\",\"tool_name\":\"n\",\"args_json\":\"{}\",\"timeout_ms\":-5}",
+    );
+}
+
+test "tool envelope rejects malformed tool metadata without leaks" {
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_register",
+        "{\"tool\":{\"name\":\"n\",\"description\":\"d\",\"parameters_schema_json\":\"{}\",\"required_permissions\":\"read\"}}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_register",
+        "{\"tool\":{\"name\":\"n\",\"description\":\"d\",\"parameters_schema_json\":\"{}\",\"required_permissions\":[\"read\",7]}}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_register",
+        "{\"tool\":{\"name\":\"n\",\"description\":\"d\",\"parameters_schema_json\":\"{}\",\"estimated_duration_ms\":-1}}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_register",
+        "{\"tool\":{\"name\":\"n\",\"description\":\"d\",\"parameters_schema_json\":\"{}\",\"version\":9}}",
+    );
+}
+
+test "tool envelope frees earlier tools when a later tool is malformed" {
+    try expectToolPayloadDecodeError(
+        error.MissingField,
+        "tool_list_response",
+        "{\"tools\":[" ++ valid_tool_metadata_json ++ ",{\"name\":\"b\",\"description\":\"d\"}]}",
+    );
+    try expectToolPayloadDecodeError(
+        error.InvalidField,
+        "tool_list_response",
+        "{\"tools\":[" ++ valid_tool_metadata_json ++ ",{\"name\":\"b\",\"description\":\"d\",\"parameters_schema_json\":\"{}\",\"required_permissions\":[7]}]}",
+    );
 }

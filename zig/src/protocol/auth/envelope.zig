@@ -185,20 +185,23 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !auth
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
-    const type_str = root.get("type").?.string;
-    const stream_id = try parseUlidRequired(root.get("stream_id").?.string);
-    const message_id = try parseUlidRequired(root.get("message_id").?.string);
-    const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
-    const timestamp = root.get("timestamp").?.integer;
-    const version = @as(u8, @intCast(root.get("version").?.integer));
+    const root = try asObject(parsed.value);
+    const type_str = try requiredString(root, "type");
+    const stream_id = try parseUlidRequired(try requiredString(root, "stream_id"));
+    const message_id = try parseUlidRequired(try requiredString(root, "message_id"));
+    const sequence = try requiredBoundedInteger(u64, root, "sequence");
+    const timestamp = try requiredInteger(root, "timestamp");
+    const version: u8 = if (root.get("version")) |value|
+        try asBoundedInteger(u8, value)
+    else
+        auth_types.PROTOCOL_VERSION;
 
     var in_reply_to: ?auth_types.Ulid = null;
     if (root.get("in_reply_to")) |value| {
-        in_reply_to = try parseUlidRequired(value.string);
+        in_reply_to = try parseUlidRequired(try asString(value));
     }
 
-    const payload = try deserializePayload(type_str, root.get("payload").?.object, allocator);
+    const payload = try deserializePayload(type_str, try requiredObject(root, "payload"), allocator);
 
     return .{
         .version = version,
@@ -211,6 +214,79 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !auth
     };
 }
 
+const FieldError = error{ MissingField, InvalidField };
+
+fn asString(value: std.json.Value) FieldError![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidField,
+    };
+}
+
+fn asBool(value: std.json.Value) FieldError!bool {
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidField,
+    };
+}
+
+fn asInteger(value: std.json.Value) FieldError!i64 {
+    return switch (value) {
+        .integer => |n| n,
+        else => error.InvalidField,
+    };
+}
+
+fn asBoundedInteger(comptime T: type, value: std.json.Value) FieldError!T {
+    return std.math.cast(T, try asInteger(value)) orelse error.InvalidField;
+}
+
+fn asArray(value: std.json.Value) FieldError!std.json.Array {
+    return switch (value) {
+        .array => |a| a,
+        else => error.InvalidField,
+    };
+}
+
+fn asObject(value: std.json.Value) FieldError!std.json.ObjectMap {
+    return switch (value) {
+        .object => |o| o,
+        else => error.InvalidField,
+    };
+}
+
+fn requiredField(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Value {
+    return obj.get(key) orelse error.MissingField;
+}
+
+fn requiredString(obj: std.json.ObjectMap, key: []const u8) FieldError![]const u8 {
+    return asString(try requiredField(obj, key));
+}
+
+fn requiredInteger(obj: std.json.ObjectMap, key: []const u8) FieldError!i64 {
+    return asInteger(try requiredField(obj, key));
+}
+
+fn requiredBoundedInteger(comptime T: type, obj: std.json.ObjectMap, key: []const u8) FieldError!T {
+    return asBoundedInteger(T, try requiredField(obj, key));
+}
+
+fn requiredArray(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.Array {
+    return asArray(try requiredField(obj, key));
+}
+
+fn requiredObject(obj: std.json.ObjectMap, key: []const u8) FieldError!std.json.ObjectMap {
+    return asObject(try requiredField(obj, key));
+}
+
+fn optionalString(obj: std.json.ObjectMap, key: []const u8) FieldError!?[]const u8 {
+    return if (obj.get(key)) |value| try asString(value) else null;
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8, fallback: bool) FieldError!bool {
+    return if (obj.get(key)) |value| try asBool(value) else fallback;
+}
+
 fn parseUlidRequired(value: []const u8) !auth_types.Ulid {
     return auth_types.parseUlid(value) orelse error.InvalidUlid;
 }
@@ -221,69 +297,99 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "auth_login_start")) {
+        const provider_id = try requiredString(payload, "provider_id");
         return .{ .auth_login_start = .{
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("provider_id").?.string)),
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "auth_prompt_response")) {
+        const flow_id = try parseUlidRequired(try requiredString(payload, "flow_id"));
+        const prompt_id = try requiredString(payload, "prompt_id");
+        const answer = try requiredString(payload, "answer");
+
+        const prompt_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id));
+        errdefer {
+            var mutable = prompt_id_slice;
+            mutable.deinit(allocator);
+        }
+
         return .{ .auth_prompt_response = .{
-            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
-            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("prompt_id").?.string)),
-            .answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("answer").?.string)),
+            .flow_id = flow_id,
+            .prompt_id = prompt_id_slice,
+            .answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, answer)),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "auth_cancel")) {
         return .{ .auth_cancel = .{
-            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(try requiredString(payload, "flow_id")),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "ack")) {
         return .{ .ack = .{
-            .acknowledged_id = try parseUlidRequired(payload.get("acknowledged_id").?.string),
+            .acknowledged_id = try parseUlidRequired(try requiredString(payload, "acknowledged_id")),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "nack")) {
+        const rejected_id = try parseUlidRequired(try requiredString(payload, "rejected_id"));
+        const reason = try requiredString(payload, "reason");
+        const error_code = try optionalString(payload, "error_code");
+
         var nack = auth_types.Nack{
-            .rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string),
-            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string)),
+            .rejected_id = rejected_id,
+            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, reason)),
         };
 
-        if (payload.get("error_code")) |error_code| {
-            nack.error_code = std.meta.stringToEnum(auth_types.ErrorCode, error_code.string) orelse .invalid_request;
+        if (error_code) |value| {
+            nack.error_code = std.meta.stringToEnum(auth_types.ErrorCode, value) orelse .invalid_request;
         }
 
         return .{ .nack = nack };
     }
 
     if (std.mem.eql(u8, type_str, "auth_providers_response")) {
-        const providers_value = payload.get("providers") orelse return error.InvalidPayloadType;
-        if (providers_value != .array) return error.InvalidPayloadType;
+        const providers_array = try requiredArray(payload, "providers");
 
-        const providers = try allocator.alloc(auth_types.AuthProviderInfo, providers_value.array.items.len);
+        const providers = try allocator.alloc(auth_types.AuthProviderInfo, providers_array.items.len);
+        var initialized: usize = 0;
         errdefer {
-            for (providers) |*provider| {
+            for (providers[0..initialized]) |*provider| {
                 provider.deinit(allocator);
             }
             allocator.free(providers);
         }
 
-        for (providers_value.array.items, 0..) |provider_value, i| {
-            if (provider_value != .object) return error.InvalidPayloadType;
-            const provider_obj = provider_value.object;
+        for (providers_array.items, 0..) |provider_value, i| {
+            const provider_obj = try asObject(provider_value);
+            const id = try requiredString(provider_obj, "id");
+            const name = try requiredString(provider_obj, "name");
+            const auth_status = try requiredString(provider_obj, "auth_status");
+            const last_error = try optionalString(provider_obj, "last_error");
+
+            const id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, id));
+            errdefer {
+                var mutable = id_slice;
+                mutable.deinit(allocator);
+            }
+            const name_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, name));
+            errdefer {
+                var mutable = name_slice;
+                mutable.deinit(allocator);
+            }
 
             providers[i] = .{
-                .id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_obj.get("id").?.string)),
-                .name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_obj.get("name").?.string)),
-                .auth_status = std.meta.stringToEnum(auth_types.AuthStatus, provider_obj.get("auth_status").?.string) orelse .unknown,
+                .id = id_slice,
+                .name = name_slice,
+                .auth_status = std.meta.stringToEnum(auth_types.AuthStatus, auth_status) orelse .unknown,
             };
 
-            if (provider_obj.get("last_error")) |last_error| {
-                providers[i].last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, last_error.string));
+            if (last_error) |value| {
+                providers[i].last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
             }
+            initialized += 1;
         }
 
         return .{ .auth_providers_response = .{
@@ -296,10 +402,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "auth_login_result")) {
+        const flow_id = try parseUlidRequired(try requiredString(payload, "flow_id"));
+        const provider_id = try requiredString(payload, "provider_id");
+        const status = try requiredString(payload, "status");
+
         return .{ .auth_login_result = .{
-            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("provider_id").?.string)),
-            .status = std.meta.stringToEnum(auth_types.AuthLoginStatus, payload.get("status").?.string) orelse .failed,
+            .flow_id = flow_id,
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
+            .status = std.meta.stringToEnum(auth_types.AuthLoginStatus, status) orelse .failed,
         } };
     }
 
@@ -308,15 +418,17 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     if (std.mem.eql(u8, type_str, "pong")) {
+        const ping_id = try requiredString(payload, "ping_id");
         return .{ .pong = .{
-            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("ping_id").?.string)),
+            .ping_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, ping_id)),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "goodbye")) {
+        const reason = try optionalString(payload, "reason");
         var goodbye = auth_types.Goodbye{};
-        if (payload.get("reason")) |reason| {
-            goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, reason.string));
+        if (reason) |value| {
+            goodbye.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
         return .{ .goodbye = goodbye };
     }
@@ -326,65 +438,120 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
 fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocator) !auth_types.AuthEvent {
     if (payload.get("auth_url")) |auth_url_value| {
-        if (auth_url_value != .object) return error.InvalidPayloadType;
-        const auth_url = auth_url_value.object;
+        const auth_url = try asObject(auth_url_value);
+        const flow_id = try parseUlidRequired(try requiredString(auth_url, "flow_id"));
+        const provider_id = try requiredString(auth_url, "provider_id");
+        const url = try requiredString(auth_url, "url");
+        const instructions = try optionalString(auth_url, "instructions");
+
+        const provider_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id));
+        errdefer {
+            var mutable = provider_id_slice;
+            mutable.deinit(allocator);
+        }
+        const url_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, url));
+        errdefer {
+            var mutable = url_slice;
+            mutable.deinit(allocator);
+        }
 
         var result: auth_types.AuthEvent = .{ .auth_url = .{
-            .flow_id = try parseUlidRequired(auth_url.get("flow_id").?.string),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, auth_url.get("provider_id").?.string)),
-            .url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, auth_url.get("url").?.string)),
+            .flow_id = flow_id,
+            .provider_id = provider_id_slice,
+            .url = url_slice,
         } };
 
-        if (auth_url.get("instructions")) |instructions| {
-            result.auth_url.instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, instructions.string));
+        if (instructions) |value| {
+            result.auth_url.instructions = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
 
         return result;
     }
 
     if (payload.get("prompt")) |prompt_value| {
-        if (prompt_value != .object) return error.InvalidPayloadType;
-        const prompt = prompt_value.object;
+        const prompt = try asObject(prompt_value);
+        const flow_id = try parseUlidRequired(try requiredString(prompt, "flow_id"));
+        const prompt_id = try requiredString(prompt, "prompt_id");
+        const provider_id = try requiredString(prompt, "provider_id");
+        const message = try requiredString(prompt, "message");
+        const allow_empty = try optionalBool(prompt, "allow_empty", false);
+
+        const prompt_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id));
+        errdefer {
+            var mutable = prompt_id_slice;
+            mutable.deinit(allocator);
+        }
+        const provider_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id));
+        errdefer {
+            var mutable = provider_id_slice;
+            mutable.deinit(allocator);
+        }
+
         return .{ .prompt = .{
-            .flow_id = try parseUlidRequired(prompt.get("flow_id").?.string),
-            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("prompt_id").?.string)),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("provider_id").?.string)),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("message").?.string)),
-            .allow_empty = if (prompt.get("allow_empty")) |allow_empty| allow_empty.bool else false,
+            .flow_id = flow_id,
+            .prompt_id = prompt_id_slice,
+            .provider_id = provider_id_slice,
+            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, message)),
+            .allow_empty = allow_empty,
         } };
     }
 
     if (payload.get("progress")) |progress_value| {
-        if (progress_value != .object) return error.InvalidPayloadType;
-        const progress = progress_value.object;
+        const progress = try asObject(progress_value);
+        const flow_id = try parseUlidRequired(try requiredString(progress, "flow_id"));
+        const provider_id = try requiredString(progress, "provider_id");
+        const message = try requiredString(progress, "message");
+
+        const provider_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id));
+        errdefer {
+            var mutable = provider_id_slice;
+            mutable.deinit(allocator);
+        }
+
         return .{ .progress = .{
-            .flow_id = try parseUlidRequired(progress.get("flow_id").?.string),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, progress.get("provider_id").?.string)),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, progress.get("message").?.string)),
+            .flow_id = flow_id,
+            .provider_id = provider_id_slice,
+            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, message)),
         } };
     }
 
     if (payload.get("success")) |success_value| {
-        if (success_value != .object) return error.InvalidPayloadType;
-        const success = success_value.object;
+        const success = try asObject(success_value);
+        const flow_id = try parseUlidRequired(try requiredString(success, "flow_id"));
+        const provider_id = try requiredString(success, "provider_id");
+
         return .{ .success = .{
-            .flow_id = try parseUlidRequired(success.get("flow_id").?.string),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, success.get("provider_id").?.string)),
+            .flow_id = flow_id,
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } };
     }
 
     if (payload.get("error")) |error_value| {
-        if (error_value != .object) return error.InvalidPayloadType;
-        const event_error = error_value.object;
+        const event_error = try asObject(error_value);
+        const flow_id = try parseUlidRequired(try requiredString(event_error, "flow_id"));
+        const provider_id = try requiredString(event_error, "provider_id");
+        const message = try requiredString(event_error, "message");
+        const code = try optionalString(event_error, "code");
+
+        const provider_id_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id));
+        errdefer {
+            var mutable = provider_id_slice;
+            mutable.deinit(allocator);
+        }
+        const message_slice = OwnedSlice(u8).initOwned(try allocator.dupe(u8, message));
+        errdefer {
+            var mutable = message_slice;
+            mutable.deinit(allocator);
+        }
 
         var result: auth_types.AuthEvent = .{ .@"error" = .{
-            .flow_id = try parseUlidRequired(event_error.get("flow_id").?.string),
-            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, event_error.get("provider_id").?.string)),
-            .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, event_error.get("message").?.string)),
+            .flow_id = flow_id,
+            .provider_id = provider_id_slice,
+            .message = message_slice,
         } };
 
-        if (event_error.get("code")) |code| {
-            result.@"error".code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, code.string));
+        if (code) |value| {
+            result.@"error".code = OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
         }
 
         return result;
@@ -429,4 +596,239 @@ test "auth envelope rejects unknown payload type" {
     const bad =
         "{\"type\":\"not_real\",\"stream_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(bad, allocator));
+}
+
+const test_stream_id = "00000000000000000000000001";
+const test_message_id = "00000000000000000000000002";
+
+fn expectEnvelopeDecodeError(expected: anyerror, json: []const u8) !void {
+    try std.testing.expectError(expected, deserializeEnvelope(json, std.testing.allocator));
+}
+
+fn expectAuthPayloadDecodeError(expected: anyerror, type_str: []const u8, payload_json: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"{s}\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{s}}}",
+        .{ type_str, test_stream_id, test_message_id, payload_json },
+    );
+    defer allocator.free(json);
+    try std.testing.expectError(expected, deserializeEnvelope(json, allocator));
+}
+
+test "auth envelope rejects a non-object root" {
+    try expectEnvelopeDecodeError(error.InvalidField, "[1,2,3]");
+    try expectEnvelopeDecodeError(error.InvalidField, "42");
+    try expectEnvelopeDecodeError(error.InvalidField, "\"frame\"");
+}
+
+test "auth envelope rejects a frame with no envelope fields instead of panicking" {
+    try expectEnvelopeDecodeError(error.MissingField, "{\"type\":\"auth_event\"}");
+    try expectEnvelopeDecodeError(error.MissingField, "{}");
+}
+
+test "auth envelope rejects a missing or non-string type" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(missing);
+    try expectEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":7,\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(non_string);
+    try expectEnvelopeDecodeError(error.InvalidField, non_string);
+}
+
+test "auth envelope rejects a missing, non-string or invalid stream_id" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_message_id},
+    );
+    defer allocator.free(missing);
+    try expectEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":123,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_message_id},
+    );
+    defer allocator.free(non_string);
+    try expectEnvelopeDecodeError(error.InvalidField, non_string);
+
+    const null_valued = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":null,\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_message_id},
+    );
+    defer allocator.free(null_valued);
+    try expectEnvelopeDecodeError(error.InvalidField, null_valued);
+
+    const bad_ulid = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"not-a-ulid\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_message_id},
+    );
+    defer allocator.free(bad_ulid);
+    try expectEnvelopeDecodeError(error.InvalidUlid, bad_ulid);
+}
+
+test "auth envelope rejects a missing or non-string message_id" {
+    const allocator = std.testing.allocator;
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_stream_id},
+    );
+    defer allocator.free(missing);
+    try expectEnvelopeDecodeError(error.MissingField, missing);
+
+    const non_string = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":[],\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{test_stream_id},
+    );
+    defer allocator.free(non_string);
+    try expectEnvelopeDecodeError(error.InvalidField, non_string);
+}
+
+test "auth envelope rejects a missing, non-integer or out-of-range sequence" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { fragment: []const u8, expected: anyerror }{
+        .{ .fragment = "", .expected = error.MissingField },
+        .{ .fragment = "\"sequence\":\"1\",", .expected = error.InvalidField },
+        .{ .fragment = "\"sequence\":1.5,", .expected = error.InvalidField },
+        .{ .fragment = "\"sequence\":-1,", .expected = error.InvalidField },
+    };
+
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",{s}\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+            .{ test_stream_id, test_message_id, case.fragment },
+        );
+        defer allocator.free(json);
+        try expectEnvelopeDecodeError(case.expected, json);
+    }
+}
+
+test "auth envelope rejects a missing timestamp and an out-of-range version" {
+    const allocator = std.testing.allocator;
+
+    const missing_timestamp = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(missing_timestamp);
+    try expectEnvelopeDecodeError(error.MissingField, missing_timestamp);
+
+    const oversized_version = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":999,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(oversized_version);
+    try expectEnvelopeDecodeError(error.InvalidField, oversized_version);
+}
+
+test "auth envelope defaults version to the protocol version when absent" {
+    const allocator = std.testing.allocator;
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(auth_types.PROTOCOL_VERSION, parsed.version);
+}
+
+test "auth envelope rejects a missing or non-object payload and a non-string in_reply_to" {
+    const allocator = std.testing.allocator;
+
+    const missing_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(missing_payload);
+    try expectEnvelopeDecodeError(error.MissingField, missing_payload);
+
+    const non_object_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":\"{{}}\"}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(non_object_payload);
+    try expectEnvelopeDecodeError(error.InvalidField, non_object_payload);
+
+    const non_string_reply = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"stream_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"in_reply_to\":false,\"payload\":{{}}}}",
+        .{ test_stream_id, test_message_id },
+    );
+    defer allocator.free(non_string_reply);
+    try expectEnvelopeDecodeError(error.InvalidField, non_string_reply);
+}
+
+test "auth envelope rejects missing required payload fields" {
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_login_start", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_prompt_response", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_prompt_response", "{\"flow_id\":\"00000000000000000000000003\",\"prompt_id\":\"p\"}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_cancel", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "ack", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "nack", "{\"rejected_id\":\"00000000000000000000000003\"}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_providers_response", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_providers_response", "{\"providers\":[{\"id\":\"anthropic\"}]}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_login_result", "{\"flow_id\":\"00000000000000000000000003\",\"provider_id\":\"anthropic\"}");
+    try expectAuthPayloadDecodeError(error.MissingField, "pong", "{}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_event", "{\"prompt\":{\"flow_id\":\"00000000000000000000000003\"}}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_event", "{\"auth_url\":{\"flow_id\":\"00000000000000000000000003\",\"provider_id\":\"anthropic\"}}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_event", "{\"success\":{\"flow_id\":\"00000000000000000000000003\"}}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_event", "{\"progress\":{\"flow_id\":\"00000000000000000000000003\",\"provider_id\":\"anthropic\"}}");
+    try expectAuthPayloadDecodeError(error.MissingField, "auth_event", "{\"error\":{\"flow_id\":\"00000000000000000000000003\",\"provider_id\":\"anthropic\"}}");
+}
+
+test "auth envelope rejects wrongly typed payload fields" {
+    try expectAuthPayloadDecodeError(error.InvalidField, "auth_login_start", "{\"provider_id\":5}");
+    try expectAuthPayloadDecodeError(error.InvalidField, "auth_cancel", "{\"flow_id\":[]}");
+    try expectAuthPayloadDecodeError(error.InvalidField, "nack", "{\"rejected_id\":\"00000000000000000000000003\",\"reason\":\"x\",\"error_code\":7}");
+    try expectAuthPayloadDecodeError(error.InvalidField, "auth_providers_response", "{\"providers\":\"none\"}");
+    try expectAuthPayloadDecodeError(error.InvalidField, "auth_providers_response", "{\"providers\":[\"not-an-object\"]}");
+    try expectAuthPayloadDecodeError(error.InvalidField, "auth_event", "{\"prompt\":\"not-an-object\"}");
+    try expectAuthPayloadDecodeError(
+        error.InvalidField,
+        "auth_event",
+        "{\"prompt\":{\"flow_id\":\"00000000000000000000000003\",\"prompt_id\":\"p\",\"provider_id\":\"anthropic\",\"message\":\"m\",\"allow_empty\":\"yes\"}}",
+    );
+    try expectAuthPayloadDecodeError(error.InvalidField, "goodbye", "{\"reason\":9}");
+}
+
+test "auth envelope frees earlier providers when a later provider is malformed" {
+    try expectAuthPayloadDecodeError(
+        error.MissingField,
+        "auth_providers_response",
+        "{\"providers\":[{\"id\":\"anthropic\",\"name\":\"Anthropic\",\"auth_status\":\"authenticated\",\"last_error\":\"none\"},{\"id\":\"openai\",\"name\":\"OpenAI\"}]}",
+    );
+    try expectAuthPayloadDecodeError(
+        error.InvalidField,
+        "auth_providers_response",
+        "{\"providers\":[{\"id\":\"anthropic\",\"name\":\"Anthropic\",\"auth_status\":\"authenticated\"},7]}",
+    );
 }
