@@ -147,7 +147,9 @@ pub const ToolProtocolServer = struct {
                     if (prefix) |p| {
                         if (!std.mem.startsWith(u8, tool.name, p)) continue;
                     }
-                    try metas.append(allocator, try toolMetadataFromAgentTool(allocator, tool));
+                    var meta = try toolMetadataFromAgentTool(allocator, tool);
+                    errdefer deinitToolMetadata(&meta, allocator);
+                    try metas.append(allocator, meta);
                 }
                 return self.nextEnvelope(env.message_id, .{ .tool_list_response = .{ .tools = try metas.toOwnedSlice(allocator) } });
             },
@@ -771,4 +773,53 @@ fn toolMetadataFromAgentToolProbe(allocator: std.mem.Allocator) !void {
 
 test "toolMetadataFromAgentTool survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, toolMetadataFromAgentToolProbe, .{});
+}
+
+fn toolListHandoffProbe(allocator: std.mem.Allocator) !void {
+    const stub = struct {
+        fn execute(
+            tool_call_id: []const u8,
+            args_json: []const u8,
+            cancel_token: ?ai_types.CancelToken,
+            on_update_ctx: ?*anyopaque,
+            on_update: ?agent_types.ToolUpdateCallback,
+            tool_allocator: std.mem.Allocator,
+        ) anyerror!agent_types.AgentToolResult {
+            _ = tool_call_id;
+            _ = args_json;
+            _ = cancel_token;
+            _ = on_update_ctx;
+            _ = on_update;
+            _ = tool_allocator;
+            return .{};
+        }
+    };
+
+    const schema =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    ;
+
+    var server = ToolProtocolServer.init(allocator);
+    defer server.deinit();
+
+    try server.registerTools(&[_]agent_types.AgentTool{
+        .{ .label = "Shell", .name = "shell_execute", .description = "Run a shell command", .parameters_schema_json = schema, .execute = stub.execute },
+        .{ .label = "Read", .name = "file_read", .description = "Read a file from the workspace", .parameters_schema_json = schema, .execute = stub.execute },
+        .{ .label = "Search", .name = "search_files", .description = "Search the workspace for a pattern", .parameters_schema_json = schema, .execute = stub.execute },
+    });
+
+    const request = tool_types.Envelope{
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_list = .{} },
+    };
+
+    var response = (try ToolProtocolServer.handleClientEnvelope(@ptrCast(&server), request, allocator)).?;
+    response.deinit(allocator);
+}
+
+test "tool_list handoff to metas.append survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolListHandoffProbe, .{});
 }

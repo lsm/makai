@@ -727,14 +727,20 @@ fn parseUserContentPart(allocator: std.mem.Allocator, value: std.json.Value) !ai
         else => return error.InvalidMessage,
     };
     const kind = stringField(obj, "type") orelse return error.InvalidMessage;
-    if (std.mem.eql(u8, kind, "text")) return .{ .text = .{
-        .text = try allocator.dupe(u8, stringField(obj, "text") orelse ""),
-        .text_signature = if (stringField(obj, "text_signature")) |sig| try allocator.dupe(u8, sig) else null,
-    } };
-    if (std.mem.eql(u8, kind, "image")) return .{ .image = .{
-        .data = try allocator.dupe(u8, stringField(obj, "data") orelse ""),
-        .mime_type = try allocator.dupe(u8, stringField(obj, "mime_type") orelse ""),
-    } };
+    if (std.mem.eql(u8, kind, "text")) {
+        const text = try allocator.dupe(u8, stringField(obj, "text") orelse "");
+        errdefer allocator.free(text);
+        const text_signature: ?[]u8 = if (stringField(obj, "text_signature")) |sig| try allocator.dupe(u8, sig) else null;
+
+        return .{ .text = .{ .text = text, .text_signature = text_signature } };
+    }
+    if (std.mem.eql(u8, kind, "image")) {
+        const data = try allocator.dupe(u8, stringField(obj, "data") orelse "");
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, stringField(obj, "mime_type") orelse "");
+
+        return .{ .image = .{ .data = data, .mime_type = mime_type } };
+    }
     return error.InvalidMessage;
 }
 
@@ -767,24 +773,43 @@ fn parseAssistantContent(allocator: std.mem.Allocator, value: std.json.Value) !a
         else => return error.InvalidMessage,
     };
     const kind = stringField(obj, "type") orelse return error.InvalidMessage;
-    if (std.mem.eql(u8, kind, "text")) return .{ .text = .{
-        .text = try allocator.dupe(u8, stringField(obj, "text") orelse ""),
-        .text_signature = if (stringField(obj, "text_signature")) |sig| try allocator.dupe(u8, sig) else null,
-    } };
-    if (std.mem.eql(u8, kind, "thinking")) return .{ .thinking = .{
-        .thinking = try allocator.dupe(u8, stringField(obj, "thinking") orelse ""),
-        .thinking_signature = if (stringField(obj, "thinking_signature")) |sig| try allocator.dupe(u8, sig) else null,
-    } };
-    if (std.mem.eql(u8, kind, "tool_call")) return .{ .tool_call = .{
-        .id = try allocator.dupe(u8, stringField(obj, "id") orelse ""),
-        .name = try allocator.dupe(u8, stringField(obj, "name") orelse ""),
-        .arguments_json = try allocator.dupe(u8, stringField(obj, "arguments_json") orelse ""),
-        .thought_signature = if (stringField(obj, "thought_signature")) |sig| try allocator.dupe(u8, sig) else null,
-    } };
-    if (std.mem.eql(u8, kind, "image")) return .{ .image = .{
-        .data = try allocator.dupe(u8, stringField(obj, "data") orelse ""),
-        .mime_type = try allocator.dupe(u8, stringField(obj, "mime_type") orelse ""),
-    } };
+    if (std.mem.eql(u8, kind, "text")) {
+        const text = try allocator.dupe(u8, stringField(obj, "text") orelse "");
+        errdefer allocator.free(text);
+        const text_signature: ?[]u8 = if (stringField(obj, "text_signature")) |sig| try allocator.dupe(u8, sig) else null;
+
+        return .{ .text = .{ .text = text, .text_signature = text_signature } };
+    }
+    if (std.mem.eql(u8, kind, "thinking")) {
+        const thinking = try allocator.dupe(u8, stringField(obj, "thinking") orelse "");
+        errdefer allocator.free(thinking);
+        const thinking_signature: ?[]u8 = if (stringField(obj, "thinking_signature")) |sig| try allocator.dupe(u8, sig) else null;
+
+        return .{ .thinking = .{ .thinking = thinking, .thinking_signature = thinking_signature } };
+    }
+    if (std.mem.eql(u8, kind, "tool_call")) {
+        const id = try allocator.dupe(u8, stringField(obj, "id") orelse "");
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, stringField(obj, "name") orelse "");
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, stringField(obj, "arguments_json") orelse "");
+        errdefer allocator.free(arguments_json);
+        const thought_signature: ?[]u8 = if (stringField(obj, "thought_signature")) |sig| try allocator.dupe(u8, sig) else null;
+
+        return .{ .tool_call = .{
+            .id = id,
+            .name = name,
+            .arguments_json = arguments_json,
+            .thought_signature = thought_signature,
+        } };
+    }
+    if (std.mem.eql(u8, kind, "image")) {
+        const data = try allocator.dupe(u8, stringField(obj, "data") orelse "");
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, stringField(obj, "mime_type") orelse "");
+
+        return .{ .image = .{ .data = data, .mime_type = mime_type } };
+    }
     return error.InvalidMessage;
 }
 
@@ -1528,4 +1553,50 @@ fn parseMessageToolResultProbe(allocator: std.mem.Allocator) !void {
 
 test "parseMessage tool_result survives an allocation failure at every step" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseMessageToolResultProbe, .{});
+}
+
+fn parseAssistantContentProbe(allocator: std.mem.Allocator) !void {
+    const payloads = [_][]const u8{
+        \\{"type":"text","text":"assistant answer text","text_signature":"sig-abcdefgh"}
+        ,
+        \\{"type":"thinking","thinking":"reasoning trace here","thinking_signature":"tsig-abcdefgh"}
+        ,
+        \\{"type":"tool_call","id":"call-0123456789","name":"shell_execute","arguments_json":"{\"command\":\"ls\"}","thought_signature":"thought-abcdefgh"}
+        ,
+        \\{"type":"image","data":"aW1hZ2UtYnl0ZXM=","mime_type":"image/png"}
+        ,
+    };
+
+    for (payloads) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+
+        var block = [_]ai_types.AssistantContent{try parseAssistantContent(allocator, parsed.value)};
+        deinitAssistantContentPrefix(allocator, &block);
+    }
+}
+
+test "parseAssistantContent survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAssistantContentProbe, .{});
+}
+
+fn parseUserContentPartProbe(allocator: std.mem.Allocator) !void {
+    const payloads = [_][]const u8{
+        \\{"type":"text","text":"user message text","text_signature":"sig-abcdefgh"}
+        ,
+        \\{"type":"image","data":"aW1hZ2UtYnl0ZXM=","mime_type":"image/png"}
+        ,
+    };
+
+    for (payloads) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+
+        var part = try parseUserContentPart(allocator, parsed.value);
+        part.deinit(allocator);
+    }
+}
+
+test "parseUserContentPart survives an allocation failure at every step" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseUserContentPartProbe, .{});
 }
