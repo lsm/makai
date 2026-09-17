@@ -115,6 +115,7 @@ pub const OAuthOriginSources = struct {
     global: []const u8 = "",
     provider: []const u8 = "",
     credential: []const u8 = "",
+    credential_is_api_key: bool = false,
 };
 
 const ANTHROPIC_OAUTH_ORIGIN = "https://api.anthropic.com";
@@ -203,11 +204,14 @@ pub fn oauthOriginAllowedWithSources(
     const trimmed = std.mem.trim(u8, base_url, " \t\r\n");
     if (trimmed.len == 0) return true;
 
+    const policy_for_provider = oauthOriginPolicyFor(provider_id);
+    if (sources.credential_is_api_key and policy_for_provider == null) return true;
+
     const requested = parseOrigin(trimmed) orelse return false;
     if (sources.global.len > 0 and originsMatch(requested, sources.global)) return true;
     if (sources.provider.len > 0 and originsMatch(requested, sources.provider)) return true;
 
-    const policy = oauthOriginPolicyFor(provider_id) orelse return false;
+    const policy = policy_for_provider orelse return false;
     if (policy.credential_declares_origin and
         sources.credential.len > 0 and
         originsMatch(requested, sources.credential))
@@ -239,14 +243,20 @@ pub fn credentialDeclaredBaseUrl(allocator: std.mem.Allocator, provider_data: []
     return allocator.dupe(u8, value.string) catch null;
 }
 
+pub fn storedCredentialIsApiKeyShaped(refresh: []const u8) bool {
+    return refresh.len == 0;
+}
+
 pub fn oauthOriginAllowed(
     allocator: std.mem.Allocator,
     provider_id: []const u8,
     base_url: []const u8,
+    refresh: []const u8,
     provider_data: ?[]const u8,
 ) bool {
     const trimmed = std.mem.trim(u8, base_url, " \t\r\n");
     if (trimmed.len == 0) return true;
+    if (storedCredentialIsApiKeyShaped(refresh) and oauthOriginPolicyFor(provider_id) == null) return true;
 
     const global = envOwnedOrNull(allocator, "MAKAI_BASE_URL") catch null;
     defer if (global) |value| allocator.free(value);
@@ -267,6 +277,7 @@ pub fn oauthOriginAllowed(
         .global = global orelse "",
         .provider = provider_override orelse "",
         .credential = credential orelse "",
+        .credential_is_api_key = storedCredentialIsApiKeyShaped(refresh),
     });
 }
 
@@ -523,6 +534,34 @@ test "oauthOriginAllowedWithSources fails closed for an unpoliced provider id" {
     }));
 }
 
+test "oauthOriginAllowedWithSources exempts an api-key-shaped entry under an unpoliced id" {
+    try std.testing.expect(oauthOriginAllowedWithSources("kimi", "https://api.kimi.com/coding", .{
+        .credential_is_api_key = true,
+    }));
+    try std.testing.expect(oauthOriginAllowedWithSources("kimi", "https://api.moonshot.ai", .{
+        .credential_is_api_key = true,
+    }));
+    try std.testing.expect(oauthOriginAllowedWithSources("gateway", "https://gateway.test", .{
+        .credential_is_api_key = true,
+    }));
+    try std.testing.expect(!oauthOriginAllowedWithSources("kimi", "https://api.kimi.com/coding", .{}));
+
+    try std.testing.expect(!oauthOriginAllowedWithSources("anthropic", "https://attacker.test", .{
+        .credential_is_api_key = true,
+    }));
+    try std.testing.expect(!oauthOriginAllowedWithSources("github-copilot", "https://attacker.test", .{
+        .credential_is_api_key = true,
+    }));
+    try std.testing.expect(!oauthOriginAllowedWithSources("openai-codex", "https://attacker.test", .{
+        .credential_is_api_key = true,
+    }));
+}
+
+test "storedCredentialIsApiKeyShaped keys on the absent refresh token" {
+    try std.testing.expect(storedCredentialIsApiKeyShaped(""));
+    try std.testing.expect(!storedCredentialIsApiKeyShaped("refresh-token"));
+}
+
 test "oauthOriginAllowedWithSources honours operator-configured overrides" {
     try std.testing.expect(oauthOriginAllowedWithSources("anthropic", "https://proxy.corp.test/anthropic", .{
         .provider = "https://proxy.corp.test",
@@ -581,15 +620,24 @@ test "oauthOriginAllowed reads the credential-declared endpoint" {
         allocator,
         "github-copilot",
         "https://copilot.acme.test",
+        "gho-refresh",
         "{\"baseUrl\":\"https://copilot.acme.test\"}",
     ));
     try std.testing.expect(!oauthOriginAllowed(
         allocator,
         "github-copilot",
         "https://attacker.test",
+        "gho-refresh",
         "{\"baseUrl\":\"https://copilot.acme.test\"}",
     ));
-    try std.testing.expect(oauthOriginAllowed(allocator, "anthropic", "", null));
+    try std.testing.expect(oauthOriginAllowed(allocator, "anthropic", "", "refresh", null));
+}
+
+test "oauthOriginAllowed lets a kimi login keep streaming" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(oauthOriginAllowed(allocator, "kimi", "https://api.kimi.com/coding", "", "region:china"));
+    try std.testing.expect(oauthOriginAllowed(allocator, "kimi", "https://api.moonshot.ai", "", "region:global"));
+    try std.testing.expect(!oauthOriginAllowed(allocator, "anthropic", "https://attacker.test", "", null));
 }
 
 test "normalizeKimiRegion accepts catalog region aliases" {

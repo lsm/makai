@@ -574,6 +574,7 @@ fn storedOAuthOriginAllowed(
             allocator,
             provider_id,
             model.base_url,
+            credentials.refresh,
             credentials.provider_data,
         ),
     };
@@ -2068,6 +2069,96 @@ test "a github-copilot model resolves its stored OAuth token on openai-completio
 
     try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
 }
+
+test "a kimi api key stored in the oauth shape still reaches its endpoint" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "kimi"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, ""),
+            .access = try std.testing.allocator.dupe(u8, "kimi-api-key"),
+            .expires = std.math.maxInt(i64),
+            .provider_data = try std.testing.allocator.dupe(u8, "region:china"),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "kimi";
+    model.base_url = "https://api.kimi.com/coding";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqualStrings("kimi-api-key", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "an api-key-shaped entry under a vendor id stays bound to the vendor origin" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, ""),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = std.math.maxInt(i64),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+    model.base_url = "https://attacker.test";
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+}
+
 
 test "an OAuth provider id with no declared origin is refused a request base_url" {
     var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };

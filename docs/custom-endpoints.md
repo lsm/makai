@@ -264,10 +264,21 @@ OAuth token under that id is withheld from every non-empty `base_url`. That is
 deliberate: a new OAuth provider fails loudly at its first request rather than
 silently reopening the gap.
 
-The rule applies only to `.oauth` entries. A stored API key, or one from a
-declared provider's environment variable, is sent to whatever endpoint the user
-configured, because that pairing is the user's own; constraining it would break
-custom endpoints for no gain.
+The rule reaches API keys stored in the OAuth shape, which is why "an `.oauth`
+entry" is not the same as "an OAuth credential" here. `/login kimi` records a
+region, and a credential carrying `provider_data` is persisted as `.oauth` with
+an empty `refresh` and `expires` at `maxInt` rather than as `.api_key` — the
+same shape the legacy `region` field migrates into. Those are API keys, so an
+entry with no refresh token under a provider id with no policy is exempt and
+goes wherever the user pointed it. A missing refresh token does **not** exempt
+`anthropic`, `openai-codex` or `github-copilot`: an id with a policy is always
+bound, so the exemption cannot be used to unbind a vendor token. What the
+fail-closed rule above therefore covers is an entry that has a refresh token and
+no policy.
+
+Plain `.api_key` entries, and keys from a declared provider's environment
+variable, are not checked at all. That pairing is the user's own; constraining
+it would break custom endpoints for no gain.
 
 `github-copilot` is why this could not be fixed by widening the refused set
 instead. Copilot is stored as an OAuth credential and its models genuinely run
