@@ -146,10 +146,26 @@ See `.github/workflows/ci.yml` for the exact env wiring and which lanes are curr
 ### Guardrails (CI runs both before unit tests)
 
 ```bash
-./scripts/check-zig-patterns.sh                  # no runtime `catch unreachable`, no direct std.crypto.random, deinit poisoning in critical types
+./scripts/check-zig-patterns.sh                  # no runtime `catch unreachable`, no direct std.crypto.random, deinit poisoning in critical types, no multi-allocation struct literals
 node scripts/check-no-comments.mjs --check       # zero-comments policy over every tracked .zig/.ts (--stats for counts, --write to strip)
 node --test scripts/check-no-comments.test.mjs   # checker self-tests
 ```
+
+`check-zig-patterns.sh` also rejects **a struct literal that allocates more than once**. Zig
+evaluates literal fields in order, so when a later `try allocator.dupe` fails the literal never
+completes and every field already allocated for it leaks; an `errdefer` cannot be placed inside a
+literal, and one written after it never runs, because the assignment it guards was never reached.
+The remedy is to build each field into a local with its own `errdefer` first, so the literal itself
+is infallible — `cloneModelDescriptor` in `zig/src/protocol/model_catalog_types.zig` is the
+reference shape, and `std.testing.checkAllAllocationFailures` is how a fix is proved. The check
+scans only non-`test` code and only `dupe`/`dupeZ`/`allocSentinel`/`allocPrint`/`owned(` calls, so
+it is a floor rather than a complete detector: the sibling shapes it does **not** see are an
+`errdefer` that frees a container without its contents, and a fully-built value dropped in a
+hand-off such as `try list.append(allocator, try build(allocator))`. `known_multi_alloc_literals`
+declares the 41 sites that predate the check. It is a shrinking backlog, not an approved list:
+adding an entry needs a commit-message reason why that literal cannot leak, and the check also
+fails when a declared entry disappears, so fixing one requires removing its line.
+
 
 ### TypeScript SDK
 
