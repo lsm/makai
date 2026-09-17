@@ -313,7 +313,7 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
     if (std.mem.eql(u8, type_str, "tool_register")) {
         const tool = try deserializeToolMetadata(try fields.requiredObject(payload, "tool"), allocator);
-        errdefer freeToolMetadata(allocator, tool);
+        errdefer tool.deinit(allocator);
         var req = tool_types.ToolRegisterRequest{ .tool = tool };
         if (try fields.optionalString(payload, "callback_url")) |v| req.callback_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v));
         return .{ .tool_register = req };
@@ -345,7 +345,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         const tools = try allocator.alloc(tool_types.ToolMetadata, tools_arr.items.len);
         var initialized: usize = 0;
         errdefer {
-            for (tools[0..initialized]) |tool| freeToolMetadata(allocator, tool);
+            for (tools[0..initialized]) |*tool| tool.deinit(allocator);
             allocator.free(tools);
         }
         for (tools_arr.items, 0..) |t, i| {
@@ -597,17 +597,6 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
 
     return error.InvalidPayloadType;
-}
-
-fn freeToolMetadata(allocator: std.mem.Allocator, tool: tool_types.ToolMetadata) void {
-    allocator.free(tool.name);
-    allocator.free(tool.description);
-    allocator.free(tool.parameters_schema_json);
-    allocator.free(tool.version);
-    if (tool.required_permissions) |perms| {
-        for (perms) |p| allocator.free(p);
-        allocator.free(perms);
-    }
 }
 
 fn deserializeToolMetadata(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ToolMetadata {
