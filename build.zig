@@ -1179,6 +1179,7 @@ pub fn build(b: *std.Build) void {
     const oauth_utils_pkce_test = b.addTest(.{ .root_module = oauth_utils_pkce_mod });
     const oauth_openai_codex_test = b.addTest(.{ .root_module = oauth_openai_codex_mod });
 
+    const oauth_storage_test = b.addTest(.{ .root_module = oauth_storage_mod });
     const refresh_lock_test = b.addTest(.{ .root_module = refresh_lock_mod });
 
     const oauth_test = b.addTest(.{
@@ -1696,6 +1697,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_storage_test).step);
     test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(permission_test).step);
@@ -1819,6 +1821,7 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_storage_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);

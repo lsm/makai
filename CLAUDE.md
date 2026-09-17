@@ -41,14 +41,14 @@ Most groups map to a job in the `unit-tests` matrix in `.github/workflows/ci.yml
 
 `tools/*` tests have their own matrix-covered group, **`test-unit-tools`**; none of the `agent-*` subgroups contains them. All eleven tool artifacts are wired there, and `test_unit_agent_step` pulls that step in rather than re-listing its members. So a new `tools/*` test goes into `test_unit_tools_step` (plus `test`).
 
-The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`.
+The invariant behind both paragraphs: every artifact wired into the global `test` step must also be wired into at least one group the matrix actually invokes, and vice versa — `zig build test` is meant to be the superset of CI, not a disjoint set. Wiring a test only into `test` and `test-unit-agent` runs it in no CI job at all; that was live for `tools_artifact_test` until the `test-unit-tools` group was added, and for `sse_parser_test` and `transport_retry_test` in the opposite direction, which sat in matrix groups but not in `test`. `oauth/storage.zig` was the worst case: it had a module but no `addTest` at all, so its thirteen tests ran nowhere and silently rotted past compiling against Zig 0.16 until `oauth_storage_test` was wired into both steps. A module without a test artifact is invisible to this invariant, so check that the `addTest` exists, not just that a group references it.
 
 ```bash
 zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker, owned_slice, string_builder, hive_array, compat, artifact store, bench helpers
 zig build test-unit-transport     # transport, stdio, sse, websocket, in_process, transport_retry
 zig build test-unit-protocol      # provider/agent/auth/tool protocol types+envelope+server+client+runtime, partial serializer/reconstructor, model_ref, model catalog types, provider_base_url
 zig build test-unit-providers     # api_registry, stream, register_builtins, sse_parser, every provider API, auth provider defs
-zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
+zig build test-unit-utils         # oauth (pkce, openai_codex, refresh_lock, storage, mod), github_copilot, overflow, retry, oom, sanitize, pre_transform, auth_resolver
 zig build test-unit-makai-cli     # zig/src/tools/makai.zig + auth_cli
 zig build test-unit-tui           # tui runtime/session/config/state/commands/login/app/views, model_catalog, scenarios + e2e + mock transport
 zig build test-unit-tools         # all 11 tools/*: common, process_runner, artifact, shell, file, edit, hashline, search, workspace, mcp_bridge, registry
