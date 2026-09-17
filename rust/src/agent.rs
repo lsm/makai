@@ -89,6 +89,10 @@ struct SessionGuard {
     start_reply_observed: bool,
     /// True once the session has been stopped, or must never be stopped.
     settled: bool,
+    /// The sequence to stop with while the `agent_message` is still unresolved:
+    /// a message the server has not admitted has not advanced its counter.
+    /// Cleared once admission is known either way.
+    unresolved_sequence: Option<u64>,
 }
 
 impl SessionGuard {
@@ -100,6 +104,7 @@ impl SessionGuard {
             id_client_generated,
             start_reply_observed: false,
             settled: true,
+            unresolved_sequence: None,
         }
     }
 
@@ -144,10 +149,26 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        // A `Drop` cannot await, so cancellation is fire-and-forget: the stop is
-        // sent, but its `agent_stopped` is not waited for and the sequence probe
-        // the terminal path can afford is skipped.
-        self.stop("client aborted");
+        // A `Drop` cannot await, so it cannot read the reply that tells the
+        // terminal path which sequence was right. Where admission is still
+        // unresolved it sends both candidates rather than guessing one: the
+        // server answers the wrong one with `invalid_request` and leaves the
+        // session untouched, so the pair costs one ignored error frame and
+        // stops the session whichever way admission actually went.
+        let post_send = self.next_sequence;
+        match self.unresolved_sequence.take() {
+            Some(pre_send) if pre_send != post_send => {
+                self.next_sequence = pre_send;
+                if self.stop("client aborted").is_some() {
+                    self.settled = false;
+                    self.next_sequence = post_send;
+                    self.stop("client aborted");
+                }
+            }
+            _ => {
+                self.stop("client aborted");
+            }
+        }
     }
 }
 
@@ -581,9 +602,6 @@ struct AgentSession {
     start_message_id: String,
     message_message_id: Option<String>,
     start_accepted: bool,
-    /// The sequence to stop with while the `agent_message` is still unresolved:
-    /// a message the server has not accepted has not advanced its counter.
-    unresolved_sequence: Option<u64>,
 }
 
 impl AgentSession {
@@ -627,7 +645,6 @@ impl AgentSession {
             start_message_id,
             message_message_id: None,
             start_accepted: false,
-            unresolved_sequence: None,
         })
     }
 
@@ -702,18 +719,18 @@ impl AgentSession {
         self.transport.send(&message)?;
         self.message_message_id = Some(message_id);
         self.guard.next_sequence = 3;
-        self.unresolved_sequence = Some(2);
+        self.guard.unresolved_sequence = Some(2);
         Ok(())
     }
 
     /// Any run output proves the message was admitted, so the server's counter
     /// has advanced and a stop must carry the post-send value.
     fn mark_message_settled(&mut self) {
-        self.unresolved_sequence = None;
+        self.guard.unresolved_sequence = None;
     }
 
     fn rollback_message_sequence(&mut self) {
-        if let Some(sequence) = self.unresolved_sequence.take() {
+        if let Some(sequence) = self.guard.unresolved_sequence.take() {
             self.guard.next_sequence = sequence;
         }
     }
@@ -735,7 +752,7 @@ impl AgentSession {
     /// never admitted leaves the counter where it was, so a stop rejected as
     /// out-of-order is retried once with the post-send value.
     async fn teardown(&mut self, reason: &str) {
-        let probe_sequence = self.unresolved_sequence.take();
+        let probe_sequence = self.guard.unresolved_sequence.take();
         if let Some(pre_send) = probe_sequence {
             let post_send = self.guard.next_sequence;
             self.guard.next_sequence = pre_send;

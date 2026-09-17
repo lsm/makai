@@ -503,6 +503,56 @@ async fn an_unresolved_message_makes_the_stop_probe_both_sequences() {
 }
 
 #[tokio::test]
+async fn an_aborted_stream_stops_an_unresolved_session_at_both_sequences() {
+    // The stream-path mirror of the probe test above. A stream generator that
+    // exits through `?` -- here a response timeout with no run output -- never
+    // reaches `teardown`, and `Drop` cannot await the reply that would say
+    // which sequence was right. The fake is told to expect 2, modelling a
+    // server that never admitted the `agent_message`, so a lone post-send stop
+    // is answered `invalid_request` and leaves the session registered until
+    // idle eviction.
+    let log = tempfile::NamedTempFile::new().expect("temp file");
+    let client = common::fake_builder("agent_silent_after_message")
+        .env("MAKAI_FAKE_REQUEST_LOG", log.path().display().to_string())
+        .env("MAKAI_FAKE_EXPECTED_STOP_SEQUENCE", "2")
+        .response_timeout(Duration::from_millis(300))
+        .connect()
+        .await
+        .expect("connects");
+
+    {
+        let mut events = Box::pin(client.agent().stream(ExecutionRequest::prompt(MODEL, "hi")));
+        let failure = events
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the run times out");
+        assert!(failure.to_string().contains("timed out"), "{failure}");
+    }
+
+    let frames = common::wait_for_logged(log.path(), |frames| {
+        kinds(frames)
+            .iter()
+            .filter(|kind| *kind == "agent_stop")
+            .count()
+            == 2
+    })
+    .await;
+    let stops: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame["type"] == serde_json::json!("agent_stop"))
+        .filter_map(|frame| frame["sequence"].as_u64())
+        .collect();
+    assert_eq!(
+        stops,
+        vec![2, 3],
+        "expected the pre-send candidate then the post-send one: {:?}",
+        kinds(&frames)
+    );
+    client.close().await;
+}
+
+#[tokio::test]
 async fn a_settled_run_stops_once_without_probing() {
     // The mirror of the probe test: any run output proves the message was
     // admitted, so the stop goes straight to the post-send value.
