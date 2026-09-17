@@ -38,7 +38,10 @@ Frame Routing, V1.1") defines the semantics summarized here.
 - Ledger scope: the agent-protocol surface — `zig/src/protocol/agent/` (types,
   envelope, server, runtime), the stdio host (`zig/src/tools/makai.zig`), and the TS
   SDK client (`typescript/src/execution_client.ts`). Provider, auth, and tool
-  protocols are out of scope until their own passes.
+  protocols are out of scope until their own passes. The native OAP endpoint added
+  under `zig/src/protocol/oap/` (types, envelope, server, bridge) and the
+  `makai --oap` host are in scope and covered by their own section below; they sit
+  in front of the agent-protocol surface and change none of its rows.
 
 Feedback rule (from lsm/open-agent-protocol#3): an adapter mismatch resolves as
 either an OAP revision (issue/decision on lsm/open-agent-protocol) or a makai fix
@@ -81,6 +84,138 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | envelope shape | flat envelope: `version`, `type`, `session_id`, `message_id`, `sequence`, `in_reply_to`, `timestamp`, `payload` | aligned structurally | OAP's envelope adds `protocol`/`profile` strings and scope fields (`run_id`, `turn_id`, …) makai does not carry; mapping is mechanical for the adapter. |
 | process exit before settlement | transport rejects the registered frame wait; reads queued behind the transport read lock surface the death as their response timeout; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule; adapters must keep timeout handling for lock-queued reads rather than expecting prompt rejection for every concurrent request. |
 | stdin EOF while a run waits on a distributed `tool_result` | the host latches the disconnect; the wait fails with a typed error and the run settles through the failure pair (`tool_execution_error` settlement), then the process drains and exits | aligned (#210 gap 4) | §13.2.7 rule 7: EOF-cancel applies to the tool-waiting case — the tool host IS the disconnected client. A `tool_result` delivered before EOF wins its wait (checked before the latch); a run needing client input after EOF settles failed, never success (§13.4.6), with pending tool requests dropped unpublished; provider-executing runs keep being pumped toward settlement until they need client input. Late frames from the cancelled run settle nothing — the pump's disconnect classification publishes the failure pair once and the run is removed, working with (not around) the §13.4.5 generation guard. |
+| control-layer-provided tools (`session.open.request.tools`, staged unit T3c, [OAP Decision 0011](https://github.com/lsm/open-agent-protocol/blob/main/decisions/0011-control-layer-provided-tools.md)) | tool catalogue carried in the `agent_start` `config_json` and restated in the `agent_message` `message_json`; `parseAgentTools` resolves message-first, config as fallback | deviating: per-submit override, unexercised — `[planned]` aligned (session-scoped) | §13.2 rule 8. The override is dead capability in both directions: every consumer writes the same list into both payloads from one request object and always emits the key (empty array when none), so the message value unconditionally shadows the config and **the session-scoped field has never been read by any consumer**. All three SDKs in tree (TypeScript, Go, Python) are one-shot and expose no session handle, as does the unmerged Rust client (#309); the native OAP bridge is the only multi-message consumer and declares `"tools": []` in both payloads. Makai narrows to session-scoped declaration on its own timeline, justified by the silent failure the current precedence permits (declare tools at start, send `"tools": []` per message, receive no tools and no error) and NOT contingent on T3c graduating. Decision 0011 provisions tools at session open and defers per-submit, citing this row's finding; when it graduates, makai's narrowing is already aligned. Reversal condition: sufficient only while makai owns every consumer — the host accepts repeated `agent_message` (§13.2 rule 3), so the wire supports per-submit provisioning and only the SDKs decline it; a persistent-session API with steering messages reopens this row. |
+| caller-executed tools (`action.call.resolve.request` / `.response`, staged unit T3c) | `tool_execute` published by the host, answered by a correlated `tool_result` (`in_reply_to` matches the request `message_id`) | deviating: no counterpart in the shipped OAP core | The shipped `action.call.*` six are observational — they report execution the endpoint owns, with `execution_owner` naming the actor — and the only caller round-trips in the core are `action.permission.resolve.*` and `user.input.resolve.*`. Decision 0008 (accepted 2026-09-16) scopes its unit to T3a/T3b and names T3c a deferral; [Decision 0011](https://github.com/lsm/open-agent-protocol/blob/main/decisions/0011-control-layer-provided-tools.md) discharges that deferral with the missing resolve pair but is `Status: proposed`, so client-hosted tools remain unavailable over OAP by two distinct mechanisms, neither of which compensates. Through the Go adapter in lsm/open-agent-protocol, a host-published `tool_execute` fails the run — `adapter/makai/session.go:288` in that repo, error string `makai_tool_executor_unavailable`; the identifier is the adapter's own and appears nowhere in this tree. In native OAP mode the frame never arises: `bridge.zig` declares `"tools": []` in both payloads (`buildConfigJson`, `buildMessageJson`), so the agent loop is offered no tool to call, and the bridge has no `tool_execute` handling at all — `applyNativeLine`'s switch ends `else => {}`, so such a frame would be dropped rather than answered if one ever appeared. This gap is live through the bridge today and is not created by any native-mode decision; it is the one item that keeps T3c on the critical path for replacing the native wire. Note `execution_owner` ships on `protocol.ToolDefinition` but is undescribed in the core profile draft — an upstream documentation gap, raised. |
+
+## Native OAP mode (`makai --oap`)
+
+Everything above describes makai's **native agent protocol**, which this section
+does not change. `makai --oap` adds a second, parallel front end: an OAP
+agent-control-core endpoint that speaks OAP envelopes on the wire and drives the
+same in-process agent host the `--stdio` mode drives. The adapter-first plan of
+lsm/open-agent-protocol#3 is unchanged — this is the first native slice, not a
+replacement for the external adapter, and the two can disagree only where this
+section says they do.
+
+### Protocol source
+
+Worked from `lsm/open-agent-protocol` @ `main`:
+
+- `drafts/agent-control-core.md` — the profile: envelope, minimum core surface,
+  data shapes, capability keys, snapshot freshness, minimum conformance.
+- `drafts/conformance.md` — profile/unit claim syntax, the ten stateful checks,
+  degradation expectations.
+- `decisions/0001-agent-control-v0.1-executable-core.md` — typed identity
+  domains, one foreground run per session, deterministic run event order,
+  cancellation intent vs settlement, resume/reconciliation/replay split.
+- `decisions/0002-admission-before-start.md` — the two canonical admission
+  shapes and pre-start settlement.
+- `decisions/0005-run-controls.md` — the fail-closed run-control gate.
+- `schema/v0.1/*.json` — the normative envelope and payload schemas.
+- `cmd/oap validate` — the executable validator used as the conformance oracle
+  below.
+
+### Claim
+
+`open-agent-protocol.agent-control-core+run-controls`, over a JSONL-on-stdio
+binding. The core is transport agnostic by its own Transport section, and
+bindings are a binding concern; stdio NDJSON is chosen because it is already
+makai's language-neutral process boundary and needs no new transport. The
+binding is declared in the descriptor as `{kind: "stdio", serialization:
+"jsonl"}`, so a later HTTP/SSE or WebSocket binding is additive.
+
+`+run-controls` is claimed in its refusal half plus one executed control. Three
+of the four controls are unadvertised and refused before admission with
+`unsupported_feature` / `details.reason: "unadvertised"`; `run.model_selection`
+is advertised `native` with `mode: "per_run"`, because makai genuinely applies a
+per-message `model_ref` to the run it was requested for and leaves the session
+default alone.
+
+No other unit is claimed. `+tools`, `+permissions`, `+user-input`,
+`+persistence`, `+models`, `+queue`, `+steer`, `+btw`, `capabilities.updates`,
+and extension packs are all unadvertised, and an unadvertised key is refused
+rather than silently ignored.
+
+### How the mode resolves the deviations above
+
+| Deviation (native row) | Resolution at the OAP boundary | Residual |
+| --- | --- | --- |
+| endpoint / participant identity absent | The OAP endpoint synthesizes a stable `endpoint_id` (`makai.agent-control`) and answers `protocol.initialize.request` with it. | Participant identity is accepted on the request and not yet used for reverse-interaction ownership, because no reverse interaction is advertised. |
+| no `submission_id` / `run_id` split | The endpoint allocates both as fresh ULIDs at admission and keys all run-scoped events by `run_id`. | The native settlement frame still carries no run identity (`RESIDUAL-5`), so the endpoint attributes a settlement to the session's single in-flight run. That is exact only because the endpoint enforces one foreground run per session. |
+| no admission receipt | `session.message.submit.response` is emitted synchronously, before the native `agent_message` is written, as Decision 0002 shape 1 (`admission: "started"`, `effective_delivery: "start"`, `status: "running"`, `delivery_resolution: "session_idle"`), with `run.started` emitted atomically after it. | A native rejection that arrives later settles the already-started run as `run.failed`. This is legal under Decision 0002 but means `admission: "started"` is makai's promotion evidence, not proof the provider accepted the work. |
+| sequence scope / echo replies / `sequence: 0` | Native sequence is never reused. The endpoint generates its own positive contiguous per-`run_id` sequence from receive order, starting at 1 with `run.started`, and a separate per-session counter for `session.state.updated`. | None. This is the documented resolution of the §13.1 echo/zero/gap rules: the OAP sequence domain is the endpoint's, not makai's. |
+| `agent_result` published before the terminal `agent_end` | The bridge retains the result as **evidence** and settles only on the terminal signal, then emits exactly one of `run.completed` / `run.failed` / `run.cancelled`. Anything arriving after settlement is dropped. | None observable. The duplicate-terminal suppression is tested directly. |
+| cancellation is session-scoped | `run.cancel.request` is accepted as **intent** (`run.cancel.response` with `accepted: true`, `status: "cancelling"`, plus `run.status.updated`), the native `agent_stop` is issued, and only authoritative settlement emits `run.cancelled`. Natural completion may win the race and does. | **Unresolved and disclosed**: the session dies with the run. `run.cancel` is advertised `degraded` with a degradation record, and the endpoint moves the session to `closed`, refusing later submissions with `session_not_found`. OAP has no vocabulary for "cancel closed the session". |
+| no capability negotiation | `capabilities.request` returns a revisioned descriptor (`capability_revision: "makai-oap-core-v1"`), and every non-bootstrap request carrying a different revision is refused `stale_capabilities`. | The revision is static for the process. `capabilities.updates` is not advertised, which the core explicitly permits. |
+| envelope shape | The endpoint emits the flat OAP envelope with `protocol`/`version`/`profile` and the scope fields; the native envelope is never exposed. | None. |
+| transcript load / resume / replay absent | Not advertised; `session.state` returns authoritative current state only. | **Unresolved and disclosed**: OAP separates resume, reconciliation and replay, and makai has only reconciliation. A degradation record on `session.state` says so. |
+
+### Identity domains in native mode
+
+The OAP `session_id` is **not** the native session id. The bridge allocates a
+fresh native NanoID per OAP session and keeps a two-way map. That is deliberate:
+OAP ids are opaque non-empty strings while makai's are a fixed 21-character
+alphabet, so aliasing them would let a caller's id choice decide whether the
+native server accepts a session. Envelope `id` is a fresh ULID per frame;
+`run_id`, `submission_id` and the portable assistant `message_id` are separate
+ULIDs; the native envelope `message_id` is never exposed as an OAP identity.
+
+### Conformance evidence
+
+Three traces produced by the real binary were validated with the OAP repository's
+own validator (`go run ./cmd/oap validate`), all `PASS`:
+
+1. a completed run (initialize, capabilities, session open, session state,
+   submit, `run.started`, two `content.delta`, `run.completed`) against a local
+   mock Anthropic SSE endpoint;
+2. a provider failure (a real HTTP 401) mapped to one `run.failed` with
+   `provider_error`;
+3. a cancellation (intent acknowledged, `run.status.updated: cancelling`,
+   authoritative `run.cancelled`, session `closed`).
+
+The frame-by-frame shape of all three is pinned in CI by the golden-trace tests
+in `zig/src/protocol/oap/bridge.zig` (`zig build test-unit-protocol`), so a
+regression that would break external validation fails a unit test first.
+
+### Conflicts raised, not compensated
+
+Per the feedback rule, these resolve as an OAP revision or a makai fix, never
+silent adapter-side compensation. None is compensated for in the code.
+
+1. **Cancellation closes the session.** Makai's only cancel is destructive
+   session teardown. OAP's `run.cancelled` says nothing about the session's
+   fate, and `session.status: "closed"` is reachable but has no stated relation
+   to cancellation. Disclosed as a `run.cancel` degradation record and as a
+   `closed` session that refuses further submissions. Needs either a makai
+   run-scoped cancel or an OAP note that a cancelled run may close its session.
+2. **`stale_capabilities` detail direction is ambiguous.** The core requires
+   `expected_revision` and `current_revision` in the error details but does not
+   say which is the sender's and which is the endpoint's, and no fixture pins
+   it. This endpoint reports the sender's pinned value as `expected_revision`
+   and its own as `current_revision`. Needs an OAP clarification or a fixture.
+3. **Sessions are not resumable, and OAP's `session.open` accepts a
+   `session_id`.** Reopening a known id here returns its current state; it never
+   restores a run or a transcript. `session_id` remains a correlation key. The
+   endpoint advertises no resume, load or replay capability, so no OAP rule is
+   broken — but a control layer that reads `session.open(session_id)` as resume
+   would be wrong, and the core does not forbid that reading.
+4. **A submission needs a model the core has no place to carry.** OAP
+   `session.open.request` has no model field, and makai cannot start a run
+   without a `model_ref`. The endpoint takes a process default (`--oap --model`,
+   or `MAKAI_OAP_MODEL`) and reports it as `current_model_id`; a submission with
+   neither is refused `model_not_found`. Needs either an OAP session-level
+   default-model control or acceptance that the default is endpoint
+   configuration.
+
+### Not implemented
+
+Local tool execution is deliberately switched off in this mode (the bridge sends
+an empty tool list), so no `action.call.*` lifecycle can be owed. Also absent:
+`models.list`, `transcript.load`/`transcript.delta`, `session.list`, permission
+and user-input interactions, `queue`/`steer`/`btw` delivery, dynamic capability
+updates, extension packs, and any binding other than stdio JSONL. Each is
+unadvertised, and each is refused with a typed `unsupported_feature` error
+naming the key rather than ignored.
 
 ## Documented residuals
 

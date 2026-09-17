@@ -6,6 +6,7 @@ const oauth_storage = @import("oauth/storage");
 const codex_oauth = @import("oauth/openai_codex");
 const anthropic_oauth = @import("oauth/anthropic");
 const custom_providers = @import("custom_providers");
+const github_copilot = @import("oauth/github_copilot");
 
 const openai_codex_provider_id = "openai-codex";
 const openai_codex_api_id = "openai-codex-responses";
@@ -13,6 +14,8 @@ const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
 const kimi_api_id = "openai-completions";
 const kimi_model_id = "kimi-k2.7-code";
+const github_copilot_provider_id = "github-copilot";
+const github_copilot_api_name = "openai-completions";
 const kimi_base_url = "https://api.kimi.com/coding";
 const kimi_global_base_url = "https://api.moonshot.ai";
 const codex_models_cache_name = "models_cache.json";
@@ -87,10 +90,13 @@ fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadM
         if (codex_refresh_error) |err| return err;
     }
 
+    var copilot_models = try loadGitHubCopilotModels(allocator, storage);
+    defer deinitModels(allocator, copilot_models);
+
     var custom_models = try loadCustomModels(allocator, storage, mode);
     defer deinitModels(allocator, custom_models);
 
-    const lists = [_]*[]ai_types.Model{ &codex_models, &kimi_models, &anthropic_models, &custom_models };
+    const lists = [_]*[]ai_types.Model{ &codex_models, &kimi_models, &anthropic_models, &copilot_models, &custom_models };
     var total: usize = 0;
     for (lists) |list| total += list.len;
     const models = try allocator.alloc(ai_types.Model, total);
@@ -106,6 +112,113 @@ fn loadProductionModelsWithMode(allocator: std.mem.Allocator, mode: CatalogLoadM
 
 var test_custom_providers_config: ?[]const u8 = null;
 var test_custom_discovery_ids: ?[]const []const u8 = null;
+
+
+var test_force_copilot_models: bool = false;
+
+fn copilotStringFromProviderData(allocator: std.mem.Allocator, provider_data: []const u8, key: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, provider_data, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get(key) orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return try allocator.dupe(u8, value.string);
+}
+
+fn copilotModelIdsFromProviderData(allocator: std.mem.Allocator, provider_data: []const u8) !?[][]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, provider_data, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const list = parsed.value.object.get("models") orelse return null;
+    if (list != .array) return null;
+
+    var ids = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+    for (list.array.items) |item| {
+        if (item != .string or item.string.len == 0) continue;
+        try ids.append(allocator, try allocator.dupe(u8, item.string));
+    }
+    if (ids.items.len == 0) {
+        ids.deinit(allocator);
+        return null;
+    }
+    return try ids.toOwnedSlice(allocator);
+}
+
+fn copilotModel(allocator: std.mem.Allocator, id_text: []const u8, base_url_text: []const u8) !ai_types.Model {
+    const id = try allocator.dupe(u8, id_text);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, id_text);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, github_copilot_api_name);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, github_copilot_provider_id);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, base_url_text);
+    errdefer allocator.free(base_url);
+    const input = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(input);
+    input[0] = try allocator.dupe(u8, "text");
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+        .is_owned = true,
+    };
+}
+
+fn loadGitHubCopilotModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage) ![]ai_types.Model {
+    if (builtin.is_test and !test_force_copilot_models) return emptyModels(allocator);
+
+    const stored = storage orelse return emptyModels(allocator);
+    const auth = stored.providers.get(github_copilot_provider_id) orelse return emptyModels(allocator);
+    const provider_data: ?[]const u8 = switch (auth) {
+        .oauth => |creds| creds.provider_data,
+        .api_key => null,
+    };
+
+    var discovered: ?[][]const u8 = null;
+    defer if (discovered) |ids| freeModelIds(allocator, ids);
+    var base_url_owned: ?[]u8 = null;
+    defer if (base_url_owned) |value| allocator.free(value);
+
+    if (provider_data) |data| {
+        discovered = copilotModelIdsFromProviderData(allocator, data) catch null;
+        base_url_owned = copilotStringFromProviderData(allocator, data, "baseUrl") catch null;
+        if (base_url_owned == null) {
+            if (copilotStringFromProviderData(allocator, data, "enterpriseUrl") catch null) |enterprise| {
+                allocator.free(enterprise);
+                return emptyModels(allocator);
+            }
+        }
+    }
+
+    const base_url = base_url_owned orelse github_copilot.DEFAULT_BASE_URL;
+    const ids: []const []const u8 = discovered orelse &github_copilot.KNOWN_COPILOT_MODELS;
+
+    var models = std.ArrayList(ai_types.Model).empty;
+    errdefer {
+        for (models.items) |*model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+    for (ids) |id| {
+        var model = try copilotModel(allocator, id, base_url);
+        errdefer model.deinit(allocator);
+        try models.append(allocator, model);
+    }
+    return models.toOwnedSlice(allocator);
+}
 
 fn loadCustomModels(allocator: std.mem.Allocator, storage: ?*oauth_storage.AuthStorage, mode: CatalogLoadMode) ![]ai_types.Model {
     const providers = if (builtin.is_test)
@@ -1279,6 +1392,135 @@ test "auth none reaches the model as allows_anonymous" {
     try std.testing.expect(models[0].allows_anonymous);
     try std.testing.expectEqualStrings("gw", models[1].provider);
     try std.testing.expect(!models[1].allows_anonymous);
+}
+
+test "github copilot models come from the persisted login list" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8,
+                \\{"baseUrl":"https://api.acme.githubcopilot.com","models":["gpt-5","claude-opus-4.5"]}
+            ),
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("gpt-5", models[0].id);
+    try std.testing.expectEqualStrings(github_copilot_provider_id, models[0].provider);
+    try std.testing.expectEqualStrings(github_copilot_api_name, models[0].api);
+    try std.testing.expectEqualStrings("https://api.acme.githubcopilot.com", models[0].base_url);
+    try std.testing.expectEqualStrings("claude-opus-4.5", models[1].id);
+}
+
+test "github copilot falls back to the known list and the default base url" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(github_copilot.KNOWN_COPILOT_MODELS.len, models.len);
+    try std.testing.expectEqualStrings(github_copilot.DEFAULT_BASE_URL, models[0].base_url);
+}
+
+test "an enterprise login with no stored base url contributes nothing" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8,
+                \\{"enterpriseUrl":"https://gh.acme.com"}
+            ),
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+}
+
+test "an enterprise login that stored its base url still lists models there" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8,
+                \\{"enterpriseUrl":"https://gh.acme.com","baseUrl":"https://api.acme.githubcopilot.com","models":["gpt-5"]}
+            ),
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings("https://api.acme.githubcopilot.com", models[0].base_url);
+}
+
+test "github copilot contributes nothing when it is not logged in" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+
+    const none = try loadGitHubCopilotModels(std.testing.allocator, null);
+    defer deinitModels(std.testing.allocator, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "a provider whose discovery is fully filtered contributes nothing regardless of file order" {
