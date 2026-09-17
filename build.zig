@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const provider_error_detail_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/providers/error_detail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const json_writer_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/json/writer.zig"),
         .target = target,
@@ -293,6 +299,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "provider_error_detail", .module = provider_error_detail_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "github_copilot", .module = github_copilot_mod },
@@ -314,6 +321,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "provider_error_detail", .module = provider_error_detail_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
@@ -335,6 +343,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "provider_error_detail", .module = provider_error_detail_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
@@ -356,6 +365,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "provider_error_detail", .module = provider_error_detail_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "compat", .module = compat_mod },
@@ -1074,6 +1084,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "custom_providers", .module = custom_providers_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
         },
     });
 
@@ -1246,6 +1257,8 @@ pub fn build(b: *std.Build) void {
     const auth_resolver_test = b.addTest(.{ .root_module = auth_resolver_mod });
 
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
+    const provider_error_detail_test = b.addTest(.{ .root_module = provider_error_detail_mod });
+
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
     const openai_responses_api_test = b.addTest(.{ .root_module = openai_responses_api_mod });
     const azure_openai_responses_api_test = b.addTest(.{ .root_module = azure_openai_responses_api_mod });
@@ -1777,6 +1790,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
     test_step.dependOn(&b.addRunArtifact(auth_resolver_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
+    test_step.dependOn(&b.addRunArtifact(provider_error_detail_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
     test_step.dependOn(&b.addRunArtifact(azure_openai_responses_api_test).step);
@@ -1906,6 +1920,7 @@ pub fn build(b: *std.Build) void {
     test_unit_providers_step.dependOn(&b.addRunArtifact(stream_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(provider_error_detail_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(azure_openai_responses_api_test).step);
