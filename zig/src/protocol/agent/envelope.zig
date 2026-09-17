@@ -575,9 +575,15 @@ fn deserializeModelDescriptor(
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
+            const value_text = try jf.elementAsString(entry.value_ptr.*);
+
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, value_text);
+
             metadata_items[metadata_count] = .{
-                .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.elementAsString(entry.value_ptr.*))),
+                .key = OwnedSlice(u8).initOwned(key),
+                .value = OwnedSlice(u8).initOwned(value),
             };
             metadata_count += 1;
         }
@@ -938,4 +944,56 @@ test "agent envelope roundtrip for ack and nack" {
         parsed_nack.payload.nack.reason.slice(),
     );
     try std.testing.expectEqual(agent_types.ErrorCode.not_implemented, parsed_nack.payload.nack.error_code.?);
+}
+
+test "agent models_response rejects a non-string metadata value without leaking the key" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(agent_types.ModelCapability, 1);
+    capabilities[0] = .chat;
+
+    const metadata = try allocator.alloc(agent_types.MetadataEntry, 1);
+    metadata[0] = .{
+        .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "tier")),
+        .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "premium")),
+    };
+
+    const descriptors = try allocator.alloc(agent_types.ModelDescriptor, 1);
+    descriptors[0] = .{
+        .model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude-sonnet-4-5")),
+        .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+        .display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .base_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "https://api.anthropic.com")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = OwnedSlice(agent_types.ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+        .reasoning_default = .medium,
+        .metadata = OwnedSlice(agent_types.MetadataEntry).initOwned(metadata),
+    };
+
+    var env = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .models_response = .{
+            .models = OwnedSlice(agent_types.ModelDescriptor).initOwned(descriptors),
+            .fetched_at_ms = 1_700_000_000_000,
+            .cache_max_age_ms = 300_000,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    const mistyped = try std.mem.replaceOwned(u8, allocator, json, "\"premium\"", "5");
+    defer allocator.free(mistyped);
+
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(mistyped, allocator));
 }

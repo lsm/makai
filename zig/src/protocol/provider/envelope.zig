@@ -1215,9 +1215,15 @@ fn deserializeModelDescriptor(
 
         var iter = metadata_obj.iterator();
         while (iter.next()) |entry| {
+            const value_text = try jf.elementAsString(entry.value_ptr.*);
+
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, value_text);
+
             metadata_items[metadata_count] = .{
-                .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
-                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try jf.elementAsString(entry.value_ptr.*))),
+                .key = protocol_types.OwnedSlice(u8).initOwned(key),
+                .value = protocol_types.OwnedSlice(u8).initOwned(value),
             };
             metadata_count += 1;
         }
@@ -3293,4 +3299,56 @@ test "malformed message content is rejected without leaking the partial message"
         defer allocator.free(json);
         try std.testing.expect(std.meta.isError(deserializeEnvelope(json, allocator)));
     }
+}
+
+test "models_response rejects a non-string metadata value without leaking the key" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(protocol_types.ModelCapability, 1);
+    capabilities[0] = .chat;
+
+    const metadata = try allocator.alloc(protocol_types.MetadataEntry, 1);
+    metadata[0] = .{
+        .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "tier")),
+        .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "premium")),
+    };
+
+    const models = try allocator.alloc(protocol_types.ModelDescriptor, 1);
+    models[0] = .{
+        .model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude-sonnet-4-5")),
+        .model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+        .display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .base_url = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "https://api.anthropic.com")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+        .reasoning_default = .high,
+        .metadata = protocol_types.OwnedSlice(protocol_types.MetadataEntry).initOwned(metadata),
+    };
+
+    var original = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .models_response = .{
+            .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(models),
+            .fetched_at_ms = 1_760_000_000_198,
+            .cache_max_age_ms = 300_000,
+        } },
+    };
+    defer original.deinit(allocator);
+
+    const json = try serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+
+    const mistyped = try std.mem.replaceOwned(u8, allocator, json, "\"premium\"", "5");
+    defer allocator.free(mistyped);
+
+    try std.testing.expectError(error.InvalidFieldType, deserializeEnvelope(mistyped, allocator));
 }
