@@ -162,6 +162,37 @@ result signal — some producers mark the thread done *before* publishing the
 final result. Gate on `wait()` → `null` (blocking) or `isDone()` plus a drained
 queue (polling), then read `getError()` / `cloneResult()`.
 
+## A stream is never freed underneath a live producer thread
+
+`wait_for_thread_on_deinit` makes `deinit()` join the producer before tearing
+the stream down, but the join is bounded (`join_timeout_ms`, default
+`DEINIT_THREAD_JOIN_TIMEOUT_MS` = 120 s). A producer parked in blocking I/O —
+`compat.http` sets no socket timeouts, so a stalled upstream parks a provider
+thread indefinitely — can outlast it, and the cancel token does not help there
+because providers only test it between reads.
+
+When the join fails, `deinit()` **abandons** the stream instead of finishing:
+it does not free queued events, the result or the error message, and it does
+not poison `self`. `wasAbandoned()` then reports true and the caller must not
+`destroy()` the allocation — the producer still holds the pointer and will
+dereference it the moment its I/O returns. Leaking a stream is the correct
+outcome; freeing it is a use-after-free that surfaces as a SIGSEGV inside
+`push`/`pushBlocking` on whatever thread the provider happens to be.
+
+Use `deinitAndDestroy()` for heap-allocated streams: it joins, and on success
+tears down and frees the allocation, returning `true`; on a failed join it
+marks the stream abandoned and returns `false`, leaving both the stream and
+anything the producer still references (its `CancelToken` flag in particular)
+alive. `ProtocolServer` routes every free site through this policy, and signals
+the cancel flag before joining so a cooperative provider unwinds promptly.
+
+`markThreadDone()` publishes `thread_done` as its **last** touch of the stream:
+the futex bump and wake happen first. A waiter that observes `thread_done` is
+therefore guaranteed the producer will not dereference the stream again, which
+is what makes freeing after a successful join safe. `waitForThread()` polls on
+a bounded interval (`THREAD_DONE_POLL_INTERVAL_MS`) so that ordering costs no
+latency.
+
 ## The three traps these rules prevent
 
 1. **Bus error at exit with a hand-written mock provider.** The result passed

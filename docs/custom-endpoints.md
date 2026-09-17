@@ -111,18 +111,30 @@ file. Listing them in the picker is not implemented yet.
 Startup never touches the network. Loading the catalog reads
 `~/.makai/model_catalog/custom-<id>.json`, preferring a copy younger than 24
 hours and still using an older one rather than nothing, and falls through to the
-declared `models` list when there is no cache at all. This matters because
-`compat.http` sets no connect or read timeout: a declared endpoint that is down,
-or that accepts the connection and then stalls, would otherwise hold up
-`makai --tui` and print-mode model resolution for as long as the peer cared to
-wait, and again every day once the cache went stale. Nor can it simply set one.
-`std.http.Client.ConnectTcpOptions` in Zig 0.16.0 declares a `timeout` field,
-but that is the only mention of it anywhere under `std/http/`, and
-`connectTcpOptions` never reads it, so it is inert. Bounding a request means
-either driving the connection setup below `Client.request` or running the fetch
-on a thread with a timed wait, which is why no request in this tree is bounded
-today and why keeping the fetch off the startup path is the fix that was
-available here.
+declared `models` list when there is no cache at all. Keeping the network off
+the startup path is worth doing on its own, and the discovery fetch is now
+bounded as well: it runs through `compat.http.fetch`, which gives up after
+`catalog_fetch_timeout_ms` and reports `error.Timeout` rather than waiting on
+the peer.
+
+Bounding it took a detour worth recording, because the two obvious mechanisms
+do not work. `std.http.Client.ConnectTcpOptions` in Zig 0.16.0 declares a
+`timeout` field, but that is the only mention of it anywhere under `std/http/`
+and `connectTcpOptions` never reads it, so it is inert. Setting `SO_RCVTIMEO`
+on the connected socket is worse than useless: the timeout does fire, but
+`netReadPosix` in `std.Io.Threaded` treats the resulting `EAGAIN` as a
+programmer bug and panics in debug builds. What `compat.http.fetch` does
+instead is run the whole request on its own thread that owns its client, its
+allocations and a copy of every input, and wait on a `std.Io.Event` with a
+deadline. On expiry the caller abandons the thread and returns; the thread
+frees everything it owns whenever the peer finally answers or the connection
+drops, so nothing the caller owns is touched afterwards.
+
+That primitive covers requests that read one whole response: catalog discovery,
+and the OAuth device-code, token-poll and token-exchange calls. **It does not
+cover provider streaming**, deliberately. A streaming response has no whole-body
+read to bound, and a read deadline there would kill a turn whenever a model
+thinks for longer than the timeout.
 
 The fetch happens off that path. A successful `/login <id>` refreshes every
 catalog, which is what populates the cache the first time, and a refresh

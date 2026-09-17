@@ -145,6 +145,8 @@ pub fn buildProviderData(
     return try out.toOwnedSlice(allocator);
 }
 
+pub const oauth_request_timeout_ms: u64 = 30_000;
+
 pub const DEFAULT_BASE_URL = "https://api.individual.githubcopilot.com";
 
 pub fn getDefaultBaseUrl(allocator: std.mem.Allocator) []const u8 {
@@ -157,19 +159,11 @@ pub fn enableModel(
     model_id: []const u8,
     base_url: []const u8,
 ) !bool {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = try std.fmt.allocPrint(allocator, "{s}/models/{s}/policy", .{ base_url, model_id });
     defer allocator.free(url);
 
-    const uri = try std.Uri.parse(url);
-
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth_header);
-
-    var body_buffer = "{\"state\": \"enabled\"}".*;
-    const body = body_buffer[0..];
 
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
@@ -178,17 +172,16 @@ pub fn enableModel(
     try headers.append(allocator, .{ .name = "openai-intent", .value = "chat-policy" });
     try headers.append(allocator, .{ .name = "x-interaction-type", .value = "chat-policy" });
 
-    var request = try client.openRequest(.POST, uri, .{
+    var fetched = http.fetch(allocator, url, .{
+        .method = .POST,
         .extra_headers = headers.items,
-    });
-    defer request.deinit();
+        .body = "{\"state\": \"enabled\"}",
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch return false;
+    defer fetched.deinit(allocator);
 
-    try http.sendRequest(&request, body);
-
-    var header_buffer: [4096]u8 = undefined;
-    const response = try http.receiveResponse(&request, &header_buffer);
-
-    return response.head.status == .ok;
+    return fetched.status == 200;
 }
 
 pub fn enableAllModels(
@@ -405,16 +398,11 @@ const DeviceCodeResponse = struct {
 };
 
 fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCodeResponse {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = if (std.mem.eql(u8, domain, "github.com"))
         device_code_url
     else
         try std.fmt.allocPrint(allocator, "https://{s}/login/device/code", .{domain});
     defer if (!std.mem.eql(u8, domain, "github.com")) allocator.free(@constCast(url));
-
-    const uri = try std.Uri.parse(url);
 
     const body = try std.fmt.allocPrint(allocator, "client_id={s}&scope=user:email", .{client_id});
     defer allocator.free(body);
@@ -424,30 +412,17 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
 
-    var request = try client.openRequest(.POST, uri, .{
+    var fetched = http.fetch(allocator, url, .{
+        .method = .POST,
         .extra_headers = headers.items,
-    });
-    defer request.deinit();
+        .body = body,
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch return error.OAuthFailed;
+    defer fetched.deinit(allocator);
 
-    try http.sendRequest(&request, body);
-
-    var header_buffer: [4096]u8 = undefined;
-    var response = try http.receiveResponse(&request, &header_buffer);
-
-    if (response.head.status != .ok) {
-        var buffer: [4096]u8 = undefined;
-        const reader = http.responseReader(&response, &buffer);
-        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
-        defer allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(allocator, "Device flow error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
-        defer allocator.free(err_msg);
-        return error.OAuthFailed;
-    }
-
-    var response_buffer: [8192]u8 = undefined;
-    const reader = http.responseReader(&response, &response_buffer);
-    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
-    defer allocator.free(response_body);
+    if (fetched.status != 200) return error.OAuthFailed;
+    const response_body = fetched.body;
 
     const parsed = try std.json.parseFromSlice(
         struct {
@@ -478,16 +453,11 @@ const PollResult = struct {
 };
 
 fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.Allocator) !PollResult {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = if (std.mem.eql(u8, domain, "github.com"))
         token_url
     else
         try std.fmt.allocPrint(allocator, "https://{s}/login/oauth/access_token", .{domain});
     defer if (!std.mem.eql(u8, domain, "github.com")) allocator.free(@constCast(url));
-
-    const uri = try std.Uri.parse(url);
 
     const body = try std.fmt.allocPrint(
         allocator,
@@ -501,26 +471,24 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
 
-    var request = try client.openRequest(.POST, uri, .{
+    var fetched = http.fetch(allocator, url, .{
+        .method = .POST,
         .extra_headers = headers.items,
-    });
-    defer request.deinit();
+        .body = body,
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch {
+        return .{ .error_msg = try allocator.dupe(u8, "http_error") };
+    };
+    defer fetched.deinit(allocator);
 
-    try http.sendRequest(&request, body);
-
-    var header_buffer: [4096]u8 = undefined;
-    var response = try http.receiveResponse(&request, &header_buffer);
-
-    if (response.head.status != .ok) {
+    if (fetched.status != 200) {
         return .{
             .error_msg = try allocator.dupe(u8, "http_error"),
         };
     }
 
-    var response_buffer: [8192]u8 = undefined;
-    const reader = http.responseReader(&response, &response_buffer);
-    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
-    defer allocator.free(response_body);
+    const response_body = fetched.body;
 
     const parsed = try std.json.parseFromSlice(
         struct {
@@ -552,16 +520,11 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
 }
 
 fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    var client = http.HttpClient.init(allocator);
-    defer client.deinit();
-
     const url = if (std.mem.eql(u8, domain, "github.com"))
         copilot_token_url
     else
         try std.fmt.allocPrint(allocator, "https://{s}/copilot_internal/v2/token", .{domain});
     defer if (!std.mem.eql(u8, domain, "github.com")) allocator.free(@constCast(url));
-
-    const uri = try std.Uri.parse(url);
 
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{github_token});
     defer allocator.free(auth_header);
@@ -575,30 +538,17 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     try headers.append(allocator, .{ .name = "user-agent", .value = COPILOT_HEADERS.user_agent });
     try headers.append(allocator, .{ .name = "copilot-integration-id", .value = COPILOT_HEADERS.copilot_integration_id });
 
-    var request = try client.openRequest(.GET, uri, .{
+    var fetched = http.fetch(allocator, url, .{
+        .method = .GET,
         .extra_headers = headers.items,
-    });
-    defer request.deinit();
+        .max_response_bytes = 8192,
+        .timeout_ms = oauth_request_timeout_ms,
+    }) catch return error.CopilotTokenFailed;
+    defer fetched.deinit(allocator);
 
-    try http.sendBodilessRequest(&request);
+    if (fetched.status != 200) return error.CopilotTokenFailed;
 
-    var header_buffer: [4096]u8 = undefined;
-    var response = try http.receiveResponse(&request, &header_buffer);
-
-    if (response.head.status != .ok) {
-        var buffer: [4096]u8 = undefined;
-        const reader = http.responseReader(&response, &buffer);
-        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
-        defer allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(allocator, "Copilot token error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
-        defer allocator.free(err_msg);
-        return error.CopilotTokenFailed;
-    }
-
-    var response_buffer: [8192]u8 = undefined;
-    const reader = http.responseReader(&response, &response_buffer);
-    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
-    defer allocator.free(response_body);
+    const response_body = fetched.body;
 
     const parsed = std.json.parseFromSlice(
         struct {
@@ -674,8 +624,9 @@ test "KNOWN_COPILOT_MODELS - contains expected models" {
 
 test "startDeviceFlow - returns valid response (integration test, requires network)" {
     const response = startDeviceFlow("github.com", std.testing.allocator) catch |err| {
-        if (err == error.ConnectionRefused or err == error.NetworkUnreachable or
-            err == error.SyntaxError or err == error.UnexpectedToken)
+        if (err == error.OAuthFailed or err == error.ConnectionRefused or
+            err == error.NetworkUnreachable or err == error.SyntaxError or
+            err == error.UnexpectedToken)
         {
             return error.SkipZigTest;
         }
