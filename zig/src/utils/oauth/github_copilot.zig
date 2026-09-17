@@ -256,7 +256,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
             defer if (enterprise_url) |url| allocator.free(url);
 
-            const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
+            const resolved_base_url = base_url orelse DEFAULT_BASE_URL;
             const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
 
             const provider_data = try buildProviderData(allocator, enterprise_url, resolved_base_url, enabled_models);
@@ -306,7 +306,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
 
     const base_url = getBaseUrlFromToken(copilot_token, allocator);
 
-    const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
+    const resolved_base_url = base_url orelse DEFAULT_BASE_URL;
     const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
 
     const enterprise_url = if (std.mem.eql(u8, github_domain, "github.com"))

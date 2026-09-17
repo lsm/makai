@@ -196,6 +196,12 @@ fn loadGitHubCopilotModels(allocator: std.mem.Allocator, storage: ?*oauth_storag
     if (provider_data) |data| {
         discovered = copilotModelIdsFromProviderData(allocator, data) catch null;
         base_url_owned = copilotStringFromProviderData(allocator, data, "baseUrl") catch null;
+        if (base_url_owned == null) {
+            if (copilotStringFromProviderData(allocator, data, "enterpriseUrl") catch null) |enterprise| {
+                allocator.free(enterprise);
+                return emptyModels(allocator);
+            }
+        }
     }
 
     const base_url = base_url_owned orelse github_copilot.DEFAULT_BASE_URL;
@@ -1423,6 +1429,59 @@ test "github copilot falls back to the known list and the default base url" {
 
     try std.testing.expectEqual(github_copilot.KNOWN_COPILOT_MODELS.len, models.len);
     try std.testing.expectEqualStrings(github_copilot.DEFAULT_BASE_URL, models[0].base_url);
+}
+
+test "an enterprise login with no stored base url contributes nothing" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8,
+                \\{"enterpriseUrl":"https://gh.acme.com"}
+            ),
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+}
+
+test "an enterprise login that stored its base url still lists models there" {
+    test_force_copilot_models = true;
+    defer test_force_copilot_models = false;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, github_copilot_provider_id),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho"),
+            .access = try std.testing.allocator.dupe(u8, "tok"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8,
+                \\{"enterpriseUrl":"https://gh.acme.com","baseUrl":"https://api.acme.githubcopilot.com","models":["gpt-5"]}
+            ),
+        } },
+    );
+
+    const models = try loadGitHubCopilotModels(std.testing.allocator, &storage);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings("https://api.acme.githubcopilot.com", models[0].base_url);
 }
 
 test "github copilot contributes nothing when it is not logged in" {
