@@ -52,7 +52,7 @@ pub const AgentProtocolRuntime = struct {
         const session_id = blk: {
             const text = (fields.optionalString(obj, "session_id") catch break :blk null) orelse break :blk null;
             break :blk agent_types.parseSessionId(text);
-        } orelse std.mem.zeroes(agent_types.SessionId);
+        } orelse agent_types.PLACEHOLDER_SESSION_ID;
 
         const in_reply_to = blk: {
             const text = (fields.optionalString(obj, "message_id") catch break :blk null) orelse break :blk null;
@@ -271,6 +271,12 @@ test "AgentProtocolRuntime answers malformed inbound envelopes with agent_error"
         ,
         \\{"type":"agent_start","session_id":"V1StGXR8Z5jdHi6BmyT0a","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":[]}
         ,
+        \\{"type":"agent_message","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"agent_message","session_id":"not a session id","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
+        \\{"type":"agent_message","session_id":7,"message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+        ,
     };
 
     for (malformed) |line| {
@@ -294,6 +300,7 @@ test "AgentProtocolRuntime answers malformed inbound envelopes with agent_error"
         try std.testing.expect(parsed.payload == .agent_error);
         try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, parsed.payload.agent_error.code);
         try std.testing.expectEqual(@as(u64, 0), parsed.sequence);
+        try std.testing.expect(agent_types.parseSessionId(&parsed.session_id) != null);
     }
 
     try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
