@@ -748,7 +748,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     const partial_start = createPartialMessage(model);
-    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
+    _ = stream.pushBlocking(.{ .start = .{ .partial = partial_start } });
 
     while (true) {
         if (ping_interval > 0) {
@@ -796,20 +796,20 @@ fn runThread(ctx: *ThreadCtx) void {
 
                         if (prev_len == 0 and current_text.items.len > 0) {
                             const partial = createPartialMessage(model);
-                            stream.push(.{ .text_start = .{
+                            _ = stream.pushBlocking(.{ .text_start = .{
                                 .content_index = content_blocks.items.len,
                                 .partial = partial,
-                            } }) catch {};
+                            } });
                         }
 
                         if (current_text.items.len > prev_len) {
                             const delta = current_text.items[prev_len..];
                             const partial = createPartialMessage(model);
-                            stream.push(.{ .text_delta = .{
+                            _ = stream.pushBlocking(.{ .text_delta = .{
                                 .content_index = content_blocks.items.len,
                                 .delta = delta,
                                 .partial = partial,
-                            } }) catch {};
+                            } });
                         }
                     }
 
@@ -825,11 +825,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                 continue;
                             };
                             const partial = createPartialMessage(model);
-                            stream.push(.{ .text_end = .{
+                            _ = stream.pushBlocking(.{ .text_end = .{
                                 .content_index = content_blocks.items.len - 1,
                                 .content = current_text.items,
                                 .partial = partial,
-                            } }) catch {};
+                            } });
                             current_text.clearRetainingCapacity();
                         }
 
@@ -849,23 +849,23 @@ fn runThread(ctx: *ThreadCtx) void {
 
                         const content_idx = content_blocks.items.len;
 
-                        stream.push(.{ .toolcall_start = .{
+                        if (!stream.pushBlocking(.{ .toolcall_start = .{
                             .content_index = content_idx,
                             .id = tool_id,
                             .name = tool_name,
                             .partial = createPartialMessage(model),
-                        } }) catch {
+                        } })) {
                             allocator.free(tool_id);
                             allocator.free(tool_name);
                             allocator.free(tool_args);
                             continue;
-                        };
+                        }
 
-                        stream.push(.{ .toolcall_delta = .{
+                        _ = stream.pushBlocking(.{ .toolcall_delta = .{
                             .content_index = content_idx,
                             .delta = tool_args,
                             .partial = createPartialMessage(model),
-                        } }) catch {};
+                        } });
 
                         const tool_call_struct = ai_types.ToolCall{
                             .id = tool_id,
@@ -880,17 +880,11 @@ fn runThread(ctx: *ThreadCtx) void {
                             continue;
                         };
 
-                        const event_tc = ai_types.ToolCall{
-                            .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
-                            .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
-                            .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
-                        };
-
-                        stream.push(.{ .toolcall_end = .{
+                        _ = stream.pushBlocking(.{ .toolcall_end = .{
                             .content_index = content_idx,
-                            .tool_call = event_tc,
+                            .tool_call = tool_call_struct,
                             .partial = createPartialMessage(model),
-                        } }) catch {};
+                        } });
                     }
                 }
                 line.clearRetainingCapacity();
@@ -925,20 +919,20 @@ fn runThread(ctx: *ThreadCtx) void {
 
                 if (prev_len == 0 and current_text.items.len > 0) {
                     const partial = createPartialMessage(model);
-                    stream.push(.{ .text_start = .{
+                    _ = stream.pushBlocking(.{ .text_start = .{
                         .content_index = content_blocks.items.len,
                         .partial = partial,
-                    } }) catch {};
+                    } });
                 }
 
                 if (current_text.items.len > prev_len) {
                     const delta = current_text.items[prev_len..];
                     const partial = createPartialMessage(model);
-                    stream.push(.{ .text_delta = .{
+                    _ = stream.pushBlocking(.{ .text_delta = .{
                         .content_index = content_blocks.items.len,
                         .delta = delta,
                         .partial = partial,
-                    } }) catch {};
+                    } });
                 }
             }
 
@@ -954,11 +948,11 @@ fn runThread(ctx: *ThreadCtx) void {
                         continue;
                     };
                     const partial = createPartialMessage(model);
-                    stream.push(.{ .text_end = .{
+                    _ = stream.pushBlocking(.{ .text_end = .{
                         .content_index = content_blocks.items.len - 1,
                         .content = current_text.items,
                         .partial = partial,
-                    } }) catch {};
+                    } });
                     current_text.clearRetainingCapacity();
                 }
 
@@ -978,23 +972,23 @@ fn runThread(ctx: *ThreadCtx) void {
 
                 const content_idx = content_blocks.items.len;
 
-                stream.push(.{ .toolcall_start = .{
+                if (!stream.pushBlocking(.{ .toolcall_start = .{
                     .content_index = content_idx,
                     .id = tool_id,
                     .name = tool_name,
                     .partial = createPartialMessage(model),
-                } }) catch {
+                } })) {
                     allocator.free(tool_id);
                     allocator.free(tool_name);
                     allocator.free(tool_args);
                     continue;
-                };
+                }
 
-                stream.push(.{ .toolcall_delta = .{
+                _ = stream.pushBlocking(.{ .toolcall_delta = .{
                     .content_index = content_idx,
                     .delta = tool_args,
                     .partial = createPartialMessage(model),
-                } }) catch {};
+                } });
 
                 const tool_call_struct = ai_types.ToolCall{
                     .id = tool_id,
@@ -1009,17 +1003,11 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 };
 
-                const event_tc = ai_types.ToolCall{
-                    .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
-                    .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
-                    .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
-                };
-
-                stream.push(.{ .toolcall_end = .{
+                _ = stream.pushBlocking(.{ .toolcall_end = .{
                     .content_index = content_idx,
-                    .tool_call = event_tc,
+                    .tool_call = tool_call_struct,
                     .partial = createPartialMessage(model),
-                } }) catch {};
+                } });
             }
         }
     }
@@ -1030,11 +1018,11 @@ fn runThread(ctx: *ThreadCtx) void {
             .text = text_copy,
         } }) catch {};
         const partial = createPartialMessage(model);
-        stream.push(.{ .text_end = .{
+        _ = stream.pushBlocking(.{ .text_end = .{
             .content_index = content_blocks.items.len - 1,
             .content = current_text.items,
             .partial = partial,
-        } }) catch {};
+        } });
     }
 
     if (has_tool_calls) {

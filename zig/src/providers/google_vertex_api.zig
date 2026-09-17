@@ -885,7 +885,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     const partial_start = createPartialMessage(model);
-    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
+    _ = stream.pushBlocking(.{ .start = .{ .partial = partial_start } });
 
     while (true) {
         if (ping_interval > 0) {
@@ -945,11 +945,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                             .text = text_copy,
                                             .text_signature = sig_copy,
                                         } }) catch {};
-                                        stream.push(.{ .text_end = .{
+                                        _ = stream.pushBlocking(.{ .text_end = .{
                                             .content_index = content_blocks.items.len - 1,
                                             .content = current_text.items,
                                             .partial = partial,
-                                        } }) catch {};
+                                        } });
                                         current_text.clearRetainingCapacity();
                                         current_text_signature.clearRetainingCapacity();
                                     },
@@ -963,11 +963,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                             .thinking = thinking_copy,
                                             .thinking_signature = sig_copy,
                                         } }) catch {};
-                                        stream.push(.{ .thinking_end = .{
+                                        _ = stream.pushBlocking(.{ .thinking_end = .{
                                             .content_index = content_blocks.items.len - 1,
                                             .content = current_thinking.items,
                                             .partial = partial,
-                                        } }) catch {};
+                                        } });
                                         current_thinking.clearRetainingCapacity();
                                         current_thinking_signature.clearRetainingCapacity();
                                     },
@@ -981,16 +981,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
                                 if (is_thinking) {
                                     current_block = .thinking;
-                                    stream.push(.{ .thinking_start = .{
+                                    _ = stream.pushBlocking(.{ .thinking_start = .{
                                         .content_index = content_idx,
                                         .partial = partial,
-                                    } }) catch {};
+                                    } });
                                 } else {
                                     current_block = .text;
-                                    stream.push(.{ .text_start = .{
+                                    _ = stream.pushBlocking(.{ .text_start = .{
                                         .content_index = content_idx,
                                         .partial = partial,
-                                    } }) catch {};
+                                    } });
                                 }
                             }
 
@@ -1002,11 +1002,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                     current_thinking_signature.appendSlice(allocator, sig) catch {};
                                 }
                                 const delta = current_thinking.items[prev_len..];
-                                stream.push(.{ .thinking_delta = .{
+                                _ = stream.pushBlocking(.{ .thinking_delta = .{
                                     .content_index = content_blocks.items.len,
                                     .delta = delta,
                                     .partial = partial,
-                                } }) catch {};
+                                } });
                             } else {
                                 const prev_len = current_text.items.len;
                                 current_text.appendSlice(allocator, text_part.text) catch {};
@@ -1014,11 +1014,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                     current_text_signature.appendSlice(allocator, sig) catch {};
                                 }
                                 const delta = current_text.items[prev_len..];
-                                stream.push(.{ .text_delta = .{
+                                _ = stream.pushBlocking(.{ .text_delta = .{
                                     .content_index = content_blocks.items.len,
                                     .delta = delta,
                                     .partial = partial,
-                                } }) catch {};
+                                } });
                             }
                         },
                         .tool_call => |tc| {
@@ -1035,11 +1035,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                             .text = text_copy,
                                             .text_signature = sig_copy,
                                         } }) catch {};
-                                        stream.push(.{ .text_end = .{
+                                        _ = stream.pushBlocking(.{ .text_end = .{
                                             .content_index = content_blocks.items.len - 1,
                                             .content = current_text.items,
                                             .partial = partial,
-                                        } }) catch {};
+                                        } });
                                         current_text.clearRetainingCapacity();
                                         current_text_signature.clearRetainingCapacity();
                                     },
@@ -1053,11 +1053,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                             .thinking = thinking_copy,
                                             .thinking_signature = sig_copy,
                                         } }) catch {};
-                                        stream.push(.{ .thinking_end = .{
+                                        _ = stream.pushBlocking(.{ .thinking_end = .{
                                             .content_index = content_blocks.items.len - 1,
                                             .content = current_thinking.items,
                                             .partial = partial,
-                                        } }) catch {};
+                                        } });
                                         current_thinking.clearRetainingCapacity();
                                         current_thinking_signature.clearRetainingCapacity();
                                     },
@@ -1097,23 +1097,23 @@ fn runThread(ctx: *ThreadCtx) void {
 
                             const content_idx = content_blocks.items.len;
 
-                            stream.push(.{ .toolcall_start = .{
+                            if (!stream.pushBlocking(.{ .toolcall_start = .{
                                 .content_index = content_idx,
                                 .id = tool_id,
                                 .name = tool_name,
                                 .partial = createPartialMessage(model),
-                            } }) catch {
+                            } })) {
                                 allocator.free(tool_id);
                                 allocator.free(tool_name);
                                 allocator.free(tool_args);
                                 continue;
-                            };
+                            }
 
-                            stream.push(.{ .toolcall_delta = .{
+                            _ = stream.pushBlocking(.{ .toolcall_delta = .{
                                 .content_index = content_idx,
                                 .delta = tool_args,
                                 .partial = createPartialMessage(model),
-                            } }) catch {};
+                            } });
 
                             const tool_call_struct = ai_types.ToolCall{
                                 .id = tool_id,
@@ -1128,17 +1128,11 @@ fn runThread(ctx: *ThreadCtx) void {
                                 continue;
                             };
 
-                            const event_tc = ai_types.ToolCall{
-                                .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
-                                .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
-                                .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
-                            };
-
-                            stream.push(.{ .toolcall_end = .{
+                            _ = stream.pushBlocking(.{ .toolcall_end = .{
                                 .content_index = content_idx,
-                                .tool_call = event_tc,
+                                .tool_call = tool_call_struct,
                                 .partial = createPartialMessage(model),
-                            } }) catch {};
+                            } });
                         },
                     }
                 }
@@ -1159,11 +1153,11 @@ fn runThread(ctx: *ThreadCtx) void {
                     .text = text_copy,
                     .text_signature = sig_copy,
                 } }) catch {};
-                stream.push(.{ .text_end = .{
+                _ = stream.pushBlocking(.{ .text_end = .{
                     .content_index = content_blocks.items.len - 1,
                     .content = current_text.items,
                     .partial = partial,
-                } }) catch {};
+                } });
             },
             .thinking => {
                 const partial = createPartialMessage(model);
@@ -1176,11 +1170,11 @@ fn runThread(ctx: *ThreadCtx) void {
                     .thinking = thinking_copy,
                     .thinking_signature = sig_copy,
                 } }) catch {};
-                stream.push(.{ .thinking_end = .{
+                _ = stream.pushBlocking(.{ .thinking_end = .{
                     .content_index = content_blocks.items.len - 1,
                     .content = current_thinking.items,
                     .partial = partial,
-                } }) catch {};
+                } });
             },
             .none => {},
         }
