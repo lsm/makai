@@ -295,8 +295,15 @@ pub const Server = struct {
             return;
         }
 
+        const declared_id = blk: {
+            const value = parsed.value.object.get("id") orelse break :blk null;
+            if (value != .string) break :blk null;
+            if (value.string.len == 0) break :blk null;
+            break :blk value.string;
+        } orelse return error.UnaddressableEnvelope;
+
         var env = oap_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-            try self.emitDecodeError(err);
+            try self.emitDecodeError(err, declared_id);
             return;
         };
         defer env.deinit(self.allocator);
@@ -323,7 +330,7 @@ pub const Server = struct {
         try self.outbound.append(self.allocator, line);
     }
 
-    fn emitDecodeError(self: *Self, err: anyerror) !void {
+    fn emitDecodeError(self: *Self, err: anyerror, in_reply_to: ?[]const u8) !void {
         const message = switch (err) {
             oap_envelope.DecodeError.ProtocolMismatch => "envelope protocol is not open-agent-protocol",
             oap_envelope.DecodeError.VersionMismatch => "envelope version is not 0.1",
@@ -337,7 +344,7 @@ pub const Server = struct {
             oap_envelope.DecodeError.UnknownEnvelopeType => .unsupported_feature,
             else => .invalid_request,
         };
-        try self.pushError(null, null, null, code, message, &.{});
+        try self.pushError(in_reply_to, null, null, code, message, &.{});
     }
 
     pub fn handleEnvelope(self: *Self, env: oap_types.Envelope) !void {
@@ -2682,14 +2689,27 @@ test "a json object that is neither envelope nor control is a framing defect" {
     try std.testing.expect(server.popOutbound() == null);
 }
 
-test "a declared envelope that fails to decode still answers with an error response" {
+test "a declared envelope that fails to decode answers a correlated error response" {
     const allocator = std.testing.allocator;
     var server = try Server.init(allocator, .{ .endpoint_version = "test" });
     defer server.deinit();
 
-    try server.handleLine("{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\"}");
+    try server.handleLine("{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"id\":\"req-7\"}");
 
     const line = server.popOutbound() orelse return error.TestExpectedErrorResponse;
     defer allocator.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "error.response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"in_reply_to\":\"req-7\"") != null);
+}
+
+test "a declared envelope carrying no id is fatal because nothing could address a refusal" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init(allocator, .{ .endpoint_version = "test" });
+    defer server.deinit();
+
+    try std.testing.expectError(
+        error.UnaddressableEnvelope,
+        server.handleLine("{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\"}"),
+    );
+    try std.testing.expect(server.popOutbound() == null);
 }
