@@ -627,8 +627,9 @@ test "KNOWN_COPILOT_MODELS - contains expected models" {
 
 test "startDeviceFlow - returns valid response (integration test, requires network)" {
     const response = startDeviceFlow("github.com", std.testing.allocator) catch |err| {
-        if (err == error.ConnectionRefused or err == error.NetworkUnreachable or
-            err == error.SyntaxError or err == error.UnexpectedToken)
+        if (err == error.OAuthFailed or err == error.ConnectionRefused or
+            err == error.NetworkUnreachable or err == error.SyntaxError or
+            err == error.UnexpectedToken)
         {
             return error.SkipZigTest;
         }
