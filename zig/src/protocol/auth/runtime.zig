@@ -28,7 +28,8 @@ pub const AuthProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = auth_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                self.sendNackForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                if (fields.shouldAnswerDecodeError(err)) self.sendNackForRejectedInput(line, fields.rejectionReason(err)) catch {};
+
                 continue;
             };
             defer env.deinit(self.allocator);

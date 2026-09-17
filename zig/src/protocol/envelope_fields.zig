@@ -143,6 +143,13 @@ pub fn isFieldError(err: anyerror) bool {
     };
 }
 
+pub fn shouldAnswerDecodeError(err: anyerror) bool {
+    return switch (err) {
+        error.UnknownPayloadType, error.InvalidPayloadType => false,
+        else => true,
+    };
+}
+
 pub fn rejectionReason(err: anyerror) []const u8 {
     return switch (err) {
         error.InputTooLong => "input field exceeds maximum allowed length",
@@ -241,6 +248,17 @@ test "rootObject rejects non-object documents" {
     var parsed = try parseForTest(allocator, "[1,2,3]");
     defer parsed.deinit();
     try std.testing.expectError(error.InvalidFieldType, rootObject(parsed.value));
+}
+
+test "shouldAnswerDecodeError stays silent only for unrecognized payload types" {
+    try std.testing.expect(!shouldAnswerDecodeError(error.UnknownPayloadType));
+    try std.testing.expect(!shouldAnswerDecodeError(error.InvalidPayloadType));
+    try std.testing.expect(shouldAnswerDecodeError(error.MissingField));
+    try std.testing.expect(shouldAnswerDecodeError(error.InvalidFieldType));
+    try std.testing.expect(shouldAnswerDecodeError(error.FieldOutOfRange));
+    try std.testing.expect(shouldAnswerDecodeError(error.InvalidUlid));
+    try std.testing.expect(shouldAnswerDecodeError(error.InvalidSessionId));
+    try std.testing.expect(shouldAnswerDecodeError(error.SyntaxError));
 }
 
 test "rejectionReason maps decode failures to stable text" {

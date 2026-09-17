@@ -996,16 +996,19 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
+        const reason = parseStopReason(try fields.requiredString(obj, "reason"));
         const message_obj = try fields.requiredObject(obj, "message");
         const message = try parseAssistantMessage(message_obj, allocator);
         return .{ .done = .{
-            .reason = parseStopReason(try fields.requiredString(obj, "reason")),
+            .reason = reason,
             .message = message,
         } };
     }
     if (std.mem.eql(u8, type_str, "error")) {
+        const reason = parseStopReason(try fields.requiredString(obj, "reason"));
         var err_msg = empty_partial;
         err_msg.is_owned = true;
+        errdefer err_msg.error_message.deinit(allocator);
 
         if (obj.get("error_message")) |em| {
             err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, try fields.asString(em)));
@@ -1024,7 +1027,7 @@ pub fn parseAssistantMessageEvent(
         }
 
         return .{ .@"error" = .{
-            .reason = parseStopReason(try fields.requiredString(obj, "reason")),
+            .reason = reason,
             .err = err_msg,
         } };
     }
@@ -1040,17 +1043,17 @@ pub fn parseAssistantMessage(
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {
     var content: []ai_types.AssistantContent = &.{};
+    var parsed_count: usize = 0;
+    errdefer {
+        for (content[0..parsed_count]) |c| {
+            freeAssistantContent(c, allocator);
+        }
+        allocator.free(content);
+    }
     if (obj.get("content")) |content_val| {
         if (content_val == .array) {
             const content_array = try fields.asArray(content_val);
             content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
-            var parsed_count: usize = 0;
-            errdefer {
-                for (content[0..parsed_count]) |c| {
-                    freeAssistantContent(c, allocator);
-                }
-                allocator.free(content);
-            }
             for (content_array.items, 0..) |item, i| {
                 content[i] = try parseAssistantContent(try fields.asObject(item), allocator);
                 parsed_count += 1;
@@ -1080,12 +1083,6 @@ pub fn parseAssistantMessage(
 
     var result: ai_types.AssistantMessage = undefined;
     result.content = content;
-    errdefer {
-        for (result.content) |c| {
-            freeAssistantContent(c, allocator);
-        }
-        allocator.free(result.content);
-    }
 
     result.stop_reason = parseStopReason(try fields.requiredString(obj, "stop_reason"));
 
@@ -1149,8 +1146,10 @@ fn parseAssistantContent(
             try allocator.dupe(u8, try fields.asString(sig_val))
         else
             null;
+        errdefer if (text_signature) |sig| allocator.free(sig);
+        const text = try allocator.dupe(u8, try fields.requiredString(obj, "text"));
         return .{ .text = .{
-            .text = try allocator.dupe(u8, try fields.requiredString(obj, "text")),
+            .text = text,
             .text_signature = text_signature,
         } };
     }
@@ -1159,10 +1158,16 @@ fn parseAssistantContent(
             try allocator.dupe(u8, try fields.asString(sig_val))
         else
             null;
+        errdefer if (thought_signature) |sig| allocator.free(sig);
+        const id = try allocator.dupe(u8, try fields.requiredString(obj, "id"));
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, try fields.requiredString(obj, "name"));
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, try fields.requiredString(obj, "arguments_json"));
         return .{ .tool_call = .{
-            .id = try allocator.dupe(u8, try fields.requiredString(obj, "id")),
-            .name = try allocator.dupe(u8, try fields.requiredString(obj, "name")),
-            .arguments_json = try allocator.dupe(u8, try fields.requiredString(obj, "arguments_json")),
+            .id = id,
+            .name = name,
+            .arguments_json = arguments_json,
             .thought_signature = thought_signature,
         } };
     }
@@ -1171,15 +1176,20 @@ fn parseAssistantContent(
             try allocator.dupe(u8, try fields.asString(sig_val))
         else
             null;
+        errdefer if (thinking_signature) |sig| allocator.free(sig);
+        const thinking = try allocator.dupe(u8, try fields.requiredString(obj, "thinking"));
         return .{ .thinking = .{
-            .thinking = try allocator.dupe(u8, try fields.requiredString(obj, "thinking")),
+            .thinking = thinking,
             .thinking_signature = thinking_signature,
         } };
     }
     if (std.mem.eql(u8, type_str, "image")) {
+        const data = try allocator.dupe(u8, try fields.requiredString(obj, "data"));
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, try fields.requiredString(obj, "mime_type"));
         return .{ .image = .{
-            .data = try allocator.dupe(u8, try fields.requiredString(obj, "data")),
-            .mime_type = try allocator.dupe(u8, try fields.requiredString(obj, "mime_type")),
+            .data = data,
+            .mime_type = mime_type,
         } };
     }
 
@@ -2076,4 +2086,88 @@ test "parseAssistantMessage without error_message keeps it unset" {
     var round = msg.result;
     defer round.deinit(allocator);
     try std.testing.expect(round.getErrorMessage() == null);
+}
+
+fn expectEventParseError(json: []const u8, expected: anyerror) !void {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = try fields.rootObject(parsed.value);
+    const type_str = try fields.requiredString(obj, "type");
+    try std.testing.expectError(expected, parseAssistantMessageEvent(type_str, obj, allocator));
+}
+
+fn expectMessageParseError(json: []const u8, expected: anyerror) !void {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = try fields.rootObject(parsed.value);
+    try std.testing.expectError(expected, parseAssistantMessage(obj, allocator));
+}
+
+test "parseAssistantMessage frees parsed content when usage is malformed" {
+    const negative_usage =
+        \\{"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}],"usage":{"input":-1},"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+    const wrong_typed_usage =
+        \\{"content":[{"type":"text","text":"hello"}],"usage":{"output":"many"},"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+
+    try expectMessageParseError(negative_usage, error.FieldOutOfRange);
+    try expectMessageParseError(wrong_typed_usage, error.InvalidFieldType);
+}
+
+test "parseAssistantMessage frees parsed content when a trailing required field is bad" {
+    const missing_model =
+        \\{"content":[{"type":"text","text":"hello"}],"stop_reason":"stop","api":"a","provider":"p","timestamp":1}
+    ;
+    const missing_timestamp =
+        \\{"content":[{"type":"text","text":"hello"}],"stop_reason":"stop","model":"m","api":"a","provider":"p"}
+    ;
+
+    try expectMessageParseError(missing_model, error.MissingField);
+    try expectMessageParseError(missing_timestamp, error.MissingField);
+}
+
+test "parseAssistantContent frees earlier fields when a later one is malformed" {
+    const text_after_signature =
+        \\{"content":[{"type":"text","text_signature":"sig"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+    const tool_call_missing_name =
+        \\{"content":[{"type":"tool_call","thought_signature":"sig","id":"call-1"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+    const tool_call_missing_arguments =
+        \\{"content":[{"type":"tool_call","id":"call-1","name":"lookup"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+    const thinking_after_signature =
+        \\{"content":[{"type":"thinking","thinking_signature":"sig"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+    const image_missing_mime =
+        \\{"content":[{"type":"image","data":"aW1n"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}
+    ;
+
+    try expectMessageParseError(text_after_signature, error.MissingField);
+    try expectMessageParseError(tool_call_missing_name, error.MissingField);
+    try expectMessageParseError(tool_call_missing_arguments, error.MissingField);
+    try expectMessageParseError(thinking_after_signature, error.MissingField);
+    try expectMessageParseError(image_missing_mime, error.MissingField);
+}
+
+test "parseAssistantMessageEvent frees the decoded message when done lacks a reason" {
+    const done_without_reason =
+        \\{"type":"done","message":{"content":[{"type":"text","text":"hello"}],"stop_reason":"stop","model":"m","api":"a","provider":"p","timestamp":1}}
+    ;
+    try expectEventParseError(done_without_reason, error.MissingField);
+}
+
+test "parseAssistantMessageEvent frees the error message when error lacks a reason" {
+    const error_without_reason =
+        \\{"type":"error","error_message":"boom","usage":{"input":1}}
+    ;
+    const error_with_bad_usage =
+        \\{"type":"error","reason":"error","error_message":"boom","usage":{"input":-1}}
+    ;
+
+    try expectEventParseError(error_without_reason, error.MissingField);
+    try expectEventParseError(error_with_bad_usage, error.FieldOutOfRange);
 }

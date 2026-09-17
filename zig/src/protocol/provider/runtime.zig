@@ -181,7 +181,8 @@ pub const ProviderProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                self.sendNackForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                if (fields.shouldAnswerDecodeError(err)) self.sendNackForRejectedInput(line, fields.rejectionReason(err)) catch {};
+
                 continue;
             };
             defer env.deinit(self.allocator);
@@ -425,4 +426,37 @@ test "provider runtime keeps serving well-formed envelopes after a malformed one
     var pong = try envelope.deserializeEnvelope(second, allocator);
     defer pong.deinit(allocator);
     try std.testing.expect(pong.payload == .pong);
+}
+
+test "provider runtime stays silent on a well-formed envelope with an unrecognized type" {
+    const allocator = std.testing.allocator;
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(allocator, &registry, .{});
+    defer server.deinit();
+
+    var pipe = in_process.createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    const unknown_type =
+        \\{"type":"definitely_not_a_real_envelope","stream_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","message_id":"01M2MYK69FX2M3DY769FEHK3M1","sequence":1,"timestamp":1,"version":1,"payload":{}}
+    ;
+
+    var client_sender = pipe.clientSender();
+    try client_sender.write(unknown_type);
+    try client_sender.flush();
+
+    var runtime = ProviderProtocolRuntime{
+        .server = &server,
+        .pipe = &pipe,
+        .allocator = allocator,
+    };
+    try runtime.pumpClientMessages();
+
+    const reply = try readServerReply(&pipe, allocator);
+    if (reply) |line| {
+        defer allocator.free(line);
+        return error.UnexpectedReplyToUnknownType;
+    }
 }

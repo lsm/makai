@@ -47,7 +47,8 @@ pub const ToolProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = tool_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                self.sendToolErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                if (fields.shouldAnswerDecodeError(err)) self.sendToolErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+
                 continue;
             };
             defer env.deinit(self.allocator);

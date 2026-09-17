@@ -24,7 +24,8 @@ pub const AgentProtocolRuntime = struct {
             defer self.allocator.free(line);
 
             var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch |err| {
-                self.sendErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+                if (fields.shouldAnswerDecodeError(err)) self.sendErrorForRejectedInput(line, fields.rejectionReason(err)) catch {};
+
                 continue;
             };
             defer env.deinit(self.allocator);
