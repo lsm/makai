@@ -217,6 +217,15 @@ impl Subscription {
                 return Ok(frame);
             }
             if *self.closed.borrow() {
+                // The try_recv above and this check are not one atomic step.
+                // On a multi-threaded runtime another worker can dispatch a
+                // terminal frame and set the closed flag in the window between
+                // them, and failing here would lose the frame this function's
+                // doc comment promises to deliver. Drain once more first; the
+                // caller's next call re-drains through the try_recv above.
+                if let Ok(frame) = self.receiver.try_recv() {
+                    return Ok(frame);
+                }
                 return Err(self.closed_error());
             }
             tokio::select! {
