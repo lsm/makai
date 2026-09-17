@@ -177,6 +177,16 @@ The frame-by-frame shape of all three is pinned in CI by the golden-trace tests
 in `zig/src/protocol/oap/bridge.zig` (`zig build test-unit-protocol`), so a
 regression that would break external validation fails a unit test first.
 
+The endpoint also passes the OAP repository's own conformance harness end to
+end — `go run ./cmd/oap conformance --command "makai --oap --model <ref>"`,
+which spawns the binary, drives a scripted session over
+`drafts/endpoint-stdio.md`, and hands the assembled trace to the validator the
+adapters are held to. Cursor replay is recorded as a skip: makai implements no
+transport control, answers `unsupported_control`, and the binding permits
+exactly that. The harness needs `--model` because makai advertises no
+`models.list` catalog over OAP; `+models` is an optional unit and its absence
+is not a conformance gap.
+
 ### Conflicts raised, not compensated
 
 Per the feedback rule, these resolve as an OAP revision or a makai fix, never

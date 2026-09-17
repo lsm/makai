@@ -6335,7 +6335,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--oap")) {
-        try runOapMode(allocator, args[2..], stdin, stdout, stderr);
+        runOapMode(allocator, args[2..], stdin, stdout, stderr) catch |err| {
+            if (err == error.MalformedLine) std.process.exit(1);
+            return err;
+        };
         return;
     }
 
@@ -6655,7 +6658,12 @@ fn runOapMode(
 
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
-            try oap.handleLine(line);
+            oap.handleLine(line) catch |err| {
+                if (err != error.MalformedLine) return err;
+                _ = try writeOapOutbound(stdout, allocator, &oap);
+                try compat.stdio.writeAll(stderr, OAP_MALFORMED_LINE_MESSAGE);
+                return error.MalformedLine;
+            };
             did_work = true;
         }
 
@@ -6707,6 +6715,7 @@ fn runOapMode(
 }
 
 const OAP_EOF_MESSAGE = "the makai host reached end of input before the run settled";
+const OAP_MALFORMED_LINE_MESSAGE = "makai --oap: stdin carried a line that is not an OAP envelope or control frame; the stream's framing is in doubt and the endpoint will not resynchronise\n";
 
 fn pumpOapIntents(
     allocator: std.mem.Allocator,
