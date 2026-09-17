@@ -243,6 +243,8 @@ pub const ProtocolServer = struct {
 
     refresh_lock: refresh_lock_mod.RefreshLock,
 
+    provider_thread_abandoned: bool = false,
+
     pub const ActiveStream = struct {
         stream_id: protocol_types.Ulid,
         model: ai_types.Model,
@@ -294,17 +296,18 @@ pub const ProtocolServer = struct {
     }
 
     fn releaseProviderStream(
-        allocator: std.mem.Allocator,
+        self: *ProtocolServer,
         stream: *event_stream.AssistantMessageEventStream,
         join_timeout_ms: u64,
     ) bool {
         if (!stream.cancelAndJoinThread(join_timeout_ms)) {
             stream.abandoned.store(true, .release);
+            self.provider_thread_abandoned = true;
             return false;
         }
         stream.wait_for_thread_on_deinit = false;
         stream.deinit();
-        allocator.destroy(stream);
+        self.allocator.destroy(stream);
         return true;
     }
 
@@ -312,7 +315,7 @@ pub const ProtocolServer = struct {
         var released = active_stream;
         released.partial_state.deinit();
         if (released.cancelled) |c| c.store(true, .release);
-        if (!releaseProviderStream(self.allocator, released.event_stream, self.options.provider_join_timeout_ms)) return;
+        if (!self.releaseProviderStream(released.event_stream, self.options.provider_join_timeout_ms)) return;
         if (released.cancelled) |c| self.allocator.destroy(c);
     }
 
@@ -705,7 +708,7 @@ fn streamWithRefresh(
 
     server.allocator.free(api_key_opt.?);
     api_key_opt = null;
-    _ = ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms);
+    _ = server.releaseProviderStream(stream, server.options.provider_join_timeout_ms);
 
     refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -726,7 +729,7 @@ fn streamWithRefresh(
         if (retry_stream.getError()) |retry_err_msg| {
             const retry_auth_failure = if (provider.is_auth_failure) |detector| detector(retry_err_msg) else defaultAuthFailureDetector(retry_err_msg);
             if (retry_auth_failure) {
-                _ = ProtocolServer.releaseProviderStream(server.allocator, retry_stream, server.options.provider_join_timeout_ms);
+                _ = server.releaseProviderStream(retry_stream, server.options.provider_join_timeout_ms);
                 return error.AuthRequired;
             }
         }
@@ -864,8 +867,9 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
+    server.provider_thread_abandoned = false;
     const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
-        server.allocator.destroy(cancelled);
+        if (!server.provider_thread_abandoned) server.allocator.destroy(cancelled);
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             providerErrorMessage(err),
@@ -876,7 +880,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     if (!stream.owns_events) {
         cancelled.store(true, .release);
         stream.wait_for_thread_on_deinit = true;
-        if (ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms)) {
+        if (server.releaseProviderStream(stream, server.options.provider_join_timeout_ms)) {
             server.allocator.destroy(cancelled);
         }
         return try envelope.createNack(
@@ -1002,7 +1006,9 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
 
     const options_with_cancel = injectCompleteOptions(request.options, .{ .cancelled = cancelled });
 
+    server.provider_thread_abandoned = false;
     const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
+        if (server.provider_thread_abandoned) cancel_flag_owned = false;
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             providerErrorMessage(err),
@@ -1012,7 +1018,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     };
     defer {
         cancelled.store(true, .release);
-        if (!ProtocolServer.releaseProviderStream(server.allocator, stream, server.options.provider_join_timeout_ms)) {
+        if (!server.releaseProviderStream(stream, server.options.provider_join_timeout_ms)) {
             cancel_flag_owned = false;
         }
     }

@@ -412,7 +412,7 @@ const ActiveAgentRun = struct {
 
     fn deinit(self: *ActiveAgentRun, allocator: std.mem.Allocator) void {
         self.cancel();
-        _ = self.stream.deinitAndDestroy();
+        if (!self.stream.deinitAndDestroy()) return;
         self.context.deinit();
         allocator.destroy(self.context);
         self.model.deinit(allocator);
