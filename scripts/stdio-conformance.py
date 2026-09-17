@@ -522,7 +522,7 @@ def group_envelope(ctx):
         nacks = [f for f in replies if isinstance(f, dict) and f.get("type") == "nack"]
         answered[label] = {
             "kinds": kinds(replies),
-            "correlated": bool(nacks) and nacks[0].get("in_reply_to") == frame["message_id"],
+            "correlated": bool(nacks) and nacks[0].get("in_reply_to") == frame.get("message_id"),
         }
     code = host.shutdown()
     unanswered = [k for k, v in answered.items() if not v["correlated"]]
@@ -859,10 +859,10 @@ def group_lifecycle(ctx):
         seen = []
         for frame in host.exchange(agent_frame("agent_start", session, 1, start_payload(session))):
             if isinstance(frame, dict):
-                seen.append((frame["type"], frame["sequence"]))
+                seen.append((frame.get("type"), frame.get("sequence")))
         for frame in host.exchange(agent_frame("agent_stop", session, 2, {"session_id": session, "reason": "x"})):
             if isinstance(frame, dict):
-                seen.append((frame["type"], frame["sequence"]))
+                seen.append((frame.get("type"), frame.get("sequence")))
         rounds.append(seen)
     ok = rounds[0] == rounds[1] == [("agent_started", 1), ("agent_stopped", 2)]
     results.append(Result(
@@ -1090,7 +1090,7 @@ def group_routing(ctx):
         by_session.setdefault(frame.get("session_id"), []).append(frame)
 
     expected_order = ["agent_started", "session_info", "session_info", "agent_stopped"]
-    wrong_order = [s for s in sessions if [f["type"] for f in by_session.get(s, [])] != expected_order]
+    wrong_order = [s for s in sessions if [f.get("type") for f in by_session.get(s, [])] != expected_order]
     crossed = []
     for frame in frames:
         if frame.get("type") == "agent_started":
