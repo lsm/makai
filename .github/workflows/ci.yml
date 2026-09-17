@@ -138,13 +138,6 @@ jobs:
         run: npm run check:declarations
 
   # =============================================================================
-  # Rust SDK (rust/) — lint, format, unit tests, and E2E against a real
-  # `makai --stdio` build. No API keys: the fake-server tests drive the crate's
-  # own `makai-protocol-fake` binary, and the binary-backed tests exercise the
-  # unauthenticated failure paths plus the runtime's `test-fixture` auth
-  # provider. The crate is NOT wired into the Zig build; this job is its only
-  # entry point.
-  # =============================================================================
   rust-sdk:
     name: Rust SDK
     needs: [unit-tests]
@@ -192,6 +185,59 @@ jobs:
         env:
           MAKAI_BINARY_PATH: /tmp/makai-rs/bin/makai
         run: cargo test --all-features
+
+  # =============================================================================
+  # Python SDK (python/)
+  #
+  # Mirrors ts-sdk-e2e: build the runtime, point MAKAI_BINARY_PATH at it, and
+  # run the suite. Without that variable every test in
+  # python/tests/test_real_binary.py skips, so the E2E lane sets it explicitly.
+  #
+  # MAKAI_TEST_REAL_AUTH is deliberately NOT set: the auth-protocol E2E test
+  # stays opt-in. On macOS an unsigned local build blocks on a Keychain access
+  # prompt and auth_providers_request never answers. Linux reads
+  # ~/.makai/auth.json instead and should be fine, but that has not been
+  # verified on a runner, so enabling it here is left as a follow-up rather
+  # than a guess that could redden main.
+  #
+  # The Python SDK is not wired into the Zig build; zig build install is used
+  # only to produce the binary this job exercises.
+  # =============================================================================
+  python-sdk-e2e:
+    name: Python SDK E2E
+    needs: [unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python SDK with dev extras
+        working-directory: python
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Type check (mypy --strict)
+        working-directory: python
+        run: python -m mypy
+
+      - name: Build makai binary for Python SDK E2E
+        run: zig build install --prefix /tmp/makai-py
+
+      - name: Run Python SDK unit + E2E tests
+        working-directory: python
+        env:
+          MAKAI_BINARY_PATH: /tmp/makai-py/bin/makai
+        run: python -m pytest -q
 
   # =============================================================================
   # TUI PTY Harness (deterministic, fixture provider — no API keys)
