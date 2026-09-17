@@ -222,8 +222,9 @@ check only matters for a request arriving over the protocol. Honouring it there
 would cost nothing more than an unauthenticated request to a URL the caller
 already chose, but refusing keeps the vendor paths uniformly credentialed.
 
-Three rules keep those apart, because `base_url` arrives from the request and the
-server does not police where a model points. When a request names a vendor wire
+Four rules keep those apart. `base_url` arrives from the request, so the first
+three bound which credential a request can name and the fourth bounds where an
+OAuth credential may be sent. When a request names a vendor wire
 format (`anthropic-messages`, `openai-codex-responses`) but a different
 `provider`, the server refuses outright if that `provider` is itself a vendor id,
 so claiming `provider: "openai-codex"` on `anthropic-messages` cannot pull the
@@ -232,25 +233,6 @@ api-key-only rule that skips OAuth entries entirely. A custom provider's
 credential is always a stored API key or an environment variable, so the rule
 costs it nothing, and the `anthropic` and `openai-codex` OAuth tokens cannot be
 resolved under a borrowed identity.
-
-**What these rules do not do**, stated plainly because the boundary is narrower
-than it looks. They stop a stored OAuth token being resolved under a *different*
-provider's identity. They do not constrain where a provider's *own* token is
-sent, because `base_url` arrives in the request and legitimate proxy setups
-depend on that; the `MAKAI_BASE_URL` and per-provider overrides exist for exactly
-that reason. So a request naming `anthropic` on `anthropic-messages`, or
-`github-copilot` on `openai-completions`, still reaches its own credential with
-whatever `base_url` it supplies.
-
-`github-copilot` is the sharpest case and cannot be fixed by widening the vendor
-set. Copilot is stored as an OAuth credential and its models genuinely run on
-`openai-completions`, an API that declares no `auth_provider_id`, so the
-legitimate request and the exfiltrating one are the same request with a different
-`base_url`. Adding `github-copilot` to the refused set makes Copilot resolve no
-credential at all, which a test in `protocol/provider/server.zig` pins. Binding a
-vendor credential to an allowed origin is the fix that would close this, and it
-is a separate change with its own decision about how proxy overrides stay
-usable.
 
 The third rule covers the wire formats that have no vendor of their own. Only
 `anthropic-messages` and `openai-codex-responses` declare an `auth_provider_id`;
@@ -262,6 +244,76 @@ OAuth token and sent it there, bypassing the first two rules entirely. A request
 claiming a vendor id on an API that is not that vendor's now resolves under the
 same api-key-only rule, so the token stays put and an ordinary custom provider
 with a stored key is unaffected.
+
+The fourth rule bounds the destination, which the first three deliberately do
+not. A stored OAuth credential is now bound to the origins its provider is
+expected to serve: before the token is handed to a provider, `model.base_url` is
+compared against an allowed set, and a request pointing somewhere else is
+refused with `auth_required` rather than being sent the token. Origin means
+scheme, host and port; the path is not compared, so a proxy route under an
+allowed host stays usable. An empty `base_url` is allowed, because the server
+then fills in the endpoint itself from the same defaults and overrides.
+
+The allowed set for a provider is built from three sources, and the split
+between them is the whole point of the rule: an environment variable is set by
+whoever runs the process, while `base_url` can arrive from a remote protocol
+client.
+
+- The vendor's own origin. `anthropic` is bound to `https://api.anthropic.com`
+  and `openai-codex` to `https://chatgpt.com`. `github-copilot` is bound to any
+  host under `githubcopilot.com`, which covers both the individual endpoint and
+  an `api.<tenant>.githubcopilot.com` enterprise tenant.
+- Whatever the environment names for that provider: `MAKAI_BASE_URL`, and the
+  per-provider variable where one exists (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
+  `DEEPSEEK_BASE_URL`). An operator who can already route a vendor through a
+  corporate proxy can still reach it; nothing new has to be configured, and no
+  new variable was added to relax the check. Codex and Copilot have no
+  per-provider variable, so `MAKAI_BASE_URL` is their override here exactly as it
+  already is for routing.
+- The endpoint the credential itself recorded at login. GitHub Copilot writes the
+  base URL it was issued into the credential's `provider_data`, so an enterprise
+  deployment that does not sit under `githubcopilot.com` keeps working without
+  configuration.
+
+A provider id with none of the above — today only `test-fixture`, tomorrow any
+OAuth provider added without an entry — has **no** allowed origin, so a stored
+OAuth token under that id is withheld from every non-empty `base_url`. That is
+deliberate: a new OAuth provider fails loudly at its first request rather than
+silently reopening the gap.
+
+The rule reaches API keys stored in the OAuth shape, which is why "an `.oauth`
+entry" is not the same as "an OAuth credential" here. `/login kimi` records a
+region, and a credential carrying `provider_data` is persisted as `.oauth` with
+an empty `refresh` and `expires` at `maxInt` rather than as `.api_key` — the
+same shape the legacy `region` field migrates into. Those are API keys, so an
+entry with no refresh token under a provider id with no policy is exempt and
+goes wherever the user pointed it. A missing refresh token does **not** exempt
+`anthropic`, `openai-codex` or `github-copilot`: an id with a policy is always
+bound, so the exemption cannot be used to unbind a vendor token. What the
+fail-closed rule above therefore covers is an entry that has a refresh token and
+no policy.
+
+Plain `.api_key` entries, and keys from a declared provider's environment
+variable, are not checked at all. That pairing is the user's own; constraining
+it would break custom endpoints for no gain.
+
+`github-copilot` is why this could not be fixed by widening the refused set
+instead. Copilot is stored as an OAuth credential and its models genuinely run
+on `openai-completions`, an API that declares no `auth_provider_id`, so the
+legitimate request and the exfiltrating one are the same request with a
+different `base_url`; adding `github-copilot` to the refused set would make
+Copilot resolve no credential at all. The test in
+`protocol/provider/server.zig` that pins Copilot resolving its stored token on
+`openai-completions` still does so, now against a `githubcopilot.com` base URL
+rather than an arbitrary one, and a sibling test pins the refusal at any other
+origin.
+
+**What this still does not do.** It bounds where a credential goes, not what a
+request may ask for. A caller that legitimately holds a vendor credential can
+still drive it with any prompt, and the origin set is per provider rather than
+per credential, so two logins to the same vendor are interchangeable. It also
+takes the environment and `provider_data` at face value: anything that can write
+those already runs as the user.
 
 Each provider's own environment fallback is scoped the same way. When the server
 resolves nothing it still calls the provider without a key, and the provider then

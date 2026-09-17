@@ -560,6 +560,26 @@ fn isVendorOAuthProviderId(provider_id: []const u8) bool {
         std.mem.eql(u8, provider_id, "openai-codex");
 }
 
+fn storedOAuthOriginAllowed(
+    allocator: std.mem.Allocator,
+    storage: ?*oauth_storage.AuthStorage,
+    provider_id: []const u8,
+    model: ai_types.Model,
+) bool {
+    const auth_storage = storage orelse return true;
+    const auth = auth_storage.providers.get(provider_id) orelse return true;
+    return switch (auth) {
+        .api_key => true,
+        .oauth => |credentials| provider_base_url.oauthOriginAllowed(
+            allocator,
+            provider_id,
+            model.base_url,
+            credentials.refresh,
+            credentials.provider_data,
+        ),
+    };
+}
+
 fn streamWithResolvedKey(
     server: *ProtocolServer,
     provider: api_registry.ApiProvider,
@@ -579,6 +599,10 @@ fn streamWithResolvedKey(
             break :blk null;
         break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
     };
+
+    if (kind == .any and !storedOAuthOriginAllowed(server.allocator, storage, provider_id, model)) {
+        return error.AuthRequired;
+    }
 
     const resolved = auth_resolver.resolveApiKeyOfKind(server.allocator, storage, provider_id, null, kind) catch |err| switch (err) {
         error.AuthRequired => return provider.stream(model, context, options, server.allocator),
@@ -681,6 +705,8 @@ fn streamWithRefresh(
         }
         return streamWithResolvedKey(server, provider, provider_id, model, context, options, .any);
     }
+
+    if (!storedOAuthOriginAllowed(server.allocator, storage, provider_id, model)) return error.AuthRequired;
 
     if (storage.credentialsExpired(provider_id)) {
         refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
@@ -1458,6 +1484,12 @@ fn testModel() ai_types.Model {
     };
 }
 
+fn authTestModel() ai_types.Model {
+    var model = testModel();
+    model.base_url = "";
+    return model;
+}
+
 fn testContext() ai_types.Context {
     return .{ .messages = &.{} };
 }
@@ -1825,7 +1857,7 @@ test "expired stored credentials refresh before upstream call" {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, testModel(), testContext(), null);
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, authTestModel(), testContext(), null);
     defer {
         stream.deinit();
         std.testing.allocator.destroy(stream);
@@ -1847,7 +1879,7 @@ test "upstream auth failure refreshes and retries once" {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, testModel(), testContext(), null);
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, authTestModel(), testContext(), null);
     defer {
         stream.deinit();
         std.testing.allocator.destroy(stream);
@@ -1879,7 +1911,7 @@ fn expectAuthRefreshFailedNack(state: *AuthTestState) !void {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = authTestModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_refresh_failed, response.payload.nack.error_code.?);
@@ -2020,6 +2052,7 @@ test "a github-copilot model resolves its stored OAuth token on openai-completio
     var model = testModel();
     model.api = "openai-completions";
     model.provider = "github-copilot";
+    model.base_url = "https://api.individual.githubcopilot.com";
 
     const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
     defer {
@@ -2028,6 +2061,258 @@ test "a github-copilot model resolves its stored OAuth token on openai-completio
     }
 
     try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "a kimi api key stored in the oauth shape still reaches its endpoint" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "kimi"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, ""),
+            .access = try std.testing.allocator.dupe(u8, "kimi-api-key"),
+            .expires = std.math.maxInt(i64),
+            .provider_data = try std.testing.allocator.dupe(u8, "region:china"),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "kimi";
+    model.base_url = "https://api.kimi.com/coding";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqualStrings("kimi-api-key", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "an api-key-shaped entry under a vendor id stays bound to the vendor origin" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, ""),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = std.math.maxInt(i64),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+    model.base_url = "https://attacker.test";
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+}
+
+test "an OAuth provider id with no declared origin is refused a request base_url" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registerAuthTestProvider(&registry);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
+    defer server.deinit();
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("test-api").?, testModel(), testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.refresh_count);
+}
+
+test "a github-copilot OAuth token is withheld from an unexpected base_url" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+    model.base_url = "https://attacker.test";
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+}
+
+test "a github-copilot enterprise origin recorded at login stays usable" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "github-copilot"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "gho-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "copilot-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+            .provider_data = try std.testing.allocator.dupe(u8, "{\"baseUrl\":\"https://copilot.acme.test\"}"),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "openai-completions";
+    model.provider = "github-copilot";
+    model.base_url = "https://copilot.acme.test";
+
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("openai-completions").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "an anthropic OAuth token is bound to the Anthropic origin" {
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "anthropic-messages",
+        .stream = authTestStream,
+        .stream_simple = mockStreamSimple,
+        .auth_provider_id = "anthropic",
+        .auth_refresh_fn = authTestRefresh,
+        .auth_get_api_key_fn = authTestGetApiKey,
+    }, null);
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "anthropic"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "vendor-refresh"),
+            .access = try std.testing.allocator.dupe(u8, "vendor-access"),
+            .expires = compat.time.nowMillis() + 3_600_000,
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var model = testModel();
+    model.api = "anthropic-messages";
+    model.provider = "anthropic";
+    model.base_url = "https://attacker.test";
+
+    try std.testing.expectError(
+        error.AuthRequired,
+        streamWithRefresh(&server, registry.getApiProvider("anthropic-messages").?, model, testContext(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.stream_calls);
+
+    model.base_url = "https://api.anthropic.com";
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("anthropic-messages").?, model, testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+    try std.testing.expectEqualStrings("vendor-access", state.last_api_key[0..state.last_api_key_len]);
 }
 
 test "an api without an auth provider id never resolves a vendor OAuth token" {
@@ -2147,7 +2432,7 @@ test "stored api_key used when provider has OAuth hook but storage has non-OAuth
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, testModel(), testContext(), null);
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, authTestModel(), testContext(), null);
     defer {
         stream.deinit();
         std.testing.allocator.destroy(stream);
@@ -2169,7 +2454,7 @@ test "retry auth failure returns auth_required nack" {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = authTestModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_required, response.payload.nack.error_code.?);
