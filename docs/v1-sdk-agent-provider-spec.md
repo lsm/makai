@@ -860,7 +860,10 @@ Auth refresh semantics:
 6. Phase F: switch demo to spec interfaces only.
 
 Backward compatibility:
-- Keep envelope protocol version as `1`.
+- Keep envelope protocol version as `1`. The `version` field is **required** on every
+  inbound envelope in all four protocols; an envelope that omits it is rejected as
+  `invalid_request` rather than defaulted. The provider deserializer used to default a
+  missing `version` to `1` while auth, agent and tool required it; that asymmetry is gone.
 - Feature detect by attempting models request and handling `not_implemented`.
 - V1 evolution rule: additive-only changes. Do not repurpose existing fields.
 - Unknown fields must be ignored by parsers.

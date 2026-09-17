@@ -635,7 +635,7 @@ pub fn deserializeEnvelope(
 
     const obj = try fields.rootObject(parsed.value);
 
-    const version = try fields.optionalInt(u8, obj, "version", 1);
+    const version = try fields.requiredInt(u8, obj, "version");
 
     const stream_id_str = try fields.requiredString(obj, "stream_id");
     const stream_id = protocol_types.parseUlid(stream_id_str) orelse return error.InvalidUlid;
@@ -2166,6 +2166,7 @@ test "deserializeEnvelope rejects invalid in_reply_to ulid" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
+        \\  "version": 1,
         \\  "in_reply_to": "not-a-ulid",
         \\  "payload": {}
         \\}
@@ -2417,7 +2418,7 @@ test "serializeEnvelope with stream_error payload" {
     envelope.deinit(allocator);
 }
 
-test "deserializeEnvelope with version field defaults to 1" {
+test "deserializeEnvelope rejects an envelope with no version field" {
     const allocator = std.testing.allocator;
 
     const json =
@@ -2431,10 +2432,7 @@ test "deserializeEnvelope with version field defaults to 1" {
         \\}
     ;
 
-    var envelope = try deserializeEnvelope(json, allocator);
-    defer envelope.deinit(allocator);
-
-    try std.testing.expect(envelope.version == 1);
+    try std.testing.expectError(error.MissingField, deserializeEnvelope(json, allocator));
 }
 
 test "deserializeEnvelope with explicit version" {
@@ -2700,6 +2698,7 @@ test "deserializeEnvelope with pong payload" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
+        \\  "version": 1,
         \\  "payload": {
         \\    "ping_id": "test-ping-456"
         \\  }
@@ -2723,6 +2722,7 @@ test "deserializeEnvelope with goodbye payload" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
+        \\  "version": 1,
         \\  "payload": {
         \\    "reason": "Server maintenance"
         \\  }
@@ -2746,6 +2746,7 @@ test "deserializeEnvelope with goodbye payload (no reason)" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
+        \\  "version": 1,
         \\  "payload": {}
         \\}
     ;
@@ -2767,6 +2768,7 @@ test "deserializeEnvelope with sync_request payload" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 50,
         \\  "timestamp": 1708234567900,
+        \\  "version": 1,
         \\  "payload": {
         \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
@@ -2792,6 +2794,7 @@ test "deserializeEnvelope with sync payload" {
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 60,
         \\  "timestamp": 1708234567900,
+        \\  "version": 1,
         \\  "payload": {
         \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "partial": {
