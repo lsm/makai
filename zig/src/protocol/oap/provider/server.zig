@@ -47,6 +47,9 @@ pub const ActiveInference = struct {
     temperature: ?f32 = null,
     include_snapshot: types.SnapshotPolicy,
     credential_ref: ?[]const u8 = null,
+    tools: []const types.ToolDefinition = &.{},
+    tool_choice: ?types.ToolChoice = null,
+    reasoning: ?types.ReasoningOptions = null,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
     open_part_kind: types.PartKind = .text,
@@ -59,6 +62,13 @@ pub const ActiveInference = struct {
 
     pub fn deinit(self: *ActiveInference, allocator: std.mem.Allocator) void {
         if (self.credential_ref) |value| allocator.free(value);
+        for (self.tools) |*tool| {
+            var owned = tool.*;
+            owned.deinit(allocator);
+        }
+        allocator.free(self.tools);
+        if (self.tool_choice) |*choice| choice.deinit(allocator);
+        if (self.reasoning) |*options| options.deinit(allocator);
         allocator.free(self.id);
         allocator.free(self.model_ref);
         for (self.messages) |*message| message.deinit(allocator);
@@ -289,6 +299,17 @@ pub const Server = struct {
             if (std.mem.eql(u8, descriptor.id, id)) return descriptor;
         }
         return null;
+    }
+
+    pub fn modelDeclares(self: *Self, model_ref: []const u8, capability: types.ModelCapability) bool {
+        for (self.models.items) |entry| {
+            if (!std.mem.eql(u8, entry.model_ref, model_ref)) continue;
+            for (entry.capabilities) |declared| {
+                if (declared == capability) return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     pub fn findGrant(self: *Self, reference: []const u8) ?*GrantedCredential {
@@ -624,11 +645,6 @@ pub const Server = struct {
             }
         }
 
-        if (create_request.tools.len > 0 or create_request.tool_choice != null) {
-            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward tools to a provider");
-            return;
-        }
-
         if (!create_request.stream) {
             try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint streams every inference and cannot answer unary");
             return;
@@ -641,6 +657,15 @@ pub const Server = struct {
 
         if (create_request.headers.len > 0) {
             try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward request headers to a provider");
+            return;
+        }
+
+        if (create_request.tools.len > 0 and !self.modelDeclares(create_request.model_ref, .tools)) {
+            try self.emitCreateRefusal(
+                env,
+                .unsupported_feature,
+                "this model does not declare the tools capability",
+            );
             return;
         }
 
@@ -660,9 +685,23 @@ pub const Server = struct {
             return;
         }
 
-        if (create_request.reasoning != null) {
-            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward reasoning controls");
-            return;
+        if (create_request.reasoning) |reasoning| {
+            if (!self.modelDeclares(create_request.model_ref, .reasoning)) {
+                try self.emitCreateRefusal(
+                    env,
+                    .unsupported_feature,
+                    "this model does not declare the reasoning capability",
+                );
+                return;
+            }
+            if (reasoning.encrypted_carry != null and !descriptor.round_trips_carry) {
+                try self.emitCreateRefusal(
+                    env,
+                    .unsupported_feature,
+                    "this provider does not round-trip a reasoning carry; see round_trips_carry on its descriptor",
+                );
+                return;
+            }
         }
 
         if (!self.options.accepts_inference) {
@@ -688,6 +727,25 @@ pub const Server = struct {
         else
             null;
         errdefer if (credential_ref) |value| self.allocator.free(value);
+
+        const tools = try cloneToolDefinitions(self.allocator, create_request.tools);
+        errdefer {
+            for (tools) |*tool| {
+                var owned = tool.*;
+                owned.deinit(self.allocator);
+            }
+            self.allocator.free(tools);
+        }
+        const tool_choice = try cloneToolChoice(self.allocator, create_request.tool_choice);
+        errdefer if (tool_choice) |*value| {
+            var owned = value.*;
+            owned.deinit(self.allocator);
+        };
+        const reasoning = try cloneReasoning(self.allocator, create_request.reasoning);
+        errdefer if (reasoning) |*value| {
+            var owned = value.*;
+            owned.deinit(self.allocator);
+        };
 
         const queued = try self.allocator.dupe(u8, inference_id);
         errdefer self.allocator.free(queued);
@@ -726,6 +784,9 @@ pub const Server = struct {
             .temperature = create_request.temperature,
             .include_snapshot = honoured,
             .credential_ref = credential_ref,
+            .tools = tools,
+            .tool_choice = tool_choice,
+            .reasoning = reasoning,
             .closed_parts = std.ArrayList(oap_types.ContentPart).empty,
             .text = std.ArrayList(u8).empty,
         });
@@ -1224,6 +1285,51 @@ pub const Server = struct {
         try self.push(response);
     }
 };
+
+fn cloneToolDefinitions(
+    allocator: std.mem.Allocator,
+    source: []const types.ToolDefinition,
+) ![]const types.ToolDefinition {
+    const out = try allocator.alloc(types.ToolDefinition, source.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*tool| tool.deinit(allocator);
+        allocator.free(out);
+    }
+    for (source, 0..) |tool, index| {
+        const name = try allocator.dupe(u8, tool.name);
+        errdefer allocator.free(name);
+        const description = if (tool.description) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (description) |value| allocator.free(value);
+        const schema = if (tool.input_schema_json) |value| try allocator.dupe(u8, value) else null;
+        out[index] = .{ .name = name, .description = description, .input_schema_json = schema };
+        built += 1;
+    }
+    return out;
+}
+
+fn cloneToolChoice(allocator: std.mem.Allocator, source: ?types.ToolChoice) !?types.ToolChoice {
+    const choice = source orelse return null;
+    return switch (choice) {
+        .function => |name| types.ToolChoice{ .function = try allocator.dupe(u8, name) },
+        .auto => types.ToolChoice.auto,
+        .none => types.ToolChoice.none,
+        .required => types.ToolChoice.required,
+    };
+}
+
+fn cloneReasoning(allocator: std.mem.Allocator, source: ?types.ReasoningOptions) !?types.ReasoningOptions {
+    const options = source orelse return null;
+    const effort = if (options.effort) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (effort) |value| allocator.free(value);
+    const carry = if (options.encrypted_carry) |value| try allocator.dupe(u8, value) else null;
+    return .{
+        .enabled = options.enabled,
+        .budget_tokens = options.budget_tokens,
+        .effort = effort,
+        .encrypted_carry = carry,
+    };
+}
 
 fn declaredId(line: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
@@ -2138,10 +2244,8 @@ test "a request member the endpoint cannot forward is refused rather than droppe
     defer server.deinit();
 
     const cases = [_][]const u8{
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"tools\":[{\"name\":\"search\"}]}",
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"tool_choice\":\"auto\"}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"output_schema\":{\"type\":\"object\"}}",
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"enabled\":true}}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"encrypted_carry\":\"prior\"}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"stream\":false}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",

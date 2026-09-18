@@ -6632,6 +6632,19 @@ fn oapProviderCompatibility(
     ).facts;
 }
 
+fn oapModelCapabilities(
+    allocator: std.mem.Allocator,
+    builtin: oap_provider_catalog.BuiltInProvider,
+) ![]const oap_provider_types.ModelCapability {
+    var list = std.ArrayList(oap_provider_types.ModelCapability).empty;
+    errdefer list.deinit(allocator);
+    try list.append(allocator, .chat);
+    try list.append(allocator, .streaming);
+    if (builtin.supports_tools) try list.append(allocator, .tools);
+    if (builtin.supports_reasoning) try list.append(allocator, .reasoning);
+    return list.toOwnedSlice(allocator);
+}
+
 fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provider_server.Server) !void {
     const proxy_flags = try provider_base_url.proxyCompatFlagsFromEnv(allocator);
     for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
@@ -6692,10 +6705,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
         errdefer if (!model_transferred) allocator.free(display_name);
         const provider_id = try allocator.dupe(u8, builtin.id);
         errdefer if (!model_transferred) allocator.free(provider_id);
-        const capabilities = try allocator.dupe(
-            oap_provider_types.ModelCapability,
-            &.{ .chat, .streaming },
-        );
+        const capabilities = try oapModelCapabilities(allocator, builtin);
         errdefer if (!model_transferred) allocator.free(capabilities);
 
         try server.addModel(.{
@@ -6897,6 +6907,7 @@ fn startOapInference(
     errdefer model.deinit(allocator);
     var context = try buildOapInferenceContext(allocator, inference.messages);
     errdefer context.deinit(allocator);
+    context.tools = try buildOapInferenceTools(allocator, inference.tools);
 
     const cancelled = try allocator.create(std.atomic.Value(bool));
     errdefer allocator.destroy(cancelled);
@@ -6910,6 +6921,13 @@ fn startOapInference(
     options.cancel_token = .{ .cancelled = cancelled };
     if (inference.max_output_tokens) |max| options.max_tokens = max;
     if (inference.temperature) |value| options.temperature = value;
+    if (inference.tool_choice) |choice| options.tool_choice = switch (choice) {
+        .auto => ai_types.ToolChoice{ .auto = {} },
+        .none => ai_types.ToolChoice{ .none = {} },
+        .required => ai_types.ToolChoice{ .required = {} },
+        .function => |name| ai_types.ToolChoice{ .function = name },
+    };
+    applyOapReasoning(&options, inference.reasoning);
 
     const stream = provider.stream(model, context, options, allocator) catch |err| {
         const code: oap_provider_types.ErrorCode = switch (err) {
@@ -7084,7 +7102,7 @@ fn buildOapInferenceModel(
         .api = api,
         .provider = provider,
         .base_url = base_url,
-        .reasoning = false,
+        .reasoning = builtin.supports_reasoning,
         .input = input,
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = builtin.context_window,
@@ -7113,6 +7131,42 @@ fn oapMessageText(allocator: std.mem.Allocator, message: oap_types.Message) ![]c
             break :blk try buffer.toOwnedSlice(allocator);
         },
     };
+}
+
+fn buildOapInferenceTools(
+    allocator: std.mem.Allocator,
+    source: []const oap_provider_types.ToolDefinition,
+) !?[]const ai_types.Tool {
+    if (source.len == 0) return null;
+    const out = try allocator.alloc(ai_types.Tool, source.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*tool| tool.deinit(allocator);
+        allocator.free(out);
+    }
+    for (source, 0..) |tool, index| {
+        const name = try allocator.dupe(u8, tool.name);
+        errdefer allocator.free(name);
+        const description = try allocator.dupe(u8, tool.description orelse "");
+        errdefer allocator.free(description);
+        const schema = try allocator.dupe(u8, tool.input_schema_json orelse "{\"type\":\"object\"}");
+        out[index] = .{ .name = name, .description = description, .parameters_schema_json = schema };
+        built += 1;
+    }
+    return out;
+}
+
+fn applyOapReasoning(options: *ai_types.StreamOptions, reasoning: ?oap_provider_types.ReasoningOptions) void {
+    const source = reasoning orelse return;
+    if (source.enabled) |enabled| {
+        options.thinking_enabled = enabled;
+        options.reasoning_enabled = enabled;
+    }
+    if (source.budget_tokens) |budget| options.thinking_budget_tokens = budget;
+    if (source.effort) |effort| {
+        options.thinking_effort = @TypeOf(options.thinking_effort).initBorrowed(effort);
+        options.reasoning_effort = @TypeOf(options.reasoning_effort).initBorrowed(effort);
+    }
 }
 
 fn buildOapInferenceContext(
@@ -7733,6 +7787,22 @@ test "the endpoint claims no carry round trip it cannot perform" {
         .timestamp = 0,
     };
     try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 0) == null);
+}
+
+test "reasoning options reach the stream options and the model declares reasoning" {
+    const allocator = std.testing.allocator;
+
+    var options: ai_types.StreamOptions = .{};
+    applyOapReasoning(&options, .{ .enabled = true, .budget_tokens = 2048, .effort = null, .encrypted_carry = null });
+    try std.testing.expect(options.thinking_enabled);
+    try std.testing.expectEqual(@as(?u32, 2048), options.thinking_budget_tokens);
+
+    const builtin = builtInForProvider("anthropic").?;
+    try std.testing.expect(builtin.supports_reasoning);
+
+    var model = try buildOapInferenceModel(allocator, builtin, "claude-sonnet-4-5");
+    defer model.deinit(allocator);
+    try std.testing.expect(model.reasoning);
 }
 
 test "describe names a draft revision that identifies a state rather than a stream" {

@@ -122,6 +122,8 @@ pub const BuiltInProvider = struct {
     display_name: []const u8,
     context_window: u32,
     max_output_tokens: u32,
+    supports_tools: bool = true,
+    supports_reasoning: bool = false,
 };
 
 pub const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
@@ -134,6 +136,7 @@ pub const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
         .display_name = "Claude Sonnet 4.5",
         .context_window = 200_000,
         .max_output_tokens = 8_192,
+        .supports_reasoning = true,
     },
     .{
         .id = "openai",
