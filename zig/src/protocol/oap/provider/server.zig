@@ -1155,9 +1155,9 @@ pub const Server = struct {
 
         const empty_text = try self.allocator.dupe(u8, "");
         errdefer if (!content_transferred) self.allocator.free(empty_text);
+        const messages = try self.allocator.alloc(oap_types.Message, 1);
         const content = contentFromParts(self.allocator, owned_parts, empty_text);
         content_transferred = true;
-        const messages = try self.allocator.alloc(oap_types.Message, 1);
         messages[0] = .{ .role = .assistant, .content = content };
         return messages;
     }
@@ -1378,6 +1378,11 @@ pub const Server = struct {
         };
         const content = contentFromParts(self.allocator, owned_parts, empty_text);
         content_transferred = true;
+        var content_settled = false;
+        errdefer if (!content_settled) {
+            var owned_content = content;
+            owned_content.deinit(self.allocator);
+        };
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1385,6 +1390,7 @@ pub const Server = struct {
             .stop_reason = stop_reason,
             .usage = usage,
         } });
+        content_settled = true;
     }
 
     pub fn settleCompletedFromResult(
@@ -1454,6 +1460,11 @@ pub const Server = struct {
         };
         const result_content = contentFromParts(self.allocator, owned_parts, empty_text);
         content_transferred = true;
+        var content_settled = false;
+        errdefer if (!content_settled) {
+            var owned_content = result_content;
+            owned_content.deinit(self.allocator);
+        };
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1461,6 +1472,7 @@ pub const Server = struct {
             .stop_reason = stop_reason,
             .usage = usage,
         } });
+        content_settled = true;
     }
 
     pub fn abandonOpenPart(self: *Self, inference_id: []const u8) void {
@@ -1705,14 +1717,18 @@ fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
     return switch (message.content) {
         .text => message.role == .tool,
         .parts => |parts| blk: {
+            var carries_result = false;
             for (parts) |part| {
                 switch (part) {
                     .text => {},
                     .reasoning, .tool_call => if (message.role != .assistant) break :blk true,
-                    .tool_result => if (message.role == .assistant) break :blk true,
+                    .tool_result => {
+                        if (message.role == .assistant) break :blk true;
+                        carries_result = true;
+                    },
                 }
             }
-            break :blk false;
+            break :blk message.role == .tool and !carries_result;
         },
     };
 }
@@ -2406,13 +2422,38 @@ test "a tool call keeps its carry through the snapshot and the terminal" {
     try std.testing.expect(snapshot_parts[0].tool_call.arguments_partial == null);
 }
 
+test "a tool-role message that carries no tool result is refused rather than rewritten as a user turn" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const cases = [_][]const u8{
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"bare text\"}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":[{\"type\":\"text\",\"text\":\"bare text\"}]}]}",
+    };
+
+    for (cases) |payload| {
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var refusal = try decodeOnly(allocator, &server);
+        defer refusal.deinit(allocator);
+        try std.testing.expectEqual(
+            types.ErrorCode.unsupported_feature,
+            refusal.payload.inference_create_response.err.?.code,
+        );
+        try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+    }
+}
+
 test "a carry-bearing part on a non-assistant message is refused rather than dropped" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{ .accepts_inference = true });
     defer server.deinit();
 
     const payload =
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"reasoning\",\"reasoning\":\"prior\"}]}]}";
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"reasoning\",\"reasoning\":\"prior\",\"carry\":\"REASON-SIG\"}]}]}";
     const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
     defer allocator.free(line);
     try server.handleLine(line);
@@ -2424,6 +2465,11 @@ test "a carry-bearing part on a non-assistant message is refused rather than dro
         refusal.payload.inference_create_response.err.?.code,
     );
     try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        refusal.payload.inference_create_response.err.?.message,
+        "belongs to an assistant message",
+    ) != null);
 }
 
 test "the terminal assembly repeats the carry each part ended with" {
