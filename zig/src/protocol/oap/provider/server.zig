@@ -826,6 +826,11 @@ pub const Server = struct {
         return types.parseModelRef(model_ref);
     }
 
+    fn requestAsksForReasoning(reasoning: ?types.ReasoningOptions) bool {
+        const options = reasoning orelse return false;
+        return options.enabled orelse false;
+    }
+
     fn messagesReplayACarry(messages: []const oap_types.Message) bool {
         for (messages) |message| {
             const parts = switch (message.content) {
@@ -929,7 +934,7 @@ pub const Server = struct {
                 try self.emitCreateRefusal(
                     env,
                     .unsupported_feature,
-                    "this endpoint cannot forward a tool result or a tool-role message",
+                    "a reasoning or tool_call part belongs to an assistant message, a tool_result does not, and a tool-role message must carry one",
                 );
                 return;
             }
@@ -956,6 +961,15 @@ pub const Server = struct {
                 env,
                 .unsupported_feature,
                 "this provider does not round-trip a carry; see round_trips_carry on its descriptor",
+            );
+            return;
+        }
+
+        if (messagesReplayACarry(create_request.messages) and !requestAsksForReasoning(create_request.reasoning)) {
+            try self.emitCreateRefusal(
+                env,
+                .invalid_request,
+                "a replayed carry needs reasoning enabled on this request; the provider rejects signed history without it",
             );
             return;
         }
@@ -1132,15 +1146,17 @@ pub const Server = struct {
             }
         }
 
+        var content_transferred = false;
         const owned_parts = try parts.toOwnedSlice(self.allocator);
-        errdefer {
+        errdefer if (!content_transferred) {
             for (owned_parts) |*part| part.deinit(self.allocator);
             self.allocator.free(owned_parts);
-        }
+        };
 
         const empty_text = try self.allocator.dupe(u8, "");
-        errdefer self.allocator.free(empty_text);
+        errdefer if (!content_transferred) self.allocator.free(empty_text);
         const content = contentFromParts(self.allocator, owned_parts, empty_text);
+        content_transferred = true;
         const messages = try self.allocator.alloc(oap_types.Message, 1);
         messages[0] = .{ .role = .assistant, .content = content };
         return messages;
@@ -1352,14 +1368,16 @@ pub const Server = struct {
         for (inference.closed_parts.items) |part| {
             try parts.append(self.allocator, try clonePart(self.allocator, part));
         }
+        var content_transferred = false;
         const empty_text = try self.allocator.dupe(u8, "");
-        errdefer self.allocator.free(empty_text);
+        errdefer if (!content_transferred) self.allocator.free(empty_text);
         const owned_parts = try parts.toOwnedSlice(self.allocator);
-        errdefer {
+        errdefer if (!content_transferred) {
             for (owned_parts) |*part| part.deinit(self.allocator);
             self.allocator.free(owned_parts);
-        }
+        };
         const content = contentFromParts(self.allocator, owned_parts, empty_text);
+        content_transferred = true;
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1426,14 +1444,16 @@ pub const Server = struct {
             }
         }
 
+        var content_transferred = false;
         const empty_text = try self.allocator.dupe(u8, "");
-        errdefer self.allocator.free(empty_text);
+        errdefer if (!content_transferred) self.allocator.free(empty_text);
         const owned_parts = try parts.toOwnedSlice(self.allocator);
-        errdefer {
+        errdefer if (!content_transferred) {
             for (owned_parts) |*part| part.deinit(self.allocator);
             self.allocator.free(owned_parts);
-        }
+        };
         const result_content = contentFromParts(self.allocator, owned_parts, empty_text);
+        content_transferred = true;
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1689,7 +1709,7 @@ fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
                 switch (part) {
                     .text => {},
                     .reasoning, .tool_call => if (message.role != .assistant) break :blk true,
-                    .tool_result => {},
+                    .tool_result => if (message.role == .assistant) break :blk true,
                 }
             }
             break :blk false;

@@ -7255,7 +7255,14 @@ fn buildOapInferenceContext(
         if (message.role == .assistant) {
             const content = try oapAssistantContent(allocator, message);
             const assistant = try buildOapAssistantMessage(allocator, content, identity);
-            try built_messages.append(allocator, .{ .assistant = assistant });
+            var assistant_transferred = false;
+            errdefer if (!assistant_transferred) {
+                var owned = assistant;
+                owned.deinit(allocator);
+            };
+            try built_messages.ensureUnusedCapacity(allocator, 1);
+            built_messages.appendAssumeCapacity(.{ .assistant = assistant });
+            assistant_transferred = true;
             continue;
         }
 
@@ -7263,8 +7270,26 @@ fn buildOapInferenceContext(
             for (parts) |part| {
                 if (part != .tool_result) continue;
                 const result = try buildOapToolResult(allocator, part.tool_result, source);
-                try built_messages.append(allocator, .{ .tool_result = result });
+                var result_transferred = false;
+                errdefer if (!result_transferred) {
+                    var owned = result;
+                    owned.deinit(allocator);
+                };
+                try built_messages.ensureUnusedCapacity(allocator, 1);
+                built_messages.appendAssumeCapacity(.{ .tool_result = result });
+                result_transferred = true;
             }
+
+            const spoken = try oapMessageText(allocator, message);
+            errdefer allocator.free(spoken);
+            if (spoken.len == 0) {
+                allocator.free(spoken);
+                continue;
+            }
+            try built_messages.ensureUnusedCapacity(allocator, 1);
+            built_messages.appendAssumeCapacity(.{
+                .user = .{ .content = .{ .text = spoken }, .timestamp = compat.time.nowMillis() },
+            });
             continue;
         }
 
@@ -7276,7 +7301,8 @@ fn buildOapInferenceContext(
             continue;
         }
         errdefer allocator.free(text);
-        try built_messages.append(allocator, .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } });
+        try built_messages.ensureUnusedCapacity(allocator, 1);
+        built_messages.appendAssumeCapacity(.{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } });
     }
 
     const messages = try built_messages.toOwnedSlice(allocator);
