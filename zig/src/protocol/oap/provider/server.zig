@@ -638,6 +638,11 @@ pub const Server = struct {
             return;
         }
 
+        if (!create_request.stream) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint streams every inference and cannot answer unary");
+            return;
+        }
+
         if (create_request.top_p != null) {
             try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward top_p");
             return;
@@ -2111,6 +2116,7 @@ test "a request member the endpoint cannot forward is refused rather than droppe
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"output_schema\":{\"type\":\"object\"}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"enabled\":true}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"stream\":false}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\"}]}]}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"result\"}]}",

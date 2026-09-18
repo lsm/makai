@@ -6686,8 +6686,9 @@ const RunningOapInference = struct {
     started_at_ms: i64,
 
     fn deinit(self: *RunningOapInference, allocator: std.mem.Allocator) void {
-        allocator.free(self.inference_id);
+        self.cancelled.store(true, .release);
         _ = self.stream.deinitAndDestroy();
+        if (self.inference_id.len > 0) allocator.free(self.inference_id);
         self.context.deinit(allocator);
         self.model.deinit(allocator);
         allocator.destroy(self.cancelled);
@@ -6754,17 +6755,18 @@ fn startOapInference(
         return;
     };
 
-    const owned_id = try allocator.dupe(u8, inference_id);
-    errdefer allocator.free(owned_id);
-
-    try running.append(allocator, .{
-        .inference_id = owned_id,
+    var entry = RunningOapInference{
+        .inference_id = &.{},
         .stream = stream,
         .context = context,
         .model = model,
         .cancelled = cancelled,
         .started_at_ms = compat.time.nowMillis(),
-    });
+    };
+    errdefer entry.deinit(allocator);
+
+    entry.inference_id = try allocator.dupe(u8, inference_id);
+    try running.append(allocator, entry);
 }
 
 fn pumpOapInferences(

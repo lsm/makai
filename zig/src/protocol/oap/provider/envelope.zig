@@ -952,22 +952,29 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
     const metadata = try oap_envelope.optionalRawJson(obj, "metadata", allocator);
     errdefer if (metadata) |value| allocator.free(value);
 
+    const max_output_tokens = try optionalU32(obj, "max_output_tokens");
+    const temperature = try optionalF32(obj, "temperature");
+    const top_p = try optionalF32(obj, "top_p");
+    const stream = try oap_envelope.optionalBool(obj, "stream") orelse true;
+
     const degraded = if (obj.get("allow_degraded_features") != null)
         try oap_envelope.deserializeStringArray(obj, "allow_degraded_features", allocator)
     else
         &.{};
     errdefer types.freeStringList(allocator, degraded);
 
+    const owned_tools = try tools.toOwnedSlice(allocator);
+
     return types.Payload{ .inference_create_request = .{
         .model_ref = model_ref,
         .messages = messages,
-        .tools = try tools.toOwnedSlice(allocator),
+        .tools = owned_tools,
         .tool_choice = tool_choice,
-        .max_output_tokens = try optionalU32(obj, "max_output_tokens"),
-        .temperature = try optionalF32(obj, "temperature"),
-        .top_p = try optionalF32(obj, "top_p"),
+        .max_output_tokens = max_output_tokens,
+        .temperature = temperature,
+        .top_p = top_p,
         .output_schema_json = output_schema,
-        .stream = try oap_envelope.optionalBool(obj, "stream") orelse true,
+        .stream = stream,
         .reasoning = reasoning,
         .include_snapshot = include_snapshot,
         .headers = headers,
