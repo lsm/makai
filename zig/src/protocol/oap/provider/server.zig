@@ -890,10 +890,14 @@ pub const Server = struct {
         };
         if (!due) return null;
 
-        return try self.buildSnapshot(inference);
+        return try self.buildSnapshot(inference, !at_part_end);
     }
 
-    fn buildSnapshot(self: *Self, inference: *ActiveInference) !?[]oap_types.Message {
+    fn buildSnapshot(
+        self: *Self,
+        inference: *ActiveInference,
+        include_open_part: bool,
+    ) !?[]oap_types.Message {
         var parts = std.ArrayList(oap_types.ContentPart).empty;
         errdefer {
             for (parts.items) |*part| part.deinit(self.allocator);
@@ -904,7 +908,7 @@ pub const Server = struct {
             try parts.append(self.allocator, try clonePart(self.allocator, part));
         }
 
-        if (inference.open_part != null) {
+        if (include_open_part and inference.open_part != null) {
             const accumulated = inference.text.items;
             switch (inference.open_part_kind) {
                 .text => {
@@ -1043,12 +1047,6 @@ pub const Server = struct {
         errdefer self.allocator.free(owned_text);
         const owned_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_carry) |value| self.allocator.free(value);
-        const snapshot = try self.snapshotIfDue(inference, true);
-        errdefer if (snapshot) |messages| {
-            for (messages) |*message| message.deinit(self.allocator);
-            self.allocator.free(messages);
-        };
-
         var closed_transferred = false;
         const closed_text = try self.allocator.dupe(u8, text);
         errdefer if (!closed_transferred) self.allocator.free(closed_text);
@@ -1062,6 +1060,12 @@ pub const Server = struct {
             else => .{ .text = closed_text },
         });
         closed_transferred = true;
+
+        const snapshot = try self.snapshotIfDue(inference, true);
+        errdefer if (snapshot) |messages| {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
 
         inference.open_part = null;
         try self.pushScoped(inference, .{ .inference_part_ended = .{
@@ -1351,7 +1355,7 @@ pub const Server = struct {
         if (env.inference_id) |scope| {
             if (self.findInference(scope)) |inference| {
                 if (!inference.terminal_emitted) {
-                    snapshot = try self.buildSnapshot(inference);
+                    snapshot = try self.buildSnapshot(inference, true);
                 }
             }
         }
@@ -2141,6 +2145,29 @@ test "acceptance is discriminated by the scope field, never by a payload copy" {
     );
 }
 
+test "a part-end snapshot holds the closed reasoning part once, with its carry" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "on_part_end");
+    defer allocator.free(inference_id);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    try server.notePartStarted(inference_id, 0, .reasoning, null, null);
+    try server.notePartDelta(inference_id, 0, "weighing");
+    while (server.popOutbound()) |line| allocator.free(line);
+    try server.notePartEndedTextWithCarry(inference_id, 0, .reasoning, "weighing", "REASON-SIG");
+
+    var ended = try decodeOnly(allocator, &server);
+    defer ended.deinit(allocator);
+    const snapshot = ended.payload.inference_part_ended.snapshot orelse return error.TestExpectedSnapshot;
+    const parts = snapshot[0].content.parts;
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("weighing", parts[0].reasoning.text);
+    try std.testing.expectEqualStrings("REASON-SIG", parts[0].reasoning.carry orelse "");
+}
+
 test "a tool call keeps its carry through the snapshot and the terminal" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{ .accepts_inference = true });
@@ -2162,7 +2189,9 @@ test "a tool call keeps its carry through the snapshot and the terminal" {
     const snapshot = part_ended.snapshot orelse return error.TestExpectedSnapshot;
     try std.testing.expectEqual(@as(usize, 1), snapshot.len);
     const snapshot_parts = snapshot[0].content.parts;
+    try std.testing.expectEqual(@as(usize, 1), snapshot_parts.len);
     try std.testing.expectEqualStrings("TOOL-SIG", snapshot_parts[0].tool_call.carry orelse "");
+    try std.testing.expect(snapshot_parts[0].tool_call.arguments_partial == null);
 }
 
 test "a carry-bearing part on a non-assistant message is refused rather than dropped" {

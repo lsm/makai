@@ -527,10 +527,7 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
         const reasoning = try requiredString(obj, "reasoning");
         const text = try allocator.dupe(u8, reasoning);
         errdefer allocator.free(text);
-        const carry = if (obj.get("carry")) |carry_value| switch (carry_value) {
-            .string => |raw| try allocator.dupe(u8, raw),
-            else => return DecodeError.InvalidField,
-        } else null;
+        const carry = try optionalOwnedString(obj, "carry", allocator);
         return .{ .reasoning = .{ .text = text, .carry = carry } };
     }
     if (std.mem.eql(u8, part_type, "tool_call")) {
@@ -541,10 +538,7 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
         const arguments = obj.get("arguments_json") orelse return DecodeError.MissingField;
         const arguments_json = try ownedRawJson(arguments, allocator);
         errdefer allocator.free(arguments_json);
-        const carry = if (obj.get("carry")) |carry_value| switch (carry_value) {
-            .string => |raw| try allocator.dupe(u8, raw),
-            else => return DecodeError.InvalidField,
-        } else null;
+        const carry = try optionalOwnedString(obj, "carry", allocator);
         return .{ .tool_call = .{
             .tool_call_id = tool_call_id,
             .name = name,
@@ -1083,6 +1077,8 @@ test "a carry on a content part kind that cannot hold one is refused rather than
     const refused = [_][]const u8{
         "{\"type\":\"text\",\"text\":\"spoken\",\"carry\":\"sig\"}",
         "{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":\"ok\",\"carry\":\"sig\"}",
+        "{\"type\":\"reasoning\",\"reasoning\":\"prior\",\"carry\":\"\"}",
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"s\",\"arguments_json\":\"{}\",\"carry\":\"\"}",
     };
     for (refused) |raw| {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
