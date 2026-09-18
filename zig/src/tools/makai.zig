@@ -6628,6 +6628,12 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
         const endpoint = try allocator.dupe(u8, builtin.endpoint);
         errdefer allocator.free(endpoint);
 
+        const policies = try allocator.dupe(
+            oap_provider_types.SnapshotPolicy,
+            &.{ .never, .on_part_end, .every_delta },
+        );
+        errdefer allocator.free(policies);
+
         try server.addProvider(.{
             .id = id,
             .wire = mapping.wire,
@@ -6635,6 +6641,8 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .framing = mapping.framing,
             .endpoint = endpoint,
             .allows_anonymous = builtin.allows_anonymous,
+            .snapshot_policies = policies,
+            .answers_sync = true,
             .credential_grant = .none,
             .context_window = builtin.context_window,
             .max_output_tokens = builtin.max_output_tokens,
@@ -6910,7 +6918,8 @@ fn buildOapInferenceModel(
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, builtin.id);
     errdefer allocator.free(provider);
-    const base_url = try allocator.dupe(u8, builtin.endpoint);
+    const base_url = provider_base_url.defaultBaseUrlForRef(allocator, builtin.id, builtin.api) catch
+        try allocator.dupe(u8, builtin.endpoint);
     errdefer allocator.free(base_url);
     const input = try allocator.alloc([]const u8, 1);
     errdefer allocator.free(input);
@@ -7350,4 +7359,51 @@ test "oap mode rejects unknown options, missing values, and positionals" {
         parseOapModeArgs(&[_][]const u8{"write a haiku"}, &positional),
     );
     try std.testing.expectEqualStrings("write a haiku", positional.unexpected_positional.?);
+}
+
+test "every provider the oap endpoint advertises accepts an inference" {
+    const allocator = std.testing.allocator;
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+    });
+    defer server.deinit();
+
+    try populateOapProviderCatalog(allocator, &server);
+    try std.testing.expect(server.providers.items.len > 0);
+    try std.testing.expectEqual(server.providers.items.len, server.models.items.len);
+
+    for (server.models.items, 0..) |entry, index| {
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}",
+            .{entry.model_ref},
+        );
+        defer allocator.free(payload);
+
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.create.request\",\"id\":\"q{d}\",\"payload\":{s}}}",
+            .{ oap_provider_types.PROFILE, index, payload },
+        );
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        const outbound = server.popOutbound() orelse return error.TestExpectedOutbound;
+        defer allocator.free(outbound);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, outbound, .{});
+        defer parsed.deinit();
+
+        const response_payload = parsed.value.object.get("payload").?.object;
+        const accepted = response_payload.get("accepted").?.bool;
+        if (!accepted) {
+            const message = response_payload.get("error").?.object.get("message").?.string;
+            std.debug.print("\n{s} refused at create: {s}\n", .{ entry.model_ref, message });
+        }
+        try std.testing.expect(accepted);
+    }
 }
