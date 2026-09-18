@@ -1009,7 +1009,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
         const framing = try oap_envelope.requiredEnum(types.Framing, descriptor_obj, "framing");
         const endpoint = try oap_envelope.requiredOwnedString(descriptor_obj, "endpoint", allocator);
         errdefer allocator.free(endpoint);
-        const headers = try deserializeHeaders(descriptor_obj, allocator, false);
+        const headers = try deserializeHeaders(descriptor_obj, allocator, true);
         errdefer types.freeHeaders(allocator, headers);
         const compatibility = try deserializeCompatibility(descriptor_obj);
 
@@ -1241,7 +1241,7 @@ test "a credential in call headers is refused and a tenancy header is not" {
     try std.testing.expectEqualStrings("X-Tenant", headers[0].name);
 }
 
-test "a published descriptor header is not policed the way caller text is" {
+test "a descriptor carries its ordinary headers through a decode" {
     const allocator = std.testing.allocator;
 
     const line =
@@ -1255,6 +1255,22 @@ test "a published descriptor header is not policed the way caller text is" {
     const descriptor = decoded.payload.provider_describe_response.providers[0];
     try std.testing.expectEqualStrings("X-Tenant", descriptor.headers[0].name);
     try std.testing.expectEqual(types.Framing.sse, descriptor.framing);
+}
+
+test "a descriptor may not publish a credential in its headers" {
+    const allocator = std.testing.allocator;
+
+    const prefix =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"payload\":{\"capability_revision\":\"r1\"," ++
+        "\"providers\":[{\"id\":\"gw\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\"," ++
+        "\"endpoint\":\"https://gw.test\",\"headers\":";
+
+    const named = prefix ++ "{\"Authorization\":\"whatever\"}}]}}";
+    try std.testing.expectError(DecodeError.CredentialInHeaders, deserializeEnvelope(named, allocator));
+
+    const bearer_shaped = prefix ++ "{\"X-Gateway\":\"Bearer sk-abc\"}}]}}";
+    try std.testing.expectError(DecodeError.CredentialInHeaders, deserializeEnvelope(bearer_shaped, allocator));
 }
 
 test "all twelve compatibility facts survive a round trip" {
