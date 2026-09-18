@@ -1273,6 +1273,61 @@ test "a descriptor may not publish a credential in its headers" {
     try std.testing.expectError(DecodeError.CredentialInHeaders, deserializeEnvelope(bearer_shaped, allocator));
 }
 
+test "the decoder refuses a foreign protocol, version and envelope shape" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(DecodeError.InvalidEnvelope, deserializeEnvelope("[]", allocator));
+    try std.testing.expectError(DecodeError.InvalidEnvelope, deserializeEnvelope("\"x\"", allocator));
+
+    const foreign_protocol =
+        "{\"protocol\":\"other-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.started\",\"id\":\"m1\",\"inference_id\":\"inf1\",\"sequence\":1,\"payload\":{}}";
+    try std.testing.expectError(DecodeError.ProtocolMismatch, deserializeEnvelope(foreign_protocol, allocator));
+
+    const foreign_version =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"9.9\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.started\",\"id\":\"m1\",\"inference_id\":\"inf1\",\"sequence\":1,\"payload\":{}}";
+    try std.testing.expectError(DecodeError.VersionMismatch, deserializeEnvelope(foreign_version, allocator));
+}
+
+test "a field of the wrong json type is refused rather than reached into" {
+    const allocator = std.testing.allocator;
+
+    const head =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++ "\",";
+
+    const cases = [_][]const u8{
+        head ++ "\"type\":\"inference.started\",\"id\":\"m\",\"inference_id\":\"i\",\"sequence\":1,\"payload\":\"x\"}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":\"x\"}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":{\"X-A\":1}}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":{\"tool_call_id_format\":1}}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"grant_kinds\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"wire_id\":\"nope\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\"}]}}",
+        head ++ "\"type\":\"provider.models.list.response\",\"id\":\"m\",\"payload\":{\"models\":\"x\"}}",
+        head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":\"x\"}}",
+        head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":[],\"tools\":\"x\"}}",
+        head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":[],\"reasoning\":\"x\"}}",
+        head ++ "\"type\":\"inference.part.started\",\"id\":\"m\",\"inference_id\":\"i\",\"sequence\":1,\"payload\":{\"part_index\":4294967296,\"part_kind\":\"text\"}}",
+    };
+
+    for (cases) |line| {
+        const decoded = deserializeEnvelope(line, allocator);
+        if (decoded) |env| {
+            var owned = env;
+            owned.deinit(allocator);
+            std.debug.print("\naccepted a malformed frame: {s}\n", .{line});
+            return error.MalformedFrameAccepted;
+        } else |err| {
+            if (err != DecodeError.InvalidField) {
+                std.debug.print("\n{s}\n  expected InvalidField, found {s}\n", .{ line, @errorName(err) });
+                return error.WrongRefusal;
+            }
+        }
+    }
+}
+
 test "all twelve compatibility facts survive a round trip" {
     const allocator = std.testing.allocator;
 
