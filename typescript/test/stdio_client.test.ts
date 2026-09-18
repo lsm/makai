@@ -232,6 +232,30 @@ test("reply arriving while its owner is between waits is parked, not consumed by
   }
 });
 
+test("a second reply parked by a foreign waiter survives its owner winning the concurrent read", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const owner = client.nextFrameForSession("a1", 5000, { correlate: "req-a" });
+    const foreign = client.nextFrameForSession("a1", 5000, { correlate: "req-b" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-a", payload: { replies: 2 } });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-b" });
+
+    assert.equal((await owner).in_reply_to, "req-a");
+    assert.equal((await foreign).in_reply_to, "req-b");
+
+    const second = await client.nextFrameForSession("a1", 2000, { correlate: "req-a" });
+    assert.equal(second.in_reply_to, "req-a");
+  } finally {
+    await client.close();
+  }
+});
+
 test("replies-only wait parks uncorrelated frames for the route owner", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,

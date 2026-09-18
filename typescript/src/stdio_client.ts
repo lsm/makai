@@ -243,7 +243,7 @@ export class MakaiStdioClient {
             if (options?.signal?.aborted) {
               throw new Error(`frame wait for session ${routeId} aborted`);
             }
-            return this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
+            return undefined;
           }),
         ]);
       } finally {
@@ -251,6 +251,8 @@ export class MakaiStdioClient {
         if (this.correlateDeliveries.get(correlate)?.state === state) this.correlateDeliveries.delete(correlate);
       }
       if (winner !== undefined) return winner;
+      const delivered = this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
+      if (delivered !== undefined) return delivered;
       return await this.withStreamReadLock(() => this.readRoutedLoop(route, routeId, timeoutMs, options));
     } finally {
       if (correlate !== undefined) this.releaseCorrelate(correlate);
