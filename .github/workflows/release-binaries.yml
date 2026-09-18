@@ -137,8 +137,12 @@ jobs:
           codesign --verify --strict --verbose=2 "$BINARY"
 
           if [ -z "${APPLE_NOTARY_KEY_BASE64:-}" ]; then
-            echo "::error::signing succeeded but APPLE_NOTARY_KEY_BASE64 is unset; an unnotarized Developer ID binary is still blocked by Gatekeeper"
-            exit 1
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error::signing succeeded but APPLE_NOTARY_KEY_BASE64 is unset on a tag build; an unnotarized Developer ID binary is still blocked by Gatekeeper"
+              exit 1
+            fi
+            echo "::warning::notarization secrets are unset; leaving the signed ${{ matrix.arch_name }} binary unnotarized (workflow_dispatch only)"
+            exit 0
           fi
 
           printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
