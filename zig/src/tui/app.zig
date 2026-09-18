@@ -683,7 +683,7 @@ pub const App = struct {
             if (stored.providers.get(provider_id)) |auth| {
                 return switch (auth) {
                     .api_key => .api_key,
-                    .oauth => if (stored.credentialsExpired(provider_id)) .expired else .oauth,
+                    .oauth => if (stored.configuredCredentialsExpired(provider_id)) .expired else .oauth,
                 };
             }
         }
@@ -4373,4 +4373,27 @@ test "ProductionRuntime outlives stream threads from dropped TuiRuntime" {
     }
 
     try drainStreamAndVerify(allocator, stream);
+}
+
+test "a granted credential does not change what the login badge reports" {
+    const allocator = std.testing.allocator;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(allocator),
+        .allocator = allocator,
+    };
+    defer storage.deinit();
+
+    try storage.providers.put(try allocator.dupe(u8, "anthropic"), .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "stored-refresh"),
+        .access = try allocator.dupe(u8, "stored-access"),
+        .expires = 0,
+    } });
+
+    try std.testing.expectEqual(App.LoginStatus.expired, App.loginStatusFor(&storage, "anthropic", false));
+
+    try storage.putEphemeral("anthropic", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+
+    try std.testing.expectEqual(App.LoginStatus.expired, App.loginStatusFor(&storage, "anthropic", false));
+    try std.testing.expectEqual(App.LoginStatus.none, App.loginStatusFor(&storage, "kimi", false));
 }
