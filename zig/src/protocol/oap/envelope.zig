@@ -41,7 +41,7 @@ pub fn serializeEnvelope(env: oap_types.Envelope, allocator: std.mem.Allocator) 
     return out;
 }
 
-fn writeJsonValueOrString(w: *json_writer.JsonWriter, raw: []const u8) !void {
+pub fn writeJsonValueOrString(w: *json_writer.JsonWriter, raw: []const u8) !void {
     if (isWellFormedJson(raw)) {
         try w.writeRawJson(raw);
     } else {
@@ -60,7 +60,7 @@ fn isWellFormedJson(raw: []const u8) bool {
     }
 }
 
-fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart) !void {
+pub fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart) !void {
     try w.beginObject();
     switch (part) {
         .text => |value| {
@@ -89,7 +89,7 @@ fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart)
     try w.endObject();
 }
 
-fn serializeMessage(w: *json_writer.JsonWriter, message: oap_types.Message) !void {
+pub fn serializeMessage(w: *json_writer.JsonWriter, message: oap_types.Message) !void {
     try w.beginObject();
     if (message.id) |id| try w.writeStringField("id", id);
     try w.writeStringField("role", @tagName(message.role));
@@ -105,7 +105,7 @@ fn serializeMessage(w: *json_writer.JsonWriter, message: oap_types.Message) !voi
     try w.endObject();
 }
 
-fn serializeUsage(w: *json_writer.JsonWriter, usage: oap_types.Usage) !void {
+pub fn serializeUsage(w: *json_writer.JsonWriter, usage: oap_types.Usage) !void {
     try w.writeKey("usage");
     try w.beginObject();
     if (usage.input_tokens) |value| try w.writeIntField("input_tokens", value);
@@ -145,7 +145,7 @@ fn serializeEndpoint(w: *json_writer.JsonWriter, endpoint: oap_types.Endpoint) !
     try w.endObject();
 }
 
-fn serializeStringArray(w: *json_writer.JsonWriter, key: []const u8, values: []const []const u8) !void {
+pub fn serializeStringArray(w: *json_writer.JsonWriter, key: []const u8, values: []const []const u8) !void {
     try w.writeKey(key);
     try w.beginArray();
     for (values) |value| try w.writeString(value);
@@ -416,59 +416,59 @@ pub fn deserializeEnvelope(line: []const u8, allocator: std.mem.Allocator) !oap_
     };
 }
 
-fn requiredString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+pub fn requiredString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const value = obj.get(key) orelse return DecodeError.MissingField;
     if (value != .string) return DecodeError.InvalidField;
     return value.string;
 }
 
-fn requiredOwnedString(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+pub fn requiredOwnedString(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     const value = try requiredString(obj, key);
     if (value.len == 0) return DecodeError.InvalidField;
     return allocator.dupe(u8, value);
 }
 
-fn optionalOwnedString(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
+pub fn optionalOwnedString(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
     const value = obj.get(key) orelse return null;
     if (value != .string) return DecodeError.InvalidField;
     if (value.string.len == 0) return DecodeError.InvalidField;
     return try allocator.dupe(u8, value.string);
 }
 
-fn optionalBool(obj: std.json.ObjectMap, key: []const u8) !?bool {
+pub fn optionalBool(obj: std.json.ObjectMap, key: []const u8) !?bool {
     const value = obj.get(key) orelse return null;
     if (value != .bool) return DecodeError.InvalidField;
     return value.bool;
 }
 
-fn requiredBool(obj: std.json.ObjectMap, key: []const u8) !bool {
+pub fn requiredBool(obj: std.json.ObjectMap, key: []const u8) !bool {
     return (try optionalBool(obj, key)) orelse DecodeError.MissingField;
 }
 
-fn optionalUnsigned(obj: std.json.ObjectMap, key: []const u8) !?u64 {
+pub fn optionalUnsigned(obj: std.json.ObjectMap, key: []const u8) !?u64 {
     const value = obj.get(key) orelse return null;
     if (value != .integer or value.integer < 0) return DecodeError.InvalidField;
     return @intCast(value.integer);
 }
 
-fn optionalInteger(obj: std.json.ObjectMap, key: []const u8) !?i64 {
+pub fn optionalInteger(obj: std.json.ObjectMap, key: []const u8) !?i64 {
     const value = obj.get(key) orelse return null;
     if (value != .integer) return DecodeError.InvalidField;
     return value.integer;
 }
 
-fn requiredEnum(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
+pub fn requiredEnum(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
     const value = try requiredString(obj, key);
     return std.meta.stringToEnum(T, value) orelse DecodeError.InvalidField;
 }
 
-fn optionalEnum(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !?T {
+pub fn optionalEnum(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !?T {
     const value = obj.get(key) orelse return null;
     if (value != .string) return DecodeError.InvalidField;
     return std.meta.stringToEnum(T, value.string) orelse DecodeError.InvalidField;
 }
 
-fn decodeEnumList(
+pub fn decodeEnumList(
     comptime T: type,
     obj: std.json.ObjectMap,
     key: []const u8,
@@ -485,17 +485,17 @@ fn decodeEnumList(
     return decoded;
 }
 
-fn ownedRawJson(value: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
+pub fn ownedRawJson(value: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
     if (value == .string) return allocator.dupe(u8, value.string);
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
-fn optionalRawJson(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
+pub fn optionalRawJson(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
     const value = obj.get(key) orelse return null;
     return try ownedRawJson(value, allocator);
 }
 
-fn deserializeUsage(obj: std.json.ObjectMap) !oap_types.Usage {
+pub fn deserializeUsage(obj: std.json.ObjectMap) !oap_types.Usage {
     const value = obj.get("usage") orelse return .{};
     if (value != .object) return DecodeError.InvalidField;
     return .{
@@ -505,7 +505,7 @@ fn deserializeUsage(obj: std.json.ObjectMap) !oap_types.Usage {
     };
 }
 
-fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.ContentPart {
+pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.ContentPart {
     if (value != .object) return DecodeError.InvalidField;
     const obj = value.object;
     const part_type = try requiredString(obj, "type");
@@ -546,7 +546,7 @@ fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocator) !
     return DecodeError.InvalidField;
 }
 
-fn deserializeContent(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.Content {
+pub fn deserializeContent(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.Content {
     switch (value) {
         .string => |text| return .{ .text = try allocator.dupe(u8, text) },
         .array => |array| {
@@ -567,7 +567,7 @@ fn deserializeContent(value: std.json.Value, allocator: std.mem.Allocator) !oap_
     }
 }
 
-fn deserializeMessage(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.Message {
+pub fn deserializeMessage(value: std.json.Value, allocator: std.mem.Allocator) !oap_types.Message {
     if (value != .object) return DecodeError.InvalidField;
     const obj = value.object;
     const id = try optionalOwnedString(obj, "id", allocator);
@@ -644,7 +644,7 @@ fn deserializeEndpoint(value: std.json.Value, allocator: std.mem.Allocator) !oap
     return .{ .id = id, .name = name, .version = version, .adapter = adapter };
 }
 
-fn deserializeStringArray(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+pub fn deserializeStringArray(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
     const value = obj.get(key) orelse return DecodeError.MissingField;
     if (value != .array) return DecodeError.InvalidField;
     const out = try allocator.alloc([]const u8, value.array.items.len);

@@ -274,6 +274,7 @@ zig/src/transports/websocket.zig|        compat.random.fillSecureBytes(&mask);
 zig/src/transports/websocket.zig|    compat.random.fillSecureBytes(&nonce);
 zig/src/tui/app.zig|    compat.random.fillSecureBytes(&random_bytes);
 zig/src/utils/oauth/openai_codex.zig|    return generateStateWithRandom(allocator, compat.random.fillSecureBytes);
+zig/src/protocol/oap/provider/server.zig|        compat.random.fillSecureBytes(&raw);
 zig/src/utils/oauth/pkce.zig|    return generateWithRandom(allocator, compat.random.fillSecureBytes);
 SECURE
 )"

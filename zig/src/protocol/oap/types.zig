@@ -138,11 +138,13 @@ pub const ToolCallPart = struct {
     tool_call_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
+    arguments_partial: ?[]const u8 = null,
 
     pub fn deinit(self: *ToolCallPart, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.name);
         allocator.free(self.arguments_json);
+        if (self.arguments_partial) |value| allocator.free(value);
     }
 };
 
