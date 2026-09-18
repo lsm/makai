@@ -85,6 +85,34 @@ pub fn accept(server: *Server) !Connection {
     };
 }
 
+pub const UnixAddress = std.Io.net.UnixAddress;
+
+pub fn unixListen(path: []const u8) !std.Io.net.Server {
+    const address = try UnixAddress.init(path);
+    return address.listen(defaultIo(), .{ .kernel_backlog = 1 });
+}
+
+pub const supports_unix_channels = std.Io.net.has_unix_sockets;
+
+pub fn serverHandle(server: *const std.Io.net.Server) std.Io.net.Socket.Handle {
+    return server.socket.handle;
+}
+
+pub fn acceptStream(server: *std.Io.net.Server) !Stream {
+    return Stream.init(try server.accept(defaultIo()));
+}
+
+pub fn streamHandle(stream: *const Stream) std.Io.net.Socket.Handle {
+    return stream.inner.socket.handle;
+}
+
+pub fn readableWithin(handle: std.Io.net.Socket.Handle, timeout_ms: i32) !bool {
+    if (!supports_unix_channels) return error.UnsupportedPlatform;
+    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&fds, timeout_ms);
+    return ready > 0 and (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0;
+}
+
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
     var list = try resolveAddressList(allocator, host, port);
     defer list.deinit();

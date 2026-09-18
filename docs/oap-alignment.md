@@ -389,6 +389,51 @@ which is exactly the growth the cap would backstop.
 Adapter mismatches discovered by OAP adapter #3 beyond these resolve per the feedback
 rule above.
 
+## The model-provider-core profile
+
+`makai --oap-provider` serves `open-agent-protocol.model-provider-core`, a peer profile of
+agent-control-core rather than a unit inside it. Nothing agent-control owns changes because it
+exists, and `makai --oap` refuses its envelopes.
+
+The profile was specified against makai's provider layer as design input, and this implementation
+is the first to speak it. Seventeen findings from building it changed the draft; the ones that
+remain visible as deviations on our side are below.
+
+| Area | Profile | makai | Why |
+| --- | --- | --- | --- |
+| Wire set | closed, three named values plus `other` | eight registered APIs | Five earn a named wire. Both Google APIs and Ollama say `other` with an opaque `wire_id`, because a wire is named only when more than one independent implementer speaks it. |
+| `usage_in_streaming` | `always`, `terminal_only`, `never` | `supports_usage_in_streaming`, boolean | Ours is a request-shape fact gating `stream_options.include_usage`; the profile's is a response-behaviour fact. `true` maps to `always`; `false` is undecidable between the other two and is left unstated. |
+| Credential grants | two tiers, out-of-band mandatory where the binding allows | out-of-band served, `static` kind only | The channel is a per-grant unix socket, so a build whose toolchain reports no unix-socket support advertises `none` and no kinds rather than a tier it cannot open. A granted static key is safe by construction, since a per-call `api_key` short-circuits storage in `streamWithRefresh`. A **refreshable** grant is still refused: `AuthStorage.persist` writes on both branches, so a credential that cannot reach durable storage is unrepresentable, and the profile's non-persistable requirement is not satisfiable until one exists. |
+| Keepalive | a binding concern, not an envelope | `AssistantMessageEvent.keepalive` | Dropped in translation and consumes no sequence number. |
+| Reasoning options | one object, four members | seven `StreamOptions` fields | The `thinking_*`/`reasoning_*` split is vendor vocabulary rather than two concepts. `include_reasoning_encrypted` became `encrypted_carry`, which the profile gained a return path for after this implementation showed a caller could send one and never obtain one. |
+| Stop reasons | closed set of six | identical six | The one place "carried across whole" is demonstrated rather than asserted. |
+| Compatibility facts under a destination override | facts undefined while a destination is overridden; a suite must not check them | stated only behind a declared transparent proxy | A plain `*_BASE_URL` redirect says nothing about what answers at the new address, so makai asserts nothing; `*_BASE_URL_IS_PROXY` says the vendor is still behind it, so the vendor's facts hold and we publish them. Nothing in a URL reveals which redirect it is, which is why it takes an operator flag rather than detection — and why the profile cannot require the distinction without also specifying the out-of-band carrier it has just ruled off the wire. Without this, a conformance run against a local mock checks the vendor's claims against the mock's behaviour. |
+| Destination overrides | operator-set, out of band, never from the wire | `MAKAI_BASE_URL` and the per-provider vars | The only way to reach a controlled endpoint, so conformance testing depends on it. It stays off the wire because the destination is resolved before the credential is attached: a caller-supplied override would redirect a credentialed provider to an address it chose and have the host attach the vendor key. |
+
+Conformance status: every envelope is implementable and implemented. No compatibility fact has been
+observed against the vendor it describes, which needs a live credentialed endpoint and expires when
+the vendor changes. The two words are not interchangeable about this profile.
+
+The two decoders each carry their own copy of the `protocol` and `version` checks, and only the
+agent-control one had tests for them until a mutation run over the provider decoder found the copy
+unverified. That is a structural trap rather than a testing gap: each file reads as covered because
+the other file's tests cover its own copy, and mutating either file alone never reveals it. The same
+shape produced a duplicate `model_ref` parser in this profile, where three tests covered the copy
+`inference.create` never reaches. When a rule exists twice, coverage of one instance says nothing
+about the other, and the tests are attached to the wrong artifact to tell you so.
+
+Mutation results for the provider decoder, as a baseline for anyone changing it: 49 single-line
+refusals, 29 killed, 20 surviving. That is 49 of the 68 `return DecodeError` sites in the file --
+the other nineteen are `orelse return DecodeError.MissingField`, which has no neutralising mutation
+because removing the return needs a type-appropriate default that does not exist. Those nineteen
+are unmeasured, not verified, and reading "49 guards swept" as "the decode surface is covered" is
+the same mistake as believing a descriptor that under-claims. The killed set contains every rule the profile makes normative.
+The survivors are type tags guarding a union field access — malformed-input robustness, which the
+profile does not specify and which was correct but unverified rather than wrong. Recording which
+test kills each mutant matters as much as the count: a rule killed only by a generically named test
+reads as uncovered to anyone scanning test names, which is how the rule that a `wire_id` may
+accompany only the `other` wire came to be verified by a test about JSON types.
+
 ## Deferred scope
 
 Not claimed by this ledger, each requiring a spec revision plus OAP coordination

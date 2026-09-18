@@ -289,17 +289,21 @@ pub const ProxyCompatFlags = struct {
     anthropic_proxy: bool = false,
 };
 
-pub fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8) !?ai_types.OpenAICompatOptions {
+pub fn proxyCompatFlagsFromEnv(allocator: std.mem.Allocator) !ProxyCompatFlags {
     const global_base = try envOwnedOrNull(allocator, "MAKAI_BASE_URL");
     defer if (global_base) |value| allocator.free(value);
 
-    return transparentProxyCompatForFlags(provider_id, .{
+    return .{
         .global_base_set = global_base != null,
         .global_proxy = try envFlag(allocator, "MAKAI_BASE_URL_IS_PROXY"),
         .openai_proxy = try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"),
         .deepseek_proxy = try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"),
         .anthropic_proxy = try envFlag(allocator, "ANTHROPIC_BASE_URL_IS_PROXY"),
-    });
+    };
+}
+
+pub fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8) !?ai_types.OpenAICompatOptions {
+    return transparentProxyCompatForFlags(provider_id, try proxyCompatFlagsFromEnv(allocator));
 }
 
 pub fn transparentProxyCompatForFlags(provider_id: []const u8, flags: ProxyCompatFlags) ?ai_types.OpenAICompatOptions {
