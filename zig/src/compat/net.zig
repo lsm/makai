@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const HostName = std.Io.net.HostName;
 
 fn defaultIo() std.Io {
@@ -162,7 +163,7 @@ pub fn unixAddress(path: []const u8) !UnixAddress {
     return UnixAddress.init(path);
 }
 
-pub fn unixListen(address: UnixAddress, options: ListenOptions) !Server {
+pub fn unixListen(address: UnixAddress, options: UnixAddress.ListenOptions) !Server {
     return address.listen(defaultIo(), options);
 }
 
@@ -170,19 +171,21 @@ pub fn unixConnect(address: UnixAddress) !Stream {
     return Stream.init(try address.connect(defaultIo()));
 }
 
-pub fn acceptNonBlocking(server: *Server) !?Connection {
-    const stream = server.accept(defaultIo()) catch |err| switch (err) {
-        error.WouldBlock => return null,
-        else => return err,
-    };
-    return .{ .stream = Stream.init(stream), .address = stream.socket.address };
+pub fn serverHasPendingConnection(server: *Server) !bool {
+    if (builtin.os.tag == .windows) return true;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, 0);
+    return ready > 0;
 }
 
-pub fn setServerNonBlocking(server: *Server) !void {
-    const handle = server.socket.handle;
-    if (@TypeOf(handle) != std.posix.fd_t) return;
-    const flags = try std.posix.fcntl(handle, std.posix.F.GETFL, 0);
-    _ = try std.posix.fcntl(handle, std.posix.F.SETFL, flags | @as(u32, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK")));
+pub fn acceptNonBlocking(server: *Server) !?Connection {
+    if (!try serverHasPendingConnection(server)) return null;
+    const stream = try server.accept(defaultIo());
+    return .{ .stream = Stream.init(stream), .address = stream.socket.address };
 }
 
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
@@ -271,16 +274,17 @@ test "a unix socket round trips a nonce and a value" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(dir_path);
-    const sock_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "grant.sock" });
+    const sock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/grant.sock",
+        .{tmp.sub_path},
+    );
     defer std.testing.allocator.free(sock_path);
 
     const address = try unixAddress(sock_path);
     var server = try unixListen(address, .{});
     defer closeServer(&server);
 
-    try setServerNonBlocking(&server);
     try std.testing.expect(try acceptNonBlocking(&server) == null);
 
     var client = try unixConnect(address);
@@ -291,7 +295,7 @@ test "a unix socket round trips a nonce and a value" {
         var attempts: usize = 0;
         while (attempts < 200) : (attempts += 1) {
             if (try acceptNonBlocking(&server)) |c| break :blk c;
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            @import("time.zig").sleepNs(1 * std.time.ns_per_ms);
         }
         return error.TestExpectedConnection;
     };
