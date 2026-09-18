@@ -260,9 +260,9 @@ pub const Server = struct {
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
+            .capability_revision = revision,
             .payload = .{ .provider_describe_response = .{
                 .providers = descriptors,
-                .capability_revision = revision,
                 .protocol_versions = versions,
             } },
         };
@@ -306,9 +306,9 @@ pub const Server = struct {
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
+            .capability_revision = revision,
             .payload = .{ .provider_models_list_response = .{
                 .models = entries,
-                .capability_revision = revision,
             } },
         };
         defer response.deinit(self.allocator);
@@ -448,7 +448,7 @@ pub const Server = struct {
             return;
         }
 
-        if (!descriptor.snapshot_policies.supports(create_request.include_snapshot)) {
+        if (!types.supportsSnapshotPolicy(descriptor.snapshot_policies, create_request.include_snapshot)) {
             if (!types.allowsDegraded(create_request.allow_degraded_features, types.DEGRADABLE_SNAPSHOT_KEY)) {
                 try self.emitCreateRefusal(
                     env,
@@ -480,7 +480,7 @@ pub const Server = struct {
         }
 
         var honoured = create_request.include_snapshot;
-        if (!descriptor.snapshot_policies.supports(create_request.include_snapshot)) honoured = .never;
+        if (!types.supportsSnapshotPolicy(descriptor.snapshot_policies, create_request.include_snapshot)) honoured = .never;
 
         const inference_id = try self.nextId();
         errdefer self.allocator.free(inference_id);
@@ -1018,7 +1018,7 @@ pub fn cloneDescriptor(
     errdefer allocator.free(endpoint);
     const headers = try cloneHeaders(allocator, descriptor.headers);
     errdefer types.freeHeaders(allocator, headers);
-    const policies = try allocator.dupe(types.SnapshotPolicy, descriptor.snapshot_policies.policies);
+    const policies = try allocator.dupe(types.SnapshotPolicy, descriptor.snapshot_policies);
     errdefer allocator.free(policies);
 
     return types.ProviderDescriptor{
@@ -1030,10 +1030,8 @@ pub fn cloneDescriptor(
         .endpoint = endpoint,
         .headers = headers,
         .compatibility = descriptor.compatibility,
-        .snapshot_policies = .{
-            .policies = policies,
-            .answers_sync = descriptor.snapshot_policies.answers_sync,
-        },
+        .snapshot_policies = policies,
+        .answers_sync = descriptor.answers_sync,
         .credential_grant = descriptor.credential_grant,
         .grant_kinds = try allocator.dupe(types.GrantKind, descriptor.grant_kinds),
         .allows_anonymous = descriptor.allows_anonymous,
@@ -1183,7 +1181,7 @@ fn testServer(allocator: std.mem.Allocator, options: Options) !Server {
         .framing = .ndjson,
         .endpoint = endpoint,
         .allows_anonymous = true,
-        .snapshot_policies = .{ .policies = policies, .answers_sync = false },
+        .snapshot_policies = policies,
     });
 
     const model_ref = try allocator.dupe(u8, "ollama-local/openai-chat-completions@gemma");
@@ -2010,3 +2008,4 @@ test "a terminal carrying a partial argument fragment is refused on decode" {
         envelope.deserializeEnvelope(line, allocator),
     );
 }
+

@@ -347,21 +347,12 @@ pub const GrantKind = enum {
     }
 };
 
-pub const SnapshotPolicies = struct {
-    policies: []const SnapshotPolicy = &.{},
-    answers_sync: bool = false,
-
-    pub fn supports(self: SnapshotPolicies, policy: SnapshotPolicy) bool {
-        for (self.policies) |candidate| {
-            if (candidate == policy) return true;
-        }
-        return policy == .never;
+pub fn supportsSnapshotPolicy(policies: []const SnapshotPolicy, policy: SnapshotPolicy) bool {
+    for (policies) |candidate| {
+        if (candidate == policy) return true;
     }
-
-    pub fn deinit(self: *SnapshotPolicies, allocator: std.mem.Allocator) void {
-        allocator.free(self.policies);
-    }
-};
+    return policy == .never;
+}
 
 pub const ProviderDescriptor = struct {
     id: []const u8,
@@ -372,7 +363,8 @@ pub const ProviderDescriptor = struct {
     endpoint: []const u8,
     headers: []const HeaderPair = &.{},
     compatibility: CompatibilityFacts = .{},
-    snapshot_policies: SnapshotPolicies = .{},
+    snapshot_policies: []const SnapshotPolicy = &.{},
+    answers_sync: bool = false,
     credential_grant: CredentialGrantChannel = .none,
     grant_kinds: []const GrantKind = &.{},
     allows_anonymous: bool = false,
@@ -386,7 +378,7 @@ pub const ProviderDescriptor = struct {
         allocator.free(self.endpoint);
         freeHeaders(allocator, self.headers);
         allocator.free(self.grant_kinds);
-        self.snapshot_policies.deinit(allocator);
+        allocator.free(self.snapshot_policies);
     }
 };
 
@@ -473,13 +465,11 @@ pub const DescribeRequest = struct {};
 
 pub const DescribeResponse = struct {
     providers: []ProviderDescriptor = &.{},
-    capability_revision: []const u8,
     protocol_versions: []const []const u8 = &.{},
 
     pub fn deinit(self: *DescribeResponse, allocator: std.mem.Allocator) void {
         for (self.providers) |*descriptor| descriptor.deinit(allocator);
         allocator.free(self.providers);
-        allocator.free(self.capability_revision);
         freeStringList(allocator, self.protocol_versions);
     }
 };
@@ -494,12 +484,10 @@ pub const ModelsListRequest = struct {
 
 pub const ModelsListResponse = struct {
     models: []ModelEntry = &.{},
-    capability_revision: []const u8,
 
     pub fn deinit(self: *ModelsListResponse, allocator: std.mem.Allocator) void {
         for (self.models) |*entry| entry.deinit(allocator);
         allocator.free(self.models);
-        allocator.free(self.capability_revision);
     }
 };
 
@@ -799,11 +787,13 @@ pub const Envelope = struct {
     timestamp_ms: ?i64 = null,
     in_reply_to: ?[]const u8 = null,
     inference_id: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
 
     pub fn deinit(self: *Envelope, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         if (self.in_reply_to) |value| allocator.free(value);
         if (self.inference_id) |value| allocator.free(value);
+        if (self.capability_revision) |value| allocator.free(value);
         self.payload.deinit(allocator);
     }
 };

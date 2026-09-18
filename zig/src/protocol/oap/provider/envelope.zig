@@ -31,6 +31,7 @@ pub fn serializeEnvelope(env: types.Envelope, allocator: std.mem.Allocator) ![]u
     if (env.timestamp_ms) |timestamp| try w.writeIntField("timestamp_ms", timestamp);
     if (env.in_reply_to) |value| try w.writeStringField("in_reply_to", value);
     if (env.inference_id) |value| try w.writeStringField("inference_id", value);
+    if (env.capability_revision) |value| try w.writeStringField("capability_revision", value);
 
     try w.writeKey("payload");
     try serializePayload(&w, env.payload);
@@ -77,13 +78,10 @@ fn writeProviderDescriptor(w: *json_writer.JsonWriter, descriptor: types.Provide
     if (descriptor.headers.len > 0) try writeHeaders(w, descriptor.headers);
     if (!descriptor.compatibility.isEmpty()) try writeCompatibility(w, descriptor.compatibility);
     try w.writeKey("snapshot_policies");
-    try w.beginObject();
-    try w.writeKey("policies");
     try w.beginArray();
-    for (descriptor.snapshot_policies.policies) |policy| try w.writeString(@tagName(policy));
+    for (descriptor.snapshot_policies) |policy| try w.writeString(@tagName(policy));
     try w.endArray();
-    try w.writeBoolField("answers_sync", descriptor.snapshot_policies.answers_sync);
-    try w.endObject();
+    try w.writeBoolField("answers_sync", descriptor.answers_sync);
     try w.writeStringField("credential_grant", @tagName(descriptor.credential_grant));
     if (descriptor.grant_kinds.len > 0) {
         try w.writeKey("grant_kinds");
@@ -184,7 +182,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try w.beginArray();
             for (value.providers) |descriptor| try writeProviderDescriptor(w, descriptor);
             try w.endArray();
-            try w.writeStringField("capability_revision", value.capability_revision);
             try oap_envelope.serializeStringArray(w, "protocol_versions", value.protocol_versions);
             try w.endObject();
         },
@@ -199,7 +196,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try w.beginArray();
             for (value.models) |entry| try writeModelEntry(w, entry);
             try w.endArray();
-            try w.writeStringField("capability_revision", value.capability_revision);
             try w.endObject();
         },
         .provider_credential_grant_request => |value| {
@@ -291,7 +287,12 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try w.beginObject();
             if (value.inference_id) |inference_id| try w.writeStringField("inference_id", inference_id);
             try w.writeBoolField("accepted", value.accepted);
-            if (value.honoured) |honoured| try w.writeStringField("honoured", @tagName(honoured));
+            if (value.honoured) |honoured| {
+                try w.writeKey("honoured");
+                try w.beginObject();
+                try w.writeStringField("include_snapshot", @tagName(honoured));
+                try w.endObject();
+            }
             if (value.err) |err| {
                 try w.writeKey("error");
                 try writeProtocolError(w, err);
@@ -416,6 +417,9 @@ pub fn deserializeEnvelope(line: []const u8, allocator: std.mem.Allocator) !type
     const inference_id = try oap_envelope.optionalOwnedString(root, "inference_id", allocator);
     errdefer if (inference_id) |value| allocator.free(value);
 
+    const capability_revision = try oap_envelope.optionalOwnedString(root, "capability_revision", allocator);
+    errdefer if (capability_revision) |value| allocator.free(value);
+
     const sequence = try oap_envelope.optionalUnsigned(root, "sequence");
     const timestamp_ms = try oap_envelope.optionalInteger(root, "timestamp_ms");
 
@@ -434,6 +438,7 @@ pub fn deserializeEnvelope(line: []const u8, allocator: std.mem.Allocator) !type
         .timestamp_ms = timestamp_ms,
         .in_reply_to = in_reply_to,
         .inference_id = inference_id,
+        .capability_revision = capability_revision,
     };
 }
 
@@ -688,7 +693,11 @@ fn deserializePayload(
             errdefer if (inference_id) |value| allocator.free(value);
             if (accepted and inference_id == null) return DecodeError.MissingField;
             if (!accepted and inference_id != null) return DecodeError.InvalidField;
-            const honoured = try oap_envelope.optionalEnum(types.SnapshotPolicy, obj, "honoured");
+            const honoured = blk: {
+                const value = obj.get("honoured") orelse break :blk null;
+                if (value != .object) return DecodeError.InvalidField;
+                break :blk try oap_envelope.optionalEnum(types.SnapshotPolicy, value.object, "include_snapshot");
+            };
             var err: ?types.ProtocolError = null;
             if (obj.get("error")) |error_value| {
                 err = try deserializeProtocolError(error_value, allocator);
@@ -978,17 +987,13 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
 
         var policies = std.ArrayList(types.SnapshotPolicy).empty;
         errdefer policies.deinit(allocator);
-        var answers_sync = false;
-        if (descriptor_obj.get("snapshot_policies")) |policies_value| {
-            if (policies_value != .object) return DecodeError.InvalidField;
-            answers_sync = try oap_envelope.optionalBool(policies_value.object, "answers_sync") orelse false;
-            if (policies_value.object.get("policies")) |list_value| {
-                if (list_value != .array) return DecodeError.InvalidField;
-                for (list_value.array.items) |policy_item| {
-                    if (policy_item != .string) return DecodeError.InvalidField;
-                    const policy = types.SnapshotPolicy.parse(policy_item.string) orelse return DecodeError.InvalidField;
-                    try policies.append(allocator, policy);
-                }
+        const answers_sync = try oap_envelope.optionalBool(descriptor_obj, "answers_sync") orelse false;
+        if (descriptor_obj.get("snapshot_policies")) |list_value| {
+            if (list_value != .array) return DecodeError.InvalidField;
+            for (list_value.array.items) |policy_item| {
+                if (policy_item != .string) return DecodeError.InvalidField;
+                const policy = types.SnapshotPolicy.parse(policy_item.string) orelse return DecodeError.InvalidField;
+                try policies.append(allocator, policy);
             }
         }
 
@@ -1001,10 +1006,8 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
             .endpoint = endpoint,
             .headers = headers,
             .compatibility = compatibility,
-            .snapshot_policies = .{
-                .policies = try policies.toOwnedSlice(allocator),
-                .answers_sync = answers_sync,
-            },
+            .snapshot_policies = try policies.toOwnedSlice(allocator),
+            .answers_sync = answers_sync,
             .credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none,
             .grant_kinds = try deserializeGrantKinds(descriptor_obj, allocator),
             .allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false,
@@ -1013,9 +1016,6 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
         });
     }
 
-    const revision = try oap_envelope.requiredOwnedString(obj, "capability_revision", allocator);
-    errdefer allocator.free(revision);
-
     const versions = if (obj.get("protocol_versions") != null)
         try oap_envelope.deserializeStringArray(obj, "protocol_versions", allocator)
     else
@@ -1023,7 +1023,6 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
 
     return types.Payload{ .provider_describe_response = .{
         .providers = try providers.toOwnedSlice(allocator),
-        .capability_revision = revision,
         .protocol_versions = versions,
     } };
 }
@@ -1079,12 +1078,8 @@ fn deserializeModelsListResponse(obj: std.json.ObjectMap, allocator: std.mem.All
         });
     }
 
-    const revision = try oap_envelope.requiredOwnedString(obj, "capability_revision", allocator);
-    errdefer allocator.free(revision);
-
     return types.Payload{ .provider_models_list_response = .{
         .models = try models.toOwnedSlice(allocator),
-        .capability_revision = revision,
     } };
 }
 
@@ -1260,7 +1255,7 @@ test "all twelve compatibility facts survive a round trip" {
                     .cache_ttl_control = true,
                 },
             }}),
-            .capability_revision = try allocator.dupe(u8, "rev-1"),
+
         } },
     };
     defer env.deinit(allocator);
