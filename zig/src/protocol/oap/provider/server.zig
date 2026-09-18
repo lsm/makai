@@ -489,6 +489,7 @@ pub fn cloneDescriptor(
             .answers_sync = descriptor.snapshot_policies.answers_sync,
         },
         .credential_grant = descriptor.credential_grant,
+        .grant_kinds = try allocator.dupe(types.GrantKind, descriptor.grant_kinds),
         .allows_anonymous = descriptor.allows_anonymous,
         .context_window = descriptor.context_window,
         .max_output_tokens = descriptor.max_output_tokens,

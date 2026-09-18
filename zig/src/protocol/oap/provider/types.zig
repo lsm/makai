@@ -244,6 +244,13 @@ pub const ToolCallIdFormat = enum {
 
 pub const DEGRADABLE_SNAPSHOT_KEY = "include_snapshot";
 
+pub fn acceptsGrantKind(kinds: []const GrantKind, kind: GrantKind) bool {
+    for (kinds) |candidate| {
+        if (candidate == kind) return true;
+    }
+    return false;
+}
+
 pub fn allowsDegraded(keys: []const []const u8, key: []const u8) bool {
     for (keys) |candidate| {
         if (std.mem.eql(u8, candidate, key)) return true;
@@ -326,6 +333,15 @@ pub const CredentialGrantChannel = enum {
     }
 };
 
+pub const GrantKind = enum {
+    static,
+    refreshable,
+
+    pub fn parse(value: []const u8) ?GrantKind {
+        return std.meta.stringToEnum(GrantKind, value);
+    }
+};
+
 pub const SnapshotPolicies = struct {
     policies: []const SnapshotPolicy = &.{},
     answers_sync: bool = false,
@@ -352,6 +368,7 @@ pub const ProviderDescriptor = struct {
     compatibility: CompatibilityFacts = .{},
     snapshot_policies: SnapshotPolicies = .{},
     credential_grant: CredentialGrantChannel = .none,
+    grant_kinds: []const GrantKind = &.{},
     allows_anonymous: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -361,6 +378,7 @@ pub const ProviderDescriptor = struct {
         if (self.display_name) |value| allocator.free(value);
         allocator.free(self.endpoint);
         freeHeaders(allocator, self.headers);
+        allocator.free(self.grant_kinds);
         self.snapshot_policies.deinit(allocator);
     }
 };

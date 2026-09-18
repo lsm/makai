@@ -83,6 +83,12 @@ fn writeProviderDescriptor(w: *json_writer.JsonWriter, descriptor: types.Provide
     try w.writeBoolField("answers_sync", descriptor.snapshot_policies.answers_sync);
     try w.endObject();
     try w.writeStringField("credential_grant", @tagName(descriptor.credential_grant));
+    if (descriptor.grant_kinds.len > 0) {
+        try w.writeKey("grant_kinds");
+        try w.beginArray();
+        for (descriptor.grant_kinds) |kind| try w.writeString(@tagName(kind));
+        try w.endArray();
+    }
     try w.writeBoolField("allows_anonymous", descriptor.allows_anonymous);
     if (descriptor.context_window) |value| try w.writeIntField("context_window", value);
     if (descriptor.max_output_tokens) |value| try w.writeIntField("max_output_tokens", value);
@@ -447,6 +453,19 @@ fn deserializeCompatibility(obj: std.json.ObjectMap) !types.CompatibilityFacts {
         .tool_call_id_format = try optionalToolCallIdFormat(facts),
         .cache_ttl_control = try oap_envelope.optionalBool(facts, "cache_ttl_control"),
     };
+}
+
+fn deserializeGrantKinds(obj: std.json.ObjectMap, allocator: std.mem.Allocator) ![]const types.GrantKind {
+    const value = obj.get("grant_kinds") orelse return &.{};
+    if (value != .array) return DecodeError.InvalidField;
+    var list = std.ArrayList(types.GrantKind).empty;
+    errdefer list.deinit(allocator);
+    for (value.array.items) |item| {
+        if (item != .string) return DecodeError.InvalidField;
+        const kind = types.GrantKind.parse(item.string) orelse return DecodeError.InvalidField;
+        try list.append(allocator, kind);
+    }
+    return list.toOwnedSlice(allocator);
 }
 
 fn optionalToolCallIdFormat(obj: std.json.ObjectMap) !?types.ToolCallIdFormat {
@@ -878,6 +897,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
                 .answers_sync = answers_sync,
             },
             .credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none,
+            .grant_kinds = try deserializeGrantKinds(descriptor_obj, allocator),
             .allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false,
             .context_window = try optionalU32(descriptor_obj, "context_window"),
             .max_output_tokens = try optionalU32(descriptor_obj, "max_output_tokens"),
