@@ -782,6 +782,77 @@ pub const AuthStorage = struct {
     providers: std.StringHashMap(ProviderAuth),
     allocator: std.mem.Allocator,
     save_fn: ?SaveFn = null,
+    ephemeral: ?std.StringHashMap(ProviderAuth) = null,
+
+    pub fn putEphemeral(self: *AuthStorage, provider_id: []const u8, auth: ProviderAuth) !void {
+        if (self.ephemeral == null) {
+            self.ephemeral = std.StringHashMap(ProviderAuth).init(self.allocator);
+        }
+
+        const key = try self.allocator.dupe(u8, provider_id);
+        errdefer self.allocator.free(key);
+
+        if (self.ephemeral.?.fetchRemove(key)) |existing| {
+            self.allocator.free(existing.key);
+            existing.value.deinit(self.allocator);
+        }
+
+        try self.ephemeral.?.put(key, auth);
+    }
+
+    pub fn hasEphemeral(self: *const AuthStorage, provider_id: []const u8) bool {
+        const map = self.ephemeral orelse return false;
+        return map.contains(provider_id);
+    }
+
+    pub fn ephemeralCount(self: *const AuthStorage) usize {
+        const map = self.ephemeral orelse return 0;
+        return map.count();
+    }
+
+    pub fn releaseEphemeral(self: *AuthStorage) void {
+        if (self.ephemeral) |*map| {
+            deinitProviderMap(self.allocator, map);
+            self.ephemeral = null;
+        }
+    }
+
+    fn ephemeralAuth(self: *const AuthStorage, provider_id: []const u8) ?ProviderAuth {
+        const map = self.ephemeral orelse return null;
+        return map.get(provider_id);
+    }
+
+    fn refreshEphemeral(
+        self: *AuthStorage,
+        provider_id: []const u8,
+        oauth_provider: OAuthProvider,
+        credentials: Credentials,
+    ) !Credentials {
+        const refreshed = try oauth_provider.refresh_fn(credentials, self.allocator);
+        errdefer refreshed.deinit(self.allocator);
+        try self.putEphemeral(provider_id, .{ .oauth = refreshed });
+        return refreshed;
+    }
+
+    pub fn getEphemeralApiKey(
+        self: *AuthStorage,
+        provider_id: []const u8,
+        oauth_provider: ?OAuthProvider,
+    ) !?[]const u8 {
+        const auth = self.ephemeralAuth(provider_id) orelse return null;
+
+        switch (auth) {
+            .api_key => |key| return try self.allocator.dupe(u8, key),
+            .oauth => |credentials| {
+                const provider = oauth_provider orelse return error.UnknownProvider;
+                if (compat.time.nowMillis() >= credentials.expires) {
+                    const refreshed = try self.refreshEphemeral(provider_id, provider, credentials);
+                    return try provider.get_api_key_fn(refreshed, self.allocator);
+                }
+                return try provider.get_api_key_fn(credentials, self.allocator);
+            },
+        }
+    }
 
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
         return loadFromFileWithSaveFn(allocator, null);
@@ -867,7 +938,8 @@ pub const AuthStorage = struct {
     }
 
     pub fn hasRefreshableCredentials(self: *const AuthStorage, provider_id: []const u8) bool {
-        const auth = self.providers.get(provider_id) orelse return false;
+        const auth = self.ephemeralAuth(provider_id) orelse
+            self.providers.get(provider_id) orelse return false;
         return switch (auth) {
             .api_key => false,
             .oauth => true,
@@ -875,6 +947,7 @@ pub const AuthStorage = struct {
     }
 
     pub fn credentialsExpired(self: *const AuthStorage, provider_id: []const u8) bool {
+        if (self.ephemeralAuth(provider_id)) |_| return false;
         const auth = self.providers.get(provider_id) orelse return false;
         return switch (auth) {
             .api_key => false,
@@ -922,6 +995,8 @@ pub const AuthStorage = struct {
     }
 
     pub fn getApiKey(self: *AuthStorage, provider_id: []const u8, oauth_provider: ?OAuthProvider) !?[]const u8 {
+        if (try self.getEphemeralApiKey(provider_id, oauth_provider)) |key| return key;
+
         const auth = self.providers.get(provider_id) orelse return null;
 
         switch (auth) {
@@ -944,6 +1019,7 @@ pub const AuthStorage = struct {
 
     pub fn deinit(self: *AuthStorage) void {
         deinitProviderMap(self.allocator, &self.providers);
+        self.releaseEphemeral();
     }
 };
 
@@ -1362,4 +1438,185 @@ test "oauth_storage_keychain_read_lock_waits_out_transient_contention" {
 
     thread.join();
     try std.testing.expect(acquired.load(.acquire));
+}
+
+var ephemeral_test_saves: usize = 0;
+var ephemeral_test_last_payload: [4096]u8 = undefined;
+var ephemeral_test_last_len: usize = 0;
+
+fn countingSaveFn(storage: *const AuthStorage) anyerror!void {
+    ephemeral_test_saves += 1;
+    const content = try serializeAuthJson(storage, storage.allocator);
+    defer secureFree(storage.allocator, content);
+    const len = @min(content.len, ephemeral_test_last_payload.len);
+    @memcpy(ephemeral_test_last_payload[0..len], content[0..len]);
+    ephemeral_test_last_len = len;
+}
+
+fn lastSavedPayload() []const u8 {
+    return ephemeral_test_last_payload[0..ephemeral_test_last_len];
+}
+
+fn ephemeralTestRefresh(credentials: Credentials, allocator: std.mem.Allocator) anyerror!Credentials {
+    _ = credentials;
+    return Credentials{
+        .refresh = try allocator.dupe(u8, "refreshed-refresh"),
+        .access = try allocator.dupe(u8, "refreshed-access"),
+        .expires = std.math.maxInt(i64),
+    };
+}
+
+fn ephemeralTestApiKey(credentials: Credentials, allocator: std.mem.Allocator) anyerror![]const u8 {
+    return allocator.dupe(u8, credentials.access);
+}
+
+const ephemeral_test_provider = OAuthProvider{
+    .id = "ephemeral-test",
+    .refresh_fn = ephemeralTestRefresh,
+    .get_api_key_fn = ephemeralTestApiKey,
+};
+
+fn emptyTestStorage(allocator: std.mem.Allocator) AuthStorage {
+    ephemeral_test_saves = 0;
+    ephemeral_test_last_len = 0;
+    return AuthStorage{
+        .providers = std.StringHashMap(ProviderAuth).init(allocator),
+        .allocator = allocator,
+        .save_fn = countingSaveFn,
+    };
+}
+
+test "a granted credential never reaches the serialized form a writer would emit" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-granted-secret") });
+    try storage.persist();
+
+    try std.testing.expectEqual(@as(usize, 1), ephemeral_test_saves);
+    try std.testing.expect(std.mem.indexOf(u8, lastSavedPayload(), "sk-granted-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lastSavedPayload(), "tenant-a") == null);
+}
+
+test "a durable credential beside a granted one is still written" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.providers.put(
+        try allocator.dupe(u8, "configured"),
+        .{ .api_key = try allocator.dupe(u8, "sk-configured") },
+    );
+    try storage.putEphemeral("granted", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+    try storage.persist();
+
+    try std.testing.expect(std.mem.indexOf(u8, lastSavedPayload(), "sk-configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lastSavedPayload(), "sk-granted") == null);
+}
+
+test "refreshing a granted credential writes nothing" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = 0,
+    } });
+
+    const key = try storage.getApiKey("tenant-a", ephemeral_test_provider) orelse
+        return error.TestExpectedKey;
+    defer allocator.free(key);
+
+    try std.testing.expectEqualStrings("refreshed-access", key);
+    try std.testing.expectEqual(@as(usize, 0), ephemeral_test_saves);
+}
+
+test "refreshing a configured credential still writes" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.providers.put(try allocator.dupe(u8, "configured"), .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "stored-refresh"),
+        .access = try allocator.dupe(u8, "stored-access"),
+        .expires = 0,
+    } });
+
+    const key = try storage.getApiKey("configured", ephemeral_test_provider) orelse
+        return error.TestExpectedKey;
+    defer allocator.free(key);
+
+    try std.testing.expectEqualStrings("refreshed-access", key);
+    try std.testing.expectEqual(@as(usize, 1), ephemeral_test_saves);
+}
+
+test "a granted credential outranks a configured one and stops doing so when released" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.providers.put(
+        try allocator.dupe(u8, "shared"),
+        .{ .api_key = try allocator.dupe(u8, "sk-configured") },
+    );
+    try storage.putEphemeral("shared", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+
+    const granted = try storage.getApiKey("shared", null) orelse return error.TestExpectedKey;
+    defer allocator.free(granted);
+    try std.testing.expectEqualStrings("sk-granted", granted);
+
+    storage.releaseEphemeral();
+    try std.testing.expectEqual(@as(usize, 0), storage.ephemeralCount());
+
+    const configured = try storage.getApiKey("shared", null) orelse return error.TestExpectedKey;
+    defer allocator.free(configured);
+    try std.testing.expectEqualStrings("sk-configured", configured);
+}
+
+test "replacing a granted credential frees the one it displaces" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-first") });
+    try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-second") });
+
+    try std.testing.expectEqual(@as(usize, 1), storage.ephemeralCount());
+    const key = try storage.getApiKey("tenant-a", null) orelse return error.TestExpectedKey;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("sk-second", key);
+}
+
+test "a granted oauth credential routes through the refreshable path and never through persistence" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try std.testing.expect(!storage.hasRefreshableCredentials("tenant-a"));
+
+    try storage.putEphemeral("tenant-a", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = 0,
+    } });
+
+    try std.testing.expect(storage.hasRefreshableCredentials("tenant-a"));
+    try std.testing.expect(!storage.credentialsExpired("tenant-a"));
+
+    const key = try storage.getApiKey("tenant-a", ephemeral_test_provider) orelse
+        return error.TestExpectedKey;
+    defer allocator.free(key);
+    try std.testing.expectEqual(@as(usize, 0), ephemeral_test_saves);
+}
+
+test "a granted static key is not reported as refreshable" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+    try std.testing.expect(!storage.hasRefreshableCredentials("tenant-a"));
 }
