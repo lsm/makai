@@ -797,15 +797,15 @@ fn modelWithProtocolDefaults(
     errdefer if (defaulted_base) |base| allocator.free(base);
 
     if (!client_supplied_base and model.provider.len > 0 and model.api.len > 0) {
-        const stored_kimi_region: ?[]const u8 = if (isKimiPair(model.provider, model.api))
-            try storedKimiRegion(server)
+        const resolved_kimi_region: ?[]const u8 = if (isKimiPair(model.provider, model.api))
+            try resolvedKimiRegion(server)
         else
             null;
         const resolved = try provider_base_url.defaultBaseUrlForRefWithRegion(
             allocator,
             model.provider,
             model.api,
-            stored_kimi_region,
+            resolved_kimi_region,
         );
         if (resolved.len > 0) {
             defaulted_base = resolved;
@@ -835,7 +835,7 @@ fn isKimiPair(provider_id: []const u8, api: []const u8) bool {
     return std.mem.eql(u8, provider_id, "kimi") and std.mem.eql(u8, api, "openai-completions");
 }
 
-fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
+fn resolvedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
 
@@ -850,7 +850,7 @@ fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
             break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
         } orelse return null;
 
-    const auth = storage.providers.get("kimi") orelse return null;
+    const auth = storage.resolvedCredential("kimi") orelse return null;
     if (auth != .oauth) return null;
     const provider_data = auth.oauth.provider_data orelse return null;
     if (!std.mem.startsWith(u8, provider_data, "region:")) return null;
@@ -2064,6 +2064,68 @@ test "a github-copilot model resolves its stored OAuth token on openai-completio
     }
 
     try std.testing.expectEqualStrings("copilot-access", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "a granted kimi credential decides the region when no login is stored" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    try std.testing.expect(try resolvedKimiRegion(&server) == null);
+
+    try storage.putEphemeral("kimi", .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "kimi-granted-key"),
+        .expires = std.math.maxInt(i64),
+        .provider_data = try std.testing.allocator.dupe(u8, "region:global"),
+    } });
+
+    const region = try resolvedKimiRegion(&server) orelse return error.TestExpectedRegion;
+    try std.testing.expectEqualStrings("global", region);
+}
+
+test "a granted kimi credential outranks the stored login's region" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    try storage.providers.put(
+        try std.testing.allocator.dupe(u8, "kimi"),
+        .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, ""),
+            .access = try std.testing.allocator.dupe(u8, "kimi-stored-key"),
+            .expires = std.math.maxInt(i64),
+            .provider_data = try std.testing.allocator.dupe(u8, "region:china"),
+        } },
+    );
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    const stored = try resolvedKimiRegion(&server) orelse return error.TestExpectedRegion;
+    try std.testing.expectEqualStrings("china", stored);
+
+    try storage.putEphemeral("kimi", .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "kimi-granted-key"),
+        .expires = std.math.maxInt(i64),
+        .provider_data = try std.testing.allocator.dupe(u8, "region:global"),
+    } });
+
+    const granted = try resolvedKimiRegion(&server) orelse return error.TestExpectedRegion;
+    try std.testing.expectEqualStrings("global", granted);
 }
 
 test "a kimi api key stored in the oauth shape still reaches its endpoint" {
