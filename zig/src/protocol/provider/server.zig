@@ -12,7 +12,6 @@ const hive_array = @import("hive_array");
 const auth_resolver = @import("auth_resolver");
 const oauth_storage = @import("oauth/storage");
 const refresh_lock_mod = @import("oauth/refresh_lock");
-const oom = @import("oom");
 const provider_base_url = @import("provider_base_url");
 
 pub const AuthStorage = oauth_storage.AuthStorage;
@@ -886,7 +885,11 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
 
-    const cancelled = oom.unreachableOnOom(server.allocator.create(std.atomic.Value(bool)));
+    try server.active_streams.ensureUnusedCapacity(1);
+    try server.sequence_counters.ensureUnusedCapacity(1);
+    try server.expected_sequences.ensureUnusedCapacity(1);
+
+    const cancelled = try server.allocator.create(std.atomic.Value(bool));
     cancelled.* = std.atomic.Value(bool).init(false);
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
@@ -930,11 +933,11 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .owns_cancel_flag = !server.provider_thread_abandoned,
     };
 
-    try server.active_streams.put(stream_id, active_stream);
+    server.active_streams.putAssumeCapacity(stream_id, active_stream);
 
-    try server.sequence_counters.put(stream_id, 1);
+    server.sequence_counters.putAssumeCapacity(stream_id, 1);
 
-    try server.expected_sequences.put(stream_id, received_seq + 1);
+    server.expected_sequences.putAssumeCapacity(stream_id, received_seq + 1);
 
     return .{
         .stream_id = stream_id,
@@ -4940,4 +4943,48 @@ test "refresh lock independent providers do not block each other" {
 
     lock.complete("provider-a", null, gen1, null);
     lock.complete("provider-b", null, gen2, null);
+}
+
+fn streamRegistrationProbe(allocator: std.mem.Allocator) !void {
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var server = ProtocolServer.init(allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var response = try handleStreamRequest(
+        &server,
+        .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        },
+        protocol_types.generateUlid(),
+        protocol_types.generateUlid(),
+        1,
+    );
+    response.deinit(allocator);
+}
+
+test "handleStreamRequest leaks nothing when registration allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, streamRegistrationProbe, .{});
 }
