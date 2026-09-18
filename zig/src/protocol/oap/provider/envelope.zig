@@ -120,7 +120,6 @@ fn writeProtocolError(w: *json_writer.JsonWriter, err: types.ProtocolError) !voi
     try w.beginObject();
     try w.writeStringField("code", @tagName(err.code));
     try w.writeStringField("message", err.message);
-    try w.writeStringField("action", @tagName(err.code.action()));
     if (err.details.len > 0) {
         try w.writeKey("details");
         try w.beginObject();
@@ -294,7 +293,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
                 try w.beginObject();
                 try w.writeStringField("tool_call_id", call.tool_call_id);
                 try w.writeStringField("name", call.name);
-                try w.writeKey("arguments");
+                try w.writeKey("arguments_json");
                 try oap_envelope.writeJsonValueOrString(w, call.arguments_json);
                 try w.endObject();
             }
@@ -646,7 +645,7 @@ fn deserializePayload(
                     errdefer allocator.free(call_id);
                     const name = try oap_envelope.requiredOwnedString(call_obj, "name", allocator);
                     errdefer allocator.free(name);
-                    const arguments_value = call_obj.get("arguments") orelse return DecodeError.MissingField;
+                    const arguments_value = call_obj.get("arguments_json") orelse return DecodeError.MissingField;
                     const arguments = try oap_envelope.ownedRawJson(arguments_value, allocator);
                     tool_call = .{ .tool_call_id = call_id, .name = name, .arguments_json = arguments };
                 },
