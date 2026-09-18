@@ -6722,16 +6722,12 @@ fn startOapInference(
 ) !void {
     const inference = server.findInference(inference_id) orelse return;
 
-    const slash = std.mem.indexOfScalar(u8, inference.model_ref, '/') orelse {
+    const parsed = oap_provider_server.Server.parseModelRef(inference.model_ref) orelse {
         try server.settleFailed(inference_id, .invalid_request, "model_ref is not parseable", null);
         return;
     };
-    const at = std.mem.lastIndexOfScalar(u8, inference.model_ref, '@') orelse {
-        try server.settleFailed(inference_id, .invalid_request, "model_ref names no model", null);
-        return;
-    };
-    const provider_id = inference.model_ref[0..slash];
-    const model_id = inference.model_ref[at + 1 ..];
+    const provider_id = parsed.provider_id;
+    const model_id = parsed.model_id;
 
     const builtin = builtInForProvider(provider_id) orelse {
         try server.settleFailed(inference_id, .model_not_found, "no such provider", null);
@@ -6758,8 +6754,18 @@ fn startOapInference(
     if (inference.max_output_tokens) |max| options.max_tokens = max;
     if (inference.temperature) |value| options.temperature = value;
 
-    const stream = provider.stream(model, context, options, allocator) catch {
-        try server.settleFailed(inference_id, .provider_unavailable, "the provider refused the request", null);
+    const stream = provider.stream(model, context, options, allocator) catch |err| {
+        const code: oap_provider_types.ErrorCode = switch (err) {
+            error.MissingApiKey, error.AuthRequired => .credential_missing,
+            error.AuthRefreshFailed => .credential_expired,
+            else => .provider_unavailable,
+        };
+        const message = switch (err) {
+            error.MissingApiKey, error.AuthRequired => "this provider needs a credential and none resolved",
+            error.AuthRefreshFailed => "the stored credential could not be refreshed",
+            else => "the provider refused the request",
+        };
+        try server.settleFailed(inference_id, code, message, null);
         model.deinit(allocator);
         context.deinit(allocator);
         allocator.destroy(cancelled);
@@ -6804,8 +6810,19 @@ fn pumpOapInferences(
             did_work = true;
             entry.last_progress_ms = compat.time.nowMillis();
             defer entry.stream.releaseEvent(event);
-            oap_provider_runtime.pumpEvent(server, entry.inference_id, event) catch {};
-            if (event == .done or event == .@"error") settled = true;
+            const terminal = event == .done or event == .@"error";
+            oap_provider_runtime.pumpEvent(server, entry.inference_id, event) catch {
+                if (terminal) {
+                    server.abandonOpenPart(entry.inference_id);
+                    server.settleFailed(
+                        entry.inference_id,
+                        .internal_error,
+                        "the endpoint could not deliver the terminal for this inference",
+                        null,
+                    ) catch {};
+                }
+            };
+            if (terminal) settled = true;
         }
 
         if (!settled and entry.stream.isDone()) {
@@ -7017,6 +7034,7 @@ fn runOapProviderMode(
         .capability_revision = VERSION,
         .grant_channel = .unsupported,
         .accepts_inference = true,
+        .resolves_own_credentials = true,
     });
     defer server.deinit();
 

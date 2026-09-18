@@ -602,7 +602,7 @@ pub const Server = struct {
         model_id: []const u8,
     };
 
-    fn parseModelRef(model_ref: []const u8) ?ParsedModelRef {
+    pub fn parseModelRef(model_ref: []const u8) ?ParsedModelRef {
         const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse return null;
         if (slash == 0) return null;
 
@@ -862,7 +862,9 @@ pub const Server = struct {
             self.allocator.free(owned_parts);
         }
 
-        const content = try contentFromParts(self.allocator, owned_parts);
+        const empty_text = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(empty_text);
+        const content = contentFromParts(self.allocator, owned_parts, empty_text);
         const messages = try self.allocator.alloc(oap_types.Message, 1);
         messages[0] = .{ .role = .assistant, .content = content };
         return messages;
@@ -1065,12 +1067,14 @@ pub const Server = struct {
         for (inference.closed_parts.items) |part| {
             try parts.append(self.allocator, try clonePart(self.allocator, part));
         }
+        const empty_text = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(empty_text);
         const owned_parts = try parts.toOwnedSlice(self.allocator);
         errdefer {
             for (owned_parts) |*part| part.deinit(self.allocator);
             self.allocator.free(owned_parts);
         }
-        const content = try contentFromParts(self.allocator, owned_parts);
+        const content = contentFromParts(self.allocator, owned_parts, empty_text);
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1126,12 +1130,14 @@ pub const Server = struct {
             }
         }
 
+        const empty_text = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(empty_text);
         const owned_parts = try parts.toOwnedSlice(self.allocator);
         errdefer {
             for (owned_parts) |*part| part.deinit(self.allocator);
             self.allocator.free(owned_parts);
         }
-        const result_content = try contentFromParts(self.allocator, owned_parts);
+        const result_content = contentFromParts(self.allocator, owned_parts, empty_text);
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
@@ -1351,10 +1357,14 @@ fn messageCarriesNonText(message: oap_types.Message) bool {
 fn contentFromParts(
     allocator: std.mem.Allocator,
     parts: []oap_types.ContentPart,
-) !oap_types.Content {
-    if (parts.len > 0) return .{ .parts = parts };
+    empty_text: []const u8,
+) oap_types.Content {
+    if (parts.len > 0) {
+        allocator.free(empty_text);
+        return .{ .parts = parts };
+    }
     allocator.free(parts);
-    return .{ .text = try allocator.dupe(u8, "") };
+    return .{ .text = empty_text };
 }
 
 pub fn cloneMessages(
