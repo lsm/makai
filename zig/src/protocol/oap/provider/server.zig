@@ -529,49 +529,6 @@ pub const Server = struct {
             );
             return;
         }
-
-        const reference = try std.fmt.allocPrint(
-            self.allocator,
-            "grant:{s}:{d}",
-            .{ grant_request.provider_id, self.next_grant_ordinal },
-        );
-        errdefer self.allocator.free(reference);
-        self.next_grant_ordinal += 1;
-
-        const provider_id = try self.allocator.dupe(u8, grant_request.provider_id);
-        errdefer self.allocator.free(provider_id);
-        const nonce = try self.allocator.dupe(u8, grant_request.nonce);
-        errdefer self.allocator.free(nonce);
-
-        const ttl = grant_request.ttl_ms orelse self.options.default_grant_ttl_ms;
-        const expires_at: i64 = compat.time.nowMillis() + @as(i64, @intCast(ttl));
-
-        try self.grants.append(self.allocator, .{
-            .reference = reference,
-            .provider_id = provider_id,
-            .nonce = nonce,
-            .expires_at_ms = expires_at,
-            .non_persistable = true,
-        });
-
-        const id = try self.nextId();
-        errdefer self.allocator.free(id);
-        const reply = try self.allocator.dupe(u8, env.id);
-        errdefer self.allocator.free(reply);
-        const echoed = try self.allocator.dupe(u8, reference);
-        errdefer self.allocator.free(echoed);
-
-        var response = types.Envelope{
-            .id = id,
-            .in_reply_to = reply,
-            .payload = .{ .provider_credential_grant_response = .{
-                .accepted = true,
-                .credential_ref = echoed,
-                .expires_at_ms = expires_at,
-            } },
-        };
-        defer response.deinit(self.allocator);
-        try self.push(response);
     }
 
     fn emitGrantRefusal(

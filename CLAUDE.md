@@ -297,11 +297,20 @@ host from discovering it in somebody else's decoder. The same applies to the str
 terminal.
 
 **Anything decidable from the descriptor and the request alone is a create-time refusal, never a
-terminal.** A missing credential, an unsupported `include_snapshot`, an unknown provider and a
-malformed `model_ref` are all knowable before a request leaves the process, so they refuse at
-`inference.create` and allocate nothing. A rate limit, a provider outage and an expired credential
-are terminals, because only the attempt reveals them. An inference exists if and only if it was
-accepted; a refusal carries no `inference_id` and owes no terminal.
+terminal.** An unsupported `include_snapshot`, an unknown provider and a malformed `model_ref` are
+knowable before a request leaves the process, so they refuse at `inference.create` and allocate
+nothing. A rate limit, a provider outage and an expired credential are terminals, because only the
+attempt reveals them. An inference exists if and only if it was accepted; a refusal carries no
+`inference_id` and owes no terminal.
+
+A missing credential splits across that line and the rule decides which side by its own test rather
+than by the word "credential". When the endpoint does **not** resolve its own credentials, a request
+that had to name one and did not is decidable from the descriptor and the request, and refuses at
+create. When the endpoint **does** resolve its own — which is what `makai --oap-provider` advertises,
+`resolves_own_credentials = true` — whether a usable credential exists is keychain state at the
+moment of the attempt, which is neither the descriptor nor the request, so it is an `inference.failed`
+terminal carrying `credential_missing`. Callers must expect the terminal from this host: the
+create-time branch exists for an endpoint configured the other way and never fires here.
 
 Credential grants are advertised on the descriptor (`credential_grant`, `grant_kinds`) so a caller
 learns the tier before sending a secret. makai advertises `none` today: our `AuthStorage.persist`

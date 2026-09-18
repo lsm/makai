@@ -6633,21 +6633,27 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
     for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
         const mapping = oap_provider_catalog.mapApiToWire(builtin.api) orelse continue;
 
+        var provider_transferred = false;
         const id = try allocator.dupe(u8, builtin.id);
-        errdefer allocator.free(id);
+        errdefer if (!provider_transferred) allocator.free(id);
         const endpoint = try allocator.dupe(u8, builtin.endpoint);
-        errdefer allocator.free(endpoint);
+        errdefer if (!provider_transferred) allocator.free(endpoint);
 
         const policies = try allocator.dupe(
             oap_provider_types.SnapshotPolicy,
             oap_provider_server.IMPLEMENTED_SNAPSHOT_POLICIES,
         );
-        errdefer allocator.free(policies);
+        errdefer if (!provider_transferred) allocator.free(policies);
+
+        const wire_id = if (mapping.wire_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (!provider_transferred) {
+            if (wire_id) |value| allocator.free(value);
+        };
 
         try server.addProvider(.{
             .id = id,
             .wire = mapping.wire,
-            .wire_id = if (mapping.wire_id) |value| try allocator.dupe(u8, value) else null,
+            .wire_id = wire_id,
             .framing = mapping.framing,
             .endpoint = endpoint,
             .allows_anonymous = builtin.allows_anonymous,
@@ -6658,7 +6664,9 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .context_window = builtin.context_window,
             .max_output_tokens = builtin.max_output_tokens,
         });
+        provider_transferred = true;
 
+        var model_transferred = false;
         const built_model_ref = try oap_provider_catalog.buildModelRef(
             allocator,
             builtin.id,
@@ -6666,18 +6674,18 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             mapping.wire_id,
             builtin.model_id,
         );
-        errdefer allocator.free(built_model_ref);
+        errdefer if (!model_transferred) allocator.free(built_model_ref);
         const model_id = try allocator.dupe(u8, builtin.model_id);
-        errdefer allocator.free(model_id);
+        errdefer if (!model_transferred) allocator.free(model_id);
         const display_name = try allocator.dupe(u8, builtin.display_name);
-        errdefer allocator.free(display_name);
+        errdefer if (!model_transferred) allocator.free(display_name);
         const provider_id = try allocator.dupe(u8, builtin.id);
-        errdefer allocator.free(provider_id);
+        errdefer if (!model_transferred) allocator.free(provider_id);
         const capabilities = try allocator.dupe(
             oap_provider_types.ModelCapability,
             &.{ .chat, .streaming },
         );
-        errdefer allocator.free(capabilities);
+        errdefer if (!model_transferred) allocator.free(capabilities);
 
         try server.addModel(.{
             .model_ref = built_model_ref,
@@ -6691,6 +6699,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .source = .fallback,
             .auth_status = if (builtin.allows_anonymous) .authenticated else .unknown,
         });
+        model_transferred = true;
     }
 }
 
@@ -6790,19 +6799,23 @@ fn startOapInference(
         allocator.destroy(cancelled);
         return;
     };
+    errdefer {
+        cancelled.store(true, .release);
+        _ = stream.deinitAndDestroy();
+    }
 
-    var entry = RunningOapInference{
-        .inference_id = &.{},
+    const owned_id = try allocator.dupe(u8, inference_id);
+    errdefer allocator.free(owned_id);
+    try running.ensureUnusedCapacity(allocator, 1);
+
+    running.appendAssumeCapacity(.{
+        .inference_id = owned_id,
         .stream = stream,
         .context = context,
         .model = model,
         .cancelled = cancelled,
         .last_progress_ms = compat.time.nowMillis(),
-    };
-    errdefer entry.deinit(allocator);
-
-    entry.inference_id = try allocator.dupe(u8, inference_id);
-    try running.append(allocator, entry);
+    });
 }
 
 fn pumpOapInferences(
@@ -7417,6 +7430,25 @@ test "every provider the oap endpoint advertises accepts an inference" {
         }
         try std.testing.expect(accepted);
     }
+}
+
+fn populateCatalogUnderFailure(allocator: std.mem.Allocator) !void {
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+    });
+    defer server.deinit();
+    try populateOapProviderCatalog(allocator, &server);
+}
+
+test "populating the oap catalogue leaks nothing when an allocation fails" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        populateCatalogUnderFailure,
+        .{},
+    );
 }
 
 test "every capability the oap endpoint implements is advertised and honoured" {
