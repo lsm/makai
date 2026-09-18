@@ -50,9 +50,13 @@ artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<sha1>` signs `zig-out/b
 stable identifier `ai.hyperneo.oap` — a self-signed code-signing certificate is enough for the access
 list, no Apple account needed — and a bad identity fails the build instead of silently leaving it
 unsigned. Pass the certificate's SHA-1 hash from `security find-identity -v -p codesigning` rather
-than its `Developer ID Application: ...` name, and set the `MACOS_SIGN_IDENTITY` release secret the
-same way: a keychain holding the certificate twice makes the name ambiguous and `codesign` refuses
-it, while the hash names exactly one certificate. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
+than its `Developer ID Application: ...` name: a keychain holding the certificate twice makes the
+name ambiguous and `codesign` refuses it, while the hash names exactly one certificate. The release
+secrets use the same names and formats as `lsm/hyperneo` so one set of values serves both repos —
+`APPLE_CERTIFICATE` (base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_API_PRIVATE_KEY` (raw `.p8` PEM, **not** base64), `APPLE_API_KEY` (key id) and
+`APPLE_API_ISSUER`. Either identity form works in CI, where the throwaway keychain holds one
+certificate; the ambiguity is a developer-machine problem. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
 service: an existing `com.makai.auth` item is ignored and left in place, so the first run after the
 rename falls back to `auth.json` or a fresh login. Delete it manually when you no longer want it. Delete it once after switching signing identity, since the old
 access list still names the previous one. Bound any invocation that may persist
