@@ -319,8 +319,12 @@ create-time branch exists for an endpoint configured the other way and never fir
 
 Credential grants are advertised on the descriptor (`credential_grant`, `grant_kinds`) so a caller
 learns the tier before sending a secret. makai advertises the **out-of-band tier with the `static`
-kind only**, and only where it can serve it: the channel is a per-grant unix socket, so a Windows
-build advertises `none` rather than a tier it cannot open. A static key is safe by construction
+kind only**, and only where it can serve it: the channel is a per-grant unix socket, so a build
+whose toolchain reports no unix-socket support advertises `none` rather than a tier it cannot open.
+That is `std.Io.net.has_unix_sockets`, which is false for Windows targets in Zig 0.16 — a fact about
+this toolchain and not about the platform, since Windows itself has carried AF_UNIX since build
+17063. The guard names the capability rather than the operating system so it stops applying by
+itself if the toolchain gains support. A static key is safe by construction
 because a per-call `api_key` short-circuits the storage path entirely in `streamWithRefresh`; a
 **refreshable** grant is still refused, because `AuthStorage.persist` has two branches and both
 write, so we have no representation for a credential that cannot reach durable storage and the

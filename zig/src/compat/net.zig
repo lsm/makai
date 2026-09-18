@@ -92,7 +92,7 @@ pub fn unixListen(path: []const u8) !std.Io.net.Server {
     return address.listen(defaultIo(), .{ .kernel_backlog = 1 });
 }
 
-pub const supports_unix_channels = @import("builtin").os.tag != .windows and std.Io.net.has_unix_sockets;
+pub const supports_unix_channels = std.Io.net.has_unix_sockets;
 
 pub fn serverHandle(server: *const std.Io.net.Server) std.Io.net.Socket.Handle {
     return server.socket.handle;
