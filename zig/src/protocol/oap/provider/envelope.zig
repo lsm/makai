@@ -677,7 +677,7 @@ fn deserializePayload(
             var usage: ?oap_types.Usage = null;
             if (obj.get("usage")) |usage_value| {
                 if (usage_value != .object) return DecodeError.InvalidField;
-                usage = try oap_envelope.deserializeUsage(usage_value.object);
+                usage = try oap_envelope.deserializeUsage(obj);
             }
             return types.Payload{ .inference_completed = .{
                 .message = message,
@@ -692,7 +692,7 @@ fn deserializePayload(
             var usage: ?oap_types.Usage = null;
             if (obj.get("usage")) |usage_value| {
                 if (usage_value != .object) return DecodeError.InvalidField;
-                usage = try oap_envelope.deserializeUsage(usage_value.object);
+                usage = try oap_envelope.deserializeUsage(obj);
             }
             return types.Payload{ .inference_failed = .{ .err = err, .usage = usage } };
         },
@@ -1185,4 +1185,42 @@ test "the agent control profile is refused on this wire" {
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_types.PROFILE ++
         "\",\"type\":\"provider.describe.request\",\"id\":\"m1\",\"payload\":{}}";
     try std.testing.expectError(DecodeError.ProfileMismatch, deserializeEnvelope(line, allocator));
+}
+
+test "usage survives a round trip on both terminals" {
+    const allocator = std.testing.allocator;
+
+    var completed = types.Envelope{
+        .id = try allocator.dupe(u8, "m1"),
+        .inference_id = try allocator.dupe(u8, "inf1"),
+        .sequence = 3,
+        .payload = .{ .inference_completed = .{
+            .message = .{ .role = .assistant, .content = .{ .text = try allocator.dupe(u8, "hi") } },
+            .stop_reason = .stop,
+            .usage = .{ .input_tokens = 11, .output_tokens = 5, .total_tokens = 16 },
+        } },
+    };
+    defer completed.deinit(allocator);
+
+    var decoded = try expectRoundTrip(allocator, completed);
+    defer decoded.deinit(allocator);
+    const usage = decoded.payload.inference_completed.usage.?;
+    try std.testing.expectEqual(@as(u64, 11), usage.input_tokens.?);
+    try std.testing.expectEqual(@as(u64, 5), usage.output_tokens.?);
+    try std.testing.expectEqual(@as(u64, 16), usage.total_tokens.?);
+
+    var failed = types.Envelope{
+        .id = try allocator.dupe(u8, "m2"),
+        .inference_id = try allocator.dupe(u8, "inf1"),
+        .sequence = 4,
+        .payload = .{ .inference_failed = .{
+            .err = .{ .code = .rate_limited, .message = try allocator.dupe(u8, "slow down") },
+            .usage = .{ .input_tokens = 7 },
+        } },
+    };
+    defer failed.deinit(allocator);
+
+    var failed_decoded = try expectRoundTrip(allocator, failed);
+    defer failed_decoded.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 7), failed_decoded.payload.inference_failed.usage.?.input_tokens.?);
 }

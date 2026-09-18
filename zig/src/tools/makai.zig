@@ -2299,6 +2299,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --oap [--model <model-ref>]
+        \\  makai --oap-provider
         \\  makai --tui
         \\  makai -p [--agent] [--storage] [--model <id>] "<prompt>"
         \\  makai auth providers [--json]
@@ -2307,7 +2308,8 @@ fn printUsage(file: std.Io.File) !void {
         \\Commands:
         \\  --version        Print binary version
         \\  --stdio          Start stdio mode
-        \\  --oap            Start native Open Agent Protocol mode (JSONL over stdio)
+        \\  --oap            Start native Open Agent Protocol mode, agent control (JSONL over stdio)
+        \\  --oap-provider   Start native Open Agent Protocol mode, model provider (JSONL over stdio)
         \\  --tui            Start terminal UI shell
         \\  -p               Non-interactive print mode: stream a prompt using
         \\                   stored credentials and print every event to stdout.
@@ -6348,6 +6350,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--oap-provider")) {
+        if (args.len > 2) {
+            var buf: [256]u8 = undefined;
+            const msg = try std.fmt.bufPrint(
+                &buf,
+                "--oap-provider takes no arguments: {s}\n\n",
+                .{args[2]},
+            );
+            try compat.stdio.writeAll(stderr, msg);
+            try printUsage(stderr);
+            return error.UnknownOapProviderArgument;
+        }
         runOapProviderMode(allocator, stdin, stdout, stderr) catch |err| {
             if (err == error.MalformedProviderLine) std.process.exit(1);
             return err;
@@ -6643,7 +6656,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
         errdefer allocator.free(provider_id);
         const capabilities = try allocator.dupe(
             oap_provider_types.ModelCapability,
-            &.{ .chat, .streaming, .tools },
+            &.{ .chat, .streaming },
         );
         errdefer allocator.free(capabilities);
 
@@ -6662,17 +6675,22 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
     }
 }
 
+const OAP_PROVIDER_STREAM_TIMEOUT_MS: i64 = 120_000;
+
 const RunningOapInference = struct {
     inference_id: []const u8,
     stream: *event_stream.AssistantMessageStream,
     context: ai_types.Context,
     model: ai_types.Model,
+    cancelled: *std.atomic.Value(bool),
+    started_at_ms: i64,
 
     fn deinit(self: *RunningOapInference, allocator: std.mem.Allocator) void {
         allocator.free(self.inference_id);
         _ = self.stream.deinitAndDestroy();
         self.context.deinit(allocator);
         self.model.deinit(allocator);
+        allocator.destroy(self.cancelled);
     }
 };
 
@@ -6718,10 +6736,21 @@ fn startOapInference(
     var context = try buildOapInferenceContext(allocator, inference.messages);
     errdefer context.deinit(allocator);
 
-    const stream = provider.stream(model, context, null, allocator) catch {
+    const cancelled = try allocator.create(std.atomic.Value(bool));
+    errdefer allocator.destroy(cancelled);
+    cancelled.* = std.atomic.Value(bool).init(false);
+
+    var options: ai_types.StreamOptions = .{};
+    options.requires_owned_stream_events = true;
+    options.cancel_token = .{ .cancelled = cancelled };
+    if (inference.max_output_tokens) |max| options.max_tokens = max;
+    if (inference.temperature) |value| options.temperature = value;
+
+    const stream = provider.stream(model, context, options, allocator) catch {
         try server.settleFailed(inference_id, .provider_unavailable, "the provider refused the request", null);
         model.deinit(allocator);
         context.deinit(allocator);
+        allocator.destroy(cancelled);
         return;
     };
 
@@ -6733,6 +6762,8 @@ fn startOapInference(
         .stream = stream,
         .context = context,
         .model = model,
+        .cancelled = cancelled,
+        .started_at_ms = compat.time.nowMillis(),
     });
 }
 
@@ -6747,18 +6778,23 @@ fn pumpOapInferences(
         const entry = &running.items[index];
         var settled = false;
 
+        if (server.findInference(entry.inference_id)) |inference| {
+            if (inference.cancel_requested) entry.cancelled.store(true, .release);
+        }
+
+        if (compat.time.nowMillis() - entry.started_at_ms > OAP_PROVIDER_STREAM_TIMEOUT_MS) {
+            entry.cancelled.store(true, .release);
+        }
+
         while (entry.stream.poll()) |event| {
             did_work = true;
+            defer entry.stream.releaseEvent(event);
             oap_provider_runtime.pumpEvent(server, entry.inference_id, event) catch {};
             if (event == .done or event == .@"error") settled = true;
         }
 
         if (!settled and entry.stream.isDone()) {
-            if (entry.stream.getError()) |message| {
-                try server.settleFailed(server_inference_id(entry), .provider_unavailable, message, null);
-            } else {
-                try server.settleCompleted(server_inference_id(entry), .stop, null);
-            }
+            try settleOapInference(server, entry);
             settled = true;
             did_work = true;
         }
@@ -6774,8 +6810,50 @@ fn pumpOapInferences(
     return did_work;
 }
 
-fn server_inference_id(entry: *const RunningOapInference) []const u8 {
-    return entry.inference_id;
+fn settleOapInference(
+    server: *oap_provider_server.Server,
+    entry: *const RunningOapInference,
+) !void {
+    if (entry.stream.getError()) |message| {
+        try server.settleFailed(entry.inference_id, .provider_unavailable, message, null);
+        return;
+    }
+
+    const result = entry.stream.getResult() orelse {
+        try server.settleFailed(
+            entry.inference_id,
+            .provider_unavailable,
+            "the provider stream ended with no result",
+            null,
+        );
+        return;
+    };
+
+    const usage = oap_types.Usage{
+        .input_tokens = result.usage.input,
+        .output_tokens = result.usage.output,
+        .total_tokens = if (result.usage.total_tokens > 0)
+            result.usage.total_tokens
+        else
+            result.usage.input + result.usage.output,
+    };
+
+    if (result.stop_reason == .@"error") {
+        try server.settleFailed(
+            entry.inference_id,
+            .provider_unavailable,
+            result.getErrorMessage() orelse "the provider reported a failure",
+            usage,
+        );
+        return;
+    }
+
+    try server.settleCompletedFromResult(
+        entry.inference_id,
+        oap_provider_runtime.mapStopReason(result.stop_reason),
+        usage,
+        result.content,
+    );
 }
 
 fn buildOapInferenceModel(
@@ -6813,6 +6891,10 @@ fn buildOapInferenceModel(
     };
 }
 
+fn oapRoleIsSystem(role: oap_types.Role) bool {
+    return role == .system or role == .developer;
+}
+
 fn oapMessageText(allocator: std.mem.Allocator, message: oap_types.Message) ![]const u8 {
     return switch (message.content) {
         .text => |value| try allocator.dupe(u8, value),
@@ -6834,24 +6916,42 @@ fn buildOapInferenceContext(
     allocator: std.mem.Allocator,
     source: []const oap_types.Message,
 ) !ai_types.Context {
-    const messages = try allocator.alloc(ai_types.Message, source.len);
+    var system = std.ArrayList(u8).empty;
+    errdefer system.deinit(allocator);
+
+    var conversation: usize = 0;
+    for (source) |message| {
+        if (!oapRoleIsSystem(message.role)) conversation += 1;
+    }
+
+    const messages = try allocator.alloc(ai_types.Message, conversation);
     var built: usize = 0;
     errdefer {
         for (messages[0..built]) |*message| message.deinit(allocator);
         allocator.free(messages);
     }
 
-    for (source, 0..) |message, index| {
+    for (source) |message| {
         const text = try oapMessageText(allocator, message);
+        if (oapRoleIsSystem(message.role)) {
+            defer allocator.free(text);
+            if (system.items.len > 0) try system.appendSlice(allocator, "\n\n");
+            try system.appendSlice(allocator, text);
+            continue;
+        }
         errdefer allocator.free(text);
-        messages[index] = switch (message.role) {
+        messages[built] = switch (message.role) {
             .assistant => .{ .assistant = try buildOapAssistantMessage(allocator, text) },
             else => .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } },
         };
         built += 1;
     }
 
+    const system_prompt = try system.toOwnedSlice(allocator);
+    errdefer allocator.free(system_prompt);
+
     return ai_types.Context{
+        .system_prompt = ai_types.OwnedSlice(u8).initOwned(system_prompt),
         .messages = messages,
         .is_owned = true,
     };

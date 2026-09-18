@@ -773,6 +773,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oap_provider_types", .module = protocol_oap_provider_types_mod },
             .{ .name = "oap_provider_envelope", .module = protocol_oap_provider_envelope_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
         },
     });
 

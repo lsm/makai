@@ -3,6 +3,7 @@ const oap_types = @import("oap_types");
 const types = @import("oap_provider_types");
 const envelope = @import("oap_provider_envelope");
 const compat = @import("compat");
+const ai_content = @import("ai_types");
 
 pub const GrantChannel = enum {
     out_of_band,
@@ -37,6 +38,9 @@ pub const ActiveInference = struct {
     id: []const u8,
     model_ref: []const u8,
     messages: []oap_types.Message = &.{},
+    max_output_tokens: ?u32 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
     include_snapshot: types.SnapshotPolicy,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
@@ -448,6 +452,21 @@ pub const Server = struct {
             }
         }
 
+        if (create_request.tools.len > 0 or create_request.tool_choice != null) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward tools to a provider");
+            return;
+        }
+
+        if (create_request.output_schema_json != null) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward a structured output schema");
+            return;
+        }
+
+        if (create_request.reasoning != null) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward reasoning controls");
+            return;
+        }
+
         if (!self.options.accepts_inference) {
             try self.emitCreateRefusal(env, .provider_unavailable, "no inference backend is attached to this endpoint");
             return;
@@ -470,6 +489,9 @@ pub const Server = struct {
             .id = inference_id,
             .model_ref = model_ref,
             .messages = messages,
+            .max_output_tokens = create_request.max_output_tokens,
+            .temperature = create_request.temperature,
+            .top_p = create_request.top_p,
             .include_snapshot = honoured,
             .text = std.ArrayList(u8).empty,
         });
@@ -701,6 +723,62 @@ pub const Server = struct {
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
             .message = .{ .role = .assistant, .content = .{ .text = text } },
+            .stop_reason = stop_reason,
+            .usage = usage,
+        } });
+    }
+
+    pub fn settleCompletedFromResult(
+        self: *Self,
+        inference_id: []const u8,
+        stop_reason: types.StopReason,
+        usage: ?oap_types.Usage,
+        content: []const ai_content.AssistantContent,
+    ) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        if (inference.terminal_emitted) return error.TerminalAlreadyEmitted;
+        if (inference.open_part != null) return error.PartStillOpen;
+
+        var parts = std.ArrayList(oap_types.ContentPart).empty;
+        errdefer {
+            for (parts.items) |*part| part.deinit(self.allocator);
+            parts.deinit(self.allocator);
+        }
+
+        for (content) |item| {
+            switch (item) {
+                .text => |text| {
+                    const owned = try self.allocator.dupe(u8, text.text);
+                    errdefer self.allocator.free(owned);
+                    try parts.append(self.allocator, .{ .text = owned });
+                },
+                .thinking => |thinking| {
+                    const owned = try self.allocator.dupe(u8, thinking.thinking);
+                    errdefer self.allocator.free(owned);
+                    try parts.append(self.allocator, .{ .reasoning = owned });
+                },
+                .tool_call => |call| {
+                    const id = try self.allocator.dupe(u8, call.id);
+                    errdefer self.allocator.free(id);
+                    const name = try self.allocator.dupe(u8, call.name);
+                    errdefer self.allocator.free(name);
+                    const arguments = try self.allocator.dupe(u8, call.arguments_json);
+                    errdefer self.allocator.free(arguments);
+                    try parts.append(self.allocator, .{ .tool_call = .{
+                        .tool_call_id = id,
+                        .name = name,
+                        .arguments_json = arguments,
+                    } });
+                },
+                .image => {},
+            }
+        }
+
+        const owned_parts = try parts.toOwnedSlice(self.allocator);
+
+        inference.terminal_emitted = true;
+        try self.pushScoped(inference, .{ .inference_completed = .{
+            .message = .{ .role = .assistant, .content = .{ .parts = owned_parts } },
             .stop_reason = stop_reason,
             .usage = usage,
         } });
@@ -1655,4 +1733,94 @@ test "cancellation is intent and the terminal is the settlement" {
     var terminal = try decodeOnly(allocator, &server);
     defer terminal.deinit(allocator);
     try std.testing.expectEqual(types.StopReason.aborted, terminal.payload.inference_completed.stop_reason);
+}
+
+test "the terminal is built from the provider result, not from accumulated deltas" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try server.notePartDelta(inference_id, 0, "streamed");
+    try server.notePartEndedText(inference_id, 0, .text, "streamed");
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    const content = [_]ai_content.AssistantContent{
+        .{ .text = .{ .text = "final text" } },
+        .{ .tool_call = .{ .id = "call_1", .name = "search", .arguments_json = "{}" } },
+    };
+
+    try server.settleCompletedFromResult(
+        inference_id,
+        .tool_use,
+        .{ .input_tokens = 11, .output_tokens = 5, .total_tokens = 16 },
+        &content,
+    );
+
+    var terminal = try decodeOnly(allocator, &server);
+    defer terminal.deinit(allocator);
+
+    const completed = terminal.payload.inference_completed;
+    try std.testing.expectEqual(types.StopReason.tool_use, completed.stop_reason);
+    try std.testing.expectEqual(@as(u64, 16), completed.usage.?.total_tokens.?);
+
+    const parts = completed.message.content.parts;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("final text", parts[0].text);
+    try std.testing.expectEqualStrings("call_1", parts[1].tool_call.tool_call_id);
+}
+
+test "a request member the endpoint cannot forward is refused rather than dropped" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const cases = [_][]const u8{
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"tools\":[{\"name\":\"search\"}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"tool_choice\":\"auto\"}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"output_schema\":{\"type\":\"object\"}}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"enabled\":true}}",
+    };
+
+    for (cases) |payload| {
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var response = try decodeOnly(allocator, &server);
+        defer response.deinit(allocator);
+        try std.testing.expect(!response.payload.inference_create_response.accepted);
+        try std.testing.expectEqual(
+            types.ErrorCode.unsupported_feature,
+            response.payload.inference_create_response.err.?.code,
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), server.active.items.len);
+}
+
+test "sampling controls the endpoint does forward are carried onto the inference" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const line = try makeRequest(
+        allocator,
+        "inference.create.request",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"max_output_tokens\":256,\"temperature\":0.25}",
+        "q1",
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var response = try decodeOnly(allocator, &server);
+    defer response.deinit(allocator);
+    const inference_id = response.payload.inference_create_response.inference_id.?;
+
+    const inference = server.findInference(inference_id).?;
+    try std.testing.expectEqual(@as(u32, 256), inference.max_output_tokens.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), inference.temperature.?, 0.0001);
 }
