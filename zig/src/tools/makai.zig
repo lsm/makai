@@ -6353,18 +6353,23 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--oap-provider")) {
+        var answers_specimens = false;
         if (args.len > 2) {
-            var buf: [256]u8 = undefined;
-            const msg = try std.fmt.bufPrint(
-                &buf,
-                "--oap-provider takes no arguments: {s}\n\n",
-                .{args[2]},
-            );
-            try compat.stdio.writeAll(stderr, msg);
-            try printUsage(stderr);
-            return error.UnknownOapProviderArgument;
+            if (args.len == 3 and std.mem.eql(u8, args[2], "--specimens")) {
+                answers_specimens = true;
+            } else {
+                var buf: [256]u8 = undefined;
+                const msg = try std.fmt.bufPrint(
+                    &buf,
+                    "--oap-provider takes only --specimens: {s}\n\n",
+                    .{args[2]},
+                );
+                try compat.stdio.writeAll(stderr, msg);
+                try printUsage(stderr);
+                return error.UnknownOapProviderArgument;
+            }
         }
-        try runOapProviderMode(allocator, stdin, stdout, stderr);
+        try runOapProviderMode(allocator, stdin, stdout, stderr, answers_specimens);
         return;
     }
 
@@ -7419,11 +7424,25 @@ fn buildOapAssistantMessage(
     };
 }
 
+fn oapSpecimenRequestId(line: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
+    if (std.mem.indexOfScalar(u8, line, '{') == null) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const control = parsed.value.object.get("control") orelse return null;
+    if (control != .string) return null;
+    if (!std.mem.eql(u8, control.string, "specimen")) return null;
+    const id = parsed.value.object.get("id") orelse return try allocator.dupe(u8, "");
+    if (id != .string) return try allocator.dupe(u8, "");
+    return try allocator.dupe(u8, id.string);
+}
+
 fn runOapProviderMode(
     allocator: std.mem.Allocator,
     stdin: std.Io.File,
     stdout: std.Io.File,
     stderr: std.Io.File,
+    answers_specimens: bool,
 ) !void {
     var registry = api_registry.ApiRegistry.init(allocator);
     defer registry.deinit();
@@ -7474,6 +7493,20 @@ fn runOapProviderMode(
 
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
+
+            if (try oapSpecimenRequestId(line, allocator)) |request_id| {
+                defer allocator.free(request_id);
+                if (answers_specimens) {
+                    try server.emitSpecimens(request_id);
+                } else {
+                    try server.emitSpecimenError(
+                        request_id,
+                        "this endpoint was not started with --specimens",
+                    );
+                }
+                did_work = true;
+                continue;
+            }
 
             server.handleLine(line) catch |err| {
                 _ = try drainOapProviderOutbound(stdout, allocator, &server);

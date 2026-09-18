@@ -2,6 +2,7 @@ const std = @import("std");
 const oap_types = @import("oap_types");
 const types = @import("oap_provider_types");
 const envelope = @import("oap_provider_envelope");
+const json_writer = @import("json_writer");
 const compat = @import("compat");
 const ai_content = @import("ai_types");
 
@@ -108,6 +109,7 @@ pub const Server = struct {
     models: std.ArrayList(types.ModelEntry),
     grants: std.ArrayList(GrantedCredential),
     outbound: std.ArrayList([]const u8),
+    specimen_sequence: u64 = 1,
     active: std.ArrayList(ActiveInference),
     pending_starts: std.ArrayList([]const u8),
     pending_grants: std.ArrayList(PendingGrant),
@@ -365,6 +367,196 @@ pub const Server = struct {
         try self.outbound.append(self.allocator, line);
         var owned = env;
         owned.deinit(self.allocator);
+    }
+
+    pub const SPECIMEN_INFERENCE_ID = "specimen-inference";
+
+    pub const SPECIMEN_TYPES = [_][]const u8{
+        "provider.describe.response",
+        "provider.models.list.response",
+        "inference.create.response",
+        "inference.started",
+        "inference.part.started",
+        "inference.part.delta",
+        "inference.part.ended",
+        "inference.completed",
+        "inference.failed",
+        "inference.cancel.response",
+        "inference.sync.response",
+        "error",
+    };
+
+    pub const SPECIMEN_EXCLUDED = [_][]const u8{
+        "provider.credential.grant.channel",
+        "provider.credential.grant.response",
+    };
+
+    fn pushRawLine(self: *Self, line: []const u8) !void {
+        errdefer self.allocator.free(line);
+        try self.outbound.append(self.allocator, line);
+    }
+
+    fn specimenControlLine(
+        self: *Self,
+        control: []const u8,
+        request_id: []const u8,
+        include_lists: bool,
+    ) ![]const u8 {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+
+        try w.beginObject();
+        try w.writeStringField("control", control);
+        try w.writeStringField("in_reply_to", request_id);
+        if (include_lists) {
+            try w.writeKey("types");
+            try w.beginArray();
+            for (SPECIMEN_TYPES) |name| try w.writeString(name);
+            try w.endArray();
+            try w.writeKey("excluded");
+            try w.beginArray();
+            for (SPECIMEN_EXCLUDED) |name| try w.writeString(name);
+            try w.endArray();
+        }
+        try w.endObject();
+        return buffer.toOwnedSlice(self.allocator);
+    }
+
+    pub fn emitSpecimenError(self: *Self, request_id: []const u8, reason: []const u8) !void {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+        try w.beginObject();
+        try w.writeStringField("control", "specimen.error");
+        try w.writeStringField("in_reply_to", request_id);
+        try w.writeStringField("reason", reason);
+        try w.endObject();
+        const line = try buffer.toOwnedSlice(self.allocator);
+        try self.pushRawLine(line);
+    }
+
+    pub fn emitSpecimens(self: *Self, request_id: []const u8) !void {
+        if (self.active.items.len > 0) {
+            try self.emitSpecimenError(request_id, "specimens are answered only on a connection with no active inference");
+            return;
+        }
+
+        self.specimen_sequence = 1;
+        const accepted = try self.specimenControlLine("specimen.accepted", request_id, true);
+        try self.pushRawLine(accepted);
+
+        for (SPECIMEN_TYPES) |name| try self.pushSpecimenFor(name);
+
+        const complete = try self.specimenControlLine("specimen.complete", request_id, false);
+        try self.pushRawLine(complete);
+    }
+
+    fn specimenEnvelope(self: *Self, payload: types.Payload, scoped: bool) !types.Envelope {
+        var owned_payload = payload;
+        errdefer owned_payload.deinit(self.allocator);
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const scope = if (scoped) try self.allocator.dupe(u8, SPECIMEN_INFERENCE_ID) else null;
+        var sequence: ?u64 = null;
+        if (owned_payload.isScopedEvent()) {
+            sequence = self.specimen_sequence;
+            self.specimen_sequence += 1;
+        }
+        return types.Envelope{
+            .id = id,
+            .inference_id = scope,
+            .sequence = sequence,
+            .payload = owned_payload,
+        };
+    }
+
+    fn specimenError(self: *Self) !types.ProtocolError {
+        const message = try self.allocator.dupe(u8, "a specimen instance of this envelope, not a real failure");
+        return types.ProtocolError{ .code = .provider_unavailable, .message = message };
+    }
+
+    fn specimenMessage(self: *Self) !oap_types.Message {
+        const text = try self.allocator.dupe(u8, "specimen");
+        errdefer self.allocator.free(text);
+        const parts = try self.allocator.alloc(oap_types.ContentPart, 1);
+        parts[0] = .{ .text = text };
+        return oap_types.Message{ .role = .assistant, .content = .{ .parts = parts } };
+    }
+
+    fn pushSpecimenFor(self: *Self, type_name: []const u8) !void {
+        const eql = std.mem.eql;
+        if (eql(u8, type_name, "provider.describe.response")) {
+            const versions = try self.allocator.alloc([]const u8, 1);
+            errdefer self.allocator.free(versions);
+            versions[0] = try self.allocator.dupe(u8, types.VERSION);
+            const providers = try self.allocator.alloc(types.ProviderDescriptor, 0);
+            return self.push(try self.specimenEnvelope(.{ .provider_describe_response = .{
+                .providers = providers,
+                .protocol_versions = versions,
+            } }, false));
+        }
+        if (eql(u8, type_name, "provider.models.list.response")) {
+            const models = try self.allocator.alloc(types.ModelEntry, 0);
+            return self.push(try self.specimenEnvelope(.{ .provider_models_list_response = .{ .models = models } }, false));
+        }
+        if (eql(u8, type_name, "inference.create.response")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_create_response = .{
+                .accepted = true,
+                .honoured = .never,
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.started")) {
+            const model_ref = try self.allocator.dupe(u8, "specimen/anthropic-messages@specimen-model");
+            return self.push(try self.specimenEnvelope(.{ .inference_started = .{
+                .model_ref = model_ref,
+                .started_at_ms = compat.time.nowMillis(),
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.part.started")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_part_started = .{
+                .part_index = 0,
+                .part_kind = .text,
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.part.delta")) {
+            const delta = try self.allocator.dupe(u8, "spec");
+            return self.push(try self.specimenEnvelope(.{ .inference_part_delta = .{
+                .part_index = 0,
+                .delta = delta,
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.part.ended")) {
+            const text = try self.allocator.dupe(u8, "specimen");
+            return self.push(try self.specimenEnvelope(.{ .inference_part_ended = .{
+                .part_index = 0,
+                .part_kind = .text,
+                .text = text,
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.completed")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_completed = .{
+                .message = try self.specimenMessage(),
+                .stop_reason = .stop,
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.failed")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_failed = .{
+                .err = try self.specimenError(),
+            } }, true));
+        }
+        if (eql(u8, type_name, "inference.cancel.response")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_cancel_response = .{ .accepted = true } }, true));
+        }
+        if (eql(u8, type_name, "inference.sync.response")) {
+            return self.push(try self.specimenEnvelope(.{ .inference_sync_response = .{} }, true));
+        }
+        if (eql(u8, type_name, "error")) {
+            return self.push(try self.specimenEnvelope(.{ .protocol_error = .{
+                .err = try self.specimenError(),
+            } }, false));
+        }
+        return error.UnknownSpecimenType;
     }
 
     fn nextId(self: *Self) ![]const u8 {
@@ -2351,6 +2543,77 @@ test "a refused create consumes no inference sequence because it opens no infere
     var started = try decodeOnly(allocator, &server);
     defer started.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), started.sequence.?);
+}
+
+test "a specimen run emits every type it announced, bracketed, and nothing it excluded" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    try server.emitSpecimens("s1");
+
+    var lines = std.ArrayList([]const u8).empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    while (server.popOutbound()) |line| try lines.append(allocator, line);
+
+    try std.testing.expectEqual(Server.SPECIMEN_TYPES.len + 2, lines.items.len);
+
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[0], .{});
+    defer first.deinit();
+    try std.testing.expectEqualStrings("specimen.accepted", first.value.object.get("control").?.string);
+    try std.testing.expectEqualStrings("s1", first.value.object.get("in_reply_to").?.string);
+    const announced = first.value.object.get("types").?.array;
+    try std.testing.expectEqual(Server.SPECIMEN_TYPES.len, announced.items.len);
+    try std.testing.expectEqual(Server.SPECIMEN_EXCLUDED.len, first.value.object.get("excluded").?.array.items.len);
+
+    var last = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[lines.items.len - 1], .{});
+    defer last.deinit();
+    try std.testing.expectEqualStrings("specimen.complete", last.value.object.get("control").?.string);
+
+    for (lines.items[1 .. lines.items.len - 1], 0..) |line, index| {
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        try std.testing.expectEqualStrings(announced.items[index].string, env.payload.typeName());
+        try std.testing.expectEqualStrings(Server.SPECIMEN_TYPES[index], env.payload.typeName());
+        if (env.inference_id) |scope| {
+            try std.testing.expectEqualStrings(Server.SPECIMEN_INFERENCE_ID, scope);
+        }
+        for (Server.SPECIMEN_EXCLUDED) |withheld| {
+            try std.testing.expect(!std.mem.eql(u8, withheld, env.payload.typeName()));
+        }
+    }
+}
+
+test "a specimen inference id cannot be produced by the real id generator" {
+    for (Server.SPECIMEN_INFERENCE_ID) |byte| {
+        const is_hex = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+        if (!is_hex) return;
+    }
+    return error.SpecimenIdIsHexAndCouldCollide;
+}
+
+test "specimens are refused while an inference is running rather than interleaved" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    try server.emitSpecimens("s1");
+
+    const line = server.popOutbound() orelse return error.TestExpectedOutbound;
+    defer allocator.free(line);
+    try std.testing.expect(server.popOutbound() == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("specimen.error", parsed.value.object.get("control").?.string);
+    try std.testing.expectEqualStrings("s1", parsed.value.object.get("in_reply_to").?.string);
 }
 
 test "a streamed inference emits one contiguous sequence and exactly one terminal" {
