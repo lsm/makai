@@ -1444,8 +1444,8 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .partial = createPartialMessage(model),
                             } });
 
-                            pending_delta_frees.append(allocator, cbs.tool_id) catch allocator.free(cbs.tool_id);
-                            pending_delta_frees.append(allocator, cbs.tool_name) catch allocator.free(cbs.tool_name);
+                            pending_delta_frees.append(allocator, cbs.tool_id) catch {};
+                            pending_delta_frees.append(allocator, cbs.tool_name) catch {};
                         },
                     }
 
@@ -1459,12 +1459,12 @@ fn runThread(ctx: *ThreadCtx) void {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
                                 _ = stream.pushBlocking(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } });
-                                pending_delta_frees.append(allocator, txt) catch allocator.free(txt);
+                                pending_delta_frees.append(allocator, txt) catch {};
                             },
                             .thinking => |thk| {
                                 current_thinking.appendSlice(allocator, thk) catch {};
                                 _ = stream.pushBlocking(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } });
-                                pending_delta_frees.append(allocator, thk) catch allocator.free(thk);
+                                pending_delta_frees.append(allocator, thk) catch {};
                             },
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
@@ -1480,7 +1480,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .partial = createPartialMessage(model),
                                     } });
                                 }
-                                pending_delta_frees.append(allocator, json_delta) catch allocator.free(json_delta);
+                                pending_delta_frees.append(allocator, json_delta) catch {};
                             },
                         }
                     } else {
@@ -1591,6 +1591,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     stream.completeWithError(err);
                     stream.markThreadDone();
                     return;
+                },
+                .content_block_start => |cbs| {
+                    if (cbs.block_type == .tool_use) {
+                        allocator.free(cbs.tool_id);
+                        allocator.free(cbs.tool_name);
+                    }
                 },
                 else => {},
             }
