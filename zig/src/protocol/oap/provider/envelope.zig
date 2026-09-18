@@ -1025,6 +1025,15 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
             }
         }
 
+        const credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none;
+        const allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false;
+        const context_window = try optionalU32(descriptor_obj, "context_window");
+        const max_output_tokens = try optionalU32(descriptor_obj, "max_output_tokens");
+        const grant_kinds = try deserializeGrantKinds(descriptor_obj, allocator);
+        errdefer allocator.free(grant_kinds);
+        const owned_policies = try policies.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_policies);
+
         try providers.append(allocator, .{
             .id = id,
             .display_name = display_name,
@@ -1034,13 +1043,13 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
             .endpoint = endpoint,
             .headers = headers,
             .compatibility = compatibility,
-            .snapshot_policies = try policies.toOwnedSlice(allocator),
+            .snapshot_policies = owned_policies,
             .answers_sync = answers_sync,
-            .credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none,
-            .grant_kinds = try deserializeGrantKinds(descriptor_obj, allocator),
-            .allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false,
-            .context_window = try optionalU32(descriptor_obj, "context_window"),
-            .max_output_tokens = try optionalU32(descriptor_obj, "max_output_tokens"),
+            .credential_grant = credential_grant,
+            .grant_kinds = grant_kinds,
+            .allows_anonymous = allows_anonymous,
+            .context_window = context_window,
+            .max_output_tokens = max_output_tokens,
         });
     }
 
@@ -1048,9 +1057,12 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
         try oap_envelope.deserializeStringArray(obj, "protocol_versions", allocator)
     else
         &.{};
+    errdefer types.freeStringList(allocator, versions);
+
+    const owned_providers = try providers.toOwnedSlice(allocator);
 
     return types.Payload{ .provider_describe_response = .{
-        .providers = try providers.toOwnedSlice(allocator),
+        .providers = owned_providers,
         .protocol_versions = versions,
     } };
 }
@@ -1090,19 +1102,28 @@ fn deserializeModelsListResponse(obj: std.json.ObjectMap, allocator: std.mem.All
             }
         }
 
+        const context_window = try optionalU32(entry_obj, "context_window");
+        const max_output_tokens = try optionalU32(entry_obj, "max_output_tokens");
+        const lifecycle = try oap_envelope.optionalEnum(types.ModelLifecycle, entry_obj, "lifecycle") orelse .stable;
+        const source = try oap_envelope.optionalEnum(types.ModelSource, entry_obj, "source") orelse .discovered;
+        const reasoning_default = try oap_envelope.optionalEnum(types.ReasoningLevel, entry_obj, "reasoning_default");
+        const auth_status = try oap_envelope.optionalEnum(types.AuthStatus, entry_obj, "auth_status") orelse .unknown;
+        const owned_capabilities = try capabilities.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_capabilities);
+
         try models.append(allocator, .{
             .model_ref = model_ref,
             .model_id = model_id,
             .display_name = display_name,
             .provider_id = provider_id,
             .wire = wire,
-            .context_window = try optionalU32(entry_obj, "context_window"),
-            .max_output_tokens = try optionalU32(entry_obj, "max_output_tokens"),
-            .capabilities = try capabilities.toOwnedSlice(allocator),
-            .lifecycle = try oap_envelope.optionalEnum(types.ModelLifecycle, entry_obj, "lifecycle") orelse .stable,
-            .source = try oap_envelope.optionalEnum(types.ModelSource, entry_obj, "source") orelse .discovered,
-            .reasoning_default = try oap_envelope.optionalEnum(types.ReasoningLevel, entry_obj, "reasoning_default"),
-            .auth_status = try oap_envelope.optionalEnum(types.AuthStatus, entry_obj, "auth_status") orelse .unknown,
+            .context_window = context_window,
+            .max_output_tokens = max_output_tokens,
+            .capabilities = owned_capabilities,
+            .lifecycle = lifecycle,
+            .source = source,
+            .reasoning_default = reasoning_default,
+            .auth_status = auth_status,
         });
     }
 
@@ -1307,6 +1328,44 @@ test "a wire id rides only with the unnamed wire" {
     const descriptor = decoded.payload.provider_describe_response.providers[0];
     try std.testing.expectEqual(types.Wire.other, descriptor.wire);
     try std.testing.expectEqualStrings("ollama-chat", descriptor.wire_id.?);
+}
+
+fn expectNoLeakUnderAllocationFailure(line: []const u8) !void {
+    var index: usize = 0;
+    while (index < 512) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        const allocator = failing.allocator();
+        if (deserializeEnvelope(line, allocator)) |decoded| {
+            var owned = decoded;
+            owned.deinit(allocator);
+        } else |_| {}
+    }
+}
+
+const DESCRIBE_RESPONSE_LINE =
+    "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+    "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"payload\":{\"capability_revision\":\"r1\"," ++
+    "\"providers\":[{\"id\":\"gw\",\"display_name\":\"Gateway\",\"wire\":\"other\",\"wire_id\":\"ollama-chat\"," ++
+    "\"framing\":\"ndjson\",\"endpoint\":\"https://gw.test\",\"headers\":{\"X-Tenant\":\"acme\"}," ++
+    "\"snapshot_policies\":[\"never\",\"on_part_end\",\"every_delta\"],\"answers_sync\":true," ++
+    "\"credential_grant\":\"out_of_band\",\"grant_kinds\":[\"static\",\"refreshable\"]," ++
+    "\"allows_anonymous\":false,\"context_window\":128000,\"max_output_tokens\":8192}]," ++
+    "\"protocol_versions\":[\"0.1\"]}}";
+
+const MODELS_LIST_RESPONSE_LINE =
+    "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+    "\",\"type\":\"provider.models.list.response\",\"id\":\"m1\",\"payload\":{\"models\":[{" ++
+    "\"model_ref\":\"gw/other:ollama-chat@llama3\",\"model_id\":\"llama3\",\"display_name\":\"Llama 3\"," ++
+    "\"provider_id\":\"gw\",\"wire\":\"other\",\"context_window\":128000,\"max_output_tokens\":8192," ++
+    "\"capabilities\":[\"chat\",\"streaming\"],\"lifecycle\":\"stable\",\"source\":\"discovered\"," ++
+    "\"reasoning_default\":\"medium\",\"auth_status\":\"authenticated\"}]}}";
+
+test "a describe response decode leaks nothing when an allocation fails" {
+    try expectNoLeakUnderAllocationFailure(DESCRIBE_RESPONSE_LINE);
+}
+
+test "a models list decode leaks nothing when an allocation fails" {
+    try expectNoLeakUnderAllocationFailure(MODELS_LIST_RESPONSE_LINE);
 }
 
 test "a field of the wrong json type is refused rather than reached into" {

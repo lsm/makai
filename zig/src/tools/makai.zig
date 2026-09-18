@@ -6741,6 +6741,16 @@ fn builtInForProvider(provider_id: []const u8) ?oap_provider_catalog.BuiltInProv
     return null;
 }
 
+fn failOapInference(
+    server: *oap_provider_server.Server,
+    inference_id: []const u8,
+    code: oap_provider_types.ErrorCode,
+    message: []const u8,
+) !void {
+    try server.settleFailed(inference_id, code, message, null);
+    server.releaseInference(inference_id);
+}
+
 fn startOapInference(
     allocator: std.mem.Allocator,
     registry: *api_registry.ApiRegistry,
@@ -6751,19 +6761,19 @@ fn startOapInference(
     const inference = server.findInference(inference_id) orelse return;
 
     const parsed = oap_provider_server.Server.parseModelRef(inference.model_ref) orelse {
-        try server.settleFailed(inference_id, .invalid_request, "model_ref is not parseable", null);
+        try failOapInference(server, inference_id, .invalid_request, "model_ref is not parseable");
         return;
     };
     const provider_id = parsed.provider_id;
     const model_id = parsed.model_id;
 
     const builtin = builtInForProvider(provider_id) orelse {
-        try server.settleFailed(inference_id, .model_not_found, "no such provider", null);
+        try failOapInference(server, inference_id, .model_not_found, "no such provider");
         return;
     };
 
     const provider = registry.getApiProvider(builtin.api) orelse {
-        try server.settleFailed(inference_id, .provider_unavailable, "the api is not registered", null);
+        try failOapInference(server, inference_id, .provider_unavailable, "the api is not registered");
         return;
     };
 
@@ -6793,10 +6803,10 @@ fn startOapInference(
             error.AuthRefreshFailed => "the stored credential could not be refreshed",
             else => "the provider refused the request",
         };
-        try server.settleFailed(inference_id, code, message, null);
         model.deinit(allocator);
         context.deinit(allocator);
         allocator.destroy(cancelled);
+        try failOapInference(server, inference_id, code, message);
         return;
     };
     errdefer {
@@ -7430,6 +7440,52 @@ test "every provider the oap endpoint advertises accepts an inference" {
         }
         try std.testing.expect(accepted);
     }
+}
+
+test "a failed start releases the inference it could not run" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+    });
+    defer server.deinit();
+
+    try populateOapProviderCatalog(allocator, &server);
+
+    var running = std.ArrayList(RunningOapInference).empty;
+    defer running.deinit(allocator);
+
+    const entry = server.models.items[0];
+    const line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.create.request\",\"id\":\"q1\",\"payload\":{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}}}",
+        .{ oap_provider_types.PROFILE, entry.model_ref },
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+    while (server.popOutbound()) |out| allocator.free(out);
+
+    try std.testing.expectEqual(@as(usize, 1), server.active.items.len);
+    const inference_id = try allocator.dupe(u8, server.active.items[0].id);
+    defer allocator.free(inference_id);
+
+    try startOapInference(allocator, &registry, &server, &running, inference_id);
+
+    try std.testing.expectEqual(@as(usize, 0), running.items.len);
+    if (server.active.items.len != 0) {
+        std.debug.print(
+            "\na failed start left {d} inference(s) in server.active\n",
+            .{server.active.items.len},
+        );
+        return error.FailedStartLeakedInference;
+    }
+    while (server.popOutbound()) |out| allocator.free(out);
 }
 
 fn populateCatalogUnderFailure(allocator: std.mem.Allocator) !void {
