@@ -2387,7 +2387,8 @@ test "acceptance is discriminated by the scope field, never by a payload copy" {
 
     const refusal_with_scope =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"inference_id\":\"inf1\",\"payload\":{\"accepted\":false}}";
+        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"inference_id\":\"inf1\"," ++
+        "\"payload\":{\"accepted\":false,\"error\":{\"code\":\"invalid_request\",\"message\":\"no\"}}}";
     try std.testing.expectError(
         envelope.DecodeError.AcceptanceScopeMismatch,
         envelope.deserializeEnvelope(refusal_with_scope, allocator),

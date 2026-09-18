@@ -775,9 +775,13 @@ fn deserializePayload(
                 break :blk try oap_envelope.optionalEnum(types.SnapshotPolicy, value.object, "include_snapshot");
             };
             var err: ?types.ProtocolError = null;
+            errdefer if (err) |*value| value.deinit(allocator);
             if (obj.get("error")) |error_value| {
                 err = try deserializeProtocolError(error_value, allocator);
             }
+            if (accepted and err != null) return DecodeError.InvalidField;
+            if (!accepted and err == null) return DecodeError.MissingField;
+            if (!accepted and honoured != null) return DecodeError.InvalidField;
             return types.Payload{ .inference_create_response = .{
                 .accepted = accepted,
                 .honoured = honoured,
@@ -1214,6 +1218,47 @@ test "a grant response cannot grant and refuse at the same time" {
         defer allocator.free(line);
         try std.testing.expectError(case.expected, deserializeEnvelope(line, allocator));
     }
+}
+
+test "a create response cannot accept and refuse at the same time, and a refusal honours nothing" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { scope: []const u8, payload: []const u8, expected: DecodeError }{
+        .{
+            .scope = ",\"inference_id\":\"0123456789abcdef0123456789abcdef\"",
+            .payload = "{\"accepted\":true,\"error\":{\"code\":\"invalid_request\"," ++
+                "\"message\":\"a message long enough to allocate\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+        .{ .scope = "", .payload = "{\"accepted\":false}", .expected = DecodeError.MissingField },
+        .{
+            .scope = "",
+            .payload = "{\"accepted\":false,\"honoured\":{\"include_snapshot\":\"never\"}," ++
+                "\"error\":{\"code\":\"invalid_request\",\"message\":\"a message long enough to allocate\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+    };
+    for (cases) |case| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\"," ++
+                "\"type\":\"inference.create.response\",\"id\":\"c1\",\"in_reply_to\":\"q1\"{s}," ++
+                "\"payload\":{s}}}",
+            .{ types.PROFILE, case.scope, case.payload },
+        );
+        defer allocator.free(line);
+        try std.testing.expectError(case.expected, deserializeEnvelope(line, allocator));
+    }
+
+    const coherent =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.create.response\",\"id\":\"c1\",\"in_reply_to\":\"q1\"," ++
+        "\"inference_id\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"payload\":{\"accepted\":true,\"honoured\":{\"include_snapshot\":\"on_part_end\"}}}";
+    var decoded = try deserializeEnvelope(coherent, allocator);
+    defer decoded.deinit(allocator);
+    try std.testing.expect(decoded.payload.inference_create_response.accepted);
+    try std.testing.expectEqual(types.SnapshotPolicy.on_part_end, decoded.payload.inference_create_response.honoured.?);
 }
 
 test "a tool call keeps its carry through whichever snapshot encoding it uses" {
