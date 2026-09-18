@@ -758,6 +758,8 @@ fn deserializePayload(
             }
             if (accepted and credential_ref == null) return DecodeError.MissingField;
             if (!accepted and credential_ref != null) return DecodeError.InvalidField;
+            if (accepted and err != null) return DecodeError.InvalidField;
+            if (!accepted and err == null) return DecodeError.MissingField;
             return types.Payload{ .provider_credential_grant_response = .{
                 .accepted = accepted,
                 .credential_ref = credential_ref,
@@ -1191,6 +1193,27 @@ fn expectRoundTrip(allocator: std.mem.Allocator, env: types.Envelope) !types.Env
     const line = try serializeEnvelope(env, allocator);
     defer allocator.free(line);
     return try deserializeEnvelope(line, allocator);
+}
+
+test "a grant response cannot grant and refuse at the same time" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { payload: []const u8, expected: DecodeError }{
+        .{
+            .payload = "{\"accepted\":true,\"credential_ref\":\"cr1\",\"error\":{\"code\":\"credential_rejected\",\"message\":\"no\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+        .{ .payload = "{\"accepted\":false}", .expected = DecodeError.MissingField },
+    };
+    for (cases) |case| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"provider.credential.grant.response\",\"id\":\"g3\",\"payload\":{s}}}",
+            .{ types.PROFILE, case.payload },
+        );
+        defer allocator.free(line);
+        try std.testing.expectError(case.expected, deserializeEnvelope(line, allocator));
+    }
 }
 
 test "a tool call keeps its carry through whichever snapshot encoding it uses" {
