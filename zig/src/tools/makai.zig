@@ -6630,7 +6630,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
 
         const policies = try allocator.dupe(
             oap_provider_types.SnapshotPolicy,
-            &.{ .never, .on_part_end, .every_delta },
+            oap_provider_server.IMPLEMENTED_SNAPSHOT_POLICIES,
         );
         errdefer allocator.free(policies);
 
@@ -6642,7 +6642,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .endpoint = endpoint,
             .allows_anonymous = builtin.allows_anonymous,
             .snapshot_policies = policies,
-            .answers_sync = true,
+            .answers_sync = oap_provider_server.IMPLEMENTS_SYNC,
             .credential_grant = .none,
             .context_window = builtin.context_window,
             .max_output_tokens = builtin.max_output_tokens,
@@ -7405,5 +7405,83 @@ test "every provider the oap endpoint advertises accepts an inference" {
             std.debug.print("\n{s} refused at create: {s}\n", .{ entry.model_ref, message });
         }
         try std.testing.expect(accepted);
+    }
+}
+
+test "every capability the oap endpoint implements is advertised and honoured" {
+    const allocator = std.testing.allocator;
+
+    inline for (@typeInfo(oap_provider_types.SnapshotPolicy).@"enum".fields) |field| {
+        const policy = @field(oap_provider_types.SnapshotPolicy, field.name);
+        var implemented = false;
+        for (oap_provider_server.IMPLEMENTED_SNAPSHOT_POLICIES) |candidate| {
+            if (candidate == policy) implemented = true;
+        }
+        try std.testing.expect(implemented);
+    }
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+    });
+    defer server.deinit();
+
+    try populateOapProviderCatalog(allocator, &server);
+    try std.testing.expect(server.providers.items.len > 0);
+
+    for (server.providers.items) |descriptor| {
+        try std.testing.expectEqual(oap_provider_server.IMPLEMENTS_SYNC, descriptor.answers_sync);
+        try std.testing.expectEqual(
+            oap_provider_server.IMPLEMENTED_SNAPSHOT_POLICIES.len,
+            descriptor.snapshot_policies.len,
+        );
+    }
+
+    var counter: usize = 0;
+    for (server.models.items) |entry| {
+        for (oap_provider_server.IMPLEMENTED_SNAPSHOT_POLICIES) |policy| {
+            counter += 1;
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"include_snapshot\":\"{s}\"}}",
+                .{ entry.model_ref, @tagName(policy) },
+            );
+            defer allocator.free(payload);
+
+            const line = try std.fmt.allocPrint(
+                allocator,
+                "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.create.request\",\"id\":\"s{d}\",\"payload\":{s}}}",
+                .{ oap_provider_types.PROFILE, counter, payload },
+            );
+            defer allocator.free(line);
+            try server.handleLine(line);
+
+            const outbound = server.popOutbound() orelse return error.TestExpectedOutbound;
+            defer allocator.free(outbound);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, outbound, .{});
+            defer parsed.deinit();
+
+            const response_payload = parsed.value.object.get("payload").?.object;
+            if (!response_payload.get("accepted").?.bool) {
+                const message = response_payload.get("error").?.object.get("message").?.string;
+                std.debug.print(
+                    "\n{s} refused include_snapshot={s}: {s}\n",
+                    .{ entry.model_ref, @tagName(policy), message },
+                );
+                return error.AdvertisedPolicyRefused;
+            }
+
+            const honoured = response_payload.get("honoured").?.object.get("include_snapshot").?.string;
+            if (!std.mem.eql(u8, honoured, @tagName(policy))) {
+                std.debug.print(
+                    "\n{s} downgraded include_snapshot={s} to {s}\n",
+                    .{ entry.model_ref, @tagName(policy), honoured },
+                );
+                return error.AdvertisedPolicyDowngraded;
+            }
+        }
     }
 }

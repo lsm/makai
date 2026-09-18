@@ -11,6 +11,10 @@ pub const GrantChannel = enum {
     unsupported,
 };
 
+pub const IMPLEMENTED_SNAPSHOT_POLICIES: []const types.SnapshotPolicy = &.{ .never, .on_part_end, .every_delta };
+
+pub const IMPLEMENTS_SYNC = true;
+
 pub const Options = struct {
     capability_revision: []const u8 = "r1",
     grant_channel: GrantChannel = .unsupported,
@@ -375,7 +379,7 @@ pub const Server = struct {
             .provider_credential_grant_request => |grant_request| try self.handleGrant(env, grant_request),
             .inference_create_request => |create_request| try self.handleCreate(env, create_request),
             .inference_cancel_request => try self.handleCancel(env),
-            .inference_sync_request => try self.handleSyncUnsupported(env),
+            .inference_sync_request => try self.handleSync(env),
             else => try self.emitError(
                 .invalid_request,
                 "this envelope is not accepted by the implementation in its current state",
@@ -1240,7 +1244,7 @@ pub const Server = struct {
         try self.push(response);
     }
 
-    fn handleSyncUnsupported(self: *Self, env: types.Envelope) !void {
+    fn handleSync(self: *Self, env: types.Envelope) !void {
         const id = try self.nextId();
         errdefer self.allocator.free(id);
         const reply = try self.allocator.dupe(u8, env.id);
