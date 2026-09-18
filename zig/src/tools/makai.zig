@@ -29,6 +29,8 @@ const oap_server = @import("oap_server");
 const oap_provider_types = @import("oap_provider_types");
 const oap_provider_server = @import("oap_provider_server");
 const oap_provider_catalog = @import("oap_provider_catalog");
+const oap_provider_runtime = @import("oap_provider_runtime");
+const oap_types = @import("oap_types");
 const oap_bridge = @import("oap_bridge");
 
 pub const VERSION = "0.0.1";
@@ -6660,18 +6662,245 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
     }
 }
 
+const RunningOapInference = struct {
+    inference_id: []const u8,
+    stream: *event_stream.AssistantMessageStream,
+    context: ai_types.Context,
+    model: ai_types.Model,
+
+    fn deinit(self: *RunningOapInference, allocator: std.mem.Allocator) void {
+        allocator.free(self.inference_id);
+        _ = self.stream.deinitAndDestroy();
+        self.context.deinit(allocator);
+        self.model.deinit(allocator);
+    }
+};
+
+fn builtInForProvider(provider_id: []const u8) ?oap_provider_catalog.BuiltInProvider {
+    for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
+        if (std.mem.eql(u8, builtin.id, provider_id)) return builtin;
+    }
+    return null;
+}
+
+fn startOapInference(
+    allocator: std.mem.Allocator,
+    registry: *api_registry.ApiRegistry,
+    server: *oap_provider_server.Server,
+    running: *std.ArrayList(RunningOapInference),
+    inference_id: []const u8,
+) !void {
+    const inference = server.findInference(inference_id) orelse return;
+
+    const slash = std.mem.indexOfScalar(u8, inference.model_ref, '/') orelse {
+        try server.settleFailed(inference_id, .invalid_request, "model_ref is not parseable", null);
+        return;
+    };
+    const at = std.mem.lastIndexOfScalar(u8, inference.model_ref, '@') orelse {
+        try server.settleFailed(inference_id, .invalid_request, "model_ref names no model", null);
+        return;
+    };
+    const provider_id = inference.model_ref[0..slash];
+    const model_id = inference.model_ref[at + 1 ..];
+
+    const builtin = builtInForProvider(provider_id) orelse {
+        try server.settleFailed(inference_id, .model_not_found, "no such provider", null);
+        return;
+    };
+
+    const provider = registry.getApiProvider(builtin.api) orelse {
+        try server.settleFailed(inference_id, .provider_unavailable, "the api is not registered", null);
+        return;
+    };
+
+    var model = try buildOapInferenceModel(allocator, builtin, model_id);
+    errdefer model.deinit(allocator);
+    var context = try buildOapInferenceContext(allocator, inference.messages);
+    errdefer context.deinit(allocator);
+
+    const stream = provider.stream(model, context, null, allocator) catch {
+        try server.settleFailed(inference_id, .provider_unavailable, "the provider refused the request", null);
+        model.deinit(allocator);
+        context.deinit(allocator);
+        return;
+    };
+
+    const owned_id = try allocator.dupe(u8, inference_id);
+    errdefer allocator.free(owned_id);
+
+    try running.append(allocator, .{
+        .inference_id = owned_id,
+        .stream = stream,
+        .context = context,
+        .model = model,
+    });
+}
+
+fn pumpOapInferences(
+    allocator: std.mem.Allocator,
+    server: *oap_provider_server.Server,
+    running: *std.ArrayList(RunningOapInference),
+) !bool {
+    var did_work = false;
+    var index: usize = 0;
+    while (index < running.items.len) {
+        const entry = &running.items[index];
+        var settled = false;
+
+        while (entry.stream.poll()) |event| {
+            did_work = true;
+            oap_provider_runtime.pumpEvent(server, entry.inference_id, event) catch {};
+            if (event == .done or event == .@"error") settled = true;
+        }
+
+        if (!settled and entry.stream.isDone()) {
+            if (entry.stream.getError()) |message| {
+                try server.settleFailed(server_inference_id(entry), .provider_unavailable, message, null);
+            } else {
+                try server.settleCompleted(server_inference_id(entry), .stop, null);
+            }
+            settled = true;
+            did_work = true;
+        }
+
+        if (!settled) {
+            index += 1;
+            continue;
+        }
+
+        var removed = running.orderedRemove(index);
+        removed.deinit(allocator);
+    }
+    return did_work;
+}
+
+fn server_inference_id(entry: *const RunningOapInference) []const u8 {
+    return entry.inference_id;
+}
+
+fn buildOapInferenceModel(
+    allocator: std.mem.Allocator,
+    builtin: oap_provider_catalog.BuiltInProvider,
+    model_id: []const u8,
+) !ai_types.Model {
+    const id = try allocator.dupe(u8, model_id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, model_id);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, builtin.api);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, builtin.id);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, builtin.endpoint);
+    errdefer allocator.free(base_url);
+    const input = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(input);
+    input[0] = try allocator.dupe(u8, "text");
+
+    return ai_types.Model{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = builtin.context_window,
+        .max_tokens = builtin.max_output_tokens,
+        .allows_anonymous = builtin.allows_anonymous,
+        .is_owned = true,
+    };
+}
+
+fn oapMessageText(allocator: std.mem.Allocator, message: oap_types.Message) ![]const u8 {
+    return switch (message.content) {
+        .text => |value| try allocator.dupe(u8, value),
+        .parts => |parts| blk: {
+            var buffer = std.ArrayList(u8).empty;
+            errdefer buffer.deinit(allocator);
+            for (parts) |part| {
+                switch (part) {
+                    .text => |value| try buffer.appendSlice(allocator, value),
+                    else => {},
+                }
+            }
+            break :blk try buffer.toOwnedSlice(allocator);
+        },
+    };
+}
+
+fn buildOapInferenceContext(
+    allocator: std.mem.Allocator,
+    source: []const oap_types.Message,
+) !ai_types.Context {
+    const messages = try allocator.alloc(ai_types.Message, source.len);
+    var built: usize = 0;
+    errdefer {
+        for (messages[0..built]) |*message| message.deinit(allocator);
+        allocator.free(messages);
+    }
+
+    for (source, 0..) |message, index| {
+        const text = try oapMessageText(allocator, message);
+        errdefer allocator.free(text);
+        messages[index] = switch (message.role) {
+            .assistant => .{ .assistant = try buildOapAssistantMessage(allocator, text) },
+            else => .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } },
+        };
+        built += 1;
+    }
+
+    return ai_types.Context{
+        .messages = messages,
+        .is_owned = true,
+    };
+}
+
+fn buildOapAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !ai_types.AssistantMessage {
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = text } };
+    const api = try allocator.dupe(u8, "");
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, "");
+    errdefer allocator.free(provider);
+    const model = try allocator.dupe(u8, "");
+
+    return ai_types.AssistantMessage{
+        .content = content,
+        .api = api,
+        .provider = provider,
+        .model = model,
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+        .is_owned = true,
+    };
+}
+
 fn runOapProviderMode(
     allocator: std.mem.Allocator,
     stdin: std.Io.File,
     stdout: std.Io.File,
     stderr: std.Io.File,
 ) !void {
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
     var server = oap_provider_server.Server.init(allocator, .{
         .capability_revision = VERSION,
         .grant_channel = .unsupported,
-        .accepts_inference = false,
+        .accepts_inference = true,
     });
     defer server.deinit();
+
+    var running = std.ArrayList(RunningOapInference).empty;
+    defer {
+        for (running.items) |*entry| entry.deinit(allocator);
+        running.deinit(allocator);
+    }
 
     try populateOapProviderCatalog(allocator, &server);
 
@@ -6698,9 +6927,17 @@ fn runOapProviderMode(
             did_work = true;
         }
 
+        while (server.popPendingStart()) |inference_id| {
+            defer allocator.free(inference_id);
+            try startOapInference(allocator, &registry, &server, &running, inference_id);
+            did_work = true;
+        }
+
+        if (try pumpOapInferences(allocator, &server, &running)) did_work = true;
+
         if (try drainOapProviderOutbound(stdout, allocator, &server)) did_work = true;
 
-        if (stdin_stream.isDone() and !stdin_stream.hasPending() and !did_work) break;
+        if (stdin_stream.isDone() and !stdin_stream.hasPending() and running.items.len == 0 and !did_work) break;
         if (!did_work) compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 

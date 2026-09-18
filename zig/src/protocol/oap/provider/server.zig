@@ -15,6 +15,7 @@ pub const Options = struct {
     grant_channel: GrantChannel = .unsupported,
     default_grant_ttl_ms: u64 = 300_000,
     accepts_inference: bool = false,
+    resolves_own_credentials: bool = false,
 };
 
 pub const GrantedCredential = struct {
@@ -35,6 +36,7 @@ pub const GrantedCredential = struct {
 pub const ActiveInference = struct {
     id: []const u8,
     model_ref: []const u8,
+    messages: []oap_types.Message = &.{},
     include_snapshot: types.SnapshotPolicy,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
@@ -46,6 +48,8 @@ pub const ActiveInference = struct {
     pub fn deinit(self: *ActiveInference, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.model_ref);
+        for (self.messages) |*message| message.deinit(allocator);
+        allocator.free(self.messages);
         self.text.deinit(allocator);
         self.* = undefined;
     }
@@ -61,6 +65,7 @@ pub const Server = struct {
     grants: std.ArrayList(GrantedCredential),
     outbound: std.ArrayList([]const u8),
     active: std.ArrayList(ActiveInference),
+    pending_starts: std.ArrayList([]const u8),
     next_grant_ordinal: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
@@ -72,6 +77,7 @@ pub const Server = struct {
             .grants = std.ArrayList(GrantedCredential).empty,
             .outbound = std.ArrayList([]const u8).empty,
             .active = std.ArrayList(ActiveInference).empty,
+            .pending_starts = std.ArrayList([]const u8).empty,
         };
     }
 
@@ -86,6 +92,8 @@ pub const Server = struct {
         self.outbound.deinit(self.allocator);
         for (self.active.items) |*inference| inference.deinit(self.allocator);
         self.active.deinit(self.allocator);
+        for (self.pending_starts.items) |id| self.allocator.free(id);
+        self.pending_starts.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -95,6 +103,11 @@ pub const Server = struct {
 
     pub fn addModel(self: *Self, entry: types.ModelEntry) !void {
         try self.models.append(self.allocator, entry);
+    }
+
+    pub fn popPendingStart(self: *Self) ?[]const u8 {
+        if (self.pending_starts.items.len == 0) return null;
+        return self.pending_starts.orderedRemove(0);
     }
 
     pub fn popOutbound(self: *Self) ?[]const u8 {
@@ -419,6 +432,9 @@ pub const Server = struct {
                 try self.emitCreateRefusal(env, .credential_missing, "credential_ref names no credential this implementation holds");
                 return;
             }
+        } else if (!descriptor.allows_anonymous and !self.options.resolves_own_credentials) {
+            try self.emitCreateRefusal(env, .credential_missing, "this provider needs a credential and the request named none");
+            return;
         }
 
         if (!descriptor.snapshot_policies.supports(create_request.include_snapshot)) {
@@ -444,13 +460,23 @@ pub const Server = struct {
         errdefer self.allocator.free(inference_id);
         const model_ref = try self.allocator.dupe(u8, create_request.model_ref);
         errdefer self.allocator.free(model_ref);
+        const messages = try cloneMessages(self.allocator, create_request.messages);
+        errdefer {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        }
 
         try self.active.append(self.allocator, .{
             .id = inference_id,
             .model_ref = model_ref,
+            .messages = messages,
             .include_snapshot = honoured,
             .text = std.ArrayList(u8).empty,
         });
+
+        const queued = try self.allocator.dupe(u8, inference_id);
+        errdefer self.allocator.free(queued);
+        try self.pending_starts.append(self.allocator, queued);
 
         const id = try self.nextId();
         errdefer self.allocator.free(id);
@@ -864,6 +890,66 @@ pub fn cloneHeaders(
         built += 1;
     }
     return out;
+}
+
+pub fn cloneMessages(
+    allocator: std.mem.Allocator,
+    messages: []const oap_types.Message,
+) ![]oap_types.Message {
+    const out = try allocator.alloc(oap_types.Message, messages.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*message| message.deinit(allocator);
+        allocator.free(out);
+    }
+    for (messages, 0..) |message, index| {
+        const id = if (message.id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (id) |value| allocator.free(value);
+        const content: oap_types.Content = switch (message.content) {
+            .text => |value| .{ .text = try allocator.dupe(u8, value) },
+            .parts => |parts| blk: {
+                const cloned = try allocator.alloc(oap_types.ContentPart, parts.len);
+                var parts_built: usize = 0;
+                errdefer {
+                    for (cloned[0..parts_built]) |*part| part.deinit(allocator);
+                    allocator.free(cloned);
+                }
+                for (parts, 0..) |part, part_index| {
+                    cloned[part_index] = try clonePart(allocator, part);
+                    parts_built += 1;
+                }
+                break :blk .{ .parts = cloned };
+            },
+        };
+        out[index] = .{ .id = id, .role = message.role, .content = content };
+        built += 1;
+    }
+    return out;
+}
+
+fn clonePart(allocator: std.mem.Allocator, part: oap_types.ContentPart) !oap_types.ContentPart {
+    return switch (part) {
+        .text => |value| .{ .text = try allocator.dupe(u8, value) },
+        .reasoning => |value| .{ .reasoning = try allocator.dupe(u8, value) },
+        .tool_call => |call| blk: {
+            const id = try allocator.dupe(u8, call.tool_call_id);
+            errdefer allocator.free(id);
+            const name = try allocator.dupe(u8, call.name);
+            errdefer allocator.free(name);
+            const arguments = try allocator.dupe(u8, call.arguments_json);
+            break :blk .{ .tool_call = .{ .tool_call_id = id, .name = name, .arguments_json = arguments } };
+        },
+        .tool_result => |result| blk: {
+            const id = try allocator.dupe(u8, result.tool_call_id);
+            errdefer allocator.free(id);
+            const json = try allocator.dupe(u8, result.result_json);
+            break :blk .{ .tool_result = .{
+                .tool_call_id = id,
+                .result_json = json,
+                .is_error = result.is_error,
+            } };
+        },
+    };
 }
 
 pub fn cloneModelEntry(allocator: std.mem.Allocator, entry: types.ModelEntry) !types.ModelEntry {
