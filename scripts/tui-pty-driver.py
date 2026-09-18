@@ -1073,18 +1073,19 @@ def scenario_keys(args):
     return run
 
 
-def findUserEntryEcho(plain, text, from_index):
+# Asserted against the rendered screen rather than the raw byte stream: a
+# bottom-anchored frame repaints rows above an insertion too, so "the next
+# thing written after a You header" is no longer the entry's own text.
+def findUserEntryEcho(session, text):
     needle = plain_text(text.encode())
-    header = plain_text(b"You")
-    search_from = from_index
-    while True:
-        header_at = plain.find(header, search_from)
-        if header_at < 0:
-            return -1
-        text_at = plain.find(needle, header_at)
-        if text_at >= 0 and text_at - header_at <= 160:
-            return text_at
-        search_from = header_at + len(header)
+    rows = session.screen_rows()
+    for index, row in enumerate(rows):
+        if plain_text(b"You") not in row:
+            continue
+        for follower in rows[index + 1 : index + 3]:
+            if needle in follower:
+                return index
+    return -1
 
 
 def scenario_steer_abort(args):
@@ -1100,12 +1101,11 @@ def scenario_steer_abort(args):
         run.frame("streaming")
 
         run.session.type_text("steer this turn")
-        echo_from = len(run.session.plain)
         run.session.send(KEY_ENTER, "Enter (steer)")
         run.session.wait_for(b"queue", 6.0, "queued steer indicator")
         run.settle()
         run.frame("steer-queued")
-        if findUserEntryEcho(run.session.plain, "steer this turn", echo_from) < 0:
+        if findUserEntryEcho(run.session, "steer this turn") < 0:
             raise ScenarioError("steer-abort: steered text did not echo into the transcript as a user entry at steer time")
         run.note("Enter while streaming queues the steer and echoes the steered text into the transcript immediately as a 'You' entry, alongside the 'queued 1' composer footer")
 
@@ -1129,12 +1129,11 @@ def scenario_steer_abort(args):
         run.frame("tool-turn-streaming")
 
         run.session.type_text("steer this turn too")
-        tool_echo_from = len(run.session.plain)
         run.session.send(KEY_ENTER, "Enter (steer)")
         run.session.wait_for(b"queue", 6.0, "queued steer indicator during tool run")
         run.settle()
         run.frame("tool-steer-queued")
-        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+        if findUserEntryEcho(run.session, "steer this turn too") < 0:
             raise ScenarioError("steer-abort: steered text did not echo during the tool run")
 
         run.session.wait_for(b"steer-consumed-done", 15.0, "turn completion after steer consumption")
@@ -1143,7 +1142,7 @@ def scenario_steer_abort(args):
         done_at = run.session.plain.rfind(plain_text(b"steer-consumed-done"))
         if run.session.plain.find(plain_text(b"queued"), done_at) >= 0:
             raise ScenarioError("steer-abort: queued indicator survived steer consumption")
-        if findUserEntryEcho(run.session.plain, "steer this turn too", tool_echo_from) < 0:
+        if findUserEntryEcho(run.session, "steer this turn too") < 0:
             raise ScenarioError("steer-abort: steered text echo vanished after consumption")
         run.note("a steer queued during a tool run is consumed when the tool finishes: the queue indicator clears, the turn completes, and the echoed steered text stays rendered exactly as echoed (runtime-declared consumption reconciles pending steers even when consumption events never reach the app)")
 
