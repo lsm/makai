@@ -89,6 +89,10 @@ jobs:
           OUT_ROOT="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}"
           zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$OUT_ROOT"
 
+      # MACOS_SIGN_IDENTITY is the certificate's SHA-1 hash (security find-identity
+      # -v -p codesigning), not the "Developer ID Application: ..." name. A keychain
+      # holding the certificate twice makes the name ambiguous and codesign refuses
+      # it; the hash names one certificate and cannot become ambiguous.
       - name: Sign and notarize macOS binary
         if: matrix.os_name == 'macos'
         shell: bash

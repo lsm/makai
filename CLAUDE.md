@@ -46,10 +46,13 @@ lists bind to the **code hash**, so every unsigned rebuild is a new identity and
 a signed build escapes it, because the access list then binds to the signing certificate rather than
 the hash. Released macOS binaries are signed with Developer ID, hardened-runtime enabled and
 notarized in `release-binaries.yml`; a tag build fails rather than publishing unsigned macOS
-artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<name>` signs `zig-out/bin/makai` under the
+artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<sha1>` signs `zig-out/bin/makai` under the
 stable identifier `ai.hyperneo.oap` — a self-signed code-signing certificate is enough for the access
 list, no Apple account needed — and a bad identity fails the build instead of silently leaving it
-unsigned. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
+unsigned. Pass the certificate's SHA-1 hash from `security find-identity -v -p codesigning` rather
+than its `Developer ID Application: ...` name, and set the `MACOS_SIGN_IDENTITY` release secret the
+same way: a keychain holding the certificate twice makes the name ambiguous and `codesign` refuses
+it, while the hash names exactly one certificate. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
 service: an existing `com.makai.auth` item is ignored and left in place, so the first run after the
 rename falls back to `auth.json` or a fresh login. Delete it manually when you no longer want it. Delete it once after switching signing identity, since the old
 access list still names the previous one. Bound any invocation that may persist
