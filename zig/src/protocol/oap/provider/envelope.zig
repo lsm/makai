@@ -13,6 +13,7 @@ pub const DecodeError = error{
     MissingField,
     InvalidField,
     CredentialInHeaders,
+    PartialArgumentsInTerminal,
 };
 
 pub fn serializeEnvelope(env: types.Envelope, allocator: std.mem.Allocator) ![]u8 {
@@ -129,10 +130,45 @@ fn writeProtocolError(w: *json_writer.JsonWriter, err: types.ProtocolError) !voi
     try w.endObject();
 }
 
+fn writeSnapshotPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart) !void {
+    switch (part) {
+        .tool_call => |value| {
+            try w.beginObject();
+            try w.writeStringField("type", "tool_call");
+            try w.writeStringField("tool_call_id", value.tool_call_id);
+            try w.writeStringField("name", value.name);
+            if (value.arguments_partial) |partial| {
+                try w.writeStringField("arguments_partial", partial);
+            } else {
+                try w.writeKey("arguments_json");
+                try oap_envelope.writeJsonValueOrString(w, value.arguments_json);
+            }
+            try w.endObject();
+        },
+        else => try oap_envelope.serializeContentPart(w, part),
+    }
+}
+
+fn writeSnapshotMessage(w: *json_writer.JsonWriter, message: oap_types.Message) !void {
+    try w.beginObject();
+    if (message.id) |id| try w.writeStringField("id", id);
+    try w.writeStringField("role", @tagName(message.role));
+    try w.writeKey("content");
+    switch (message.content) {
+        .text => |value| try w.writeString(value),
+        .parts => |parts| {
+            try w.beginArray();
+            for (parts) |part| try writeSnapshotPart(w, part);
+            try w.endArray();
+        },
+    }
+    try w.endObject();
+}
+
 fn writeMessageArray(w: *json_writer.JsonWriter, key: []const u8, messages: []const oap_types.Message) !void {
     try w.writeKey(key);
     try w.beginArray();
-    for (messages) |message| try oap_envelope.serializeMessage(w, message);
+    for (messages) |message| try writeSnapshotMessage(w, message);
     try w.endArray();
 }
 
@@ -469,7 +505,72 @@ fn optionalToolCallIdFormat(obj: std.json.ObjectMap) !?types.ToolCallIdFormat {
     return types.ToolCallIdFormat.parse(value.string) orelse DecodeError.InvalidField;
 }
 
-fn deserializeMessageArray(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]oap_types.Message {
+fn deserializeSnapshotPart(
+    value: std.json.Value,
+    allocator: std.mem.Allocator,
+    allow_partial: bool,
+) !oap_types.ContentPart {
+    if (value == .object) {
+        if (value.object.get("arguments_partial")) |partial| {
+            if (!allow_partial) return DecodeError.PartialArgumentsInTerminal;
+            if (partial != .string) return DecodeError.InvalidField;
+            if (value.object.get("arguments_json") != null) return DecodeError.InvalidField;
+
+            const tool_call_id = try oap_envelope.requiredOwnedString(value.object, "tool_call_id", allocator);
+            errdefer allocator.free(tool_call_id);
+            const name = try oap_envelope.requiredOwnedString(value.object, "name", allocator);
+            errdefer allocator.free(name);
+            const empty = try allocator.dupe(u8, "");
+            errdefer allocator.free(empty);
+            const owned_partial = try allocator.dupe(u8, partial.string);
+
+            return oap_types.ContentPart{ .tool_call = .{
+                .tool_call_id = tool_call_id,
+                .name = name,
+                .arguments_json = empty,
+                .arguments_partial = owned_partial,
+            } };
+        }
+    }
+    return oap_envelope.deserializeContentPart(value, allocator);
+}
+
+fn deserializeSnapshotMessage(
+    value: std.json.Value,
+    allocator: std.mem.Allocator,
+    allow_partial: bool,
+) !oap_types.Message {
+    if (value != .object) return DecodeError.InvalidField;
+    const obj = value.object;
+
+    const content_value = obj.get("content") orelse return DecodeError.MissingField;
+    if (content_value != .array) return oap_envelope.deserializeMessage(value, allocator);
+
+    const id = try oap_envelope.optionalOwnedString(obj, "id", allocator);
+    errdefer if (id) |owned| allocator.free(owned);
+    const role = try oap_envelope.requiredEnum(oap_types.Role, obj, "role");
+
+    if (content_value.array.items.len == 0) return DecodeError.InvalidField;
+    const parts = try allocator.alloc(oap_types.ContentPart, content_value.array.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (parts[0..built]) |*part| part.deinit(allocator);
+        allocator.free(parts);
+    }
+    for (content_value.array.items, 0..) |item, index| {
+        parts[index] = try deserializeSnapshotPart(item, allocator, allow_partial);
+        built += 1;
+    }
+
+    return oap_types.Message{ .id = id, .role = role, .content = .{ .parts = parts } };
+}
+
+fn deserializeMessageArrayWithPolicy(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    allocator: std.mem.Allocator,
+    allow_partial: bool,
+) !?[]oap_types.Message {
     const value = obj.get(key) orelse return null;
     if (value != .array) return DecodeError.InvalidField;
 
@@ -480,11 +581,15 @@ fn deserializeMessageArray(obj: std.json.ObjectMap, key: []const u8, allocator: 
     }
 
     for (value.array.items) |item| {
-        const message = try oap_envelope.deserializeMessage(item, allocator);
+        const message = try deserializeSnapshotMessage(item, allocator, allow_partial);
         try list.append(allocator, message);
     }
 
     return try list.toOwnedSlice(allocator);
+}
+
+fn deserializeMessageArray(obj: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) !?[]oap_types.Message {
+    return deserializeMessageArrayWithPolicy(obj, key, allocator, true);
 }
 
 fn deserializeProtocolError(value: std.json.Value, allocator: std.mem.Allocator) !types.ProtocolError {
@@ -670,7 +775,7 @@ fn deserializePayload(
         },
         .inference_completed => {
             const message_value = obj.get("message") orelse return DecodeError.MissingField;
-            var message = try oap_envelope.deserializeMessage(message_value, allocator);
+            var message = try deserializeSnapshotMessage(message_value, allocator, false);
             errdefer message.deinit(allocator);
             const stop_reason = try oap_envelope.requiredEnum(types.StopReason, obj, "stop_reason");
             var usage: ?oap_types.Usage = null;

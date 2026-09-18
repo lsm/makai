@@ -44,7 +44,10 @@ pub const ActiveInference = struct {
     include_snapshot: types.SnapshotPolicy,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
-    open_part_offset: usize = 0,
+    open_part_kind: types.PartKind = .text,
+    open_tool_call_id: ?[]const u8 = null,
+    open_tool_name: ?[]const u8 = null,
+    closed_parts: std.ArrayList(oap_types.ContentPart),
     text: std.ArrayList(u8),
     terminal_emitted: bool = false,
     cancel_requested: bool = false,
@@ -54,6 +57,10 @@ pub const ActiveInference = struct {
         allocator.free(self.model_ref);
         for (self.messages) |*message| message.deinit(allocator);
         allocator.free(self.messages);
+        if (self.open_tool_call_id) |value| allocator.free(value);
+        if (self.open_tool_name) |value| allocator.free(value);
+        for (self.closed_parts.items) |*part| part.deinit(allocator);
+        self.closed_parts.deinit(allocator);
         self.text.deinit(allocator);
         self.* = undefined;
     }
@@ -493,6 +500,7 @@ pub const Server = struct {
             .temperature = create_request.temperature,
             .top_p = create_request.top_p,
             .include_snapshot = honoured,
+            .closed_parts = std.ArrayList(oap_types.ContentPart).empty,
             .text = std.ArrayList(u8).empty,
         });
 
@@ -556,10 +564,60 @@ pub const Server = struct {
         };
         if (!due) return null;
 
-        const text = try self.allocator.dupe(u8, inference.text.items);
-        errdefer self.allocator.free(text);
+        return try self.buildSnapshot(inference);
+    }
+
+    fn buildSnapshot(self: *Self, inference: *ActiveInference) !?[]oap_types.Message {
+        var parts = std.ArrayList(oap_types.ContentPart).empty;
+        errdefer {
+            for (parts.items) |*part| part.deinit(self.allocator);
+            parts.deinit(self.allocator);
+        }
+
+        for (inference.closed_parts.items) |part| {
+            try parts.append(self.allocator, try clonePart(self.allocator, part));
+        }
+
+        if (inference.open_part != null) {
+            const accumulated = inference.text.items;
+            switch (inference.open_part_kind) {
+                .text => {
+                    const owned = try self.allocator.dupe(u8, accumulated);
+                    errdefer self.allocator.free(owned);
+                    try parts.append(self.allocator, .{ .text = owned });
+                },
+                .reasoning => {
+                    const owned = try self.allocator.dupe(u8, accumulated);
+                    errdefer self.allocator.free(owned);
+                    try parts.append(self.allocator, .{ .reasoning = owned });
+                },
+                .tool_call => {
+                    const id = try self.allocator.dupe(u8, inference.open_tool_call_id orelse "");
+                    errdefer self.allocator.free(id);
+                    const name = try self.allocator.dupe(u8, inference.open_tool_name orelse "");
+                    errdefer self.allocator.free(name);
+                    const empty = try self.allocator.dupe(u8, "");
+                    errdefer self.allocator.free(empty);
+                    const partial = try self.allocator.dupe(u8, accumulated);
+                    try parts.append(self.allocator, .{ .tool_call = .{
+                        .tool_call_id = id,
+                        .name = name,
+                        .arguments_json = empty,
+                        .arguments_partial = partial,
+                    } });
+                },
+            }
+        }
+
+        const owned_parts = try parts.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_parts) |*part| part.deinit(self.allocator);
+            self.allocator.free(owned_parts);
+        }
+
+        const content = try contentFromParts(self.allocator, owned_parts);
         const messages = try self.allocator.alloc(oap_types.Message, 1);
-        messages[0] = .{ .role = .assistant, .content = .{ .text = text } };
+        messages[0] = .{ .role = .assistant, .content = content };
         return messages;
     }
 
@@ -592,7 +650,12 @@ pub const Server = struct {
         errdefer if (owned_name) |value| self.allocator.free(value);
 
         inference.open_part = part_index;
-        inference.open_part_offset = inference.text.items.len;
+        inference.open_part_kind = part_kind;
+        inference.text.clearRetainingCapacity();
+        if (inference.open_tool_call_id) |value| self.allocator.free(value);
+        if (inference.open_tool_name) |value| self.allocator.free(value);
+        inference.open_tool_call_id = if (tool_call_id) |value| try self.allocator.dupe(u8, value) else null;
+        inference.open_tool_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
         try self.pushScoped(inference, .{ .inference_part_started = .{
             .part_index = part_index,
             .part_kind = part_kind,
@@ -640,7 +703,7 @@ pub const Server = struct {
         if (part_kind == .tool_call) return error.ToolCallNeedsCompleteCall;
         if (carry != null and part_kind == .text) return error.CarryRefusedOnText;
 
-        inference.text.shrinkRetainingCapacity(inference.open_part_offset);
+        inference.text.clearRetainingCapacity();
         try inference.text.appendSlice(self.allocator, text);
 
         const owned_text = try self.allocator.dupe(u8, text);
@@ -652,6 +715,13 @@ pub const Server = struct {
             for (messages) |*message| message.deinit(self.allocator);
             self.allocator.free(messages);
         };
+
+        const closed_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(closed_text);
+        try inference.closed_parts.append(self.allocator, switch (part_kind) {
+            .reasoning => .{ .reasoning = closed_text },
+            else => .{ .text = closed_text },
+        });
 
         inference.open_part = null;
         try self.pushScoped(inference, .{ .inference_part_ended = .{
@@ -686,7 +756,19 @@ pub const Server = struct {
         const owned_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_carry) |value| self.allocator.free(value);
 
-        inference.text.shrinkRetainingCapacity(inference.open_part_offset);
+        const closed_id = try self.allocator.dupe(u8, tool_call_id);
+        errdefer self.allocator.free(closed_id);
+        const closed_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(closed_name);
+        const closed_arguments = try self.allocator.dupe(u8, arguments_json);
+        errdefer self.allocator.free(closed_arguments);
+        try inference.closed_parts.append(self.allocator, .{ .tool_call = .{
+            .tool_call_id = closed_id,
+            .name = closed_name,
+            .arguments_json = closed_arguments,
+        } });
+
+        inference.text.clearRetainingCapacity();
         const snapshot = try self.snapshotIfDue(inference, true);
         errdefer if (snapshot) |messages| {
             for (messages) |*message| message.deinit(self.allocator);
@@ -717,12 +799,24 @@ pub const Server = struct {
         if (inference.terminal_emitted) return error.TerminalAlreadyEmitted;
         if (inference.open_part != null) return error.PartStillOpen;
 
-        const text = try self.allocator.dupe(u8, inference.text.items);
-        errdefer self.allocator.free(text);
+        var parts = std.ArrayList(oap_types.ContentPart).empty;
+        errdefer {
+            for (parts.items) |*part| part.deinit(self.allocator);
+            parts.deinit(self.allocator);
+        }
+        for (inference.closed_parts.items) |part| {
+            try parts.append(self.allocator, try clonePart(self.allocator, part));
+        }
+        const owned_parts = try parts.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_parts) |*part| part.deinit(self.allocator);
+            self.allocator.free(owned_parts);
+        }
+        const content = try contentFromParts(self.allocator, owned_parts);
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
-            .message = .{ .role = .assistant, .content = .{ .text = text } },
+            .message = .{ .role = .assistant, .content = content },
             .stop_reason = stop_reason,
             .usage = usage,
         } });
@@ -775,10 +869,15 @@ pub const Server = struct {
         }
 
         const owned_parts = try parts.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_parts) |*part| part.deinit(self.allocator);
+            self.allocator.free(owned_parts);
+        }
+        const result_content = try contentFromParts(self.allocator, owned_parts);
 
         inference.terminal_emitted = true;
         try self.pushScoped(inference, .{ .inference_completed = .{
-            .message = .{ .role = .assistant, .content = .{ .parts = owned_parts } },
+            .message = .{ .role = .assistant, .content = result_content },
             .stop_reason = stop_reason,
             .usage = usage,
         } });
@@ -880,11 +979,7 @@ pub const Server = struct {
         if (env.inference_id) |scope| {
             if (self.findInference(scope)) |inference| {
                 if (!inference.terminal_emitted) {
-                    const text = try self.allocator.dupe(u8, inference.text.items);
-                    errdefer self.allocator.free(text);
-                    const messages = try self.allocator.alloc(oap_types.Message, 1);
-                    messages[0] = .{ .role = .assistant, .content = .{ .text = text } };
-                    snapshot = messages;
+                    snapshot = try self.buildSnapshot(inference);
                 }
             }
         }
@@ -968,6 +1063,15 @@ pub fn cloneHeaders(
         built += 1;
     }
     return out;
+}
+
+fn contentFromParts(
+    allocator: std.mem.Allocator,
+    parts: []oap_types.ContentPart,
+) !oap_types.Content {
+    if (parts.len > 0) return .{ .parts = parts };
+    allocator.free(parts);
+    return .{ .text = try allocator.dupe(u8, "") };
 }
 
 pub fn cloneMessages(
@@ -1570,7 +1674,7 @@ test "a streamed inference emits one contiguous sequence and exactly one termina
         switch (env.payload) {
             .inference_completed => |completed| {
                 terminals += 1;
-                try std.testing.expectEqualStrings("hello", completed.message.content.text);
+                try std.testing.expectEqualStrings("hello", completed.message.content.parts[0].text);
                 try std.testing.expectEqual(types.StopReason.stop, completed.stop_reason);
             },
             .inference_failed => terminals += 1,
@@ -1695,7 +1799,8 @@ test "sync answers with the running snapshot and with nothing once it has settle
 
     var live = try decodeOnly(allocator, &server);
     defer live.deinit(allocator);
-    try std.testing.expectEqualStrings("partial", live.payload.inference_sync_response.snapshot.?[0].content.text);
+    const live_parts = live.payload.inference_sync_response.snapshot.?[0].content.parts;
+    try std.testing.expectEqualStrings("partial", live_parts[0].text);
 
     try server.notePartEndedText(inference_id, 0, .text, "partial");
     try server.settleCompleted(inference_id, .stop, null);
@@ -1823,4 +1928,85 @@ test "sampling controls the endpoint does forward are carried onto the inference
     const inference = server.findInference(inference_id).?;
     try std.testing.expectEqual(@as(u32, 256), inference.max_output_tokens.?);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), inference.temperature.?, 0.0001);
+}
+
+test "a snapshot taken mid tool call carries the fragment and never valid arguments" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "on_part_end");
+    defer allocator.free(inference_id);
+
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try server.notePartEndedText(inference_id, 0, .text, "before");
+    try server.notePartStarted(inference_id, 1, .tool_call, "call_1", "search");
+    try server.notePartDelta(inference_id, 1, "{\"q\":");
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    const sync_line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.sync.request\",\"id\":\"s1\",\"inference_id\":\"{s}\",\"payload\":{{}}}}",
+        .{ types.PROFILE, inference_id },
+    );
+    defer allocator.free(sync_line);
+    try server.handleLine(sync_line);
+
+    var live = try decodeOnly(allocator, &server);
+    defer live.deinit(allocator);
+
+    const parts = live.payload.inference_sync_response.snapshot.?[0].content.parts;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("before", parts[0].text);
+
+    const call = parts[1].tool_call;
+    try std.testing.expectEqualStrings("call_1", call.tool_call_id);
+    try std.testing.expectEqualStrings("search", call.name);
+    try std.testing.expectEqualStrings("{\"q\":", call.arguments_partial.?);
+    try std.testing.expectEqualStrings("", call.arguments_json);
+}
+
+test "a completed tool call appears in the snapshot with complete arguments" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "on_part_end");
+    defer allocator.free(inference_id);
+
+    try server.notePartStarted(inference_id, 0, .tool_call, "call_1", "search");
+    try server.notePartDelta(inference_id, 0, "{\"q\":\"zig\"}");
+    try server.notePartEndedToolCall(inference_id, 0, "call_1", "search", "{\"q\":\"zig\"}", null);
+
+    var found = false;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        const ended = switch (env.payload) {
+            .inference_part_ended => |value| value,
+            else => continue,
+        };
+        const snapshot = ended.snapshot orelse continue;
+        const call = snapshot[0].content.parts[0].tool_call;
+        try std.testing.expectEqualStrings("{\"q\":\"zig\"}", call.arguments_json);
+        try std.testing.expect(call.arguments_partial == null);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a terminal carrying a partial argument fragment is refused on decode" {
+    const allocator = std.testing.allocator;
+
+    const line =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.completed\",\"id\":\"m1\",\"inference_id\":\"i1\",\"sequence\":9," ++
+        "\"payload\":{\"stop_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":[" ++
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_partial\":\"{\\\"q\\\":\"}]}}}";
+
+    try std.testing.expectError(
+        envelope.DecodeError.PartialArgumentsInTerminal,
+        envelope.deserializeEnvelope(line, allocator),
+    );
 }
