@@ -951,6 +951,14 @@ pub const AuthStorage = struct {
         };
     }
 
+    pub fn configuredCredentialsExpired(self: *const AuthStorage, provider_id: []const u8) bool {
+        const auth = self.providers.get(provider_id) orelse return false;
+        return switch (auth) {
+            .api_key => false,
+            .oauth => |credentials| compat.time.nowMillis() >= credentials.expires,
+        };
+    }
+
     pub fn credentialsExpired(self: *const AuthStorage, provider_id: []const u8) bool {
         if (self.ephemeralAuth(provider_id)) |_| return false;
         const auth = self.providers.get(provider_id) orelse return false;
@@ -1694,4 +1702,24 @@ test "the origin check sees a granted credential rather than skipping it" {
     const configured = storage.resolvedCredential("configured") orelse
         return error.TestExpectedCredential;
     try std.testing.expectEqualStrings("stored-refresh", configured.oauth.refresh);
+}
+
+test "a granted credential does not make an expired configured login look current" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.providers.put(try allocator.dupe(u8, "anthropic"), .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "stored-refresh"),
+        .access = try allocator.dupe(u8, "stored-access"),
+        .expires = 0,
+    } });
+
+    try std.testing.expect(storage.credentialsExpired("anthropic"));
+    try std.testing.expect(storage.configuredCredentialsExpired("anthropic"));
+
+    try storage.putEphemeral("anthropic", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+
+    try std.testing.expect(!storage.credentialsExpired("anthropic"));
+    try std.testing.expect(storage.configuredCredentialsExpired("anthropic"));
 }
