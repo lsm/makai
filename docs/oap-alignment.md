@@ -389,6 +389,29 @@ which is exactly the growth the cap would backstop.
 Adapter mismatches discovered by OAP adapter #3 beyond these resolve per the feedback
 rule above.
 
+## The model-provider-core profile
+
+`makai --oap-provider` serves `open-agent-protocol.model-provider-core`, a peer profile of
+agent-control-core rather than a unit inside it. Nothing agent-control owns changes because it
+exists, and `makai --oap` refuses its envelopes.
+
+The profile was specified against makai's provider layer as design input, and this implementation
+is the first to speak it. Seventeen findings from building it changed the draft; the ones that
+remain visible as deviations on our side are below.
+
+| Area | Profile | makai | Why |
+| --- | --- | --- | --- |
+| Wire set | closed, three named values plus `other` | eight registered APIs | Five earn a named wire. Both Google APIs and Ollama say `other` with an opaque `wire_id`, because a wire is named only when more than one independent implementer speaks it. |
+| `usage_in_streaming` | `always`, `terminal_only`, `never` | `supports_usage_in_streaming`, boolean | Ours is a request-shape fact gating `stream_options.include_usage`; the profile's is a response-behaviour fact. `true` maps to `always`; `false` is undecidable between the other two and is left unstated. |
+| Credential grants | two tiers, out-of-band mandatory where the binding allows | advertised as `none` | `AuthStorage.persist` writes on both branches, so a credential that cannot reach durable storage is unrepresentable. A granted static key would be safe by construction, since a per-call `api_key` short-circuits storage in `streamWithRefresh`; a refreshable grant is refused rather than accepted and written down. |
+| Keepalive | a binding concern, not an envelope | `AssistantMessageEvent.keepalive` | Dropped in translation and consumes no sequence number. |
+| Reasoning options | one object, four members | seven `StreamOptions` fields | The `thinking_*`/`reasoning_*` split is vendor vocabulary rather than two concepts. `include_reasoning_encrypted` became `encrypted_carry`, which the profile gained a return path for after this implementation showed a caller could send one and never obtain one. |
+| Stop reasons | closed set of six | identical six | The one place "carried across whole" is demonstrated rather than asserted. |
+
+Conformance status: every envelope is implementable and implemented. No compatibility fact has been
+observed against the vendor it describes, which needs a live credentialed endpoint and expires when
+the vendor changes. The two words are not interchangeable about this profile.
+
 ## Deferred scope
 
 Not claimed by this ledger, each requiring a spec revision plus OAP coordination

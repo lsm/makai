@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus SDKs for TypeScript, Python, Go and Rust. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus a native Open Agent Protocol endpoint (`protocol/oap/`), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. Each SDK (`typescript/`, `python/`, `go/`, `rust/`) spawns `makai --stdio` and exposes the same `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames; none of them is wired into the Zig build.
+Makai is a Zig-first streaming AI runtime plus SDKs for TypeScript, Python, Go and Rust. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus two native Open Agent Protocol endpoints (`protocol/oap/` for agent control, `protocol/oap/provider/` for model providers), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. Each SDK (`typescript/`, `python/`, `go/`, `rust/`) spawns `makai --stdio` and exposes the same `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames; none of them is wired into the Zig build.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -263,6 +263,59 @@ Ownership and auth boundary (non-negotiable):
 
 `runStdioMode` in `zig/src/tools/makai.zig` hosts all three protocol servers (auth, provider, agent) in one process, each behind its own `in_process.SerializedPipe`, and routes inbound stdin frames by envelope type. The agent server drives `agent_loop` through `agent/provider_protocol_bridge.zig` (`InProcessProviderProtocolBridge`), so even in-process the agent talks to providers through the provider protocol. Distributed tools are executed by the SDK client: the host publishes `tool_execute`, waits for a correlated `tool_result` (`in_reply_to` must match the request `message_id`), and cancels parked waits on stdin EOF. `MAKAI_AGENT_SESSION_IDLE_TTL_MS` tunes server-side idle-session eviction (default 30 min, `0` disables).
 
+### The two OAP profiles are separate endpoints, not one endpoint with a switch
+
+`makai --oap` serves `open-agent-protocol.agent-control-core` and `makai --oap-provider` serves
+`open-agent-protocol.model-provider-core`. Each **refuses the other's profile** at decode, so a
+client cannot reach the provider vocabulary through the agent-control mode or the reverse, and the
+refusal names which profile the endpoint serves. They share the base envelope and the shared
+vocabulary (`ContentPart`, `Message`, `Usage`) by importing the agent-control types rather than
+redeclaring them, so a content part means the same thing on both boundaries. They do **not** share
+`ProtocolError`: the two profiles have disjoint error code sets and neither is a subset of the
+other, so each carries its own.
+
+The provider endpoint is `zig/src/protocol/oap/provider/` — `types`, `envelope`, `server`,
+`catalog`, `runtime`. `catalog.zig` maps our eight registered APIs onto the profile's closed wire
+set: five earn a named wire (`anthropic-messages`, `openai-chat-completions`, and
+`openai-responses`, which Azure, Codex and native OpenAI all share and are told apart by provider
+id and endpoint), and three say `other` with an opaque `wire_id` because no second implementer
+speaks their shape — both Google APIs and Ollama. `runtime.zig` translates our assistant event
+union into the profile's part triples and our `OpenAICompatOptions` into its twelve compatibility
+facts.
+
+**Eleven of those twelve facts carry across unchanged; `usage_in_streaming` does not.** Ours gates
+whether we send `stream_options.include_usage` — a request-shape fact. The profile's describes when
+usage arrives. `true` implies `always`, but `false` says nothing about whether the endpoint reports
+usage in its terminal chunk, so the mapping leaves the fact unstated rather than guessing between
+`never` and `terminal_only`, and reports the undecidable case in its return type.
+
+Two rules the profile makes normative are enforced at **both** ends rather than only on decode: a
+`tool_call` part start must carry `tool_call_id` and `name` and a `text` or `reasoning` start must
+not, and a part end is kind-discriminated. Refusing to *build* an invalid frame is what stops a
+host from discovering it in somebody else's decoder. The same applies to the structural invariants
+— a delta with no open part, a mismatched part index, a terminal with a part still open, a second
+terminal.
+
+**Anything decidable from the descriptor and the request alone is a create-time refusal, never a
+terminal.** A missing credential, an unsupported `include_snapshot`, an unknown provider and a
+malformed `model_ref` are all knowable before a request leaves the process, so they refuse at
+`inference.create` and allocate nothing. A rate limit, a provider outage and an expired credential
+are terminals, because only the attempt reveals them. An inference exists if and only if it was
+accepted; a refusal carries no `inference_id` and owes no terminal.
+
+Credential grants are advertised on the descriptor (`credential_grant`, `grant_kinds`) so a caller
+learns the tier before sending a secret. makai advertises `none` today: our `AuthStorage.persist`
+has two branches and both write, so we have no representation for a credential that cannot reach
+durable storage, and the profile's non-persistable requirement is not satisfiable for a refreshable
+grant until one exists. A granted **static** key would be safe by construction, because a per-call
+`api_key` short-circuits the storage path entirely in `streamWithRefresh`.
+
+The profile can be **conformance-tested** and cannot yet be **compatibility-tested**, and the two
+words must not be used interchangeably about it. A harness can spawn `makai --oap-provider`, drive
+discovery, run an inference against a local anonymous provider with no credentials, and assemble a
+trace — that covers every envelope. None of the twelve compatibility facts has been checked against
+the vendor it describes.
+
 ### Protocol Normative Rules (from DESIGN.md §4-5)
 
 - IDs: `session_id` is a 21-char NanoID; `message_id`, `stream_id`, `flow_id` are 26-char uppercase Crockford ULIDs. Treat all as opaque.
@@ -309,7 +362,8 @@ Passing an explicit `std.mem.Allocator` is the convention, not a guarantee the c
 ```
 makai --version
 makai --stdio                                   # protocol host for the TS SDK (NDJSON frames on stdin/stdout)
-makai --oap [--model <model-ref>]               # native Open Agent Protocol host (OAP JSONL frames on stdin/stdout)
+makai --oap [--model <model-ref>]               # native Open Agent Protocol host, agent-control-core profile
+makai --oap-provider                            # native Open Agent Protocol host, model-provider-core profile
 makai --tui                                     # local-only terminal UI
 makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream one prompt, dump every event
 makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
