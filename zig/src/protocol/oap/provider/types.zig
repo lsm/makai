@@ -249,13 +249,6 @@ pub const ToolCallIdFormat = enum {
 
 pub const DEGRADABLE_SNAPSHOT_KEY = "include_snapshot";
 
-pub fn acceptsGrantKind(kinds: []const GrantKind, kind: GrantKind) bool {
-    for (kinds) |candidate| {
-        if (candidate == kind) return true;
-    }
-    return false;
-}
-
 pub fn allowsDegraded(keys: []const []const u8, key: []const u8) bool {
     for (keys) |candidate| {
         if (std.mem.eql(u8, candidate, key)) return true;
@@ -382,11 +375,37 @@ pub const ProviderDescriptor = struct {
     }
 };
 
-pub fn wireComponent(model_ref: []const u8) ?[]const u8 {
+pub const ParsedModelRef = struct {
+    provider_id: []const u8,
+    wire: Wire,
+    wire_id: ?[]const u8,
+    model_id: []const u8,
+};
+
+pub fn parseModelRef(model_ref: []const u8) ?ParsedModelRef {
     const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse return null;
+    if (slash == 0) return null;
+
     const rest = model_ref[slash + 1 ..];
     const at = std.mem.indexOfScalar(u8, rest, '@') orelse return null;
-    return rest[0..at];
+    if (at + 1 >= rest.len) return null;
+
+    const component = rest[0..at];
+    if (component.len == 0) return null;
+    const wire = parseWireComponent(component) orelse return null;
+    const wire_id = wireIdComponent(component);
+    if (wire == .other and wire_id == null) return null;
+    if (wire != .other and wire_id != null) return null;
+    if (wire_id) |value| {
+        if (value.len == 0) return null;
+    }
+
+    return .{
+        .provider_id = model_ref[0..slash],
+        .wire = wire,
+        .wire_id = wire_id,
+        .model_id = rest[at + 1 ..],
+    };
 }
 
 pub fn parseWireComponent(component: []const u8) ?Wire {

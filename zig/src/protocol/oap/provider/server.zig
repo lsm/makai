@@ -599,37 +599,10 @@ pub const Server = struct {
         try self.push(response);
     }
 
-    pub const ParsedModelRef = struct {
-        provider_id: []const u8,
-        wire: types.Wire,
-        wire_id: ?[]const u8,
-        model_id: []const u8,
-    };
+    pub const ParsedModelRef = types.ParsedModelRef;
 
     pub fn parseModelRef(model_ref: []const u8) ?ParsedModelRef {
-        const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse return null;
-        if (slash == 0) return null;
-
-        const rest = model_ref[slash + 1 ..];
-        const at = std.mem.indexOfScalar(u8, rest, '@') orelse return null;
-        if (at + 1 >= rest.len) return null;
-
-        const component = rest[0..at];
-        if (component.len == 0) return null;
-        const wire = types.parseWireComponent(component) orelse return null;
-        const wire_id = types.wireIdComponent(component);
-        if (wire == .other and wire_id == null) return null;
-        if (wire != .other and wire_id != null) return null;
-        if (wire_id) |value| {
-            if (value.len == 0) return null;
-        }
-
-        return .{
-            .provider_id = model_ref[0..slash],
-            .wire = wire,
-            .wire_id = wire_id,
-            .model_id = rest[at + 1 ..],
-        };
+        return types.parseModelRef(model_ref);
     }
 
     fn handleCreate(self: *Self, env: types.Envelope, create_request: types.CreateRequest) !void {

@@ -46,7 +46,7 @@ pub fn mapApiToWire(api: []const u8) ?WireMapping {
     return null;
 }
 
-pub fn isExpressible(api: []const u8) bool {
+fn isExpressible(api: []const u8) bool {
     return mapApiToWire(api) != null;
 }
 
@@ -55,7 +55,7 @@ pub fn hasNamedWire(api: []const u8) bool {
     return mapping.wire.isNamed();
 }
 
-pub fn unnamedWireApis(buffer: [][]const u8) [][]const u8 {
+fn unnamedWireApis(buffer: [][]const u8) [][]const u8 {
     var count: usize = 0;
     for (MAKAI_API_NAMES) |api| {
         if (hasNamedWire(api)) continue;
@@ -181,9 +181,11 @@ test "an unnamed wire carries an opaque discriminator in the reference" {
     defer allocator.free(model_ref);
     try std.testing.expectEqualStrings("ollama/other:ollama-chat@llama3", model_ref);
 
-    const component = types.wireComponent(model_ref).?;
-    try std.testing.expectEqual(types.Wire.other, types.parseWireComponent(component).?);
-    try std.testing.expectEqualStrings("ollama-chat", types.wireIdComponent(component).?);
+    const parsed = types.parseModelRef(model_ref).?;
+    try std.testing.expectEqual(types.Wire.other, parsed.wire);
+    try std.testing.expectEqualStrings("ollama-chat", parsed.wire_id.?);
+    try std.testing.expectEqualStrings("ollama", parsed.provider_id);
+    try std.testing.expectEqualStrings("llama3", parsed.model_id);
 }
 
 test "two unnamed wires on one provider stay distinguishable" {
@@ -197,8 +199,8 @@ test "two unnamed wires on one provider stay distinguishable" {
     defer allocator.free(b);
 
     try std.testing.expect(!std.mem.eql(u8, a, b));
-    try std.testing.expectEqualStrings("google-generative-ai", types.wireIdComponent(types.wireComponent(a).?).?);
-    try std.testing.expectEqualStrings("google-gemini-cli", types.wireIdComponent(types.wireComponent(b).?).?);
+    try std.testing.expectEqualStrings("google-generative-ai", types.parseModelRef(a).?.wire_id.?);
+    try std.testing.expectEqualStrings("google-gemini-cli", types.parseModelRef(b).?.wire_id.?);
 }
 
 test "a named wire carries no discriminator and parses without one" {
@@ -210,9 +212,11 @@ test "a named wire carries no discriminator and parses without one" {
     defer allocator.free(model_ref);
     try std.testing.expectEqualStrings("anthropic/anthropic-messages@claude", model_ref);
 
-    const component = types.wireComponent(model_ref).?;
-    try std.testing.expectEqual(types.Wire.@"anthropic-messages", types.parseWireComponent(component).?);
-    try std.testing.expect(types.wireIdComponent(component) == null);
+    const parsed = types.parseModelRef(model_ref).?;
+    try std.testing.expectEqual(types.Wire.@"anthropic-messages", parsed.wire);
+    try std.testing.expect(parsed.wire_id == null);
+    try std.testing.expectEqualStrings("anthropic", parsed.provider_id);
+    try std.testing.expectEqualStrings("claude", parsed.model_id);
 }
 
 test "every built in provider maps to a describable wire" {
