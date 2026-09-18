@@ -268,8 +268,7 @@ test("concurrent waits sharing one correlate are each delivered while a foreign 
     const lockHolder = client.nextFrameForSession("a1", 3000, { correlate: "req-idle" });
     const firstOwner = client.nextFrameForSession("a1", 1500, { correlate: "req-a" });
     const secondOwner = client.nextFrameForSession("a1", 1500, { correlate: "req-a" });
-    client.send({ type: "agent_message", session_id: "a1", message_id: "req-a" });
-    client.send({ type: "agent_message", session_id: "a1", message_id: "req-a" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-a", payload: { replies: 2 } });
 
     const lockHolderSettled = lockHolder.then(() => "lock-holder", () => "lock-holder");
     const bothDelivered = Promise.all([firstOwner, secondOwner]).then(() => "owners", () => "owners");

@@ -50,6 +50,12 @@ type StreamQueueEntry = {
   replyTo?: string;
 };
 
+type CorrelateDelivery = {
+  signal: () => void;
+  state: { settled: boolean };
+  signalled: boolean;
+};
+
 export type FrameWaitOptions = {
   correlate?: string;
   repliesOnly?: boolean;
@@ -74,7 +80,7 @@ export class MakaiStdioClient {
   private sessionFrameQueues = new Map<string, StreamQueueEntry[]>();
   private replyFrameQueues = new Map<string, StreamQueueEntry[]>();
   private activeCorrelates = new Map<string, number>();
-  private correlateDeliveries = new Map<string, Array<{ signal: () => void; state: { settled: boolean } }>>();
+  private correlateDeliveries = new Map<string, CorrelateDelivery[]>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
@@ -231,7 +237,7 @@ export class MakaiStdioClient {
       const poke = new Promise<void>((resolve) => {
         signalPoke = resolve;
       });
-      const delivery = { signal: signalPoke, state };
+      const delivery: CorrelateDelivery = { signal: signalPoke, state, signalled: false };
       this.registerCorrelateDelivery(correlate, delivery);
       let winner: StdioFrame | undefined;
       try {
@@ -401,17 +407,19 @@ export class MakaiStdioClient {
   private deliverCorrelatedFrame(correlate: string, frame: StdioFrame): void {
     this.enqueueRoutedFrame(this.replyFrameQueues, correlate, frame, correlate);
     const pending = this.correlateDeliveries.get(correlate);
-    const waiting = pending?.find((entry) => !entry.state.settled);
-    if (waiting) waiting.signal();
+    const waiting = pending?.find((entry) => !entry.signalled && !entry.state.settled);
+    if (!waiting) return;
+    waiting.signalled = true;
+    waiting.signal();
   }
 
-  private registerCorrelateDelivery(correlate: string, delivery: { signal: () => void; state: { settled: boolean } }): void {
+  private registerCorrelateDelivery(correlate: string, delivery: CorrelateDelivery): void {
     const pending = this.correlateDeliveries.get(correlate);
     if (pending) pending.push(delivery);
     else this.correlateDeliveries.set(correlate, [delivery]);
   }
 
-  private releaseCorrelateDelivery(correlate: string, delivery: { signal: () => void; state: { settled: boolean } }): void {
+  private releaseCorrelateDelivery(correlate: string, delivery: CorrelateDelivery): void {
     const pending = this.correlateDeliveries.get(correlate);
     if (!pending) return;
     const index = pending.indexOf(delivery);
