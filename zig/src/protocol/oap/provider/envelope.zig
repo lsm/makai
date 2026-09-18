@@ -546,12 +546,15 @@ fn deserializeSnapshotPart(
             const empty = try allocator.dupe(u8, "");
             errdefer allocator.free(empty);
             const owned_partial = try allocator.dupe(u8, partial.string);
+            errdefer allocator.free(owned_partial);
+            const carry = try oap_envelope.optionalOwnedString(value.object, "carry", allocator);
 
             return oap_types.ContentPart{ .tool_call = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
                 .arguments_json = empty,
                 .arguments_partial = owned_partial,
+                .carry = carry,
             } };
         }
     }
@@ -1188,6 +1191,23 @@ fn expectRoundTrip(allocator: std.mem.Allocator, env: types.Envelope) !types.Env
     const line = try serializeEnvelope(env, allocator);
     defer allocator.free(line);
     return try deserializeEnvelope(line, allocator);
+}
+
+test "a tool call keeps its carry through whichever snapshot encoding it uses" {
+    const allocator = std.testing.allocator;
+
+    const forms = [_][]const u8{
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\",\"carry\":\"TOOL-SIG\"}",
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_partial\":\"{\\\"q\\\":\",\"carry\":\"TOOL-SIG\"}",
+    };
+
+    for (forms) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        var part = try deserializeSnapshotPart(parsed.value, allocator, true);
+        defer part.deinit(allocator);
+        try std.testing.expectEqualStrings("TOOL-SIG", part.tool_call.carry orelse "");
+    }
 }
 
 test "a tool call part start carries identity and a text part start refuses it" {
