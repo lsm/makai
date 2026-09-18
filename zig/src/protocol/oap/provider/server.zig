@@ -517,11 +517,11 @@ pub const Server = struct {
             return;
         }
 
-        if (self.options.grant_channel == .on_envelope and grant_request.value == null) {
+        if (self.options.grant_channel == .on_envelope) {
             try self.emitGrantRefusal(
                 env,
-                .invalid_request,
-                "this binding has no side channel; the grant envelope must carry the value",
+                .unsupported_feature,
+                "this implementation cannot yet honour a credential carried on the grant envelope",
             );
             return;
         }
@@ -595,22 +595,65 @@ pub const Server = struct {
         try self.push(response);
     }
 
-    fn resolveProviderId(model_ref: []const u8) ?[]const u8 {
+    pub const ParsedModelRef = struct {
+        provider_id: []const u8,
+        wire: types.Wire,
+        wire_id: ?[]const u8,
+        model_id: []const u8,
+    };
+
+    fn parseModelRef(model_ref: []const u8) ?ParsedModelRef {
         const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse return null;
         if (slash == 0) return null;
-        return model_ref[0..slash];
+
+        const rest = model_ref[slash + 1 ..];
+        const at = std.mem.indexOfScalar(u8, rest, '@') orelse return null;
+        if (at + 1 >= rest.len) return null;
+
+        const component = rest[0..at];
+        if (component.len == 0) return null;
+        const wire = types.parseWireComponent(component) orelse return null;
+        const wire_id = types.wireIdComponent(component);
+        if (wire == .other and wire_id == null) return null;
+        if (wire != .other and wire_id != null) return null;
+        if (wire_id) |value| {
+            if (value.len == 0) return null;
+        }
+
+        return .{
+            .provider_id = model_ref[0..slash],
+            .wire = wire,
+            .wire_id = wire_id,
+            .model_id = rest[at + 1 ..],
+        };
     }
 
     fn handleCreate(self: *Self, env: types.Envelope, create_request: types.CreateRequest) !void {
-        const provider_id = resolveProviderId(create_request.model_ref) orelse {
+        const parsed = parseModelRef(create_request.model_ref) orelse {
             try self.emitCreateRefusal(env, .invalid_request, "model_ref must be provider_id/wire@model_id");
             return;
         };
 
-        const descriptor = self.findProvider(provider_id) orelse {
+        const descriptor = self.findProvider(parsed.provider_id) orelse {
             try self.emitCreateRefusal(env, .model_not_found, "no such provider");
             return;
         };
+
+        if (descriptor.wire != parsed.wire) {
+            try self.emitCreateRefusal(env, .invalid_request, "model_ref names a wire this provider does not speak");
+            return;
+        }
+
+        const descriptor_wire_id = descriptor.wire_id;
+        const refs_disagree = blk: {
+            if (descriptor_wire_id == null and parsed.wire_id == null) break :blk false;
+            if (descriptor_wire_id == null or parsed.wire_id == null) break :blk true;
+            break :blk !std.mem.eql(u8, descriptor_wire_id.?, parsed.wire_id.?);
+        };
+        if (refs_disagree) {
+            try self.emitCreateRefusal(env, .invalid_request, "model_ref names a wire this provider does not speak");
+            return;
+        }
 
         if (create_request.credential_ref) |reference| {
             if (self.findGrant(reference) == null and !descriptor.allows_anonymous) {
@@ -1553,36 +1596,7 @@ test "an out of band binding refuses a grant envelope that carries the value" {
 
 test "every granted credential is marked non persistable and released with the connection" {
     const allocator = std.testing.allocator;
-    var server = try testServer(allocator, .{ .grant_channel = .on_envelope });
-    defer server.deinit();
-
-    const line = try makeRequest(
-        allocator,
-        "provider.credential.grant.request",
-        "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\",\"value\":\"sk-secret\"}",
-        "q1",
-    );
-    defer allocator.free(line);
-    try server.handleLine(line);
-
-    var response = try decodeOnly(allocator, &server);
-    defer response.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), server.grants.items.len);
-    try std.testing.expect(server.grants.items[0].non_persistable);
-    try std.testing.expect(server.grants.items[0].expires_at_ms != null);
-
-    const reference = response.payload.provider_credential_grant_response.credential_ref.?;
-    try std.testing.expect(server.findGrant(reference) != null);
-
-    server.releaseGrants();
-    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
-    try std.testing.expect(server.findGrant(reference) == null);
-}
-
-test "an on envelope binding refuses a grant with no value rather than inventing one" {
-    const allocator = std.testing.allocator;
-    var server = try testServer(allocator, .{ .grant_channel = .on_envelope });
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band });
     defer server.deinit();
 
     const line = try makeRequest(
@@ -1593,15 +1607,44 @@ test "an on envelope binding refuses a grant with no value rather than inventing
     );
     defer allocator.free(line);
     try server.handleLine(line);
+    try server.announceChannel("n1", "/tmp/grant-n1.sock");
+
+    const reference = try server.completeGrant("n1");
+    defer allocator.free(reference);
+    while (server.popOutbound()) |outbound| allocator.free(outbound);
+
+    try std.testing.expectEqual(@as(usize, 1), server.grants.items.len);
+    try std.testing.expect(server.grants.items[0].non_persistable);
+    try std.testing.expect(server.grants.items[0].expires_at_ms != null);
+    try std.testing.expect(server.findGrant(reference) != null);
+
+    server.releaseGrants();
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
+    try std.testing.expect(server.findGrant(reference) == null);
+}
+test "the envelope-carrying tier is refused rather than accepting a secret it cannot honour" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .on_envelope });
+    defer server.deinit();
+
+    const with_value = try makeRequest(
+        allocator,
+        "provider.credential.grant.request",
+        "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\",\"value\":\"sk-secret\"}",
+        "q1",
+    );
+    defer allocator.free(with_value);
+    try server.handleLine(with_value);
 
     var response = try decodeOnly(allocator, &server);
     defer response.deinit(allocator);
+    try std.testing.expect(!response.payload.provider_credential_grant_response.accepted);
     try std.testing.expectEqual(
-        types.ErrorCode.invalid_request,
+        types.ErrorCode.unsupported_feature,
         response.payload.provider_credential_grant_response.err.?.code,
     );
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
 }
-
 test "the agent control profile is refused and the refusal names the caller's envelope" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{});
@@ -2357,4 +2400,114 @@ test "a nonce already in flight is refused rather than opening a second channel"
         refusal.payload.provider_credential_grant_response.err.?.code,
     );
     try std.testing.expectEqual(@as(usize, 1), server.pending_grants.items.len);
+}
+
+test "a model ref is validated whole at create, not one segment of it" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const malformed = [_][]const u8{
+        "ollama-local/openai-chat-completions",
+        "ollama-local/@gemma",
+        "ollama-local/openai-chat-completions@",
+        "/openai-chat-completions@gemma",
+        "ollama-local/not-a-wire@gemma",
+        "ollama-local/openai-chat-completions:bolted-on@gemma",
+    };
+
+    for (malformed) |model_ref| {
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"model_ref\":\"{s}\",\"messages\":[]}}",
+            .{model_ref},
+        );
+        defer allocator.free(payload);
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var response = try decodeOnly(allocator, &server);
+        defer response.deinit(allocator);
+        try std.testing.expect(!response.payload.inference_create_response.accepted);
+        try std.testing.expectEqual(
+            types.ErrorCode.invalid_request,
+            response.payload.inference_create_response.err.?.code,
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), server.active.items.len);
+}
+
+test "a ref naming a wire the provider does not speak is refused before anything is spent" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const wrong_wire = try makeRequest(
+        allocator,
+        "inference.create.request",
+        "{\"model_ref\":\"ollama-local/openai-responses@gemma\",\"messages\":[]}",
+        "q1",
+    );
+    defer allocator.free(wrong_wire);
+    try server.handleLine(wrong_wire);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+    try std.testing.expectEqual(@as(usize, 0), server.active.items.len);
+
+    const right_wire = try makeRequest(
+        allocator,
+        "inference.create.request",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[]}",
+        "q2",
+    );
+    defer allocator.free(right_wire);
+    try server.handleLine(right_wire);
+
+    var accepted = try decodeOnly(allocator, &server);
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.payload.inference_create_response.accepted);
+}
+
+test "an unnamed wire must carry the discriminator the descriptor published" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const provider_id = try allocator.dupe(u8, "vendor");
+    errdefer allocator.free(provider_id);
+    const wire_id = try allocator.dupe(u8, "vendor-chat");
+    errdefer allocator.free(wire_id);
+    const endpoint = try allocator.dupe(u8, "https://vendor.test");
+    errdefer allocator.free(endpoint);
+
+    try server.addProvider(.{
+        .id = provider_id,
+        .wire = .other,
+        .wire_id = wire_id,
+        .framing = .ndjson,
+        .endpoint = endpoint,
+        .allows_anonymous = true,
+    });
+
+    const cases = [_]struct { ref: []const u8, accepted: bool }{
+        .{ .ref = "vendor/other:vendor-chat@m", .accepted = true },
+        .{ .ref = "vendor/other:something-else@m", .accepted = false },
+        .{ .ref = "vendor/other@m", .accepted = false },
+    };
+
+    for (cases) |case| {
+        const payload = try std.fmt.allocPrint(allocator, "{{\"model_ref\":\"{s}\",\"messages\":[]}}", .{case.ref});
+        defer allocator.free(payload);
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var response = try decodeOnly(allocator, &server);
+        defer response.deinit(allocator);
+        try std.testing.expectEqual(case.accepted, response.payload.inference_create_response.accepted);
+    }
 }

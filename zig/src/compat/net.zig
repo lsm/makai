@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const HostName = std.Io.net.HostName;
 
 fn defaultIo() std.Io {
