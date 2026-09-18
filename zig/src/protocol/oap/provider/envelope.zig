@@ -14,6 +14,8 @@ pub const DecodeError = error{
     InvalidField,
     CredentialInHeaders,
     PartialArgumentsInTerminal,
+    ScopeRepeatedInPayload,
+    AcceptanceScopeMismatch,
 };
 
 pub fn serializeEnvelope(env: types.Envelope, allocator: std.mem.Allocator) ![]u8 {
@@ -285,7 +287,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
         },
         .inference_create_response => |value| {
             try w.beginObject();
-            if (value.inference_id) |inference_id| try w.writeStringField("inference_id", inference_id);
             try w.writeBoolField("accepted", value.accepted);
             if (value.honoured) |honoured| {
                 try w.writeKey("honoured");
@@ -429,6 +430,12 @@ pub fn deserializeEnvelope(line: []const u8, allocator: std.mem.Allocator) !type
     if (payload.isScopedEvent()) {
         if (sequence == null or sequence.? == 0) return DecodeError.InvalidField;
         if (inference_id == null) return DecodeError.MissingField;
+    }
+
+    if (payload == .inference_create_response) {
+        const accepted = payload.inference_create_response.accepted;
+        if (accepted and inference_id == null) return DecodeError.AcceptanceScopeMismatch;
+        if (!accepted and inference_id != null) return DecodeError.AcceptanceScopeMismatch;
     }
 
     return types.Envelope{
@@ -689,10 +696,7 @@ fn deserializePayload(
         },
         .inference_create_response => {
             const accepted = try oap_envelope.requiredBool(obj, "accepted");
-            const inference_id = try oap_envelope.optionalOwnedString(obj, "inference_id", allocator);
-            errdefer if (inference_id) |value| allocator.free(value);
-            if (accepted and inference_id == null) return DecodeError.MissingField;
-            if (!accepted and inference_id != null) return DecodeError.InvalidField;
+            if (obj.get("inference_id") != null) return DecodeError.ScopeRepeatedInPayload;
             const honoured = blk: {
                 const value = obj.get("honoured") orelse break :blk null;
                 if (value != .object) return DecodeError.InvalidField;
@@ -703,7 +707,6 @@ fn deserializePayload(
                 err = try deserializeProtocolError(error_value, allocator);
             }
             return types.Payload{ .inference_create_response = .{
-                .inference_id = inference_id,
                 .accepted = accepted,
                 .honoured = honoured,
                 .err = err,

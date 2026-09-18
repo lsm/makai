@@ -245,7 +245,7 @@ fn acceptInference(allocator: std.mem.Allocator, server: *Server) ![]const u8 {
     defer allocator.free(response_line);
     var response = try envelope.deserializeEnvelope(response_line, allocator);
     defer response.deinit(allocator);
-    return allocator.dupe(u8, response.payload.inference_create_response.inference_id.?);
+    return allocator.dupe(u8, response.inference_id.?);
 }
 
 test "a provider stream with reasoning and a tool call crosses without approximation" {

@@ -525,13 +525,11 @@ pub const CreateRequest = struct {
 };
 
 pub const CreateResponse = struct {
-    inference_id: ?[]const u8 = null,
     accepted: bool,
     honoured: ?SnapshotPolicy = null,
     err: ?ProtocolError = null,
 
     pub fn deinit(self: *CreateResponse, allocator: std.mem.Allocator) void {
-        if (self.inference_id) |value| allocator.free(value);
         if (self.err) |*value| value.deinit(allocator);
     }
 };

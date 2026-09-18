@@ -514,15 +514,12 @@ pub const Server = struct {
         errdefer self.allocator.free(reply);
         const scope = try self.allocator.dupe(u8, inference_id);
         errdefer self.allocator.free(scope);
-        const echoed = try self.allocator.dupe(u8, inference_id);
-        errdefer self.allocator.free(echoed);
 
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .inference_id = scope,
             .payload = .{ .inference_create_response = .{
-                .inference_id = echoed,
                 .accepted = true,
                 .honoured = honoured,
             } },
@@ -1502,7 +1499,6 @@ test "a refusal allocates no inference and is correlated by in_reply_to alone" {
     defer response.deinit(allocator);
 
     try std.testing.expect(response.inference_id == null);
-    try std.testing.expect(response.payload.inference_create_response.inference_id == null);
     try std.testing.expectEqualStrings("q1", response.in_reply_to.?);
 }
 
@@ -1606,23 +1602,32 @@ test "describe tells a caller which grant tier the binding uses before it sends 
     );
 }
 
-test "an accepted response must name its inference and a refusal must not" {
+test "acceptance is discriminated by the scope field, never by a payload copy" {
     const allocator = std.testing.allocator;
 
-    const refusal_with_id =
+    const refusal_with_scope =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"payload\":{\"accepted\":false,\"inference_id\":\"inf1\"}}";
+        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"inference_id\":\"inf1\",\"payload\":{\"accepted\":false}}";
     try std.testing.expectError(
-        envelope.DecodeError.InvalidField,
-        envelope.deserializeEnvelope(refusal_with_id, allocator),
+        envelope.DecodeError.AcceptanceScopeMismatch,
+        envelope.deserializeEnvelope(refusal_with_scope, allocator),
     );
 
-    const accepted_without_id =
+    const acceptance_without_scope =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
         "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"payload\":{\"accepted\":true}}";
     try std.testing.expectError(
-        envelope.DecodeError.MissingField,
-        envelope.deserializeEnvelope(accepted_without_id, allocator),
+        envelope.DecodeError.AcceptanceScopeMismatch,
+        envelope.deserializeEnvelope(acceptance_without_scope, allocator),
+    );
+
+    const scope_repeated_in_payload =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"inference_id\":\"inf1\"," ++
+        "\"payload\":{\"accepted\":true,\"inference_id\":\"inf1\"}}";
+    try std.testing.expectError(
+        envelope.DecodeError.ScopeRepeatedInPayload,
+        envelope.deserializeEnvelope(scope_repeated_in_payload, allocator),
     );
 }
 
@@ -1640,7 +1645,7 @@ fn acceptOne(allocator: std.mem.Allocator, server: *Server, snapshot: []const u8
     var response = try decodeOnly(allocator, server);
     defer response.deinit(allocator);
     try std.testing.expect(response.payload.inference_create_response.accepted);
-    return allocator.dupe(u8, response.payload.inference_create_response.inference_id.?);
+    return allocator.dupe(u8, response.inference_id.?);
 }
 
 test "a streamed inference emits one contiguous sequence and exactly one terminal" {
@@ -1921,7 +1926,7 @@ test "sampling controls the endpoint does forward are carried onto the inference
 
     var response = try decodeOnly(allocator, &server);
     defer response.deinit(allocator);
-    const inference_id = response.payload.inference_create_response.inference_id.?;
+    const inference_id = response.inference_id.?;
 
     const inference = server.findInference(inference_id).?;
     try std.testing.expectEqual(@as(u32, 256), inference.max_output_tokens.?);
@@ -2008,4 +2013,5 @@ test "a terminal carrying a partial argument fragment is refused on decode" {
         envelope.deserializeEnvelope(line, allocator),
     );
 }
+
 
