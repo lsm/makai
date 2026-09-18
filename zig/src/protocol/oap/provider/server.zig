@@ -452,6 +452,12 @@ pub const Server = struct {
         try self.pushRawLine(complete);
     }
 
+    fn pushSpecimen(self: *Self, payload: types.Payload, scoped: bool) !void {
+        var env = try self.specimenEnvelope(payload, scoped);
+        errdefer env.deinit(self.allocator);
+        try self.push(env);
+    }
+
     fn specimenEnvelope(self: *Self, payload: types.Payload, scoped: bool) !types.Envelope {
         var owned_payload = payload;
         errdefer owned_payload.deinit(self.allocator);
@@ -487,74 +493,79 @@ pub const Server = struct {
     fn pushSpecimenFor(self: *Self, type_name: []const u8) !void {
         const eql = std.mem.eql;
         if (eql(u8, type_name, "provider.describe.response")) {
+            var transferred = false;
             const versions = try self.allocator.alloc([]const u8, 1);
-            errdefer self.allocator.free(versions);
+            errdefer if (!transferred) self.allocator.free(versions);
             versions[0] = try self.allocator.dupe(u8, types.VERSION);
+            errdefer if (!transferred) self.allocator.free(versions[0]);
             const providers = try self.allocator.alloc(types.ProviderDescriptor, 0);
-            return self.push(try self.specimenEnvelope(.{ .provider_describe_response = .{
+            errdefer if (!transferred) self.allocator.free(providers);
+            const payload = types.Payload{ .provider_describe_response = .{
                 .providers = providers,
                 .protocol_versions = versions,
-            } }, false));
+            } };
+            transferred = true;
+            return self.pushSpecimen(payload, false);
         }
         if (eql(u8, type_name, "provider.models.list.response")) {
             const models = try self.allocator.alloc(types.ModelEntry, 0);
-            return self.push(try self.specimenEnvelope(.{ .provider_models_list_response = .{ .models = models } }, false));
+            return self.pushSpecimen(.{ .provider_models_list_response = .{ .models = models } }, false);
         }
         if (eql(u8, type_name, "inference.create.response")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_create_response = .{
+            return self.pushSpecimen(.{ .inference_create_response = .{
                 .accepted = true,
                 .honoured = .never,
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.started")) {
             const model_ref = try self.allocator.dupe(u8, "specimen/anthropic-messages@specimen-model");
-            return self.push(try self.specimenEnvelope(.{ .inference_started = .{
+            return self.pushSpecimen(.{ .inference_started = .{
                 .model_ref = model_ref,
                 .started_at_ms = compat.time.nowMillis(),
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.part.started")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_part_started = .{
+            return self.pushSpecimen(.{ .inference_part_started = .{
                 .part_index = 0,
                 .part_kind = .text,
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.part.delta")) {
             const delta = try self.allocator.dupe(u8, "spec");
-            return self.push(try self.specimenEnvelope(.{ .inference_part_delta = .{
+            return self.pushSpecimen(.{ .inference_part_delta = .{
                 .part_index = 0,
                 .delta = delta,
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.part.ended")) {
             const text = try self.allocator.dupe(u8, "specimen");
-            return self.push(try self.specimenEnvelope(.{ .inference_part_ended = .{
+            return self.pushSpecimen(.{ .inference_part_ended = .{
                 .part_index = 0,
                 .part_kind = .text,
                 .text = text,
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.completed")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_completed = .{
+            return self.pushSpecimen(.{ .inference_completed = .{
                 .message = try self.specimenMessage(),
                 .stop_reason = .stop,
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.failed")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_failed = .{
+            return self.pushSpecimen(.{ .inference_failed = .{
                 .err = try self.specimenError(),
-            } }, true));
+            } }, true);
         }
         if (eql(u8, type_name, "inference.cancel.response")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_cancel_response = .{ .accepted = true } }, true));
+            return self.pushSpecimen(.{ .inference_cancel_response = .{ .accepted = true } }, true);
         }
         if (eql(u8, type_name, "inference.sync.response")) {
-            return self.push(try self.specimenEnvelope(.{ .inference_sync_response = .{} }, true));
+            return self.pushSpecimen(.{ .inference_sync_response = .{} }, true);
         }
         if (eql(u8, type_name, "error")) {
-            return self.push(try self.specimenEnvelope(.{ .protocol_error = .{
+            return self.pushSpecimen(.{ .protocol_error = .{
                 .err = try self.specimenError(),
-            } }, false));
+            } }, false);
         }
         return error.UnknownSpecimenType;
     }
@@ -826,6 +837,20 @@ pub const Server = struct {
         return types.parseModelRef(model_ref);
     }
 
+    fn messagesCarryPartialArguments(messages: []const oap_types.Message) bool {
+        for (messages) |message| {
+            const parts = switch (message.content) {
+                .parts => |value| value,
+                else => continue,
+            };
+            for (parts) |part| {
+                if (part != .tool_call) continue;
+                if (part.tool_call.arguments_partial != null) return true;
+            }
+        }
+        return false;
+    }
+
     fn requestAsksForReasoning(reasoning: ?types.ReasoningOptions) bool {
         const options = reasoning orelse return false;
         return options.enabled orelse false;
@@ -954,6 +979,15 @@ pub const Server = struct {
                 );
                 return;
             }
+        }
+
+        if (messagesCarryPartialArguments(create_request.messages)) {
+            try self.emitCreateRefusal(
+                env,
+                .invalid_request,
+                "a replayed tool call must carry complete arguments_json; arguments_partial names a call still in flight",
+            );
+            return;
         }
 
         if (!descriptor.round_trips_carry and messagesReplayACarry(create_request.messages)) {
@@ -1849,12 +1883,13 @@ fn testServer(allocator: std.mem.Allocator, options: Options) !Server {
     var server = Server.init(allocator, options);
     errdefer server.deinit();
 
+    var provider_transferred = false;
     const provider_id = try allocator.dupe(u8, "ollama-local");
-    errdefer allocator.free(provider_id);
+    errdefer if (!provider_transferred) allocator.free(provider_id);
     const endpoint = try allocator.dupe(u8, "http://127.0.0.1:11434");
-    errdefer allocator.free(endpoint);
+    errdefer if (!provider_transferred) allocator.free(endpoint);
     const policies = try allocator.dupe(types.SnapshotPolicy, &.{ .never, .on_part_end });
-    errdefer allocator.free(policies);
+    errdefer if (!provider_transferred) allocator.free(policies);
 
     try server.addProvider(.{
         .id = provider_id,
@@ -1869,15 +1904,17 @@ fn testServer(allocator: std.mem.Allocator, options: Options) !Server {
         .allows_anonymous = true,
         .snapshot_policies = policies,
     });
+    provider_transferred = true;
 
+    var model_transferred = false;
     const model_ref = try allocator.dupe(u8, "ollama-local/openai-chat-completions@gemma");
-    errdefer allocator.free(model_ref);
+    errdefer if (!model_transferred) allocator.free(model_ref);
     const model_id = try allocator.dupe(u8, "gemma");
-    errdefer allocator.free(model_id);
+    errdefer if (!model_transferred) allocator.free(model_id);
     const model_provider_id = try allocator.dupe(u8, "ollama-local");
-    errdefer allocator.free(model_provider_id);
+    errdefer if (!model_transferred) allocator.free(model_provider_id);
     const capabilities = try allocator.dupe(types.ModelCapability, &.{ .chat, .streaming });
-    errdefer allocator.free(capabilities);
+    errdefer if (!model_transferred) allocator.free(capabilities);
 
     try server.addModel(.{
         .model_ref = model_ref,
@@ -1888,6 +1925,7 @@ fn testServer(allocator: std.mem.Allocator, options: Options) !Server {
         .source = .discovered,
         .auth_status = .authenticated,
     });
+    model_transferred = true;
 
     return server;
 }
@@ -2422,6 +2460,30 @@ test "a tool call keeps its carry through the snapshot and the terminal" {
     try std.testing.expect(snapshot_parts[0].tool_call.arguments_partial == null);
 }
 
+test "a replayed tool call with partial arguments is refused rather than forwarded empty" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const payload =
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_partial\":\"{\\\"q\\\":\"}]}]}";
+    const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expectEqual(
+        types.ErrorCode.invalid_request,
+        refusal.payload.inference_create_response.err.?.code,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        refusal.payload.inference_create_response.err.?.message,
+        "arguments_partial",
+    ) != null);
+}
+
 test "a tool-role message that carries no tool result is refused rather than rewritten as a user turn" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{ .accepts_inference = true });
@@ -2609,6 +2671,20 @@ test "a refused create consumes no inference sequence because it opens no infere
     var started = try decodeOnly(allocator, &server);
     defer started.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), started.sequence.?);
+}
+
+fn emitSpecimensUnderFailure(allocator: std.mem.Allocator) !void {
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+    try server.emitSpecimens("s1");
+}
+
+test "a specimen run frees nothing twice and leaks nothing under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        emitSpecimensUnderFailure,
+        .{},
+    );
 }
 
 test "a specimen run emits every type it announced, bracketed, and nothing it excluded" {

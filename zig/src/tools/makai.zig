@@ -2302,7 +2302,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --oap [--model <model-ref>]
-        \\  makai --oap-provider
+        \\  makai --oap-provider [--specimens]
         \\  makai --tui
         \\  makai -p [--agent] [--storage] [--model <id>] "<prompt>"
         \\  makai auth providers [--json]
@@ -7451,7 +7451,7 @@ fn buildOapAssistantMessage(
 }
 
 fn oapSpecimenRequestId(line: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
-    if (std.mem.indexOfScalar(u8, line, '{') == null) return null;
+    if (std.mem.indexOf(u8, line, "\"control\"") == null) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
