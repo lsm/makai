@@ -40,7 +40,6 @@ pub const ActiveInference = struct {
     messages: []oap_types.Message = &.{},
     max_output_tokens: ?u32 = null,
     temperature: ?f32 = null,
-    top_p: ?f32 = null,
     include_snapshot: types.SnapshotPolicy,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
@@ -639,6 +638,27 @@ pub const Server = struct {
             return;
         }
 
+        if (create_request.top_p != null) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward top_p");
+            return;
+        }
+
+        if (create_request.headers.len > 0) {
+            try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward request headers to a provider");
+            return;
+        }
+
+        for (create_request.messages) |message| {
+            if (messageCarriesNonText(message)) {
+                try self.emitCreateRefusal(
+                    env,
+                    .unsupported_feature,
+                    "this endpoint forwards text content only; a tool call, tool result or reasoning part cannot be carried",
+                );
+                return;
+            }
+        }
+
         if (create_request.output_schema_json != null) {
             try self.emitCreateRefusal(env, .unsupported_feature, "this endpoint does not forward a structured output schema");
             return;
@@ -673,7 +693,6 @@ pub const Server = struct {
             .messages = messages,
             .max_output_tokens = create_request.max_output_tokens,
             .temperature = create_request.temperature,
-            .top_p = create_request.top_p,
             .include_snapshot = honoured,
             .closed_parts = std.ArrayList(oap_types.ContentPart).empty,
             .text = std.ArrayList(u8).empty,
@@ -1055,6 +1074,16 @@ pub const Server = struct {
         } });
     }
 
+    pub fn abandonOpenPart(self: *Self, inference_id: []const u8) void {
+        const inference = self.findInference(inference_id) orelse return;
+        inference.open_part = null;
+        inference.text.clearRetainingCapacity();
+        if (inference.open_tool_call_id) |value| self.allocator.free(value);
+        if (inference.open_tool_name) |value| self.allocator.free(value);
+        inference.open_tool_call_id = null;
+        inference.open_tool_name = null;
+    }
+
     pub fn settleFailed(
         self: *Self,
         inference_id: []const u8,
@@ -1064,6 +1093,7 @@ pub const Server = struct {
     ) !void {
         const inference = self.findInference(inference_id) orelse return error.UnknownInference;
         if (inference.terminal_emitted) return error.TerminalAlreadyEmitted;
+        inference.open_part = null;
 
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
@@ -1233,6 +1263,22 @@ pub fn cloneHeaders(
         built += 1;
     }
     return out;
+}
+
+fn messageCarriesNonText(message: oap_types.Message) bool {
+    if (message.role == .tool) return true;
+    return switch (message.content) {
+        .text => false,
+        .parts => |parts| blk: {
+            for (parts) |part| {
+                switch (part) {
+                    .text => {},
+                    else => break :blk true,
+                }
+            }
+            break :blk false;
+        },
+    };
 }
 
 fn contentFromParts(
@@ -2064,6 +2110,10 @@ test "a request member the endpoint cannot forward is refused rather than droppe
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"tool_choice\":\"auto\"}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"output_schema\":{\"type\":\"object\"}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"enabled\":true}}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\"}]}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"result\"}]}",
     };
 
     for (cases) |payload| {

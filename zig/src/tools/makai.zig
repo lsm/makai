@@ -6794,7 +6794,15 @@ fn pumpOapInferences(
         }
 
         if (!settled and entry.stream.isDone()) {
-            try settleOapInference(server, entry);
+            settleOapInference(server, entry) catch {
+                server.abandonOpenPart(entry.inference_id);
+                server.settleFailed(
+                    entry.inference_id,
+                    .internal_error,
+                    "the endpoint could not assemble a terminal for this inference",
+                    null,
+                ) catch {};
+            };
             settled = true;
             did_work = true;
         }
@@ -6805,6 +6813,7 @@ fn pumpOapInferences(
         }
 
         var removed = running.orderedRemove(index);
+        server.releaseInference(removed.inference_id);
         removed.deinit(allocator);
     }
     return did_work;

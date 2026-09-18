@@ -156,38 +156,6 @@ pub fn tcpConnect(address: Address) !Stream {
     return Stream.init(try address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }));
 }
 
-pub const UnixAddress = std.Io.net.UnixAddress;
-pub const has_unix_sockets = std.Io.net.has_unix_sockets;
-
-pub fn unixAddress(path: []const u8) !UnixAddress {
-    return UnixAddress.init(path);
-}
-
-pub fn unixListen(address: UnixAddress, options: UnixAddress.ListenOptions) !Server {
-    return address.listen(defaultIo(), options);
-}
-
-pub fn unixConnect(address: UnixAddress) !Stream {
-    return Stream.init(try address.connect(defaultIo()));
-}
-
-pub fn serverHasPendingConnection(server: *Server) !bool {
-    if (builtin.os.tag == .windows) return true;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, 0);
-    return ready > 0;
-}
-
-pub fn acceptNonBlocking(server: *Server) !?Connection {
-    if (!try serverHasPendingConnection(server)) return null;
-    const stream = try server.accept(defaultIo());
-    return .{ .stream = Stream.init(stream), .address = stream.socket.address };
-}
-
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
     return address.listen(defaultIo(), options);
 }
@@ -266,51 +234,4 @@ test "compat networking loopback connect read write round trip" {
     thread.join();
     thread_joined = true;
     try context.result;
-}
-
-test "a unix socket round trips a nonce and a value" {
-    if (!has_unix_sockets) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const sock_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        ".zig-cache/tmp/{s}/grant.sock",
-        .{tmp.sub_path},
-    );
-    defer std.testing.allocator.free(sock_path);
-
-    const address = try unixAddress(sock_path);
-    var server = try unixListen(address, .{});
-    defer closeServer(&server);
-
-    try std.testing.expect(try acceptNonBlocking(&server) == null);
-
-    var client = try unixConnect(address);
-    try client.writeAll("nonce-1\nsk-secret");
-    client.close();
-
-    var conn = blk: {
-        var attempts: usize = 0;
-        while (attempts < 200) : (attempts += 1) {
-            if (try acceptNonBlocking(&server)) |c| break :blk c;
-            @import("time.zig").sleepNs(1 * std.time.ns_per_ms);
-        }
-        return error.TestExpectedConnection;
-    };
-    defer conn.stream.close();
-
-    var buffer: [128]u8 = undefined;
-    var total: usize = 0;
-    while (total < buffer.len) {
-        const n = conn.stream.read(buffer[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-
-    const received = buffer[0..total];
-    const newline = std.mem.indexOfScalar(u8, received, '\n') orelse return error.TestExpectedNewline;
-    try std.testing.expectEqualStrings("nonce-1", received[0..newline]);
-    try std.testing.expectEqualStrings("sk-secret", received[newline + 1 ..]);
 }

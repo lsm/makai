@@ -699,6 +699,7 @@ fn deserializePayload(
             errdefer if (credential_ref) |value| allocator.free(value);
             const expires_at_ms = try oap_envelope.optionalInteger(obj, "expires_at_ms");
             var err: ?types.ProtocolError = null;
+            errdefer if (err) |*value| value.deinit(allocator);
             if (obj.get("error")) |error_value| {
                 err = try deserializeProtocolError(error_value, allocator);
             }
@@ -1342,4 +1343,28 @@ test "usage survives a round trip on both terminals" {
     var failed_decoded = try expectRoundTrip(allocator, failed);
     defer failed_decoded.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 7), failed_decoded.payload.inference_failed.usage.?.input_tokens.?);
+}
+
+test "a malformed grant response frees what it decoded before refusing" {
+    const allocator = std.testing.allocator;
+
+    const accepted_without_reference =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"provider.credential.grant.response\",\"id\":\"m1\",\"in_reply_to\":\"q1\"," ++
+        "\"payload\":{\"accepted\":true,\"error\":{\"code\":\"credential_rejected\",\"message\":\"a message long enough to allocate\"}}}";
+    try std.testing.expectError(
+        DecodeError.MissingField,
+        deserializeEnvelope(accepted_without_reference, allocator),
+    );
+
+    const refusal_with_reference =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"provider.credential.grant.response\",\"id\":\"m1\",\"in_reply_to\":\"q1\"," ++
+        "\"payload\":{\"accepted\":false,\"credential_ref\":\"grant:x:0\"," ++
+        "\"error\":{\"code\":\"credential_rejected\",\"message\":\"a message long enough to allocate\"," ++
+        "\"details\":{\"reason\":\"deadline\"}}}}";
+    try std.testing.expectError(
+        DecodeError.InvalidField,
+        deserializeEnvelope(refusal_with_reference, allocator),
+    );
 }
