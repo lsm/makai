@@ -30,7 +30,7 @@ A root `Makefile` wraps the everyday commands: `make build`, `make tui` (build, 
 On macOS, credential storage is Keychain-first, and the two directions behave differently.
 
 **Reads fail fast.** Every read path runs under `SecKeychainSetUserInteractionAllowed(0)`, so a
-binary the `com.makai.auth` item's access list does not authorize gets `errSecInteractionNotAllowed`
+binary the `ai.hyperneo.oap` item's access list does not authorize gets `errSecInteractionNotAllowed`
 rather than an authorization prompt, and `AuthStorage.loadDefault` falls back to `~/.makai/auth.json`.
 That fallback goes through `loadFromFile`, **not** `loadFromFileWithSaveFn`, so a background token
 refresh cannot re-save and re-arm the prompt. The degradation is silent by design: the run continues
@@ -42,14 +42,29 @@ mid-prompt no longer makes a concurrent read look like an authorization failure.
 **Writes still prompt.** `macos_keychain.write` takes the mutex blocking and leaves interaction
 enabled, so persisting credentials from an unauthorized binary raises the prompt — and in a
 non-interactive shell that prompt never surfaces, so the write blocks rather than failing. Access
-lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again; the
-macOS artifacts this repo publishes are plain `zig build install` output and are unsigned too. Only
-a Developer-ID-signed build, keyed by team ID, escapes it. Bound any invocation that may persist
+lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again. Only
+a signed build escapes it, because the access list then binds to the signing certificate rather than
+the hash. Released macOS binaries are signed with Developer ID, hardened-runtime enabled and
+notarized in `release-binaries.yml`; a tag build fails rather than publishing unsigned macOS
+artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<sha1>` signs `zig-out/bin/makai` under the
+stable identifier `ai.hyperneo.oap` — a self-signed code-signing certificate is enough for the access
+list, no Apple account needed — and a bad identity fails the build instead of silently leaving it
+unsigned. Pass the certificate's SHA-1 hash from `security find-identity -v -p codesigning` rather
+than its `Developer ID Application: ...` name: a keychain holding the certificate twice makes the
+name ambiguous and `codesign` refuses it, while the hash names exactly one certificate. The release
+secrets use the same names and formats as `lsm/hyperneo` so one set of values serves both repos —
+`APPLE_CERTIFICATE` (base64 `.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_API_PRIVATE_KEY` (raw `.p8` PEM, **not** base64), `APPLE_API_KEY` (key id) and
+`APPLE_API_ISSUER`. Either identity form works in CI, where the throwaway keychain holds one
+certificate; the ambiguity is a developer-machine problem. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
+service: an existing `com.makai.auth` item is ignored and left in place, so the first run after the
+rename falls back to `auth.json` or a fresh login. Delete it manually when you no longer want it. Delete it once after switching signing identity, since the old
+access list still names the previous one. Bound any invocation that may persist
 credentials with an external timeout so a hang is visible rather than silent.
 
 Reads blocked the same way before #315, which is why older notes describe `makai auth providers
 --json` printing `ready` and then going silent on the first credential-touching request. That
-symptom is gone. A machine with no `com.makai.auth` item never reproduced it either —
+symptom is gone. A machine with no `ai.hyperneo.oap` item never reproduced it either —
 `SecKeychainFindGenericPassword` returns `errSecItemNotFound` and the load falls back to the file —
 so a clean CI runner was never a useful test of it.
 
@@ -401,7 +416,7 @@ makai auth login --provider <id> [--json]
 
 Print-mode options are position-independent as of #287 (see Print Mode CLI above): `--agent`, `--storage`, and `--model <id>` parse before or after the prompt, an unknown `--flag` or a second positional argument is a hard error rather than being ignored, and `--tui-runtime` must still precede the prompt.
 
-On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `com.makai.auth` is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
+On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `ai.hyperneo.oap` (account `auth.shared.json`, renamed from `com.makai.auth`, which is no longer read) is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
 
 ## Providers
 
