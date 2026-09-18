@@ -176,9 +176,12 @@ pub const Server = struct {
         errdefer self.allocator.free(owned_nonce);
         const owned_channel = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(owned_channel);
+        const reply = try self.allocator.dupe(u8, grant.request_id);
+        errdefer self.allocator.free(reply);
 
         var env = types.Envelope{
             .id = id,
+            .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_channel = .{
                 .nonce = owned_nonce,
                 .channel = owned_channel,
@@ -2203,6 +2206,7 @@ test "an out of band grant answers with a channel before it answers the grant" {
     try server.announceChannel("n1", "/tmp/grant-n1.sock");
     var channel = try decodeOnly(allocator, &server);
     defer channel.deinit(allocator);
+    try std.testing.expectEqualStrings("q1", channel.in_reply_to.?);
     try std.testing.expectEqualStrings("n1", channel.payload.provider_credential_grant_channel.nonce);
     try std.testing.expectEqualStrings("/tmp/grant-n1.sock", channel.payload.provider_credential_grant_channel.channel);
     try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
@@ -2294,3 +2298,4 @@ test "a nonce already in flight is refused rather than opening a second channel"
     );
     try std.testing.expectEqual(@as(usize, 1), server.pending_grants.items.len);
 }
+
