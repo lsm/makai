@@ -12,7 +12,6 @@ fn defaultIo() std.Io {
 const auth_file_name = "auth.json";
 const auth_temp_prefix = auth_file_name ++ ".tmp.";
 const keychain_service = "ai.hyperneo.oap";
-const legacy_keychain_service = "com.makai.auth";
 const keychain_service_env = "MAKAI_KEYCHAIN_SERVICE";
 const keychain_account = auth_file_name;
 const keychain_shared_account = "auth.shared.json";
@@ -576,27 +575,10 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         defer scope.end();
 
         if (try findServiceAccount(allocator, service, keychain_shared_account)) |content| return content;
-        if (try findServiceAccount(allocator, service, keychain_account)) |legacy| {
-            writeServiceAccount(service, keychain_shared_account, legacy) catch return legacy;
-            deleteServiceAccount(service, keychain_account) catch {};
-            return legacy;
-        }
-        if (!std.mem.eql(u8, service, keychain_service)) return null;
-        return migrateLegacyService(allocator, service);
-    }
-
-    fn migrateLegacyService(allocator: std.mem.Allocator, service: []const u8) KeychainAllocError!?[]u8 {
-        for ([_][]const u8{ keychain_shared_account, keychain_account }) |account| {
-            const found = findServiceAccount(allocator, legacy_keychain_service, account) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return null,
-            };
-            const content = found orelse continue;
-            writeServiceAccount(service, keychain_shared_account, content) catch return content;
-            deleteServiceAccount(legacy_keychain_service, account) catch {};
-            return content;
-        }
-        return null;
+        const legacy = (try findServiceAccount(allocator, service, keychain_account)) orelse return null;
+        writeServiceAccount(service, keychain_shared_account, legacy) catch return legacy;
+        deleteServiceAccount(service, keychain_account) catch {};
+        return legacy;
     }
 
     fn write(allocator: std.mem.Allocator, data: []const u8) KeychainAllocError!void {

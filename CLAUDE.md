@@ -49,10 +49,9 @@ notarized in `release-binaries.yml`; a tag build fails rather than publishing un
 artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<name>` signs `zig-out/bin/makai` under the
 stable identifier `ai.hyperneo.oap` — a self-signed code-signing certificate is enough for the access
 list, no Apple account needed — and a bad identity fails the build instead of silently leaving it
-unsigned. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`, whose contents a first read
-tries to migrate). That migration is best-effort and usually does **not** fire: the old item's access
-list names the binary that wrote it, so a differently-signed build is refused with `errSecAuthFailed`
-and falls back to the file or a fresh login, leaving the old item intact for manual copying. Delete it once after switching signing identity, since the old
+unsigned. The Keychain item is `ai.hyperneo.oap` (renamed from `com.makai.auth`). Nothing reads the old
+service: an existing `com.makai.auth` item is ignored and left in place, so the first run after the
+rename falls back to `auth.json` or a fresh login. Delete it manually when you no longer want it. Delete it once after switching signing identity, since the old
 access list still names the previous one. Bound any invocation that may persist
 credentials with an external timeout so a hang is visible rather than silent.
 
@@ -327,7 +326,7 @@ makai auth login --provider <id> [--json]
 
 Print-mode options are position-independent as of #287 (see Print Mode CLI above): `--agent`, `--storage`, and `--model <id>` parse before or after the prompt, an unknown `--flag` or a second positional argument is a hard error rather than being ignored, and `--tui-runtime` must still precede the prompt.
 
-On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `ai.hyperneo.oap` (account `auth.shared.json`, renamed from `com.makai.auth`, whose contents are migrated on first read) is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
+On-disk state: **credential storage is platform-dependent.** On macOS the login Keychain item `ai.hyperneo.oap` (account `auth.shared.json`, renamed from `com.makai.auth`, which is no longer read) is the primary store: `AuthStorage.loadDefault` reads it first and `saveToPreferredStorage` writes there, falling back to `~/.makai/auth.json` only when the item is absent or the Keychain is unavailable. Everywhere else (and under `builtin.is_test`) the file is the store. So on macOS, debugging, backing up, or clearing credentials by touching `auth.json` alone inspects the wrong place and can leave live credentials in the Keychain. The file itself is mode 0600, written via same-directory temp + rename. TUI sessions live in `~/.makai/sessions` and TUI config under `~/.makai`. `.makai/` is gitignored. `MAKAI_BASE_URL` (+ `MAKAI_BASE_URL_IS_PROXY`) and per-provider `*_BASE_URL` vars override endpoints (`provider_base_url.zig`). `MAKAI_DEBUG_PROVIDER_PAYLOAD=<path>` makes the OpenAI Completions provider write its request body to that file.
 
 ## Providers
 
