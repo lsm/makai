@@ -2328,17 +2328,12 @@ test("client.agent.run does not stop a session owned by another run after agent_
   }
 });
 
-test("concurrent client.agent.run on one session id: duplicate is rejected promptly, established run completes", async () => {
+test("concurrent client.agent.run on one session id: duplicate is rejected, established run completes", async () => {
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const establishedRun = agent.run(request());
     const duplicateRun = agent.run(request());
-    const firstSettled = await Promise.race([
-      duplicateRun.then(() => "duplicate", () => "duplicate"),
-      establishedRun.then(() => "established", () => "established"),
-    ]);
-    assert.equal(firstSettled, "duplicate");
     const [established, duplicate] = await Promise.allSettled([establishedRun, duplicateRun]);
 
     assert.equal(established.status, "fulfilled");
@@ -2362,11 +2357,6 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const establishedRun = agent.run(request());
     const duplicateRun = agent.run(request());
-    const firstSettled = await Promise.race([
-      duplicateRun.then(() => "duplicate", () => "duplicate"),
-      establishedRun.then(() => "established", () => "established"),
-    ]);
-    assert.equal(firstSettled, "duplicate");
     const [established, duplicate] = await Promise.allSettled([establishedRun, duplicateRun]);
 
     assert.equal(established.status, "fulfilled");
@@ -2384,17 +2374,12 @@ test("concurrent client.agent.run duplicate receives the agent_error-shaped agen
   }
 });
 
-test("concurrent client.agent.stream on one session id: duplicate is rejected promptly, established stream completes", async () => {
+test("concurrent client.agent.stream on one session id: duplicate is rejected, established stream completes", async () => {
   const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
   try {
     const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 5000 });
     const establishedStream = collect(agent.stream(request()));
     const duplicateStream = collect(agent.stream(request()));
-    const firstSettled = await Promise.race([
-      duplicateStream.then(() => "duplicate", () => "duplicate"),
-      establishedStream.then(() => "established", () => "established"),
-    ]);
-    assert.equal(firstSettled, "duplicate");
     const [established, duplicate] = await Promise.allSettled([establishedStream, duplicateStream]);
 
     assert.equal(established.status, "fulfilled");

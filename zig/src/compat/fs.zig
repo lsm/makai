@@ -58,6 +58,27 @@ pub fn createDir(dir: Dir, path: []const u8) !void {
     try dir.createDirPath(defaultIo(), path);
 }
 
+pub const private_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+
+pub fn createPrivateDir(path: []const u8) !void {
+    try getCwd().createDir(defaultIo(), path, private_dir_mode);
+}
+
+pub fn removeDir(path: []const u8) void {
+    getCwd().deleteDir(defaultIo(), path) catch {};
+}
+
+pub fn removeFile(path: []const u8) void {
+    getCwd().deleteFile(defaultIo(), path) catch {};
+}
+
+pub fn directoryPermissions(path: []const u8) !u32 {
+    var dir = try getCwd().openDir(defaultIo(), path, .{});
+    defer dir.close(defaultIo());
+    const stat = try dir.stat(defaultIo());
+    return @intFromEnum(stat.permissions) & 0o777;
+}
+
 pub fn modifiedMillis(dir: Dir, path: []const u8) !i64 {
     var file = try dir.openFile(defaultIo(), path, .{});
     defer file.close(defaultIo());

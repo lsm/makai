@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig-first streaming AI runtime plus SDKs for TypeScript, Python, Go and Rust. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus a native Open Agent Protocol endpoint (`protocol/oap/`), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. Each SDK (`typescript/`, `python/`, `go/`, `rust/`) spawns `makai --stdio` and exposes the same `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames; none of them is wired into the Zig build.
+Makai is a Zig-first streaming AI runtime plus SDKs for TypeScript, Python, Go and Rust. The Zig core (`zig/src/`) provides a unified multi-provider streaming abstraction (Anthropic, OpenAI Completions/Responses, Azure OpenAI, Google Generative AI, OpenAI Codex, Gemini CLI, Ollama; a Vertex implementation exists but is not registered, see Providers), four distributed wire protocols (auth, provider, agent, tool) plus two native Open Agent Protocol endpoints (`protocol/oap/` for agent control, `protocol/oap/provider/` for model providers), an agent loop with local tool execution, OAuth flows with credential storage, pluggable transports, and a `makai` binary that runs as a stdio protocol host, a native OAP host, a terminal UI, or a one-shot CLI. Each SDK (`typescript/`, `python/`, `go/`, `rust/`) spawns `makai --stdio` and exposes the same `auth`/`models`/`provider`/`agent` namespaces over newline-delimited JSON frames; none of them is wired into the Zig build.
 
 `DESIGN.md` is the authoritative design reference (layers, protocol boundaries, sequencing, ownership, transport posture, test strategy). `docs/v1-sdk-agent-provider-spec.md` is the normative SDK + protocol spec. Read those before changing protocol or SDK behavior.
 
@@ -160,8 +160,13 @@ is infallible — `cloneModelDescriptor` in `zig/src/protocol/model_catalog_type
 reference shape, and `std.testing.checkAllAllocationFailures` is how a fix is proved. The check
 scans only non-`test` code and only `dupe`/`dupeZ`/`allocSentinel`/`allocPrint`/`owned(` calls, so
 it is a floor rather than a complete detector: the sibling shapes it does **not** see are an
-`errdefer` that frees a container without its contents, and a fully-built value dropped in a
-hand-off such as `try list.append(allocator, try build(allocator))`. `known_multi_alloc_literals`
+`errdefer` that frees a container without its contents, a fully-built value dropped in a
+hand-off such as `try list.append(allocator, try build(allocator))`, and an `errdefer` left armed
+after a successful ownership transfer, where a later `try` in the same scope frees what the new
+owner will free again. That last one is the most common defect in this tree — six instances on the
+`model-provider-core` branch alone — and the thing that finds it is not this script but
+`std.testing.checkAllAllocationFailures` over the allocating function, which aborts inside the
+owner's `deinit`. Any function that allocates and then hands off ownership should have one. `known_multi_alloc_literals`
 declares the 41 sites that predate the check. It is a shrinking backlog, not an approved list:
 adding an entry needs a commit-message reason why that literal cannot leak, and the check also
 fails when a declared entry disappears, so fixing one requires removing its line.
@@ -261,7 +266,84 @@ Ownership and auth boundary (non-negotiable):
 
 ### How the `makai --stdio` host is wired
 
-`runStdioMode` in `zig/src/tools/makai.zig` hosts all three protocol servers (auth, provider, agent) in one process, each behind its own `in_process.SerializedPipe`, and routes inbound stdin frames by envelope type. The agent server drives `agent_loop` through `agent/provider_protocol_bridge.zig` (`InProcessProviderProtocolBridge`), so even in-process the agent talks to providers through the provider protocol. Distributed tools are executed by the SDK client: the host publishes `tool_execute`, waits for a correlated `tool_result` (`in_reply_to` must match the request `message_id`), and cancels parked waits on stdin EOF. `MAKAI_AGENT_SESSION_IDLE_TTL_MS` tunes server-side idle-session eviction (default 30 min, `0` disables).
+`runStdioMode` in `zig/src/tools/makai.zig` hosts all three protocol servers (auth, provider, agent) in one process, each behind its own `in_process.SerializedPipe`, and routes inbound stdin frames by envelope type. The agent server drives `agent_loop` through `agent/provider_protocol_bridge.zig` (`InProcessProviderProtocolBridge`), so even in-process the agent talks to providers through the provider protocol. Distributed tools are executed by the SDK client: the host publishes `tool_execute`, waits for a correlated `tool_result` (`in_reply_to` must match the request `message_id`), and cancels parked waits on stdin EOF. `MAKAI_AGENT_SESSION_IDLE_TTL_MS` tunes server-side idle-session eviction (default 30 min, `0` disables). `MAKAI_OAP_PROVIDER_STREAM_IDLE_TTL_MS` does the same for `makai --oap-provider`: it cancels a provider stream that has produced **no event** for that long (default 2 min, `0` disables). It measures silence rather than total duration on purpose — an extended-thinking generation legitimately runs for minutes and would be aborted by a wall-clock cap, while a wedged connection produces nothing at all.
+
+### The two OAP profiles are separate endpoints, not one endpoint with a switch
+
+`makai --oap` serves `open-agent-protocol.agent-control-core` and `makai --oap-provider` serves
+`open-agent-protocol.model-provider-core`. Each **refuses the other's profile** at decode, so a
+client cannot reach the provider vocabulary through the agent-control mode or the reverse, and the
+refusal names which profile the endpoint serves. They share the base envelope and the shared
+vocabulary (`ContentPart`, `Message`, `Usage`) by importing the agent-control types rather than
+redeclaring them, so a content part means the same thing on both boundaries. They do **not** share
+`ProtocolError`: the two profiles have disjoint error code sets and neither is a subset of the
+other, so each carries its own.
+
+The provider endpoint is `zig/src/protocol/oap/provider/` — `types`, `envelope`, `server`,
+`catalog`, `runtime`. `catalog.zig` maps our eight registered APIs onto the profile's closed wire
+set: five earn a named wire (`anthropic-messages`, `openai-chat-completions`, and
+`openai-responses`, which Azure, Codex and native OpenAI all share and are told apart by provider
+id and endpoint), and three say `other` with an opaque `wire_id` because no second implementer
+speaks their shape — both Google APIs and Ollama. `runtime.zig` translates our assistant event
+union into the profile's part triples and our `OpenAICompatOptions` into its twelve compatibility
+facts.
+
+**Eleven of those twelve facts carry across unchanged; `usage_in_streaming` does not.** Ours gates
+whether we send `stream_options.include_usage` — a request-shape fact. The profile's describes when
+usage arrives. `true` implies `always`, but `false` says nothing about whether the endpoint reports
+usage in its terminal chunk, so the mapping leaves the fact unstated rather than guessing between
+`never` and `terminal_only`, and reports the undecidable case in its return type.
+
+Two rules the profile makes normative are enforced at **both** ends rather than only on decode: a
+`tool_call` part start must carry `tool_call_id` and `name` and a `text` or `reasoning` start must
+not, and a part end is kind-discriminated. Refusing to *build* an invalid frame is what stops a
+host from discovering it in somebody else's decoder. The same applies to the structural invariants
+— a delta with no open part, a mismatched part index, a terminal with a part still open, a second
+terminal.
+
+**Anything decidable from the descriptor and the request alone is a create-time refusal, never a
+terminal.** An unsupported `include_snapshot`, an unknown provider and a malformed `model_ref` are
+knowable before a request leaves the process, so they refuse at `inference.create` and allocate
+nothing. A rate limit, a provider outage and an expired credential are terminals, because only the
+attempt reveals them. An inference exists if and only if it was accepted; a refusal carries no
+`inference_id` and owes no terminal.
+
+A missing credential splits across that line and the rule decides which side by its own test rather
+than by the word "credential". When the endpoint does **not** resolve its own credentials, a request
+that had to name one and did not is decidable from the descriptor and the request, and refuses at
+create. When the endpoint **does** resolve its own — which is what `makai --oap-provider` advertises,
+`resolves_own_credentials = true` — whether a usable credential exists is keychain state at the
+moment of the attempt, which is neither the descriptor nor the request, so it is an `inference.failed`
+terminal carrying `credential_missing`. Callers must expect the terminal from this host: the
+create-time branch exists for an endpoint configured the other way and never fires here.
+
+Credential grants are advertised on the descriptor (`credential_grant`, `grant_kinds`) so a caller
+learns the tier before sending a secret. makai advertises the **out-of-band tier with the `static`
+kind only**, and only where it can serve it: the channel is a per-grant unix socket, so a build
+whose toolchain reports no unix-socket support advertises `none` rather than a tier it cannot open.
+That is `std.Io.net.has_unix_sockets`, which is false for Windows targets in Zig 0.16 — a fact about
+this toolchain and not about the platform, since Windows itself has carried AF_UNIX since build
+17063. The guard names the capability rather than the operating system so it stops applying by
+itself if the toolchain gains support. A static key is safe by construction
+because a per-call `api_key` short-circuits the storage path entirely in `streamWithRefresh`; a
+**refreshable** grant is still refused, because `AuthStorage.persist` has two branches and both
+write, so we have no representation for a credential that cannot reach durable storage and the
+profile's non-persistable requirement is not satisfiable until one exists.
+
+The channel lives in `protocol/oap/provider/grant_channel.zig` and follows the stdio binding: the
+socket is created per grant under a directory created 0700, the accept and the read are polled with
+a zero timeout so the envelope stream never blocks on a silent caller, exactly one connection is
+read, a first line that is not the nonce closes the connection without an error envelope, the value
+is the bytes after that newline to the close, and the socket and its directory are destroyed when
+the grant settles either way. A grant whose socket cannot be opened is refused immediately rather
+than left pending, because the arrival deadline runs from the channel envelope and an unannounced
+grant would have no deadline at all.
+
+The profile can be **conformance-tested** and cannot yet be **compatibility-tested**, and the two
+words must not be used interchangeably about it. A harness can spawn `makai --oap-provider`, drive
+discovery, run an inference against a local anonymous provider with no credentials, and assemble a
+trace — that covers every envelope. None of the twelve compatibility facts has been checked against
+the vendor it describes.
 
 ### Protocol Normative Rules (from DESIGN.md §4-5)
 
@@ -309,7 +391,8 @@ Passing an explicit `std.mem.Allocator` is the convention, not a guarantee the c
 ```
 makai --version
 makai --stdio                                   # protocol host for the TS SDK (NDJSON frames on stdin/stdout)
-makai --oap [--model <model-ref>]               # native Open Agent Protocol host (OAP JSONL frames on stdin/stdout)
+makai --oap [--model <model-ref>]               # native Open Agent Protocol host, agent-control-core profile
+makai --oap-provider                            # native Open Agent Protocol host, model-provider-core profile
 makai --tui                                     # local-only terminal UI
 makai -p [--agent] [--storage] [--model <id>] "<prompt>"   # print mode: stream one prompt, dump every event
 makai auth providers [--json]                   # thin wrappers over the auth protocol runtime
@@ -339,6 +422,7 @@ Notes: OpenAI Responses (`openai-responses`) and Completions (`openai-completion
 ## Zig Conventions
 
 - **Zero comments** in every tracked `.zig` and `.ts` file, including `build.zig`, tests, fixtures, and `zig/vendor`: no `//`, `///`, `//!`, block, or JSDoc comments. The only exemptions are functional directives: `// zig fmt: off|on`; in TypeScript, shebangs, file-leading `/// <reference>` and `@ts-check`/`@ts-nocheck`, `@ts-ignore`/`@ts-expect-error`, JSDoc `@deprecated`, `biome-ignore`, `eslint-*`, `oxlint-*`, knip `@public`/`knip-ignore`, and `v8`/`istanbul`/`c8` ignores. The allowlist ratchet is retired (`scripts/no-comments-allowlist.txt.retired`); there is no grandfathering. Rationale goes in commit messages, PR descriptions, `docs/`, and tests.
+- **Do not encode a capability claim in a name.** With no comments, a name is the only documentation a reader gets, and a name that contradicts its body is the one defect the policy makes invisible — nothing goes stale, nothing fails to compile. The risk is specific to names asserting what the code *supports*: `handleSyncUnsupported` answered `inference.sync` with a real snapshot for as long as sync existed, because the name was accurate when written and nothing forced the author back to it once support arrived. Names encoding an action or a predicate over data cannot rot this way — `abandonOpenPart`, `expiredGrantNonce`, `allowsDegraded` stay true because actions do not change underneath their names. An audit of the fifteen assertion-shaped names in `protocol/oap/provider/` found exactly one rotted, and it was the only capability-state one. The rule is sharper for **test** names than function names: a function with a stale name still does what it does, while a test named for a policy its body never exercises is a claim that something was checked when it wasn't, and the gap it names looks closed to everyone who scans the list. `"a published descriptor header is not policed the way caller text is"` only ever decoded a benign `X-Tenant` header, so it passed unchanged when that policy was reversed.
 - snake_case functions/variables, PascalCase types, inline tests, error unions, comptime generics.
 - **Poison after deinit**: critical `deinit()` methods end with `self.* = undefined;`. The pattern script requires it in event_stream, api_registry, agent, protocol client/server, tool_call_tracker, streaming_json, sse_parser, partial_reconstructor.
 - **`OwnedSlice(T)`** (`owned_slice.zig`) instead of ad-hoc `owned_*: bool` flags.
