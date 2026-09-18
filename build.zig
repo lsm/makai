@@ -785,6 +785,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_oap_provider_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/protocol/oap/provider/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oap_provider_types", .module = protocol_oap_provider_types_mod },
+            .{ .name = "oap_provider_server", .module = protocol_oap_provider_server_mod },
+            .{ .name = "oap_provider_envelope", .module = protocol_oap_provider_envelope_mod },
+        },
+    });
+
     const protocol_oap_server_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/oap/server.zig"),
         .target = target,
@@ -1583,6 +1595,7 @@ pub fn build(b: *std.Build) void {
     const protocol_oap_provider_envelope_test = b.addTest(.{ .root_module = protocol_oap_provider_envelope_mod });
     const protocol_oap_provider_server_test = b.addTest(.{ .root_module = protocol_oap_provider_server_mod });
     const protocol_oap_provider_catalog_test = b.addTest(.{ .root_module = protocol_oap_provider_catalog_mod });
+    const protocol_oap_provider_runtime_test = b.addTest(.{ .root_module = protocol_oap_provider_runtime_mod });
     const protocol_oap_envelope_test = b.addTest(.{ .root_module = protocol_oap_envelope_mod });
     const protocol_oap_server_test = b.addTest(.{ .root_module = protocol_oap_server_mod });
     const protocol_oap_bridge_test = b.addTest(.{ .root_module = protocol_oap_bridge_mod });
@@ -1896,6 +1909,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_server_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_catalog_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_server_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_bridge_test).step);
@@ -1955,6 +1969,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_catalog_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_runtime_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_bridge_test).step);

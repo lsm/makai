@@ -600,6 +600,45 @@ pub const Server = struct {
         } });
     }
 
+    pub fn notePartEndedToolCall(
+        self: *Self,
+        inference_id: []const u8,
+        part_index: u32,
+        tool_call_id: []const u8,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        const open = inference.open_part orelse return error.NoOpenPart;
+        if (open != part_index) return error.PartIndexMismatch;
+
+        const owned_id = try self.allocator.dupe(u8, tool_call_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_arguments = try self.allocator.dupe(u8, arguments_json);
+        errdefer self.allocator.free(owned_arguments);
+
+        inference.text.shrinkRetainingCapacity(inference.open_part_offset);
+        const snapshot = try self.snapshotIfDue(inference, true);
+        errdefer if (snapshot) |messages| {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+
+        inference.open_part = null;
+        try self.pushScoped(inference, .{ .inference_part_ended = .{
+            .part_index = part_index,
+            .part_kind = .tool_call,
+            .tool_call = .{
+                .tool_call_id = owned_id,
+                .name = owned_name,
+                .arguments_json = owned_arguments,
+            },
+            .snapshot = snapshot,
+        } });
+    }
+
     pub fn settleCompleted(
         self: *Self,
         inference_id: []const u8,
