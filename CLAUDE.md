@@ -160,8 +160,13 @@ is infallible — `cloneModelDescriptor` in `zig/src/protocol/model_catalog_type
 reference shape, and `std.testing.checkAllAllocationFailures` is how a fix is proved. The check
 scans only non-`test` code and only `dupe`/`dupeZ`/`allocSentinel`/`allocPrint`/`owned(` calls, so
 it is a floor rather than a complete detector: the sibling shapes it does **not** see are an
-`errdefer` that frees a container without its contents, and a fully-built value dropped in a
-hand-off such as `try list.append(allocator, try build(allocator))`. `known_multi_alloc_literals`
+`errdefer` that frees a container without its contents, a fully-built value dropped in a
+hand-off such as `try list.append(allocator, try build(allocator))`, and an `errdefer` left armed
+after a successful ownership transfer, where a later `try` in the same scope frees what the new
+owner will free again. That last one is the most common defect in this tree — six instances on the
+`model-provider-core` branch alone — and the thing that finds it is not this script but
+`std.testing.checkAllAllocationFailures` over the allocating function, which aborts inside the
+owner's `deinit`. Any function that allocates and then hands off ownership should have one. `known_multi_alloc_literals`
 declares the 41 sites that predate the check. It is a shrinking backlog, not an approved list:
 adding an entry needs a commit-message reason why that literal cannot leak, and the check also
 fails when a declared entry disappears, so fixing one requires removing its line.
