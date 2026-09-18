@@ -656,6 +656,7 @@ pub const CredentialChannel = struct {
 };
 
 pub const CredentialGrantResponse = struct {
+    accepted: bool,
     credential_ref: ?[]const u8 = null,
     expires_at_ms: ?i64 = null,
     err: ?ProtocolError = null,

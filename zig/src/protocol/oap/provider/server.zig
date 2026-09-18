@@ -237,6 +237,7 @@ pub const Server = struct {
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
+                .accepted = true,
                 .credential_ref = echoed,
                 .expires_at_ms = expires_at,
             } },
@@ -263,6 +264,7 @@ pub const Server = struct {
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
+                .accepted = false,
                 .err = .{ .code = .credential_rejected, .message = owned_message },
             } },
         };
@@ -560,6 +562,7 @@ pub const Server = struct {
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
+                .accepted = true,
                 .credential_ref = echoed,
                 .expires_at_ms = expires_at,
             } },
@@ -585,6 +588,7 @@ pub const Server = struct {
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
+                .accepted = false,
                 .err = .{ .code = code, .message = owned_message },
             } },
         };
@@ -2298,4 +2302,3 @@ test "a nonce already in flight is refused rather than opening a second channel"
     );
     try std.testing.expectEqual(@as(usize, 1), server.pending_grants.items.len);
 }
-

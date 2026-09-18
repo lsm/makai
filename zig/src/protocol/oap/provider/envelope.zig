@@ -216,6 +216,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
         },
         .provider_credential_grant_response => |value| {
             try w.beginObject();
+            try w.writeBoolField("accepted", value.accepted);
             if (value.credential_ref) |ref| try w.writeStringField("credential_ref", ref);
             if (value.expires_at_ms) |expiry| try w.writeIntField("expires_at_ms", expiry);
             if (value.err) |err| {
@@ -693,6 +694,7 @@ fn deserializePayload(
             return types.Payload{ .provider_credential_grant_channel = .{ .nonce = nonce, .channel = channel } };
         },
         .provider_credential_grant_response => {
+            const accepted = try oap_envelope.requiredBool(obj, "accepted");
             const credential_ref = try oap_envelope.optionalOwnedString(obj, "credential_ref", allocator);
             errdefer if (credential_ref) |value| allocator.free(value);
             const expires_at_ms = try oap_envelope.optionalInteger(obj, "expires_at_ms");
@@ -700,7 +702,10 @@ fn deserializePayload(
             if (obj.get("error")) |error_value| {
                 err = try deserializeProtocolError(error_value, allocator);
             }
+            if (accepted and credential_ref == null) return DecodeError.MissingField;
+            if (!accepted and credential_ref != null) return DecodeError.InvalidField;
             return types.Payload{ .provider_credential_grant_response = .{
+                .accepted = accepted,
                 .credential_ref = credential_ref,
                 .expires_at_ms = expires_at_ms,
                 .err = err,
