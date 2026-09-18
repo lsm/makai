@@ -889,14 +889,14 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     try server.sequence_counters.ensureUnusedCapacity(1);
     try server.expected_sequences.ensureUnusedCapacity(1);
 
+    var effective_model = try modelWithProtocolDefaults(server, request.model);
+    defer effective_model.deinit(server.allocator);
+
     const cancelled = try server.allocator.create(std.atomic.Value(bool));
     cancelled.* = std.atomic.Value(bool).init(false);
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
     const options_with_cancel = injectServerOptions(request.options, cancel_token);
-
-    var effective_model = try modelWithProtocolDefaults(server, request.model);
-    defer effective_model.deinit(server.allocator);
 
     server.provider_thread_abandoned = false;
     const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
