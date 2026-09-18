@@ -148,6 +148,13 @@ full queue lifetime yet (the Anthropic direct path frees its delta storage when
 its producer thread exits — #192). Owned events remove that race at the cost of
 one deep copy per event.
 
+Anthropic reads the flag rather than only being built by it: when the stream
+clones on push it frees each parsed delta immediately, since the queued event
+holds a copy, and only the borrowed configuration defers to thread exit. So the
+#192 window exists exactly where the flag is off, and asking for owned events
+both removes it and stops the provider holding every delta string until the
+stream ends.
+
 ## Completion is `wait()` → `null` → result, not a `done` event
 
 The `done` variant of `AssistantMessageEvent` exists, but providers are not

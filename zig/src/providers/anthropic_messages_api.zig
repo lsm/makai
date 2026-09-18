@@ -1095,6 +1095,19 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8, mode
     return out;
 }
 
+fn retireDeltaSlice(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList([]const u8),
+    stream_clones_events: bool,
+    slice: []const u8,
+) void {
+    if (stream_clones_events) {
+        allocator.free(slice);
+        return;
+    }
+    pending.append(allocator, slice) catch {};
+}
+
 fn runThread(ctx: *ThreadCtx) void {
     const allocator = ctx.allocator;
     const stream = ctx.stream;
@@ -1339,6 +1352,7 @@ fn runThread(ctx: *ThreadCtx) void {
         for (pending_delta_frees.items) |s| allocator.free(s);
         pending_delta_frees.deinit(allocator);
     }
+    const stream_clones_events = stream.owns_events and stream.clone_event_fn != null;
 
     var raw_body = std.ArrayList(u8).empty;
     defer raw_body.deinit(allocator);
@@ -1440,8 +1454,8 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .partial = createPartialMessage(model),
                             } });
 
-                            pending_delta_frees.append(allocator, cbs.tool_id) catch {};
-                            pending_delta_frees.append(allocator, cbs.tool_name) catch {};
+                            retireDeltaSlice(allocator, &pending_delta_frees, stream_clones_events, cbs.tool_id);
+                            retireDeltaSlice(allocator, &pending_delta_frees, stream_clones_events, cbs.tool_name);
                         },
                     }
 
@@ -1455,12 +1469,12 @@ fn runThread(ctx: *ThreadCtx) void {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
                                 _ = stream.pushBlocking(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } });
-                                pending_delta_frees.append(allocator, txt) catch {};
+                                retireDeltaSlice(allocator, &pending_delta_frees, stream_clones_events, txt);
                             },
                             .thinking => |thk| {
                                 current_thinking.appendSlice(allocator, thk) catch {};
                                 _ = stream.pushBlocking(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } });
-                                pending_delta_frees.append(allocator, thk) catch {};
+                                retireDeltaSlice(allocator, &pending_delta_frees, stream_clones_events, thk);
                             },
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
@@ -1476,7 +1490,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .partial = createPartialMessage(model),
                                     } });
                                 }
-                                pending_delta_frees.append(allocator, json_delta) catch {};
+                                retireDeltaSlice(allocator, &pending_delta_frees, stream_clones_events, json_delta);
                             },
                         }
                     } else {
@@ -2305,59 +2319,59 @@ const MockAnthropicServer = struct {
     }
 };
 
-test "a streamed tool call frees the id and name it hands the consumer" {
+test "a streamed tool call frees the id and name it hands the consumer, cloned or borrowed" {
     const allocator = std.testing.allocator;
 
-    var mock = try MockAnthropicServer.listen(MockAnthropicServer.complete_stream);
-    var stopped = false;
-    defer if (!stopped) mock.stop();
+    for ([_]bool{ false, true }) |owned_events| {
+        var mock = try MockAnthropicServer.listen(MockAnthropicServer.complete_stream);
+        var stopped = false;
+        defer if (!stopped) mock.stop();
 
-    const base_url = try mock.baseUrl(allocator);
-    defer allocator.free(base_url);
+        const base_url = try mock.baseUrl(allocator);
+        defer allocator.free(base_url);
 
-    try mock.start();
+        try mock.start();
 
-    const stream = try streamAnthropicMessages(
-        regressionModel("anthropic-messages", "anthropic", base_url),
-        regressionContext(),
-        .{
-            .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
-            .requires_owned_stream_events = true,
-        },
-        allocator,
-    );
-    defer {
-        stream.deinit();
-        allocator.destroy(stream);
-    }
-
-    var tool_calls_started: usize = 0;
-    while (stream.wait()) |event| {
-        var owned = event;
-        defer ai_types.deinitAssistantMessageEvent(allocator, &owned);
-        switch (owned) {
-            .toolcall_start => |call| {
-                tool_calls_started += 1;
-                try std.testing.expectEqualStrings("toolu_01LEAKCHECK", call.id);
-                try std.testing.expectEqualStrings("bash", call.name);
+        const stream = try streamAnthropicMessages(
+            regressionModel("anthropic-messages", "anthropic", base_url),
+            regressionContext(),
+            .{
+                .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
+                .requires_owned_stream_events = owned_events,
             },
-            else => {},
+            allocator,
+        );
+        defer {
+            stream.deinit();
+            allocator.destroy(stream);
         }
+
+        var tool_calls_started: usize = 0;
+        while (stream.wait()) |event| {
+            var polled = event;
+            defer if (owned_events) ai_types.deinitAssistantMessageEvent(allocator, &polled);
+            if (polled != .toolcall_start) continue;
+            tool_calls_started += 1;
+            if (owned_events) {
+                try std.testing.expectEqualStrings("toolu_01LEAKCHECK", polled.toolcall_start.id);
+                try std.testing.expectEqualStrings("bash", polled.toolcall_start.name);
+            }
+        }
+
+        try std.testing.expect(stream.waitForThread(5_000));
+        mock.stop();
+        stopped = true;
+
+        try std.testing.expect(mock.saw_messages_path.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), tool_calls_started);
+        try std.testing.expect(stream.getError() == null);
+
+        const result = stream.getResult() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), result.content.len);
+        try std.testing.expectEqualStrings("toolu_01LEAKCHECK", result.content[0].tool_call.id);
+        try std.testing.expectEqualStrings("bash", result.content[0].tool_call.name);
+        try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result.content[0].tool_call.arguments_json);
     }
-
-    try std.testing.expect(stream.waitForThread(5_000));
-    mock.stop();
-    stopped = true;
-
-    try std.testing.expect(mock.saw_messages_path.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), tool_calls_started);
-    try std.testing.expect(stream.getError() == null);
-
-    const result = stream.getResult() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    try std.testing.expectEqualStrings("toolu_01LEAKCHECK", result.content[0].tool_call.id);
-    try std.testing.expectEqualStrings("bash", result.content[0].tool_call.name);
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result.content[0].tool_call.arguments_json);
 }
 
 test "a response ending mid event frees what the tail flush parses and drops" {
