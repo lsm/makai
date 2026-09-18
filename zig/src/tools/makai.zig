@@ -6675,7 +6675,18 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
     }
 }
 
-const OAP_PROVIDER_STREAM_TIMEOUT_MS: i64 = 120_000;
+const OAP_PROVIDER_STREAM_IDLE_TTL_DEFAULT_MS: i64 = 120_000;
+
+fn oapProviderStreamIdleTtlMs(allocator: std.mem.Allocator) i64 {
+    const raw = provider_base_url.envOwnedOrNull(allocator, "MAKAI_OAP_PROVIDER_STREAM_IDLE_TTL_MS") catch
+        return OAP_PROVIDER_STREAM_IDLE_TTL_DEFAULT_MS;
+    const value = raw orelse return OAP_PROVIDER_STREAM_IDLE_TTL_DEFAULT_MS;
+    defer allocator.free(value);
+    const parsed = std.fmt.parseInt(i64, std.mem.trim(u8, value, " \t\r\n"), 10) catch
+        return OAP_PROVIDER_STREAM_IDLE_TTL_DEFAULT_MS;
+    if (parsed < 0) return OAP_PROVIDER_STREAM_IDLE_TTL_DEFAULT_MS;
+    return parsed;
+}
 
 const RunningOapInference = struct {
     inference_id: []const u8,
@@ -6683,7 +6694,7 @@ const RunningOapInference = struct {
     context: ai_types.Context,
     model: ai_types.Model,
     cancelled: *std.atomic.Value(bool),
-    started_at_ms: i64,
+    last_progress_ms: i64,
 
     fn deinit(self: *RunningOapInference, allocator: std.mem.Allocator) void {
         self.cancelled.store(true, .release);
@@ -6761,7 +6772,7 @@ fn startOapInference(
         .context = context,
         .model = model,
         .cancelled = cancelled,
-        .started_at_ms = compat.time.nowMillis(),
+        .last_progress_ms = compat.time.nowMillis(),
     };
     errdefer entry.deinit(allocator);
 
@@ -6773,6 +6784,7 @@ fn pumpOapInferences(
     allocator: std.mem.Allocator,
     server: *oap_provider_server.Server,
     running: *std.ArrayList(RunningOapInference),
+    idle_ttl_ms: i64,
 ) !bool {
     var did_work = false;
     var index: usize = 0;
@@ -6784,12 +6796,13 @@ fn pumpOapInferences(
             if (inference.cancel_requested) entry.cancelled.store(true, .release);
         }
 
-        if (compat.time.nowMillis() - entry.started_at_ms > OAP_PROVIDER_STREAM_TIMEOUT_MS) {
+        if (idle_ttl_ms > 0 and compat.time.nowMillis() - entry.last_progress_ms > idle_ttl_ms) {
             entry.cancelled.store(true, .release);
         }
 
         while (entry.stream.poll()) |event| {
             did_work = true;
+            entry.last_progress_ms = compat.time.nowMillis();
             defer entry.stream.releaseEvent(event);
             oap_provider_runtime.pumpEvent(server, entry.inference_id, event) catch {};
             if (event == .done or event == .@"error") settled = true;
@@ -7007,6 +7020,8 @@ fn runOapProviderMode(
     });
     defer server.deinit();
 
+    const idle_ttl_ms = oapProviderStreamIdleTtlMs(allocator);
+
     var running = std.ArrayList(RunningOapInference).empty;
     defer {
         for (running.items) |*entry| entry.deinit(allocator);
@@ -7044,7 +7059,7 @@ fn runOapProviderMode(
             did_work = true;
         }
 
-        if (try pumpOapInferences(allocator, &server, &running)) did_work = true;
+        if (try pumpOapInferences(allocator, &server, &running, idle_ttl_ms)) did_work = true;
 
         if (try drainOapProviderOutbound(stdout, allocator, &server)) did_work = true;
 

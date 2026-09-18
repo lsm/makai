@@ -735,7 +735,36 @@ pub const Server = struct {
             self.allocator.free(messages);
         }
 
-        try self.active.append(self.allocator, .{
+        const queued = try self.allocator.dupe(u8, inference_id);
+        errdefer self.allocator.free(queued);
+
+        const line = blk: {
+            const id = try self.nextId();
+            errdefer self.allocator.free(id);
+            const reply = try self.allocator.dupe(u8, env.id);
+            errdefer self.allocator.free(reply);
+            const scope = try self.allocator.dupe(u8, inference_id);
+            errdefer self.allocator.free(scope);
+
+            var response = types.Envelope{
+                .id = id,
+                .in_reply_to = reply,
+                .inference_id = scope,
+                .payload = .{ .inference_create_response = .{
+                    .accepted = true,
+                    .honoured = honoured,
+                } },
+            };
+            defer response.deinit(self.allocator);
+            break :blk try envelope.serializeEnvelope(response, self.allocator);
+        };
+        errdefer self.allocator.free(line);
+
+        try self.active.ensureUnusedCapacity(self.allocator, 1);
+        try self.pending_starts.ensureUnusedCapacity(self.allocator, 1);
+        try self.outbound.ensureUnusedCapacity(self.allocator, 1);
+
+        self.active.appendAssumeCapacity(.{
             .id = inference_id,
             .model_ref = model_ref,
             .messages = messages,
@@ -745,29 +774,8 @@ pub const Server = struct {
             .closed_parts = std.ArrayList(oap_types.ContentPart).empty,
             .text = std.ArrayList(u8).empty,
         });
-
-        const queued = try self.allocator.dupe(u8, inference_id);
-        errdefer self.allocator.free(queued);
-        try self.pending_starts.append(self.allocator, queued);
-
-        const id = try self.nextId();
-        errdefer self.allocator.free(id);
-        const reply = try self.allocator.dupe(u8, env.id);
-        errdefer self.allocator.free(reply);
-        const scope = try self.allocator.dupe(u8, inference_id);
-        errdefer self.allocator.free(scope);
-
-        var response = types.Envelope{
-            .id = id,
-            .in_reply_to = reply,
-            .inference_id = scope,
-            .payload = .{ .inference_create_response = .{
-                .accepted = true,
-                .honoured = honoured,
-            } },
-        };
-        defer response.deinit(self.allocator);
-        try self.push(response);
+        self.pending_starts.appendAssumeCapacity(queued);
+        self.outbound.appendAssumeCapacity(line);
     }
 
     pub fn findInference(self: *Self, id: []const u8) ?*ActiveInference {
@@ -888,13 +896,18 @@ pub const Server = struct {
         const owned_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_name) |value| self.allocator.free(value);
 
+        const next_tool_call_id = if (tool_call_id) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (next_tool_call_id) |value| self.allocator.free(value);
+        const next_tool_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (next_tool_name) |value| self.allocator.free(value);
+
         inference.open_part = part_index;
         inference.open_part_kind = part_kind;
         inference.text.clearRetainingCapacity();
         if (inference.open_tool_call_id) |value| self.allocator.free(value);
         if (inference.open_tool_name) |value| self.allocator.free(value);
-        inference.open_tool_call_id = if (tool_call_id) |value| try self.allocator.dupe(u8, value) else null;
-        inference.open_tool_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
+        inference.open_tool_call_id = next_tool_call_id;
+        inference.open_tool_name = next_tool_name;
         try self.pushScoped(inference, .{ .inference_part_started = .{
             .part_index = part_index,
             .part_kind = part_kind,
@@ -955,12 +968,15 @@ pub const Server = struct {
             self.allocator.free(messages);
         };
 
+        var closed_transferred = false;
         const closed_text = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(closed_text);
-        try inference.closed_parts.append(self.allocator, switch (part_kind) {
+        errdefer if (!closed_transferred) self.allocator.free(closed_text);
+        try inference.closed_parts.ensureUnusedCapacity(self.allocator, 1);
+        inference.closed_parts.appendAssumeCapacity(switch (part_kind) {
             .reasoning => .{ .reasoning = closed_text },
             else => .{ .text = closed_text },
         });
+        closed_transferred = true;
 
         inference.open_part = null;
         try self.pushScoped(inference, .{ .inference_part_ended = .{
@@ -995,17 +1011,20 @@ pub const Server = struct {
         const owned_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_carry) |value| self.allocator.free(value);
 
+        var closed_transferred = false;
         const closed_id = try self.allocator.dupe(u8, tool_call_id);
-        errdefer self.allocator.free(closed_id);
+        errdefer if (!closed_transferred) self.allocator.free(closed_id);
         const closed_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(closed_name);
+        errdefer if (!closed_transferred) self.allocator.free(closed_name);
         const closed_arguments = try self.allocator.dupe(u8, arguments_json);
-        errdefer self.allocator.free(closed_arguments);
-        try inference.closed_parts.append(self.allocator, .{ .tool_call = .{
+        errdefer if (!closed_transferred) self.allocator.free(closed_arguments);
+        try inference.closed_parts.ensureUnusedCapacity(self.allocator, 1);
+        inference.closed_parts.appendAssumeCapacity(.{ .tool_call = .{
             .tool_call_id = closed_id,
             .name = closed_name,
             .arguments_json = closed_arguments,
         } });
+        closed_transferred = true;
 
         inference.text.clearRetainingCapacity();
         const snapshot = try self.snapshotIfDue(inference, true);
