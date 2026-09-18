@@ -66,6 +66,14 @@ pub fn mapCompatibility(compat: ?ai_types.OpenAICompatOptions) CompatibilityMapp
     return .{ .facts = facts, .usage_in_streaming_undecidable = undecidable };
 }
 
+pub fn thinkingSignature(partial: ai_types.AssistantMessage, content_index: usize) ?[]const u8 {
+    if (content_index >= partial.content.len) return null;
+    return switch (partial.content[content_index]) {
+        .thinking => |thinking| thinking.thinking_signature,
+        else => null,
+    };
+}
+
 pub fn pumpEvent(
     server: *Server,
     inference_id: []const u8,
@@ -104,11 +112,12 @@ pub fn pumpEvent(
             @intCast(value.content_index),
             value.delta,
         ),
-        .thinking_end => |value| try server.notePartEndedText(
+        .thinking_end => |value| try server.notePartEndedTextWithCarry(
             inference_id,
             @intCast(value.content_index),
             .reasoning,
             value.content,
+            thinkingSignature(value.partial, value.content_index),
         ),
         .toolcall_start => |value| try server.notePartStarted(
             inference_id,
@@ -128,6 +137,7 @@ pub fn pumpEvent(
             value.tool_call.id,
             value.tool_call.name,
             value.tool_call.arguments_json,
+            value.tool_call.thought_signature,
         ),
         .done => |value| try server.settleCompleted(
             inference_id,
@@ -334,4 +344,97 @@ test "a keepalive does not consume a sequence number" {
     try pumpEvent(&server, inference_id, .keepalive);
     try std.testing.expect(server.popOutbound() == null);
     try std.testing.expectEqual(@as(u64, 1), server.findInference(inference_id).?.next_sequence);
+}
+
+test "an opaque carry survives the round trip on both kinds that can hold one" {
+    const allocator = std.testing.allocator;
+    var server = try scriptedServer(allocator);
+    defer server.deinit();
+
+    const inference_id = try acceptInference(allocator, &server);
+    defer allocator.free(inference_id);
+
+    const thinking_content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "ponder", .thinking_signature = "sig-reasoning" } },
+    };
+    const partial = ai_types.AssistantMessage{
+        .content = &thinking_content,
+        .api = "google-generative-ai",
+        .provider = "google",
+        .model = "m",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    try pumpEvent(&server, inference_id, .{ .thinking_start = .{ .content_index = 0, .partial = partial } });
+    try pumpEvent(&server, inference_id, .{ .thinking_end = .{
+        .content_index = 0,
+        .content = "ponder",
+        .partial = partial,
+    } });
+    try pumpEvent(&server, inference_id, .{ .toolcall_start = .{
+        .content_index = 1,
+        .id = "call_1",
+        .name = "search",
+        .partial = partial,
+    } });
+    try pumpEvent(&server, inference_id, .{ .toolcall_end = .{
+        .content_index = 1,
+        .tool_call = .{
+            .id = "call_1",
+            .name = "search",
+            .arguments_json = "{}",
+            .thought_signature = "sig-toolcall",
+        },
+        .partial = partial,
+    } });
+
+    var reasoning_carry: ?[]const u8 = null;
+    var tool_carry: ?[]const u8 = null;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .inference_part_ended => |ended| {
+                const carry = ended.carry orelse continue;
+                switch (ended.part_kind) {
+                    .reasoning => reasoning_carry = try allocator.dupe(u8, carry),
+                    .tool_call => tool_carry = try allocator.dupe(u8, carry),
+                    .text => unreachable,
+                }
+            },
+            else => {},
+        }
+    }
+    defer if (reasoning_carry) |value| allocator.free(value);
+    defer if (tool_carry) |value| allocator.free(value);
+
+    try std.testing.expectEqualStrings("sig-reasoning", reasoning_carry.?);
+    try std.testing.expectEqualStrings("sig-toolcall", tool_carry.?);
+}
+
+test "a text part cannot carry an opaque value at either end of the wire" {
+    const allocator = std.testing.allocator;
+    var server = try scriptedServer(allocator);
+    defer server.deinit();
+
+    const inference_id = try acceptInference(allocator, &server);
+    defer allocator.free(inference_id);
+
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try std.testing.expectError(
+        error.CarryRefusedOnText,
+        server.notePartEndedTextWithCarry(inference_id, 0, .text, "hi", "sig"),
+    );
+
+    const line =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.part.ended\",\"id\":\"m1\",\"inference_id\":\"i1\",\"sequence\":1," ++
+        "\"payload\":{\"part_index\":0,\"part_kind\":\"text\",\"text\":\"hi\",\"carry\":\"sig\"}}";
+    try std.testing.expectError(
+        envelope.DecodeError.InvalidField,
+        envelope.deserializeEnvelope(line, allocator),
+    );
 }

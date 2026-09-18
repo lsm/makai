@@ -568,10 +568,12 @@ pub const PartEnded = struct {
     part_kind: PartKind,
     text: ?[]const u8 = null,
     tool_call: ?ToolCallPart = null,
+    carry: ?[]const u8 = null,
     snapshot: ?[]Message = null,
 
     pub fn deinit(self: *PartEnded, allocator: std.mem.Allocator) void {
         if (self.text) |value| allocator.free(value);
+        if (self.carry) |value| allocator.free(value);
         if (self.tool_call) |*value| value.deinit(allocator);
         if (self.snapshot) |messages| {
             for (messages) |*message| message.deinit(allocator);

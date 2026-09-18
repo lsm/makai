@@ -575,16 +575,30 @@ pub const Server = struct {
     }
 
     pub fn notePartEndedText(self: *Self, inference_id: []const u8, part_index: u32, part_kind: types.PartKind, text: []const u8) !void {
+        return self.notePartEndedTextWithCarry(inference_id, part_index, part_kind, text, null);
+    }
+
+    pub fn notePartEndedTextWithCarry(
+        self: *Self,
+        inference_id: []const u8,
+        part_index: u32,
+        part_kind: types.PartKind,
+        text: []const u8,
+        carry: ?[]const u8,
+    ) !void {
         const inference = self.findInference(inference_id) orelse return error.UnknownInference;
         const open = inference.open_part orelse return error.NoOpenPart;
         if (open != part_index) return error.PartIndexMismatch;
         if (part_kind == .tool_call) return error.ToolCallNeedsCompleteCall;
+        if (carry != null and part_kind == .text) return error.CarryRefusedOnText;
 
         inference.text.shrinkRetainingCapacity(inference.open_part_offset);
         try inference.text.appendSlice(self.allocator, text);
 
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
+        const owned_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_carry) |value| self.allocator.free(value);
         const snapshot = try self.snapshotIfDue(inference, true);
         errdefer if (snapshot) |messages| {
             for (messages) |*message| message.deinit(self.allocator);
@@ -596,6 +610,7 @@ pub const Server = struct {
             .part_index = part_index,
             .part_kind = part_kind,
             .text = owned_text,
+            .carry = owned_carry,
             .snapshot = snapshot,
         } });
     }
@@ -607,6 +622,7 @@ pub const Server = struct {
         tool_call_id: []const u8,
         name: []const u8,
         arguments_json: []const u8,
+        carry: ?[]const u8,
     ) !void {
         const inference = self.findInference(inference_id) orelse return error.UnknownInference;
         const open = inference.open_part orelse return error.NoOpenPart;
@@ -619,6 +635,9 @@ pub const Server = struct {
         const owned_arguments = try self.allocator.dupe(u8, arguments_json);
         errdefer self.allocator.free(owned_arguments);
 
+        const owned_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_carry) |value| self.allocator.free(value);
+
         inference.text.shrinkRetainingCapacity(inference.open_part_offset);
         const snapshot = try self.snapshotIfDue(inference, true);
         errdefer if (snapshot) |messages| {
@@ -630,6 +649,7 @@ pub const Server = struct {
         try self.pushScoped(inference, .{ .inference_part_ended = .{
             .part_index = part_index,
             .part_kind = .tool_call,
+            .carry = owned_carry,
             .tool_call = .{
                 .tool_call_id = owned_id,
                 .name = owned_name,

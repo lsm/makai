@@ -297,6 +297,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
                 try oap_envelope.writeJsonValueOrString(w, call.arguments_json);
                 try w.endObject();
             }
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
             if (value.snapshot) |messages| try writeMessageArray(w, "snapshot", messages);
             try w.endObject();
         },
@@ -653,12 +654,17 @@ fn deserializePayload(
                 },
             }
 
+            const carry = try oap_envelope.optionalOwnedString(obj, "carry", allocator);
+            errdefer if (carry) |value| allocator.free(value);
+            if (carry != null and part_kind == .text) return DecodeError.InvalidField;
+
             const snapshot = try deserializeMessageArray(obj, "snapshot", allocator);
             return types.Payload{ .inference_part_ended = .{
                 .part_index = part_index,
                 .part_kind = part_kind,
                 .text = text,
                 .tool_call = tool_call,
+                .carry = carry,
                 .snapshot = snapshot,
             } };
         },
