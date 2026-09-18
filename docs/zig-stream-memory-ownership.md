@@ -162,6 +162,17 @@ result signal — some producers mark the thread done *before* publishing the
 final result. Gate on `wait()` → `null` (blocking) or `isDone()` plus a drained
 queue (polling), then read `getError()` / `cloneResult()`.
 
+Nor is it uniformly a *cleanup* signal. Anthropic Messages, Ollama and Azure
+OpenAI Responses defer the mark to thread exit, so `waitForThread()` returning
+true there means every allocation the producer thread owned has been freed.
+OpenAI Completions, OpenAI Responses, Google Generative and Google Vertex still
+mark on each return path, ahead of the function's own `defer`s, so their threads
+are still freeing buffers after the mark. A test that drives one of those four
+with a leak-checking allocator can observe an allocation that is about to be
+freed and report it as a leak; that is a race in the mark, not in the provider.
+Anthropic was in that group until the tool-call leak tests needed a barrier that
+meant what it said.
+
 ## A stream is never freed underneath a live producer thread
 
 `wait_for_thread_on_deinit` makes `deinit()` join the producer before tearing

@@ -1098,6 +1098,7 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8, mode
 fn runThread(ctx: *ThreadCtx) void {
     const allocator = ctx.allocator;
     const stream = ctx.stream;
+    defer stream.markThreadDone();
     const model = ctx.model;
     const api_key = ctx.api_key;
     const request_body = ctx.request_body;
@@ -1114,7 +1115,6 @@ fn runThread(ctx: *ThreadCtx) void {
         if (ct.isCancelled()) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
     }
@@ -1125,7 +1125,6 @@ fn runThread(ctx: *ThreadCtx) void {
     const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/messages") catch {
         ctx.deinit();
         stream.completeWithError("oom building url");
-        stream.markThreadDone();
         return;
     };
     defer allocator.free(url);
@@ -1133,14 +1132,12 @@ fn runThread(ctx: *ThreadCtx) void {
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
         stream.completeWithError("invalid anthropic URL");
-        stream.markThreadDone();
         return;
     };
 
     var header_set = buildAnthropicHeaders(allocator, api_key, model.headers) catch {
         ctx.deinit();
         stream.completeWithError("oom headers");
-        stream.markThreadDone();
         return;
     };
     defer header_set.deinit(allocator);
@@ -1164,7 +1161,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (ct.isCancelled()) {
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
         }
@@ -1177,7 +1173,6 @@ fn runThread(ctx: *ThreadCtx) void {
         if (testCancelAt(cancel_token, .connect_setup)) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
 
@@ -1193,12 +1188,10 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("request open failed");
-            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -1212,19 +1205,16 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("request send failed");
-            stream.markThreadDone();
             return;
         };
 
         if (testCancelAt(cancel_token, .response_headers)) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
 
@@ -1237,12 +1227,10 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("response failed");
-            stream.markThreadDone();
             return;
         };
 
@@ -1287,7 +1275,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
 
@@ -1315,7 +1302,6 @@ fn runThread(ctx: *ThreadCtx) void {
 
         ctx.deinit();
         stream.completeWithError(last_error orelse "anthropic request failed");
-        stream.markThreadDone();
         return;
     }
 
@@ -1379,7 +1365,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (ct.isCancelled()) {
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
         }
@@ -1387,14 +1372,12 @@ fn runThread(ctx: *ThreadCtx) void {
         if (testCancelAt(cancel_token, .between_sse_events)) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
 
         const n = compat.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
             stream.completeWithError("read error");
-            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
@@ -1402,7 +1385,6 @@ fn runThread(ctx: *ThreadCtx) void {
         if (testCancelAt(cancel_token, .mid_event_payload)) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
 
@@ -1414,7 +1396,6 @@ fn runThread(ctx: *ThreadCtx) void {
         const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
             stream.completeWithError(sse_parser.errorMessage(err));
-            stream.markThreadDone();
             return;
         };
 
@@ -1422,7 +1403,6 @@ fn runThread(ctx: *ThreadCtx) void {
             const result = parseAnthropicEventType(ev.data, allocator) catch {
                 ctx.deinit();
                 stream.completeWithError("event parse error");
-                stream.markThreadDone();
                 return;
             };
 
@@ -1514,14 +1494,12 @@ fn runThread(ctx: *ThreadCtx) void {
                                 const text_copy = allocator.dupe(u8, current_text.items) catch {
                                     ctx.deinit();
                                     stream.completeWithError("oom text");
-                                    stream.markThreadDone();
                                     return;
                                 };
                                 content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
                                     allocator.free(text_copy);
                                     ctx.deinit();
                                     stream.completeWithError("oom text");
-                                    stream.markThreadDone();
                                     return;
                                 };
 
@@ -1531,7 +1509,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                 const thinking_copy = allocator.dupe(u8, current_thinking.items) catch {
                                     ctx.deinit();
                                     stream.completeWithError("oom thinking");
-                                    stream.markThreadDone();
                                     return;
                                 };
                                 const sig_copy = if (current_thinking_signature.items.len > 0)
@@ -1547,7 +1524,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                     if (sig_copy) |sig| allocator.free(sig);
                                     ctx.deinit();
                                     stream.completeWithError("oom thinking");
-                                    stream.markThreadDone();
                                     return;
                                 };
 
@@ -1560,7 +1536,6 @@ fn runThread(ctx: *ThreadCtx) void {
                                         ai_types.deinitToolCall(allocator, &orphan);
                                         ctx.deinit();
                                         stream.completeWithError("oom tool call");
-                                        stream.markThreadDone();
                                         return;
                                     };
 
@@ -1584,7 +1559,6 @@ fn runThread(ctx: *ThreadCtx) void {
                     defer allocator.free(err);
                     ctx.deinit();
                     stream.completeWithError(err);
-                    stream.markThreadDone();
                     return;
                 },
             }
@@ -1595,7 +1569,6 @@ fn runThread(ctx: *ThreadCtx) void {
         const tail = parser.feed("\n\n") catch |err| {
             ctx.deinit();
             stream.completeWithError(sse_parser.errorMessage(err));
-            stream.markThreadDone();
             return;
         };
         for (tail) |ev| {
@@ -1604,7 +1577,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (result == .api_error) {
                 ctx.deinit();
                 stream.completeWithError(result.api_error);
-                stream.markThreadDone();
                 return;
             }
         }
@@ -1617,14 +1589,12 @@ fn runThread(ctx: *ThreadCtx) void {
         const text_copy = allocator.dupe(u8, current_text.items) catch {
             ctx.deinit();
             stream.completeWithError("oom text");
-            stream.markThreadDone();
             return;
         };
         content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {
             allocator.free(text_copy);
             ctx.deinit();
             stream.completeWithError("oom text");
-            stream.markThreadDone();
             return;
         };
     }
@@ -1663,14 +1633,12 @@ fn runThread(ctx: *ThreadCtx) void {
 
         ctx.deinit();
         stream.completeWithError(err_text);
-        stream.markThreadDone();
         return;
     }
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
         ctx.deinit();
         stream.completeWithError("oom content");
-        stream.markThreadDone();
         return;
     };
 
@@ -1679,19 +1647,16 @@ fn runThread(ctx: *ThreadCtx) void {
         .api = allocator.dupe(u8, model.api) catch {
             ctx.deinit();
             stream.completeWithError("oom");
-            stream.markThreadDone();
             return;
         },
         .provider = allocator.dupe(u8, model.provider) catch {
             ctx.deinit();
             stream.completeWithError("oom");
-            stream.markThreadDone();
             return;
         },
         .model = allocator.dupe(u8, model.id) catch {
             ctx.deinit();
             stream.completeWithError("oom");
-            stream.markThreadDone();
             return;
         },
         .usage = usage,
@@ -1703,7 +1668,6 @@ fn runThread(ctx: *ThreadCtx) void {
     ctx.deinit();
 
     stream.complete(out);
-    stream.markThreadDone();
 }
 
 fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
@@ -2212,6 +2176,230 @@ test "a parse result frees every string it duped, so an event nothing consumes c
         const result = try parseAnthropicEventType(data, allocator);
         result.deinit(allocator);
     }
+}
+
+const MockAnthropicServer = struct {
+    server: compat.net.Server,
+    body: []const u8,
+    thread: ?std.Thread = null,
+    served: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_messages_path: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    const sse_events =
+        \\event: message_start
+        \\data: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}
+        \\
+        \\event: content_block_start
+        \\data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01LEAKCHECK","name":"bash"}}
+        \\
+        \\event: content_block_delta
+        \\data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}
+        \\
+        \\event: content_block_delta
+        \\data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}
+        \\
+        \\event: content_block_stop
+        \\data: {"type":"content_block_stop","index":0}
+        \\
+        \\event: message_delta
+        \\data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}
+        \\
+        \\event: message_stop
+        \\data: {"type":"message_stop"}
+    ;
+    const truncated_events =
+        \\event: message_start
+        \\data: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}
+        \\
+        \\event: content_block_start
+        \\data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01LEAKCHECK","name":"bash"}}
+        \\
+        \\event: content_block_delta
+        \\data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}
+    ;
+
+    const complete_stream = sse_events ++ "\n\n";
+    const truncated_stream = truncated_events;
+
+    fn listen(body: []const u8) !MockAnthropicServer {
+        const address = try compat.net.resolveAddress(std.testing.allocator, "127.0.0.1", 0);
+        return .{
+            .server = try compat.net.tcpListen(address, .{ .reuse_address = true }),
+            .body = body,
+        };
+    }
+
+    fn baseUrl(self: *const MockAnthropicServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{compat.net.listenAddress(&self.server).getPort()});
+    }
+
+    fn start(self: *MockAnthropicServer) !void {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *MockAnthropicServer) void {
+        if (self.thread) |thread| {
+            if (!self.served.load(.acquire)) {
+                if (compat.net.tcpConnect(compat.net.listenAddress(&self.server))) |opened| {
+                    var kick = opened;
+                    kick.close();
+                } else |_| {}
+            }
+            thread.join();
+            self.thread = null;
+        }
+        compat.net.closeServer(&self.server);
+    }
+
+    fn contentLength(head: []const u8) ?usize {
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        while (lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t"), 10) catch null;
+            }
+        }
+        return null;
+    }
+
+    fn readHead(stream: *compat.net.Stream, buffer: []u8) !usize {
+        var filled: usize = 0;
+        while (filled < buffer.len) {
+            const read = try stream.read(buffer[filled .. filled + 1]);
+            if (read == 0) return error.EndOfStream;
+            filled += read;
+            if (filled >= 4 and std.mem.eql(u8, buffer[filled - 4 .. filled], "\r\n\r\n")) return filled - 4;
+        }
+        return error.StreamTooLong;
+    }
+
+    fn serve(self: *MockAnthropicServer) void {
+        defer self.served.store(true, .release);
+
+        var conn = compat.net.accept(&self.server) catch return;
+        defer conn.stream.close();
+
+        var request: [16384]u8 = undefined;
+        const head_len = readHead(&conn.stream, &request) catch return;
+        const head = request[0..head_len];
+
+        if (contentLength(head)) |length| {
+            if (length > 0 and length <= request.len) {
+                var body: [16384]u8 = undefined;
+                _ = conn.stream.read(body[0..length]) catch return;
+            }
+        }
+
+        if (std.mem.indexOf(u8, head, "POST /v1/messages ") != null) {
+            self.saw_messages_path.store(true, .release);
+        }
+
+        var head_buffer: [128]u8 = undefined;
+        const response_head = std.fmt.bufPrint(
+            &head_buffer,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{self.body.len},
+        ) catch return;
+
+        conn.stream.writeAll(response_head) catch return;
+        conn.stream.writeAll(self.body) catch return;
+    }
+};
+
+test "a streamed tool call frees the id and name it hands the consumer" {
+    const allocator = std.testing.allocator;
+
+    var mock = try MockAnthropicServer.listen(MockAnthropicServer.complete_stream);
+    var stopped = false;
+    defer if (!stopped) mock.stop();
+
+    const base_url = try mock.baseUrl(allocator);
+    defer allocator.free(base_url);
+
+    try mock.start();
+
+    const stream = try streamAnthropicMessages(
+        regressionModel("anthropic-messages", "anthropic", base_url),
+        regressionContext(),
+        .{
+            .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
+            .requires_owned_stream_events = true,
+        },
+        allocator,
+    );
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var tool_calls_started: usize = 0;
+    while (stream.wait()) |event| {
+        var owned = event;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned);
+        switch (owned) {
+            .toolcall_start => |call| {
+                tool_calls_started += 1;
+                try std.testing.expectEqualStrings("toolu_01LEAKCHECK", call.id);
+                try std.testing.expectEqualStrings("bash", call.name);
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
+    mock.stop();
+    stopped = true;
+
+    try std.testing.expect(mock.saw_messages_path.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), tool_calls_started);
+    try std.testing.expect(stream.getError() == null);
+
+    const result = stream.getResult() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings("toolu_01LEAKCHECK", result.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("bash", result.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result.content[0].tool_call.arguments_json);
+}
+
+test "a response ending mid event frees what the tail flush parses and drops" {
+    const allocator = std.testing.allocator;
+
+    var mock = try MockAnthropicServer.listen(MockAnthropicServer.truncated_stream);
+    var stopped = false;
+    defer if (!stopped) mock.stop();
+
+    const base_url = try mock.baseUrl(allocator);
+    defer allocator.free(base_url);
+
+    try mock.start();
+
+    const stream = try streamAnthropicMessages(
+        regressionModel("anthropic-messages", "anthropic", base_url),
+        regressionContext(),
+        .{
+            .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
+            .requires_owned_stream_events = true,
+        },
+        allocator,
+    );
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var tool_calls_started: usize = 0;
+    while (stream.wait()) |event| {
+        var owned = event;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned);
+        if (owned == .toolcall_start) tool_calls_started += 1;
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
+    mock.stop();
+    stopped = true;
+
+    try std.testing.expect(mock.saw_messages_path.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), tool_calls_started);
+    try std.testing.expect(stream.getError() != null);
 }
 
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
