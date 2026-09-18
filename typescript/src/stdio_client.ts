@@ -74,7 +74,7 @@ export class MakaiStdioClient {
   private sessionFrameQueues = new Map<string, StreamQueueEntry[]>();
   private replyFrameQueues = new Map<string, StreamQueueEntry[]>();
   private activeCorrelates = new Map<string, number>();
-  private correlateDeliveries = new Map<string, { signal: () => void; state: { settled: boolean } }>();
+  private correlateDeliveries = new Map<string, Array<{ signal: () => void; state: { settled: boolean } }>>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
@@ -231,7 +231,8 @@ export class MakaiStdioClient {
       const poke = new Promise<void>((resolve) => {
         signalPoke = resolve;
       });
-      this.correlateDeliveries.set(correlate, { signal: signalPoke, state });
+      const delivery = { signal: signalPoke, state };
+      this.registerCorrelateDelivery(correlate, delivery);
       let winner: StdioFrame | undefined;
       try {
         winner = await Promise.race([
@@ -248,7 +249,7 @@ export class MakaiStdioClient {
         ]);
       } finally {
         state.settled = true;
-        if (this.correlateDeliveries.get(correlate)?.state === state) this.correlateDeliveries.delete(correlate);
+        this.releaseCorrelateDelivery(correlate, delivery);
       }
       if (winner !== undefined) return winner;
       const delivered = this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
@@ -400,7 +401,22 @@ export class MakaiStdioClient {
   private deliverCorrelatedFrame(correlate: string, frame: StdioFrame): void {
     this.enqueueRoutedFrame(this.replyFrameQueues, correlate, frame, correlate);
     const pending = this.correlateDeliveries.get(correlate);
-    if (pending && !pending.state.settled) pending.signal();
+    const waiting = pending?.find((entry) => !entry.state.settled);
+    if (waiting) waiting.signal();
+  }
+
+  private registerCorrelateDelivery(correlate: string, delivery: { signal: () => void; state: { settled: boolean } }): void {
+    const pending = this.correlateDeliveries.get(correlate);
+    if (pending) pending.push(delivery);
+    else this.correlateDeliveries.set(correlate, [delivery]);
+  }
+
+  private releaseCorrelateDelivery(correlate: string, delivery: { signal: () => void; state: { settled: boolean } }): void {
+    const pending = this.correlateDeliveries.get(correlate);
+    if (!pending) return;
+    const index = pending.indexOf(delivery);
+    if (index >= 0) pending.splice(index, 1);
+    if (pending.length === 0) this.correlateDeliveries.delete(correlate);
   }
 
   private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame, replyTo?: string): void {
