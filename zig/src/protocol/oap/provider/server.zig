@@ -813,6 +813,8 @@ pub fn cloneDescriptor(
     errdefer allocator.free(id);
     const display_name = if (descriptor.display_name) |value| try allocator.dupe(u8, value) else null;
     errdefer if (display_name) |value| allocator.free(value);
+    const wire_id = if (descriptor.wire_id) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (wire_id) |value| allocator.free(value);
     const endpoint = try allocator.dupe(u8, descriptor.endpoint);
     errdefer allocator.free(endpoint);
     const headers = try cloneHeaders(allocator, descriptor.headers);
@@ -824,6 +826,7 @@ pub fn cloneDescriptor(
         .id = id,
         .display_name = display_name,
         .wire = descriptor.wire,
+        .wire_id = wire_id,
         .framing = descriptor.framing,
         .endpoint = endpoint,
         .headers = headers,

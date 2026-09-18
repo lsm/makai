@@ -70,6 +70,7 @@ fn writeProviderDescriptor(w: *json_writer.JsonWriter, descriptor: types.Provide
     try w.writeStringField("id", descriptor.id);
     if (descriptor.display_name) |value| try w.writeStringField("display_name", value);
     try w.writeStringField("wire", descriptor.wire.toString());
+    if (descriptor.wire_id) |wire_id| try w.writeStringField("wire_id", wire_id);
     try w.writeStringField("framing", @tagName(descriptor.framing));
     try w.writeStringField("endpoint", descriptor.endpoint);
     if (descriptor.headers.len > 0) try writeHeaders(w, descriptor.headers);
@@ -861,6 +862,9 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
         const display_name = try oap_envelope.optionalOwnedString(descriptor_obj, "display_name", allocator);
         errdefer if (display_name) |value| allocator.free(value);
         const wire = try oap_envelope.requiredEnum(types.Wire, descriptor_obj, "wire");
+        const wire_id = try oap_envelope.optionalOwnedString(descriptor_obj, "wire_id", allocator);
+        errdefer if (wire_id) |value| allocator.free(value);
+        if (wire_id != null and wire != .other) return DecodeError.InvalidField;
         const framing = try oap_envelope.requiredEnum(types.Framing, descriptor_obj, "framing");
         const endpoint = try oap_envelope.requiredOwnedString(descriptor_obj, "endpoint", allocator);
         errdefer allocator.free(endpoint);
@@ -888,6 +892,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
             .id = id,
             .display_name = display_name,
             .wire = wire,
+            .wire_id = wire_id,
             .framing = framing,
             .endpoint = endpoint,
             .headers = headers,

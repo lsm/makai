@@ -367,6 +367,7 @@ pub const ProviderDescriptor = struct {
     id: []const u8,
     display_name: ?[]const u8 = null,
     wire: Wire,
+    wire_id: ?[]const u8 = null,
     framing: Framing,
     endpoint: []const u8,
     headers: []const HeaderPair = &.{},
@@ -381,12 +382,31 @@ pub const ProviderDescriptor = struct {
     pub fn deinit(self: *ProviderDescriptor, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         if (self.display_name) |value| allocator.free(value);
+        if (self.wire_id) |value| allocator.free(value);
         allocator.free(self.endpoint);
         freeHeaders(allocator, self.headers);
         allocator.free(self.grant_kinds);
         self.snapshot_policies.deinit(allocator);
     }
 };
+
+pub fn wireComponent(model_ref: []const u8) ?[]const u8 {
+    const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse return null;
+    const rest = model_ref[slash + 1 ..];
+    const at = std.mem.indexOfScalar(u8, rest, '@') orelse return null;
+    return rest[0..at];
+}
+
+pub fn parseWireComponent(component: []const u8) ?Wire {
+    const colon = std.mem.indexOfScalar(u8, component, ':') orelse return Wire.parse(component);
+    return Wire.parse(component[0..colon]);
+}
+
+pub fn wireIdComponent(component: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, component, ':') orelse return null;
+    if (colon + 1 >= component.len) return null;
+    return component[colon + 1 ..];
+}
 
 pub const ModelEntry = struct {
     model_ref: []const u8,

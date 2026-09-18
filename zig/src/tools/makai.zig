@@ -6616,6 +6616,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
         try server.addProvider(.{
             .id = id,
             .wire = mapping.wire,
+            .wire_id = if (mapping.wire_id) |value| try allocator.dupe(u8, value) else null,
             .framing = mapping.framing,
             .endpoint = endpoint,
             .allows_anonymous = builtin.allows_anonymous,
@@ -6628,6 +6629,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             allocator,
             builtin.id,
             mapping.wire,
+            mapping.wire_id,
             builtin.model_id,
         );
         errdefer allocator.free(built_model_ref);

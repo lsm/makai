@@ -15,6 +15,7 @@ pub const MAKAI_API_NAMES = [_][]const u8{
 pub const WireMapping = struct {
     wire: types.Wire,
     framing: types.Framing,
+    wire_id: ?[]const u8 = null,
 };
 
 pub fn mapApiToWire(api: []const u8) ?WireMapping {
@@ -34,13 +35,13 @@ pub fn mapApiToWire(api: []const u8) ?WireMapping {
         return .{ .wire = .@"openai-responses", .framing = .sse };
     }
     if (std.mem.eql(u8, api, "google-generative-ai")) {
-        return .{ .wire = .other, .framing = .sse };
+        return .{ .wire = .other, .framing = .sse, .wire_id = "google-generative-ai" };
     }
     if (std.mem.eql(u8, api, "google-gemini-cli")) {
-        return .{ .wire = .other, .framing = .sse };
+        return .{ .wire = .other, .framing = .sse, .wire_id = "google-gemini-cli" };
     }
     if (std.mem.eql(u8, api, "ollama")) {
-        return .{ .wire = .other, .framing = .ndjson };
+        return .{ .wire = .other, .framing = .ndjson, .wire_id = "ollama-chat" };
     }
     return null;
 }
@@ -160,17 +161,58 @@ pub fn buildModelRef(
     allocator: std.mem.Allocator,
     provider_id: []const u8,
     wire: types.Wire,
+    wire_id: ?[]const u8,
     model_id: []const u8,
 ) ![]const u8 {
+    if (wire_id) |id| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}:{s}@{s}",
+            .{ provider_id, wire.toString(), id, model_id },
+        );
+    }
     return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ provider_id, wire.toString(), model_id });
 }
 
-test "a built in provider yields a model ref that names its own wire" {
+test "an unnamed wire carries an opaque discriminator in the reference" {
     const allocator = std.testing.allocator;
     const mapping = mapApiToWire("ollama").?;
-    const model_ref = try buildModelRef(allocator, "ollama", mapping.wire, "llama3");
+    const model_ref = try buildModelRef(allocator, "ollama", mapping.wire, mapping.wire_id, "llama3");
     defer allocator.free(model_ref);
-    try std.testing.expectEqualStrings("ollama/other@llama3", model_ref);
+    try std.testing.expectEqualStrings("ollama/other:ollama-chat@llama3", model_ref);
+
+    const component = types.wireComponent(model_ref).?;
+    try std.testing.expectEqual(types.Wire.other, types.parseWireComponent(component).?);
+    try std.testing.expectEqualStrings("ollama-chat", types.wireIdComponent(component).?);
+}
+
+test "two unnamed wires on one provider stay distinguishable" {
+    const allocator = std.testing.allocator;
+    const generative = mapApiToWire("google-generative-ai").?;
+    const cli = mapApiToWire("google-gemini-cli").?;
+
+    const a = try buildModelRef(allocator, "google", generative.wire, generative.wire_id, "gemini");
+    defer allocator.free(a);
+    const b = try buildModelRef(allocator, "google", cli.wire, cli.wire_id, "gemini");
+    defer allocator.free(b);
+
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    try std.testing.expectEqualStrings("google-generative-ai", types.wireIdComponent(types.wireComponent(a).?).?);
+    try std.testing.expectEqualStrings("google-gemini-cli", types.wireIdComponent(types.wireComponent(b).?).?);
+}
+
+test "a named wire carries no discriminator and parses without one" {
+    const allocator = std.testing.allocator;
+    const mapping = mapApiToWire("anthropic-messages").?;
+    try std.testing.expect(mapping.wire_id == null);
+
+    const model_ref = try buildModelRef(allocator, "anthropic", mapping.wire, mapping.wire_id, "claude");
+    defer allocator.free(model_ref);
+    try std.testing.expectEqualStrings("anthropic/anthropic-messages@claude", model_ref);
+
+    const component = types.wireComponent(model_ref).?;
+    try std.testing.expectEqual(types.Wire.@"anthropic-messages", types.parseWireComponent(component).?);
+    try std.testing.expect(types.wireIdComponent(component) == null);
 }
 
 test "every built in provider maps to a describable wire" {
