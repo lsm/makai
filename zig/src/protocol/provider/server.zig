@@ -566,7 +566,7 @@ fn storedOAuthOriginAllowed(
     model: ai_types.Model,
 ) bool {
     const auth_storage = storage orelse return true;
-    const auth = auth_storage.providers.get(provider_id) orelse return true;
+    const auth = auth_storage.credentialForOriginCheck(provider_id) orelse return true;
     return switch (auth) {
         .api_key => true,
         .oauth => |credentials| provider_base_url.oauthOriginAllowed(

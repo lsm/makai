@@ -800,6 +800,11 @@ pub const AuthStorage = struct {
         try self.ephemeral.?.put(key, auth);
     }
 
+    pub fn credentialForOriginCheck(self: *const AuthStorage, provider_id: []const u8) ?ProviderAuth {
+        if (self.ephemeralAuth(provider_id)) |auth| return auth;
+        return self.providers.get(provider_id);
+    }
+
     pub fn hasEphemeral(self: *const AuthStorage, provider_id: []const u8) bool {
         const map = self.ephemeral orelse return false;
         return map.contains(provider_id);
@@ -961,6 +966,16 @@ pub const AuthStorage = struct {
     }
 
     pub fn refreshCredentials(self: *AuthStorage, provider_id: []const u8, oauth_provider: OAuthProvider) !void {
+        if (self.ephemeralAuth(provider_id)) |ephemeral_auth| {
+            const credentials = switch (ephemeral_auth) {
+                .api_key => return error.NotRefreshable,
+                .oauth => |value| value,
+            };
+            const refreshed = try self.refreshEphemeral(provider_id, oauth_provider, credentials);
+            _ = refreshed;
+            return;
+        }
+
         const auth = self.providers.get(provider_id) orelse return error.AuthRequired;
         const credentials = switch (auth) {
             .api_key => return error.NotRefreshable,
@@ -1619,4 +1634,64 @@ test "a granted static key is not reported as refreshable" {
 
     try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
     try std.testing.expect(!storage.hasRefreshableCredentials("tenant-a"));
+}
+
+test "the explicit refresh entry point reaches a granted credential and still writes nothing" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = std.math.maxInt(i64),
+    } });
+
+    try storage.refreshCredentials("tenant-a", ephemeral_test_provider);
+    try std.testing.expectEqual(@as(usize, 0), ephemeral_test_saves);
+
+    const key = try storage.getApiKey("tenant-a", ephemeral_test_provider) orelse
+        return error.TestExpectedKey;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("refreshed-access", key);
+}
+
+test "refreshing a granted static key is refused rather than treated as absent" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+    try std.testing.expectError(
+        error.NotRefreshable,
+        storage.refreshCredentials("tenant-a", ephemeral_test_provider),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ephemeral_test_saves);
+}
+
+test "the origin check sees a granted credential rather than skipping it" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try std.testing.expect(storage.credentialForOriginCheck("tenant-a") == null);
+
+    try storage.putEphemeral("tenant-a", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = std.math.maxInt(i64),
+    } });
+
+    const auth = storage.credentialForOriginCheck("tenant-a") orelse
+        return error.TestExpectedCredential;
+    try std.testing.expectEqualStrings("granted-refresh", auth.oauth.refresh);
+
+    try storage.providers.put(try allocator.dupe(u8, "configured"), .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "stored-refresh"),
+        .access = try allocator.dupe(u8, "stored-access"),
+        .expires = std.math.maxInt(i64),
+    } });
+    const configured = storage.credentialForOriginCheck("configured") orelse
+        return error.TestExpectedCredential;
+    try std.testing.expectEqualStrings("stored-refresh", configured.oauth.refresh);
 }
