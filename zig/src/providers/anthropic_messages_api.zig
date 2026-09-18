@@ -1443,6 +1443,9 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .name = cbs.tool_name,
                                 .partial = createPartialMessage(model),
                             } });
+
+                            pending_delta_frees.append(allocator, cbs.tool_id) catch allocator.free(cbs.tool_id);
+                            pending_delta_frees.append(allocator, cbs.tool_name) catch allocator.free(cbs.tool_name);
                         },
                     }
 
