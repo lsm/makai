@@ -1290,6 +1290,25 @@ test "the decoder refuses a foreign protocol, version and envelope shape" {
     try std.testing.expectError(DecodeError.VersionMismatch, deserializeEnvelope(foreign_version, allocator));
 }
 
+test "a wire id rides only with the unnamed wire" {
+    const allocator = std.testing.allocator;
+
+    const head =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\"," ++
+        "\"providers\":[{\"id\":\"g\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",";
+
+    const named_with_id = head ++ "\"wire\":\"openai-chat-completions\",\"wire_id\":\"nope\"}]}}";
+    try std.testing.expectError(DecodeError.InvalidField, deserializeEnvelope(named_with_id, allocator));
+
+    const unnamed_with_id = head ++ "\"wire\":\"other\",\"wire_id\":\"ollama-chat\"}]}}";
+    var decoded = try deserializeEnvelope(unnamed_with_id, allocator);
+    defer decoded.deinit(allocator);
+    const descriptor = decoded.payload.provider_describe_response.providers[0];
+    try std.testing.expectEqual(types.Wire.other, descriptor.wire);
+    try std.testing.expectEqualStrings("ollama-chat", descriptor.wire_id.?);
+}
+
 test "a field of the wrong json type is refused rather than reached into" {
     const allocator = std.testing.allocator;
 
@@ -1304,7 +1323,6 @@ test "a field of the wrong json type is refused rather than reached into" {
         head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":\"x\"}]}}",
         head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":{\"tool_call_id_format\":1}}]}}",
         head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"grant_kinds\":\"x\"}]}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"wire_id\":\"nope\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\"}]}}",
         head ++ "\"type\":\"provider.models.list.response\",\"id\":\"m\",\"payload\":{\"models\":\"x\"}}",
         head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":\"x\"}}",
         head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":[],\"tools\":\"x\"}}",

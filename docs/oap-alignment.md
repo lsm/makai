@@ -414,6 +414,22 @@ Conformance status: every envelope is implementable and implemented. No compatib
 observed against the vendor it describes, which needs a live credentialed endpoint and expires when
 the vendor changes. The two words are not interchangeable about this profile.
 
+The two decoders each carry their own copy of the `protocol` and `version` checks, and only the
+agent-control one had tests for them until a mutation run over the provider decoder found the copy
+unverified. That is a structural trap rather than a testing gap: each file reads as covered because
+the other file's tests cover its own copy, and mutating either file alone never reveals it. The same
+shape produced a duplicate `model_ref` parser in this profile, where three tests covered the copy
+`inference.create` never reaches. When a rule exists twice, coverage of one instance says nothing
+about the other, and the tests are attached to the wrong artifact to tell you so.
+
+Mutation results for the provider decoder, as a baseline for anyone changing it: 49 single-line
+refusals, 33 killed, 16 surviving. The killed set contains every rule the profile makes normative.
+The survivors are type tags guarding a union field access — malformed-input robustness, which the
+profile does not specify and which was correct but unverified rather than wrong. Recording which
+test kills each mutant matters as much as the count: a rule killed only by a generically named test
+reads as uncovered to anyone scanning test names, which is how the rule that a `wire_id` may
+accompany only the `other` wire came to be verified by a test about JSON types.
+
 ## Deferred scope
 
 Not claimed by this ledger, each requiring a spec revision plus OAP coordination
