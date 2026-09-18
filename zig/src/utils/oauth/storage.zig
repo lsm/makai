@@ -785,11 +785,6 @@ pub const AuthStorage = struct {
     ephemeral: ?std.StringHashMap(ProviderAuth) = null,
 
     pub fn putEphemeral(self: *AuthStorage, provider_id: []const u8, auth: ProviderAuth) !void {
-        errdefer {
-            var rejected = auth;
-            rejected.deinit(self.allocator);
-        }
-
         if (self.ephemeral == null) {
             self.ephemeral = std.StringHashMap(ProviderAuth).init(self.allocator);
         }
@@ -1486,9 +1481,13 @@ fn lastSavedPayload() []const u8 {
 
 fn ephemeralTestRefresh(credentials: Credentials, allocator: std.mem.Allocator) anyerror!Credentials {
     _ = credentials;
+    const refresh = try allocator.dupe(u8, "refreshed-refresh");
+    errdefer allocator.free(refresh);
+    const access = try allocator.dupe(u8, "refreshed-access");
+
     return Credentials{
-        .refresh = try allocator.dupe(u8, "refreshed-refresh"),
-        .access = try allocator.dupe(u8, "refreshed-access"),
+        .refresh = refresh,
+        .access = access,
         .expires = std.math.maxInt(i64),
     };
 }
@@ -1764,10 +1763,51 @@ test "replacing a granted credential cannot lose both on an allocation failure" 
             };
             defer storage.deinit();
 
-            try storage.putEphemeral("tenant", .{ .api_key = try allocator.dupe(u8, "sk-first") });
-            try storage.putEphemeral("tenant", .{ .api_key = try allocator.dupe(u8, "sk-second") });
+            {
+                const first = try allocator.dupe(u8, "sk-first");
+                errdefer allocator.free(first);
+                try storage.putEphemeral("tenant", .{ .api_key = first });
+            }
+            {
+                const second = try allocator.dupe(u8, "sk-second");
+                errdefer allocator.free(second);
+                try storage.putEphemeral("tenant", .{ .api_key = second });
+            }
 
             try std.testing.expectEqual(@as(usize, 1), storage.ephemeralCount());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "refreshing a granted credential under allocation failure frees it exactly once" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var storage = AuthStorage{
+                .providers = std.StringHashMap(ProviderAuth).init(allocator),
+                .allocator = allocator,
+            };
+            defer storage.deinit();
+
+            {
+                const refresh = try allocator.dupe(u8, "granted-refresh");
+                errdefer allocator.free(refresh);
+                const access = try allocator.dupe(u8, "granted-access");
+                errdefer allocator.free(access);
+
+                try storage.putEphemeral("tenant", .{ .oauth = .{
+                    .refresh = refresh,
+                    .access = access,
+                    .expires = 0,
+                } });
+            }
+
+            try storage.refreshCredentials("tenant", ephemeral_test_provider);
+
+            const key = try storage.getApiKey("tenant", ephemeral_test_provider) orelse
+                return error.TestExpectedKey;
+            defer allocator.free(key);
+            try std.testing.expectEqualStrings("refreshed-access", key);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
