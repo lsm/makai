@@ -42,9 +42,15 @@ mid-prompt no longer makes a concurrent read look like an authorization failure.
 **Writes still prompt.** `macos_keychain.write` takes the mutex blocking and leaves interaction
 enabled, so persisting credentials from an unauthorized binary raises the prompt — and in a
 non-interactive shell that prompt never surfaces, so the write blocks rather than failing. Access
-lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again; the
-macOS artifacts this repo publishes are plain `zig build install` output and are unsigned too. Only
-a Developer-ID-signed build, keyed by team ID, escapes it. Bound any invocation that may persist
+lists bind to the **code hash**, so every unsigned rebuild is a new identity and prompts again. Only
+a signed build escapes it, because the access list then binds to the signing certificate rather than
+the hash. Released macOS binaries are signed with Developer ID, hardened-runtime enabled and
+notarized in `release-binaries.yml`; a tag build fails rather than publishing unsigned macOS
+artifacts. Locally, `make build MAKAI_CODESIGN_IDENTITY=<name>` signs `zig-out/bin/makai` under the
+stable identifier `com.makai.cli` — a self-signed code-signing certificate is enough for the access
+list, no Apple account needed — and a bad identity fails the build instead of silently leaving it
+unsigned. Delete the existing `com.makai.auth` item once after switching identity, since the old
+access list still names the previous one. Bound any invocation that may persist
 credentials with an external timeout so a hang is visible rather than silent.
 
 Reads blocked the same way before #315, which is why older notes describe `makai auth providers
