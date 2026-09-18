@@ -959,7 +959,7 @@ pub const Server = struct {
                 try self.emitCreateRefusal(
                     env,
                     .unsupported_feature,
-                    "a reasoning or tool_call part belongs to an assistant message, a tool_result does not, and a tool-role message must carry one",
+                    "a reasoning or tool_call part belongs to an assistant message, a tool_result to a user or tool message, and a tool-role message must carry one",
                 );
                 return;
             }
@@ -1757,7 +1757,7 @@ fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
                     .text => {},
                     .reasoning, .tool_call => if (message.role != .assistant) break :blk true,
                     .tool_result => {
-                        if (message.role == .assistant) break :blk true;
+                        if (message.role != .user and message.role != .tool) break :blk true;
                         carries_result = true;
                     },
                 }
@@ -2533,6 +2533,53 @@ test "a carry-bearing part on a non-assistant message is refused rather than dro
         refusal.payload.inference_create_response.err.?.message,
         "belongs to an assistant message",
     ) != null);
+}
+
+test "a tool result on a system or developer message is refused rather than demoting the instruction to a user turn" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const roles = [_][]const u8{ "system", "developer" };
+    for (roles) |role| {
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{{\"role\":\"{s}\"," ++
+                "\"content\":[{{\"type\":\"text\",\"text\":\"always answer in french\"}}," ++
+                "{{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":{{}}}}]}}]}}",
+            .{role},
+        );
+        defer allocator.free(payload);
+
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var refusal = try decodeOnly(allocator, &server);
+        defer refusal.deinit(allocator);
+        try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+        try std.testing.expectEqual(
+            types.ErrorCode.unsupported_feature,
+            refusal.payload.inference_create_response.err.?.code,
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            refusal.payload.inference_create_response.err.?.message,
+            "a tool_result to a user or tool message",
+        ) != null);
+    }
+
+    const user_carried =
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"user\"," ++
+        "\"content\":[{\"type\":\"text\",\"text\":\"and here is what it said\"}," ++
+        "{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":{}}]}]}";
+    const accepted_line = try makeRequest(allocator, "inference.create.request", user_carried, "q2");
+    defer allocator.free(accepted_line);
+    try server.handleLine(accepted_line);
+
+    var accepted = try decodeOnly(allocator, &server);
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.payload.inference_create_response.accepted);
 }
 
 test "the terminal assembly repeats the carry each part ended with" {
