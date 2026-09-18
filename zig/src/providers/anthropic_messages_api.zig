@@ -811,6 +811,22 @@ const ParseResult = union(enum) {
     message_stop: void,
     api_error: []const u8,
 
+    fn deinit(self: ParseResult, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .content_block_start => |cbs| {
+                if (cbs.block_type == .tool_use) {
+                    allocator.free(cbs.tool_id);
+                    allocator.free(cbs.tool_name);
+                }
+            },
+            .content_block_delta => |cbd| switch (cbd.delta) {
+                inline else => |slice| allocator.free(slice),
+            },
+            .api_error => |err| allocator.free(err),
+            .none, .message_start, .content_block_stop, .message_delta, .message_stop => {},
+        }
+    }
+
     const ContentType = enum { text, thinking, tool_use };
     const ContentDelta = union(enum) {
         text: []const u8,
@@ -1584,21 +1600,12 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         for (tail) |ev| {
             const result = parseAnthropicEventType(ev.data, allocator) catch continue;
-            switch (result) {
-                .api_error => |err| {
-                    defer allocator.free(err);
-                    ctx.deinit();
-                    stream.completeWithError(err);
-                    stream.markThreadDone();
-                    return;
-                },
-                .content_block_start => |cbs| {
-                    if (cbs.block_type == .tool_use) {
-                        allocator.free(cbs.tool_id);
-                        allocator.free(cbs.tool_name);
-                    }
-                },
-                else => {},
+            defer result.deinit(allocator);
+            if (result == .api_error) {
+                ctx.deinit();
+                stream.completeWithError(result.api_error);
+                stream.markThreadDone();
+                return;
             }
         }
     }
@@ -2169,6 +2176,42 @@ test "parseAnthropicEventType extracts tool_use id and name" {
 
     allocator.free(result.content_block_start.tool_id);
     allocator.free(result.content_block_start.tool_name);
+}
+
+test "a parse result frees every string it duped, so an event nothing consumes cannot leak" {
+    const allocator = std.testing.allocator;
+
+    const owning_events = [_][]const u8{
+        "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":" ++
+            "{\"type\":\"tool_use\",\"id\":\"toolu_01A\",\"name\":\"bash\"}}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+            "{\"type\":\"text_delta\",\"text\":\"a slice long enough to be a real allocation\"}}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+            "{\"type\":\"thinking_delta\",\"thinking\":\"a slice long enough to be a real allocation\"}}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+            "{\"type\":\"signature_delta\",\"signature\":\"a slice long enough to be a real allocation\"}}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+            "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"long enough\\\"}\"}}",
+        "{\"type\":\"error\",\"error\":{\"message\":\"a message long enough to be a real allocation\"}}",
+    };
+
+    for (owning_events) |data| {
+        const result = try parseAnthropicEventType(data, allocator);
+        try std.testing.expect(result != .none);
+        result.deinit(allocator);
+    }
+
+    const borrowing_events = [_][]const u8{
+        "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}",
+        "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}",
+        "{\"type\":\"content_block_stop\",\"index\":0}",
+        "{\"type\":\"message_stop\"}",
+    };
+
+    for (borrowing_events) |data| {
+        const result = try parseAnthropicEventType(data, allocator);
+        result.deinit(allocator);
+    }
 }
 
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
