@@ -13,6 +13,7 @@ pub const DecodeError = error{
     MissingField,
     InvalidField,
     CredentialInHeaders,
+    UnknownField,
     PartialArgumentsInTerminal,
     ScopeRepeatedInPayload,
     AcceptanceScopeMismatch,
@@ -650,11 +651,57 @@ fn deserializeProtocolError(value: std.json.Value, allocator: std.mem.Allocator)
     };
 }
 
+fn rejectUnknownMembers(obj: std.json.ObjectMap, allowed: []const []const u8) !void {
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        var known = false;
+        for (allowed) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return DecodeError.UnknownField;
+    }
+}
+
+fn allowedPayloadMembers(tag: std.meta.Tag(types.Payload)) []const []const u8 {
+    return switch (tag) {
+        .provider_describe_request => &.{},
+        .provider_describe_response => &.{ "profile_revision", "protocol_versions", "providers" },
+        .provider_models_list_request => &.{"provider_id"},
+        .provider_models_list_response => &.{"models"},
+        .provider_credential_grant_request => &.{ "nonce", "provider_id", "ttl_ms", "value" },
+        .provider_credential_grant_response => &.{ "accepted", "credential_ref", "error", "expires_at_ms" },
+        .provider_credential_grant_channel => &.{ "channel", "nonce" },
+        .inference_create_request => &.{
+            "allow_degraded_features", "credential_ref",   "headers",  "include_snapshot",
+            "max_output_tokens",       "messages",         "metadata", "model_ref",
+            "output_schema",           "reasoning",        "stream",   "temperature",
+            "tool_choice",             "tools",            "top_p",
+        },
+        .inference_create_response => &.{ "accepted", "error", "honoured" },
+        .inference_started => &.{ "endpoint", "model_ref", "started_at_ms" },
+        .inference_part_started => &.{ "name", "part_index", "part_kind", "tool_call_id" },
+        .inference_part_delta => &.{ "delta", "part_index", "snapshot" },
+        .inference_part_ended => &.{ "carry", "part_index", "part_kind", "snapshot", "text", "tool_call" },
+        .inference_completed => &.{ "message", "stop_reason", "usage" },
+        .inference_failed => &.{ "error", "usage" },
+        .inference_cancel_request => &.{"reason"},
+        .inference_cancel_response => &.{"accepted"},
+        .inference_sync_request => &.{},
+        .inference_sync_response => &.{"snapshot"},
+        .protocol_error => &.{ "error", "protocol_versions" },
+    };
+}
+
 fn deserializePayload(
     tag: std.meta.Tag(types.Payload),
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !types.Payload {
+    if (obj.get("inference_id") != null) return DecodeError.ScopeRepeatedInPayload;
+    try rejectUnknownMembers(obj, allowedPayloadMembers(tag));
     switch (tag) {
         .provider_describe_request => return types.Payload{ .provider_describe_request = .{} },
         .inference_sync_request => return types.Payload{ .inference_sync_request = .{} },
@@ -716,7 +763,6 @@ fn deserializePayload(
         },
         .inference_create_response => {
             const accepted = try oap_envelope.requiredBool(obj, "accepted");
-            if (obj.get("inference_id") != null) return DecodeError.ScopeRepeatedInPayload;
             const honoured = blk: {
                 const value = obj.get("honoured") orelse break :blk null;
                 if (value != .object) return DecodeError.InvalidField;
@@ -1271,7 +1317,7 @@ test "a descriptor carries its ordinary headers through a decode" {
 
     const line =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-        "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"payload\":{\"capability_revision\":\"r1\"," ++
+        "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"capability_revision\":\"r1\",\"payload\":{" ++
         "\"providers\":[{\"id\":\"gw\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\"," ++
         "\"endpoint\":\"https://gw.test\",\"headers\":{\"X-Tenant\":\"acme\"}}]}}";
 
@@ -1287,7 +1333,7 @@ test "a descriptor may not publish a credential in its headers" {
 
     const prefix =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-        "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"payload\":{\"capability_revision\":\"r1\"," ++
+        "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"capability_revision\":\"r1\",\"payload\":{" ++
         "\"providers\":[{\"id\":\"gw\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\"," ++
         "\"endpoint\":\"https://gw.test\",\"headers\":";
 
@@ -1320,7 +1366,7 @@ test "a wire id rides only with the unnamed wire" {
 
     const head =
         "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-        "\",\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\"," ++
+        "\",\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{" ++
         "\"providers\":[{\"id\":\"g\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",";
 
     const named_with_id = head ++ "\"wire\":\"openai-chat-completions\",\"wire_id\":\"nope\"}]}}";
@@ -1332,6 +1378,33 @@ test "a wire id rides only with the unnamed wire" {
     const descriptor = decoded.payload.provider_describe_response.providers[0];
     try std.testing.expectEqual(types.Wire.other, descriptor.wire);
     try std.testing.expectEqualStrings("ollama-chat", descriptor.wire_id.?);
+}
+
+test "a payload member the profile does not define is refused" {
+    const allocator = std.testing.allocator;
+
+    const head =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++ "\",";
+
+    const create_with_endpoint = head ++
+        "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\"," ++
+        "\"messages\":[],\"endpoint\":\"https://attacker.test\"}}";
+    try std.testing.expectError(DecodeError.UnknownField, deserializeEnvelope(create_with_endpoint, allocator));
+
+    const create_with_base_url = head ++
+        "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\"," ++
+        "\"messages\":[],\"base_url\":\"https://attacker.test\"}}";
+    try std.testing.expectError(DecodeError.UnknownField, deserializeEnvelope(create_with_base_url, allocator));
+
+    const describe_with_extra = head ++
+        "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"providers\":[],\"nonsense\":1}}";
+    try std.testing.expectError(DecodeError.UnknownField, deserializeEnvelope(describe_with_extra, allocator));
+
+    const accepted = head ++
+        "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\"," ++
+        "\"messages\":[],\"metadata\":{\"k\":\"v\"},\"temperature\":0.5}}";
+    var decoded = try deserializeEnvelope(accepted, allocator);
+    decoded.deinit(allocator);
 }
 
 test "a carry round trip claim survives the wire and defaults to absent" {
@@ -1374,7 +1447,7 @@ fn expectNoLeakUnderAllocationFailure(line: []const u8) !void {
 
 const DESCRIBE_RESPONSE_LINE =
     "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
-    "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"payload\":{\"capability_revision\":\"r1\"," ++
+    "\",\"type\":\"provider.describe.response\",\"id\":\"m1\",\"capability_revision\":\"r1\",\"payload\":{" ++
     "\"providers\":[{\"id\":\"gw\",\"display_name\":\"Gateway\",\"wire\":\"other\",\"wire_id\":\"ollama-chat\"," ++
     "\"framing\":\"ndjson\",\"endpoint\":\"https://gw.test\",\"headers\":{\"X-Tenant\":\"acme\"}," ++
     "\"snapshot_policies\":[\"never\",\"on_part_end\",\"every_delta\"],\"answers_sync\":true," ++
@@ -1406,12 +1479,12 @@ test "a field of the wrong json type is refused rather than reached into" {
 
     const cases = [_][]const u8{
         head ++ "\"type\":\"inference.started\",\"id\":\"m\",\"inference_id\":\"i\",\"sequence\":1,\"payload\":\"x\"}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":\"x\"}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":\"x\"}]}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":{\"X-A\":1}}]}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":\"x\"}]}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":{\"tool_call_id_format\":1}}]}}",
-        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"capability_revision\":\"r1\",\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"grant_kinds\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":\"x\"}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"headers\":{\"X-A\":1}}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":\"x\"}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"compatibility\":{\"tool_call_id_format\":1}}]}}",
+        head ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"capability_revision\":\"r1\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"openai-chat-completions\",\"framing\":\"sse\",\"endpoint\":\"https://g.test\",\"grant_kinds\":\"x\"}]}}",
         head ++ "\"type\":\"provider.models.list.response\",\"id\":\"m\",\"payload\":{\"models\":\"x\"}}",
         head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":\"x\"}}",
         head ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\",\"messages\":[],\"tools\":\"x\"}}",

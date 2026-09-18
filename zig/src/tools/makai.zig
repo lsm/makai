@@ -6859,7 +6859,7 @@ fn pumpOapInferences(
                     server.abandonOpenPart(entry.inference_id);
                     server.settleFailed(
                         entry.inference_id,
-                        .provider_unavailable,
+                        .endpoint_error,
                         "the endpoint could not deliver the terminal for this inference",
                         null,
                     ) catch {};
@@ -6873,7 +6873,7 @@ fn pumpOapInferences(
                 server.abandonOpenPart(entry.inference_id);
                 server.settleFailed(
                     entry.inference_id,
-                    .provider_unavailable,
+                    .endpoint_error,
                     "the endpoint could not assemble a terminal for this inference",
                     null,
                 ) catch {};

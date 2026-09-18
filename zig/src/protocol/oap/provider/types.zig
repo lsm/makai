@@ -144,6 +144,7 @@ pub const ErrorCode = enum {
     rate_limited,
     provider_unavailable,
     resource_exhausted,
+    endpoint_error,
     credential_expired,
     credential_missing,
     credential_rejected,
@@ -160,7 +161,7 @@ pub const ErrorCode = enum {
 
     pub fn action(self: ErrorCode) ErrorAction {
         return switch (self) {
-            .rate_limited, .provider_unavailable, .resource_exhausted => .retry,
+            .rate_limited, .provider_unavailable, .resource_exhausted, .endpoint_error => .retry,
             .credential_expired => .refresh,
             .credential_missing, .credential_rejected => .authenticate,
             .invalid_request,
