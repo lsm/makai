@@ -6619,7 +6619,17 @@ fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeA
 
 const OAP_PROVIDER_MALFORMED_MESSAGE = "makai --oap-provider: a line on stdin was not a decodable envelope\n";
 
+fn oapProviderCompatibility(
+    provider_id: []const u8,
+    flags: provider_base_url.ProxyCompatFlags,
+) oap_provider_types.CompatibilityFacts {
+    return oap_provider_runtime.mapCompatibility(
+        provider_base_url.transparentProxyCompatForFlags(provider_id, flags),
+    ).facts;
+}
+
 fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provider_server.Server) !void {
+    const proxy_flags = try provider_base_url.proxyCompatFlagsFromEnv(allocator);
     for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
         const mapping = oap_provider_catalog.mapApiToWire(builtin.api) orelse continue;
 
@@ -6643,6 +6653,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .allows_anonymous = builtin.allows_anonymous,
             .snapshot_policies = policies,
             .answers_sync = oap_provider_server.IMPLEMENTS_SYNC,
+            .compatibility = oapProviderCompatibility(builtin.id, proxy_flags),
             .credential_grant = .none,
             .context_window = builtin.context_window,
             .max_output_tokens = builtin.max_output_tokens,
@@ -7484,4 +7495,22 @@ test "every capability the oap endpoint implements is advertised and honoured" {
             }
         }
     }
+}
+
+test "the oap descriptors state compatibility facts only where makai asserts them" {
+    const silent = oapProviderCompatibility("openai", .{});
+    try std.testing.expect(silent.isEmpty());
+
+    const asserted = oapProviderCompatibility("openai", .{ .openai_proxy = true });
+    try std.testing.expect(!asserted.isEmpty());
+    try std.testing.expectEqual(@as(?bool, true), asserted.supports_store);
+    try std.testing.expectEqual(@as(?bool, true), asserted.supports_developer_role);
+    try std.testing.expectEqual(@as(?bool, true), asserted.supports_reasoning_effort);
+    try std.testing.expect(asserted.max_tokens_field.? == .max_completion_tokens);
+
+    const anthropic = oapProviderCompatibility("anthropic", .{ .anthropic_proxy = true });
+    try std.testing.expectEqual(@as(?bool, true), anthropic.cache_ttl_control);
+
+    const unasserted_anthropic = oapProviderCompatibility("anthropic", .{ .openai_proxy = true });
+    try std.testing.expect(unasserted_anthropic.isEmpty());
 }
