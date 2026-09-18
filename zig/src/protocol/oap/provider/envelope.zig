@@ -280,7 +280,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
                 if (reasoning.enabled) |enabled| try w.writeBoolField("enabled", enabled);
                 if (reasoning.budget_tokens) |budget| try w.writeIntField("budget_tokens", budget);
                 if (reasoning.effort) |effort| try w.writeStringField("effort", effort);
-                if (reasoning.encrypted_carry) |carry| try w.writeStringField("encrypted_carry", carry);
                 try w.endObject();
             }
             try w.writeStringField("include_snapshot", @tagName(value.include_snapshot));
@@ -980,13 +979,10 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
         const reasoning_obj = reasoning_value.object;
         const effort = try oap_envelope.optionalOwnedString(reasoning_obj, "effort", allocator);
         errdefer if (effort) |value| allocator.free(value);
-        const carry = try oap_envelope.optionalOwnedString(reasoning_obj, "encrypted_carry", allocator);
-        errdefer if (carry) |value| allocator.free(value);
         reasoning = .{
             .enabled = try oap_envelope.optionalBool(reasoning_obj, "enabled"),
             .budget_tokens = try optionalU32(reasoning_obj, "budget_tokens"),
             .effort = effort,
-            .encrypted_carry = carry,
         };
     }
 

@@ -634,6 +634,21 @@ pub const Server = struct {
         return types.parseModelRef(model_ref);
     }
 
+    fn messagesReplayACarry(messages: []const oap_types.Message) bool {
+        for (messages) |message| {
+            const parts = switch (message.content) {
+                .parts => |value| value,
+                else => continue,
+            };
+            for (parts) |part| switch (part) {
+                .reasoning => |value| if (value.carry != null) return true,
+                .tool_call => |value| if (value.carry != null) return true,
+                else => {},
+            };
+        }
+        return false;
+    }
+
     fn handleCreate(self: *Self, env: types.Envelope, create_request: types.CreateRequest) !void {
         const parsed = parseModelRef(create_request.model_ref) orelse {
             try self.emitCreateRefusal(env, .invalid_request, "model_ref must be provider_id/wire@model_id");
@@ -733,7 +748,7 @@ pub const Server = struct {
             return;
         }
 
-        if (create_request.reasoning) |reasoning| {
+        if (create_request.reasoning != null) {
             if (!self.modelDeclares(create_request.model_ref, .reasoning)) {
                 try self.emitCreateRefusal(
                     env,
@@ -742,14 +757,15 @@ pub const Server = struct {
                 );
                 return;
             }
-            if (reasoning.encrypted_carry != null and !descriptor.round_trips_carry) {
-                try self.emitCreateRefusal(
-                    env,
-                    .unsupported_feature,
-                    "this provider does not round-trip a reasoning carry; see round_trips_carry on its descriptor",
-                );
-                return;
-            }
+        }
+
+        if (!descriptor.round_trips_carry and messagesReplayACarry(create_request.messages)) {
+            try self.emitCreateRefusal(
+                env,
+                .unsupported_feature,
+                "this provider does not round-trip a carry; see round_trips_carry on its descriptor",
+            );
+            return;
         }
 
         if (!self.options.accepts_inference) {
@@ -899,7 +915,7 @@ pub const Server = struct {
                 .reasoning => {
                     const owned = try self.allocator.dupe(u8, accumulated);
                     errdefer self.allocator.free(owned);
-                    try parts.append(self.allocator, .{ .reasoning = owned });
+                    try parts.append(self.allocator, .{ .reasoning = .{ .text = owned } });
                 },
                 .tool_call => {
                     const id = try self.allocator.dupe(u8, inference.open_tool_call_id orelse "");
@@ -1036,9 +1052,13 @@ pub const Server = struct {
         var closed_transferred = false;
         const closed_text = try self.allocator.dupe(u8, text);
         errdefer if (!closed_transferred) self.allocator.free(closed_text);
+        const closed_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (!closed_transferred) {
+            if (closed_carry) |value| self.allocator.free(value);
+        };
         try inference.closed_parts.ensureUnusedCapacity(self.allocator, 1);
         inference.closed_parts.appendAssumeCapacity(switch (part_kind) {
-            .reasoning => .{ .reasoning = closed_text },
+            .reasoning => .{ .reasoning = .{ .text = closed_text, .carry = closed_carry } },
             else => .{ .text = closed_text },
         });
         closed_transferred = true;
@@ -1174,7 +1194,12 @@ pub const Server = struct {
                 .thinking => |thinking| {
                     const owned = try self.allocator.dupe(u8, thinking.thinking);
                     errdefer self.allocator.free(owned);
-                    try parts.append(self.allocator, .{ .reasoning = owned });
+                    const carry = if (thinking.thinking_signature) |value|
+                        try self.allocator.dupe(u8, value)
+                    else
+                        null;
+                    errdefer if (carry) |value| self.allocator.free(value);
+                    try parts.append(self.allocator, .{ .reasoning = .{ .text = owned, .carry = carry } });
                 },
                 .tool_call => |call| {
                     const id = try self.allocator.dupe(u8, call.id);
@@ -1183,10 +1208,16 @@ pub const Server = struct {
                     errdefer self.allocator.free(name);
                     const arguments = try self.allocator.dupe(u8, call.arguments_json);
                     errdefer self.allocator.free(arguments);
+                    const carry = if (call.thought_signature) |value|
+                        try self.allocator.dupe(u8, value)
+                    else
+                        null;
+                    errdefer if (carry) |value| self.allocator.free(value);
                     try parts.append(self.allocator, .{ .tool_call = .{
                         .tool_call_id = id,
                         .name = name,
                         .arguments_json = arguments,
+                        .carry = carry,
                     } });
                 },
                 .image => {},
@@ -1372,12 +1403,10 @@ fn cloneReasoning(allocator: std.mem.Allocator, source: ?types.ReasoningOptions)
     const options = source orelse return null;
     const effort = if (options.effort) |value| try allocator.dupe(u8, value) else null;
     errdefer if (effort) |value| allocator.free(value);
-    const carry = if (options.encrypted_carry) |value| try allocator.dupe(u8, value) else null;
     return .{
         .enabled = options.enabled,
         .budget_tokens = options.budget_tokens,
         .effort = effort,
-        .encrypted_carry = carry,
     };
 }
 
@@ -1517,7 +1546,12 @@ pub fn cloneMessages(
 fn clonePart(allocator: std.mem.Allocator, part: oap_types.ContentPart) !oap_types.ContentPart {
     return switch (part) {
         .text => |value| .{ .text = try allocator.dupe(u8, value) },
-        .reasoning => |value| .{ .reasoning = try allocator.dupe(u8, value) },
+        .reasoning => |value| blk: {
+            const text = try allocator.dupe(u8, value.text);
+            errdefer allocator.free(text);
+            const carry = if (value.carry) |raw| try allocator.dupe(u8, raw) else null;
+            break :blk .{ .reasoning = .{ .text = text, .carry = carry } };
+        },
         .tool_call => |call| blk: {
             const id = try allocator.dupe(u8, call.tool_call_id);
             errdefer allocator.free(id);
@@ -2351,7 +2385,6 @@ test "a request member the endpoint cannot forward is refused rather than droppe
 
     const cases = [_][]const u8{
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"output_schema\":{\"type\":\"object\"}}",
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"reasoning\":{\"encrypted_carry\":\"prior\"}}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"stream\":false}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",

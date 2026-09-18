@@ -69,7 +69,8 @@ pub fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentP
         },
         .reasoning => |value| {
             try w.writeStringField("type", "reasoning");
-            try w.writeStringField("reasoning", value);
+            try w.writeStringField("reasoning", value.text);
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
         },
         .tool_call => |value| {
             try w.writeStringField("type", "tool_call");
@@ -77,6 +78,7 @@ pub fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentP
             try w.writeStringField("name", value.name);
             try w.writeKey("arguments_json");
             try writeJsonValueOrString(w, value.arguments_json);
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
         },
         .tool_result => |value| {
             try w.writeStringField("type", "tool_result");
@@ -516,7 +518,13 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
     }
     if (std.mem.eql(u8, part_type, "reasoning")) {
         const reasoning = try requiredString(obj, "reasoning");
-        return .{ .reasoning = try allocator.dupe(u8, reasoning) };
+        const text = try allocator.dupe(u8, reasoning);
+        errdefer allocator.free(text);
+        const carry = if (obj.get("carry")) |carry_value| switch (carry_value) {
+            .string => |raw| try allocator.dupe(u8, raw),
+            else => return DecodeError.InvalidField,
+        } else null;
+        return .{ .reasoning = .{ .text = text, .carry = carry } };
     }
     if (std.mem.eql(u8, part_type, "tool_call")) {
         const tool_call_id = try requiredOwnedString(obj, "tool_call_id", allocator);
@@ -525,10 +533,16 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
         errdefer allocator.free(name);
         const arguments = obj.get("arguments_json") orelse return DecodeError.MissingField;
         const arguments_json = try ownedRawJson(arguments, allocator);
+        errdefer allocator.free(arguments_json);
+        const carry = if (obj.get("carry")) |carry_value| switch (carry_value) {
+            .string => |raw| try allocator.dupe(u8, raw),
+            else => return DecodeError.InvalidField,
+        } else null;
         return .{ .tool_call = .{
             .tool_call_id = tool_call_id,
             .name = name,
             .arguments_json = arguments_json,
+            .carry = carry,
         } };
     }
     if (std.mem.eql(u8, part_type, "tool_result")) {
@@ -1313,14 +1327,14 @@ test "round trips reasoning and tool content parts" {
             .session_id = "s",
             .run_id = "r",
             .message_id = "m",
-            .part = .{ .reasoning = "thinking" },
+            .part = .{ .reasoning = .{ .text = "thinking" } },
         } },
     };
     const reasoning_line = try serializeEnvelope(reasoning, allocator);
     defer allocator.free(reasoning_line);
     var decoded_reasoning = try deserializeEnvelope(reasoning_line, allocator);
     defer decoded_reasoning.deinit(allocator);
-    try std.testing.expectEqualStrings("thinking", decoded_reasoning.payload.content_delta.part.reasoning);
+    try std.testing.expectEqualStrings("thinking", decoded_reasoning.payload.content_delta.part.reasoning.text);
     try std.testing.expectEqualStrings("m", decoded_reasoning.payload.content_delta.message_id.?);
 
     const call = oap_types.Envelope{

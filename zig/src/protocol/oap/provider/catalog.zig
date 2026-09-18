@@ -124,6 +124,7 @@ pub const BuiltInProvider = struct {
     max_output_tokens: u32,
     supports_tools: bool = true,
     supports_reasoning: bool = false,
+    round_trips_carry: bool = false,
 };
 
 pub const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
@@ -137,6 +138,7 @@ pub const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
         .context_window = 200_000,
         .max_output_tokens = 8_192,
         .supports_reasoning = true,
+        .round_trips_carry = true,
     },
     .{
         .id = "openai",

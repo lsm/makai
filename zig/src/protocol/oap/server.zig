@@ -1530,7 +1530,12 @@ fn cloneDetails(allocator: std.mem.Allocator, details: []const oap_types.DetailE
 pub fn clonePart(allocator: std.mem.Allocator, part: oap_types.ContentPart) !oap_types.ContentPart {
     switch (part) {
         .text => |value| return .{ .text = try allocator.dupe(u8, value) },
-        .reasoning => |value| return .{ .reasoning = try allocator.dupe(u8, value) },
+        .reasoning => |value| {
+            const text = try allocator.dupe(u8, value.text);
+            errdefer allocator.free(text);
+            const carry = if (value.carry) |raw| try allocator.dupe(u8, raw) else null;
+            return .{ .reasoning = .{ .text = text, .carry = carry } };
+        },
         .tool_call => |value| {
             const tool_call_id = try allocator.dupe(u8, value.tool_call_id);
             errdefer allocator.free(tool_call_id);
@@ -2338,7 +2343,7 @@ test "a submission carrying non-text content is refused instead of silently drop
     const allocator = std.testing.allocator;
 
     const cases = [_]struct { part: oap_types.ContentPart, feature: []const u8 }{
-        .{ .part = .{ .reasoning = "because" }, .feature = "session.message.content.reasoning" },
+        .{ .part = .{ .reasoning = .{ .text = "because" } }, .feature = "session.message.content.reasoning" },
         .{
             .part = .{ .tool_call = .{ .tool_call_id = "c1", .name = "grep", .arguments_json = "{}" } },
             .feature = "session.message.content.tool_call",
@@ -2602,12 +2607,12 @@ test "a full conversation drives the endpoint end to end over lines" {
     try std.testing.expectEqualStrings(CAPABILITY_REVISION, admission.capability_revision.?);
 
     drainOutbound(&server, allocator);
-    try server.noteContent("sess-line", .{ .reasoning = "weighing options" });
+    try server.noteContent("sess-line", .{ .reasoning = .{ .text = "weighing options" } });
     try server.settleCompleted("sess-line", "answer", "end_turn");
 
     var reasoning = try nextEnvelope(&server, allocator);
     defer reasoning.deinit(allocator);
-    try std.testing.expectEqualStrings("weighing options", reasoning.payload.content_delta.part.reasoning);
+    try std.testing.expectEqualStrings("weighing options", reasoning.payload.content_delta.part.reasoning.text);
 
     var completed = try nextEnvelope(&server, allocator);
     defer completed.deinit(allocator);
