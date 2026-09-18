@@ -1987,7 +1987,8 @@ pub const TuiModel = struct {
             len += 1;
             parts[len] = chrome.status;
             len += 1;
-            return tui_render.joinVertical(ctx.allocator, parts[0..len]) catch chrome.composer;
+            const frame = tui_render.joinVertical(ctx.allocator, parts[0..len]) catch return chrome.composer;
+            return padFrameToHeight(ctx.allocator, frame, height) catch frame;
         }
 
         const fixed = countLines(chrome.status) + countLines(chrome.composer) + @max(countLines(chrome.extra), 1);
@@ -2282,6 +2283,16 @@ pub const TuiModel = struct {
             .bypass => "run tools without prompts",
             .ask => "ask before tool execution",
         };
+    }
+
+    fn padFrameToHeight(allocator: std.mem.Allocator, frame: []const u8, height: usize) ![]const u8 {
+        const rows = countLines(frame);
+        if (rows >= height) return frame;
+        const pad = height - rows;
+        const out = try allocator.alloc(u8, pad + frame.len);
+        @memset(out[0..pad], '\n');
+        @memcpy(out[pad..], frame);
+        return out;
     }
 
     fn countLines(text: []const u8) usize {
@@ -2764,6 +2775,32 @@ test "App inline flush stop follows the reconciliation floor" {
     resolution.tool.terminal_evidence = .both;
     app.state.advanceSummaryScanFloor();
     try std.testing.expectEqual(@as(usize, 2), TuiModel.inlineFlushStop(&app));
+}
+
+test "TuiModel inline frame fills the viewport when there is nothing to show yet" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator), .render_mode = .inline_history };
+    defer model.deinit();
+    var tctx: TestContext = undefined;
+    tctx.setup();
+    defer tctx.deinit();
+    tctx.ctx.width = 60;
+    tctx.ctx.height = 20;
+
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    const empty = model.view(&tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 20), TuiModel.countLines(empty));
+
+    try model.app.?.state.replaceComposerBuffer("/m");
+    _ = model.update(.{ .tick = .{ .timestamp = 0, .delta = 0 } }, &tctx.ctx);
+    const with_palette = model.view(&tctx.ctx);
+    try std.testing.expectEqual(@as(usize, 20), TuiModel.countLines(with_palette));
+    try std.testing.expect(std.mem.indexOf(u8, with_palette, "/model") != null);
+
+    var rows = std.mem.splitScalar(u8, with_palette, '\n');
+    var last: []const u8 = "";
+    while (rows.next()) |row| last = row;
+    try std.testing.expect(last.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, with_palette, "\n"));
 }
 
 test "TuiModel inline frame keeps the composer on the bottom row across a picker" {

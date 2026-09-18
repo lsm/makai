@@ -110,8 +110,15 @@ code paths; add a transcript row instead.
   of scrolling it into scrollback (the flush budget ignores modals, so covered rows
   are never flushed), and closing it repaints the same rows with the composer back on
   the bottom row. Because scrollback rows plus frame rows are always a prefix of the
-  stream, the terminal never shows a duplicated or missing row. While the transcript
-  is shorter than the screen the frame simply grows downward from where it started.
+  stream, the terminal never shows a duplicated or missing row. The frame is padded
+  with blank rows at the top to exactly `height`, so it is bottom-anchored from the
+  first paint rather than only once the transcript fills the screen: without the
+  padding a short transcript left the frame the height of its own content and the
+  status line sat wherever the shell cursor happened to be, with the rest of the
+  viewport blank below it. The cost is that content growth shifts every row up, so a
+  paint that adds a transcript row rewrites the whole frame instead of only the rows
+  below the insertion; a paint that changes no heights (a spinner tick) still rewrites
+  only what changed, because rows keep their index.
 - Active entries render with `live = true` (spinner, caret, tail-clipped thinking, the
   "waiting for <model>" line when streaming with nothing active); inactive rows render
   identically whether painted in the frame or flushed above it.
