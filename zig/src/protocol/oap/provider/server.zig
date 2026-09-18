@@ -46,6 +46,7 @@ pub const ActiveInference = struct {
     max_output_tokens: ?u32 = null,
     temperature: ?f32 = null,
     include_snapshot: types.SnapshotPolicy,
+    credential_ref: ?[]const u8 = null,
     next_sequence: u64 = 1,
     open_part: ?u32 = null,
     open_part_kind: types.PartKind = .text,
@@ -57,6 +58,7 @@ pub const ActiveInference = struct {
     cancel_requested: bool = false,
 
     pub fn deinit(self: *ActiveInference, allocator: std.mem.Allocator) void {
+        if (self.credential_ref) |value| allocator.free(value);
         allocator.free(self.id);
         allocator.free(self.model_ref);
         for (self.messages) |*message| message.deinit(allocator);
@@ -681,6 +683,12 @@ pub const Server = struct {
             self.allocator.free(messages);
         }
 
+        const credential_ref = if (create_request.credential_ref) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (credential_ref) |value| self.allocator.free(value);
+
         const queued = try self.allocator.dupe(u8, inference_id);
         errdefer self.allocator.free(queued);
 
@@ -717,6 +725,7 @@ pub const Server = struct {
             .max_output_tokens = create_request.max_output_tokens,
             .temperature = create_request.temperature,
             .include_snapshot = honoured,
+            .credential_ref = credential_ref,
             .closed_parts = std.ArrayList(oap_types.ContentPart).empty,
             .text = std.ArrayList(u8).empty,
         });

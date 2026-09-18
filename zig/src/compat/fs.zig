@@ -58,6 +58,29 @@ pub fn createDir(dir: Dir, path: []const u8) !void {
     try dir.createDirPath(defaultIo(), path);
 }
 
+pub fn createPrivateDir(path: [:0]const u8) !void {
+    if (std.c.mkdir(path.ptr, 0o700) != 0) {
+        return switch (std.posix.errno(@as(c_int, -1))) {
+            else => error.CreateDirFailed,
+        };
+    }
+}
+
+pub fn removeDir(path: [:0]const u8) void {
+    _ = std.c.rmdir(path.ptr);
+}
+
+pub fn removeFile(path: [:0]const u8) void {
+    _ = std.c.unlink(path.ptr);
+}
+
+pub fn directoryPermissions(path: []const u8) !u32 {
+    var dir = try getCwd().openDir(defaultIo(), path, .{});
+    defer dir.close(defaultIo());
+    const stat = try dir.stat(defaultIo());
+    return @intFromEnum(stat.permissions) & 0o777;
+}
+
 pub fn modifiedMillis(dir: Dir, path: []const u8) !i64 {
     var file = try dir.openFile(defaultIo(), path, .{});
     defer file.close(defaultIo());

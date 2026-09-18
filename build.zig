@@ -786,6 +786,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_oap_provider_grant_channel_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/protocol/oap/provider/grant_channel.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
     const protocol_oap_provider_runtime_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/protocol/oap/provider/runtime.zig"),
         .target = target,
@@ -1596,6 +1605,7 @@ pub fn build(b: *std.Build) void {
     const protocol_oap_provider_envelope_test = b.addTest(.{ .root_module = protocol_oap_provider_envelope_mod });
     const protocol_oap_provider_server_test = b.addTest(.{ .root_module = protocol_oap_provider_server_mod });
     const protocol_oap_provider_catalog_test = b.addTest(.{ .root_module = protocol_oap_provider_catalog_mod });
+    const protocol_oap_provider_grant_channel_test = b.addTest(.{ .root_module = protocol_oap_provider_grant_channel_mod });
     const protocol_oap_provider_runtime_test = b.addTest(.{ .root_module = protocol_oap_provider_runtime_mod });
     const protocol_oap_envelope_test = b.addTest(.{ .root_module = protocol_oap_envelope_mod });
     const protocol_oap_server_test = b.addTest(.{ .root_module = protocol_oap_server_mod });
@@ -1743,6 +1753,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oap_provider_types", .module = protocol_oap_provider_types_mod },
             .{ .name = "oap_provider_server", .module = protocol_oap_provider_server_mod },
             .{ .name = "oap_provider_catalog", .module = protocol_oap_provider_catalog_mod },
+            .{ .name = "oap_provider_grant_channel", .module = protocol_oap_provider_grant_channel_mod },
             .{ .name = "oap_provider_runtime", .module = protocol_oap_provider_runtime_mod },
             .{ .name = "oap_types", .module = protocol_oap_types_mod },
         },
@@ -1915,6 +1926,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_server_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_catalog_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_grant_channel_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_provider_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_oap_server_test).step);
@@ -1975,6 +1987,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_catalog_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_grant_channel_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_provider_runtime_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_oap_server_test).step);

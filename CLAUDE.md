@@ -318,11 +318,22 @@ terminal carrying `credential_missing`. Callers must expect the terminal from th
 create-time branch exists for an endpoint configured the other way and never fires here.
 
 Credential grants are advertised on the descriptor (`credential_grant`, `grant_kinds`) so a caller
-learns the tier before sending a secret. makai advertises `none` today: our `AuthStorage.persist`
-has two branches and both write, so we have no representation for a credential that cannot reach
-durable storage, and the profile's non-persistable requirement is not satisfiable for a refreshable
-grant until one exists. A granted **static** key would be safe by construction, because a per-call
-`api_key` short-circuits the storage path entirely in `streamWithRefresh`.
+learns the tier before sending a secret. makai advertises the **out-of-band tier with the `static`
+kind only**, and only where it can serve it: the channel is a per-grant unix socket, so a Windows
+build advertises `none` rather than a tier it cannot open. A static key is safe by construction
+because a per-call `api_key` short-circuits the storage path entirely in `streamWithRefresh`; a
+**refreshable** grant is still refused, because `AuthStorage.persist` has two branches and both
+write, so we have no representation for a credential that cannot reach durable storage and the
+profile's non-persistable requirement is not satisfiable until one exists.
+
+The channel lives in `protocol/oap/provider/grant_channel.zig` and follows the stdio binding: the
+socket is created per grant under a directory created 0700, the accept and the read are polled with
+a zero timeout so the envelope stream never blocks on a silent caller, exactly one connection is
+read, a first line that is not the nonce closes the connection without an error envelope, the value
+is the bytes after that newline to the close, and the socket and its directory are destroyed when
+the grant settles either way. A grant whose socket cannot be opened is refused immediately rather
+than left pending, because the arrival deadline runs from the channel envelope and an unannounced
+grant would have no deadline at all.
 
 The profile can be **conformance-tested** and cannot yet be **compatibility-tested**, and the two
 words must not be used interchangeably about it. A harness can spawn `makai --oap-provider`, drive
