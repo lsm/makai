@@ -6617,6 +6617,8 @@ fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeA
     return parsed;
 }
 
+const OAP_PROVIDER_PROFILE_REVISION = "ea5e5b9b29dc27a3e84eb6fe6a0f5055fb437988";
+
 const OAP_PROVIDER_MALFORMED_MESSAGE = "makai --oap-provider: a line on stdin was not a decodable envelope\n";
 const OAP_PROVIDER_EXHAUSTED_MESSAGE = "makai --oap-provider: out of memory decoding a line on stdin; the endpoint is stopping rather than continuing in an unknown state\n";
 
@@ -7079,6 +7081,7 @@ fn runOapProviderMode(
         .grant_channel = .unsupported,
         .accepts_inference = true,
         .resolves_own_credentials = true,
+        .profile_revision = OAP_PROVIDER_PROFILE_REVISION,
     });
     defer server.deinit();
 
@@ -7526,6 +7529,45 @@ test "the endpoint claims no carry round trip it cannot perform" {
         .timestamp = 0,
     };
     try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 0) == null);
+}
+
+test "describe names a draft revision that identifies a state rather than a stream" {
+    const allocator = std.testing.allocator;
+
+    const streams = [_][]const u8{ "main", "master", "HEAD", "head", "latest", "trunk", "drafts/main" };
+    for (streams) |stream| {
+        if (std.ascii.eqlIgnoreCase(OAP_PROVIDER_PROFILE_REVISION, stream)) {
+            std.debug.print(
+                "\nprofile_revision is \"{s}\", which names a stream and not a state\n",
+                .{OAP_PROVIDER_PROFILE_REVISION},
+            );
+            return error.ProfileRevisionNamesAStream;
+        }
+    }
+    try std.testing.expect(OAP_PROVIDER_PROFILE_REVISION.len > 0);
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+        .profile_revision = OAP_PROVIDER_PROFILE_REVISION,
+    });
+    defer server.deinit();
+
+    const line =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_provider_types.PROFILE ++
+        "\",\"type\":\"provider.describe.request\",\"id\":\"q1\",\"payload\":{}}";
+    try server.handleLine(line);
+
+    const outbound = server.popOutbound() orelse return error.TestExpectedOutbound;
+    defer allocator.free(outbound);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, outbound, .{});
+    defer parsed.deinit();
+
+    const published = parsed.value.object.get("payload").?.object.get("profile_revision").?.string;
+    try std.testing.expectEqualStrings(OAP_PROVIDER_PROFILE_REVISION, published);
 }
 
 fn populateCatalogUnderFailure(allocator: std.mem.Allocator) !void {

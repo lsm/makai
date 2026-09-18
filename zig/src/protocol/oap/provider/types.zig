@@ -486,11 +486,13 @@ pub const DescribeRequest = struct {};
 pub const DescribeResponse = struct {
     providers: []ProviderDescriptor = &.{},
     protocol_versions: []const []const u8 = &.{},
+    profile_revision: ?[]const u8 = null,
 
     pub fn deinit(self: *DescribeResponse, allocator: std.mem.Allocator) void {
         for (self.providers) |*descriptor| descriptor.deinit(allocator);
         allocator.free(self.providers);
         freeStringList(allocator, self.protocol_versions);
+        if (self.profile_revision) |value| allocator.free(value);
     }
 };
 

@@ -182,6 +182,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
         },
         .provider_describe_response => |value| {
             try w.beginObject();
+            if (value.profile_revision) |revision| try w.writeStringField("profile_revision", revision);
             try w.writeKey("providers");
             try w.beginArray();
             for (value.providers) |descriptor| try writeProviderDescriptor(w, descriptor);
@@ -1109,11 +1110,15 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
         &.{};
     errdefer types.freeStringList(allocator, versions);
 
+    const profile_revision = try oap_envelope.optionalOwnedString(obj, "profile_revision", allocator);
+    errdefer if (profile_revision) |value| allocator.free(value);
+
     const owned_providers = try providers.toOwnedSlice(allocator);
 
     return types.Payload{ .provider_describe_response = .{
         .providers = owned_providers,
         .protocol_versions = versions,
+        .profile_revision = profile_revision,
     } };
 }
 
@@ -1405,6 +1410,49 @@ test "a payload member the profile does not define is refused" {
         "\"messages\":[],\"metadata\":{\"k\":\"v\"},\"temperature\":0.5}}";
     var decoded = try deserializeEnvelope(accepted, allocator);
     decoded.deinit(allocator);
+}
+
+const Refusal = struct { line: []const u8, want: DecodeError };
+
+test "every required member and closed vocabulary is refused when it is absent or wrong" {
+    const allocator = std.testing.allocator;
+    const h = "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++ "\",";
+    const scope = "\"inference_id\":\"i\",\"sequence\":1,";
+
+    const cases = [_]Refusal{
+        .{ .line = h ++ "\"type\":\"inference.started\",\"id\":\"m\"," ++ scope ++ "\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.started\",\"id\":\"m\"," ++ scope ++ "\"payload\":{\"model_ref\":\"p/ollama@m\"}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"provider.describe.request\",\"id\":\"m\"}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"nonsense.type\",\"id\":\"m\",\"payload\":{}}", .want = DecodeError.UnknownEnvelopeType },
+        .{ .line = h ++ "\"type\":\"inference.create.request\",\"id\":\"m\",\"payload\":{\"model_ref\":\"p/ollama@m\"}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.completed\",\"id\":\"m\"," ++ scope ++ "\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.failed\",\"id\":\"m\"," ++ scope ++ "\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"error\",\"id\":\"m\",\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.part.started\",\"id\":\"m\"," ++ scope ++ "\"payload\":{\"part_kind\":\"text\"}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.part.ended\",\"id\":\"m\"," ++ scope ++ "\"payload\":{\"part_index\":0,\"part_kind\":\"tool_call\"}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.part.ended\",\"id\":\"m\"," ++ scope ++ "\"payload\":{\"part_index\":0,\"part_kind\":\"tool_call\",\"tool_call\":{\"tool_call_id\":\"c\",\"name\":\"n\"}}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"provider.models.list.response\",\"id\":\"m\",\"payload\":{}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"inference.sync.response\",\"id\":\"m\"," ++ scope ++ "\"payload\":{\"snapshot\":[{\"role\":\"assistant\"}]}}", .want = DecodeError.MissingField },
+        .{ .line = h ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"other\",\"wire_id\":\"x\",\"framing\":\"sse\",\"endpoint\":\"e\",\"grant_kinds\":[\"nope\"]}]}}", .want = DecodeError.InvalidField },
+        .{ .line = h ++ "\"type\":\"provider.describe.response\",\"id\":\"m\",\"payload\":{\"providers\":[{\"id\":\"g\",\"wire\":\"other\",\"wire_id\":\"x\",\"framing\":\"sse\",\"endpoint\":\"e\",\"snapshot_policies\":[\"nope\"]}]}}", .want = DecodeError.InvalidField },
+        .{ .line = h ++ "\"type\":\"provider.models.list.response\",\"id\":\"m\",\"payload\":{\"models\":[{\"model_ref\":\"g/other:x@m\",\"model_id\":\"m\",\"provider_id\":\"g\",\"wire\":\"other\",\"capabilities\":[\"nope\"]}]}}", .want = DecodeError.InvalidField },
+    };
+
+    for (cases, 0..) |case, index| {
+        const decoded = deserializeEnvelope(case.line, allocator);
+        if (decoded) |env| {
+            var owned = env;
+            owned.deinit(allocator);
+            std.debug.print("\ncase {d} was accepted but should be {s}\n  {s}\n", .{ index, @errorName(case.want), case.line });
+            return error.RefusalMissing;
+        } else |err| {
+            if (err != case.want) {
+                std.debug.print("\ncase {d} expected {s}, found {s}\n  {s}\n", .{ index, @errorName(case.want), @errorName(err), case.line });
+                return error.WrongRefusal;
+            }
+        }
+    }
 }
 
 test "a carry round trip claim survives the wire and defaults to absent" {

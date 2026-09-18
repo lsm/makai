@@ -17,6 +17,7 @@ pub const IMPLEMENTS_SYNC = true;
 
 pub const Options = struct {
     capability_revision: []const u8 = "r1",
+    profile_revision: ?[]const u8 = null,
     grant_channel: GrantChannel = .unsupported,
     default_grant_ttl_ms: u64 = 300_000,
     accepts_inference: bool = false,
@@ -361,6 +362,7 @@ pub const Server = struct {
             envelope.DecodeError.UnknownEnvelopeType => .invalid_request,
             envelope.DecodeError.ProfileMismatch, envelope.DecodeError.ProtocolMismatch => .protocol_violation,
             envelope.DecodeError.MissingField, envelope.DecodeError.InvalidField => .invalid_request,
+            envelope.DecodeError.UnknownField => .invalid_request,
             else => .protocol_violation,
         };
         const message = switch (err) {
@@ -369,6 +371,7 @@ pub const Server = struct {
             envelope.DecodeError.ProfileMismatch => "this endpoint serves open-agent-protocol 0.1 model-provider-core only",
             envelope.DecodeError.VersionMismatch => "unsupported protocol version",
             envelope.DecodeError.UnknownEnvelopeType => "unrecognized envelope type for this profile",
+            envelope.DecodeError.UnknownField => "this payload carries a member the profile does not define",
             else => "envelope could not be decoded",
         };
         try self.emitError(code, message, in_reply_to);
@@ -414,6 +417,12 @@ pub const Server = struct {
         errdefer self.allocator.free(versions);
         versions[0] = try self.allocator.dupe(u8, types.VERSION);
 
+        const profile_revision = if (self.options.profile_revision) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (profile_revision) |value| self.allocator.free(value);
+
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
@@ -421,6 +430,7 @@ pub const Server = struct {
             .payload = .{ .provider_describe_response = .{
                 .providers = descriptors,
                 .protocol_versions = versions,
+                .profile_revision = profile_revision,
             } },
         };
         defer response.deinit(self.allocator);
