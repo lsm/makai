@@ -2293,6 +2293,66 @@ fn acceptOne(allocator: std.mem.Allocator, server: *Server, snapshot: []const u8
     return allocator.dupe(u8, response.inference_id.?);
 }
 
+test "an inference that fails mid-stream numbers its frames the same way a completed one does" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+
+    try server.noteStarted(inference_id);
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try server.notePartDelta(inference_id, 0, "partial");
+    server.abandonOpenPart(inference_id);
+    try server.settleFailed(inference_id, .provider_unavailable, "upstream went away", null);
+
+    var expected_sequence: u64 = 1;
+    var terminals: usize = 0;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+
+        try std.testing.expectEqualStrings(inference_id, env.inference_id.?);
+        try std.testing.expectEqual(expected_sequence, env.sequence.?);
+        expected_sequence += 1;
+        if (env.payload == .inference_failed) terminals += 1;
+    }
+
+    try std.testing.expectEqual(@as(u64, 5), expected_sequence);
+    try std.testing.expectEqual(@as(usize, 1), terminals);
+}
+
+test "a refused create consumes no inference sequence because it opens no inference" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const bad = try makeRequest(
+        allocator,
+        "inference.create.request",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
+        "q1",
+    );
+    defer allocator.free(bad);
+    try server.handleLine(bad);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+    try std.testing.expect(refusal.inference_id == null);
+    try std.testing.expect(refusal.sequence == null);
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+    try server.noteStarted(inference_id);
+
+    var started = try decodeOnly(allocator, &server);
+    defer started.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), started.sequence.?);
+}
+
 test "a streamed inference emits one contiguous sequence and exactly one terminal" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{ .accepts_inference = true });
