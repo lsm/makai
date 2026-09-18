@@ -7240,23 +7240,26 @@ fn buildOapInferenceContext(
     var system = std.ArrayList(u8).empty;
     errdefer system.deinit(allocator);
 
-    var conversation: usize = 0;
-    for (source) |message| {
-        if (!oapRoleIsSystem(message.role)) conversation += 1;
-    }
-
-    const messages = try allocator.alloc(ai_types.Message, conversation);
-    var built: usize = 0;
+    var built_messages = std.ArrayList(ai_types.Message).empty;
     errdefer {
-        for (messages[0..built]) |*message| message.deinit(allocator);
-        allocator.free(messages);
+        for (built_messages.items) |*message| message.deinit(allocator);
+        built_messages.deinit(allocator);
     }
 
     for (source) |message| {
         if (message.role == .assistant) {
             const content = try oapAssistantContent(allocator, message);
-            messages[built] = .{ .assistant = try buildOapAssistantMessage(allocator, content, identity) };
-            built += 1;
+            const assistant = try buildOapAssistantMessage(allocator, content, identity);
+            try built_messages.append(allocator, .{ .assistant = assistant });
+            continue;
+        }
+
+        if (oapMessageToolResults(message)) |parts| {
+            for (parts) |part| {
+                if (part != .tool_result) continue;
+                const result = try buildOapToolResult(allocator, part.tool_result, source);
+                try built_messages.append(allocator, .{ .tool_result = result });
+            }
             continue;
         }
 
@@ -7268,8 +7271,13 @@ fn buildOapInferenceContext(
             continue;
         }
         errdefer allocator.free(text);
-        messages[built] = .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } };
-        built += 1;
+        try built_messages.append(allocator, .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } });
+    }
+
+    const messages = try built_messages.toOwnedSlice(allocator);
+    errdefer {
+        for (messages) |*message| message.deinit(allocator);
+        allocator.free(messages);
     }
 
     const system_prompt = try system.toOwnedSlice(allocator);
@@ -7279,6 +7287,54 @@ fn buildOapInferenceContext(
         .system_prompt = ai_types.OwnedSlice(u8).initOwned(system_prompt),
         .messages = messages,
         .is_owned = true,
+    };
+}
+
+fn oapMessageToolResults(message: oap_types.Message) ?[]const oap_types.ContentPart {
+    const parts = switch (message.content) {
+        .parts => |value| value,
+        else => return null,
+    };
+    for (parts) |part| {
+        if (part == .tool_result) return parts;
+    }
+    return null;
+}
+
+fn oapToolNameForCall(source: []const oap_types.Message, tool_call_id: []const u8) []const u8 {
+    for (source) |message| {
+        const parts = switch (message.content) {
+            .parts => |value| value,
+            else => continue,
+        };
+        for (parts) |part| {
+            if (part != .tool_call) continue;
+            if (std.mem.eql(u8, part.tool_call.tool_call_id, tool_call_id)) return part.tool_call.name;
+        }
+    }
+    return "";
+}
+
+fn buildOapToolResult(
+    allocator: std.mem.Allocator,
+    part: oap_types.ToolResultPart,
+    source: []const oap_types.Message,
+) !ai_types.ToolResultMessage {
+    const id = try allocator.dupe(u8, part.tool_call_id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, oapToolNameForCall(source, part.tool_call_id));
+    errdefer allocator.free(name);
+    const body = try allocator.dupe(u8, part.result_json);
+    errdefer allocator.free(body);
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{ .text = body } };
+
+    return ai_types.ToolResultMessage{
+        .tool_call_id = id,
+        .tool_name = name,
+        .content = content,
+        .is_error = part.is_error orelse false,
+        .timestamp = compat.time.nowMillis(),
     };
 }
 

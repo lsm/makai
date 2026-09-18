@@ -929,6 +929,7 @@ pub const Server = struct {
                     const empty = try self.allocator.dupe(u8, "");
                     errdefer self.allocator.free(empty);
                     const partial = try self.allocator.dupe(u8, accumulated);
+                    errdefer self.allocator.free(partial);
                     try parts.append(self.allocator, .{ .tool_call = .{
                         .tool_call_id = id,
                         .name = name,
@@ -1489,15 +1490,14 @@ pub fn cloneHeaders(
 }
 
 fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
-    if (message.role == .tool) return true;
     return switch (message.content) {
-        .text => false,
+        .text => message.role == .tool,
         .parts => |parts| blk: {
             for (parts) |part| {
                 switch (part) {
                     .text => {},
                     .reasoning, .tool_call => if (message.role != .assistant) break :blk true,
-                    .tool_result => break :blk true,
+                    .tool_result => {},
                 }
             }
             break :blk false;
@@ -2596,7 +2596,7 @@ test "a request member the endpoint cannot forward is refused rather than droppe
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"stream\":false}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":\"ok\"}]}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"bare result with no call id\"}]}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"result\"}]}",
     };
 
