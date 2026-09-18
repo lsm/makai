@@ -6363,10 +6363,7 @@ pub fn main(init: std.process.Init) !void {
             try printUsage(stderr);
             return error.UnknownOapProviderArgument;
         }
-        runOapProviderMode(allocator, stdin, stdout, stderr) catch |err| {
-            if (err == error.MalformedProviderLine) std.process.exit(1);
-            return err;
-        };
+        try runOapProviderMode(allocator, stdin, stdout, stderr);
         return;
     }
 
@@ -6621,8 +6618,14 @@ fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeA
 
 const OAP_PROVIDER_PROFILE_REVISION = "ea5e5b9b29dc27a3e84eb6fe6a0f5055fb437988";
 
-const OAP_PROVIDER_MALFORMED_MESSAGE = "makai --oap-provider: a line on stdin was not a decodable envelope\n";
 const OAP_PROVIDER_EXHAUSTED_MESSAGE = "makai --oap-provider: out of memory decoding a line on stdin; the endpoint is stopping rather than continuing in an unknown state\n";
+
+test "the only failure that escapes handleLine is the one the stderr message names" {
+    const E = @typeInfo(@typeInfo(@TypeOf(oap_provider_server.Server.handleLine)).@"fn".return_type.?).error_union.error_set;
+    const escaping = @typeInfo(E).error_set.?;
+    try std.testing.expectEqual(@as(usize, 1), escaping.len);
+    try std.testing.expectEqualStrings("OutOfMemory", escaping[0].name);
+}
 
 fn oapProviderCompatibility(
     provider_id: []const u8,
@@ -7330,10 +7333,7 @@ fn runOapProviderMode(
 
             server.handleLine(line) catch |err| {
                 _ = try drainOapProviderOutbound(stdout, allocator, &server);
-                try compat.stdio.writeAll(stderr, if (err == error.OutOfMemory)
-                    OAP_PROVIDER_EXHAUSTED_MESSAGE
-                else
-                    OAP_PROVIDER_MALFORMED_MESSAGE);
+                try compat.stdio.writeAll(stderr, OAP_PROVIDER_EXHAUSTED_MESSAGE);
                 return err;
             };
             did_work = true;

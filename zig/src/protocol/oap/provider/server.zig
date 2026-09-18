@@ -309,7 +309,38 @@ pub const Server = struct {
         return false;
     }
 
+    pub const GrantLookup = enum { live, expired, unknown };
+
+    pub fn burnExpiredGrants(self: *Self, now_ms: i64) void {
+        var index: usize = 0;
+        while (index < self.grants.items.len) {
+            const expiry = self.grants.items[index].expires_at_ms orelse {
+                index += 1;
+                continue;
+            };
+            if (now_ms < expiry) {
+                index += 1;
+                continue;
+            }
+            var removed = self.grants.orderedRemove(index);
+            removed.deinit(self.allocator);
+        }
+    }
+
+    pub fn lookupGrant(self: *Self, reference: []const u8) GrantLookup {
+        const now = compat.time.nowMillis();
+        for (self.grants.items) |*grant| {
+            if (!std.mem.eql(u8, grant.reference, reference)) continue;
+            const expiry = grant.expires_at_ms orelse return .live;
+            if (now < expiry) return .live;
+            self.burnExpiredGrants(now);
+            return .expired;
+        }
+        return .unknown;
+    }
+
     pub fn findGrant(self: *Self, reference: []const u8) ?*GrantedCredential {
+        if (self.lookupGrant(reference) != .live) return null;
         for (self.grants.items) |*grant| {
             if (std.mem.eql(u8, grant.reference, reference)) return grant;
         }
@@ -624,9 +655,20 @@ pub const Server = struct {
         }
 
         if (create_request.credential_ref) |reference| {
-            if (self.findGrant(reference) == null and !descriptor.allows_anonymous) {
-                try self.emitCreateRefusal(env, .credential_missing, "credential_ref names no credential this implementation holds");
-                return;
+            switch (self.lookupGrant(reference)) {
+                .live => {},
+                .expired => {
+                    try self.emitCreateRefusal(
+                        env,
+                        .credential_expired,
+                        "the credential this reference names has passed the expiry it was granted with",
+                    );
+                    return;
+                },
+                .unknown => if (!descriptor.allows_anonymous) {
+                    try self.emitCreateRefusal(env, .credential_missing, "credential_ref names no credential this implementation holds");
+                    return;
+                },
             }
         } else if (!descriptor.allows_anonymous and !self.options.resolves_own_credentials) {
             try self.emitCreateRefusal(env, .credential_missing, "this provider needs a credential and the request named none");
@@ -1931,6 +1973,61 @@ test "a credential ref naming no held grant is refused on a provider that needs 
         types.ErrorAction.authenticate,
         refusal.payload.inference_create_response.err.?.code.action(),
     );
+}
+
+test "a grant past its stated expiry is refused with the actionable code and burned" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band, .default_grant_ttl_ms = 0 });
+    defer server.deinit();
+
+    try server.addProvider(.{
+        .id = try allocator.dupe(u8, "acme"),
+        .wire = .@"anthropic-messages",
+        .framing = .sse,
+        .endpoint = try allocator.dupe(u8, "https://acme.test"),
+        .allows_anonymous = false,
+    });
+
+    const grant_line = try makeRequest(
+        allocator,
+        "provider.credential.grant.request",
+        "{\"provider_id\":\"acme\",\"nonce\":\"n1\"}",
+        "q1",
+    );
+    defer allocator.free(grant_line);
+    try server.handleLine(grant_line);
+    try server.announceChannel("n1", "/tmp/grant-expiry.sock");
+
+    const reference = try server.completeGrant("n1");
+    defer allocator.free(reference);
+    while (server.popOutbound()) |outbound| allocator.free(outbound);
+    try std.testing.expectEqual(@as(usize, 1), server.grants.items.len);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"model_ref\":\"acme/anthropic-messages@m\",\"messages\":[],\"credential_ref\":\"{s}\"}}",
+        .{reference},
+    );
+    defer allocator.free(payload);
+    const create_line = try makeRequest(allocator, "inference.create.request", payload, "q2");
+    defer allocator.free(create_line);
+    try server.handleLine(create_line);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expectEqual(
+        types.ErrorCode.credential_expired,
+        refusal.payload.inference_create_response.err.?.code,
+    );
+    try std.testing.expectEqual(
+        types.ErrorAction.refresh,
+        refusal.payload.inference_create_response.err.?.code.action(),
+    );
+    try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+    try std.testing.expect(refusal.inference_id == null);
+
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
+    try std.testing.expect(server.findGrant(reference) == null);
 }
 
 test "describe tells a caller which grant tier the binding uses before it sends anything" {
