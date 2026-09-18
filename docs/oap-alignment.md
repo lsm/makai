@@ -423,7 +423,7 @@ shape produced a duplicate `model_ref` parser in this profile, where three tests
 about the other, and the tests are attached to the wrong artifact to tell you so.
 
 Mutation results for the provider decoder, as a baseline for anyone changing it: 49 single-line
-refusals, 33 killed, 16 surviving. The killed set contains every rule the profile makes normative.
+refusals, 29 killed, 20 surviving. The killed set contains every rule the profile makes normative.
 The survivors are type tags guarding a union field access — malformed-input robustness, which the
 profile does not specify and which was correct but unverified rather than wrong. Recording which
 test kills each mutant matters as much as the count: a rule killed only by a generically named test
