@@ -82,6 +82,7 @@ fn writeProviderDescriptor(w: *json_writer.JsonWriter, descriptor: types.Provide
     try w.endArray();
     try w.writeBoolField("answers_sync", descriptor.snapshot_policies.answers_sync);
     try w.endObject();
+    try w.writeStringField("credential_grant", @tagName(descriptor.credential_grant));
     try w.writeBoolField("allows_anonymous", descriptor.allows_anonymous);
     if (descriptor.context_window) |value| try w.writeIntField("context_window", value);
     if (descriptor.max_output_tokens) |value| try w.writeIntField("max_output_tokens", value);
@@ -246,7 +247,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
         },
         .inference_create_response => |value| {
             try w.beginObject();
-            try w.writeStringField("inference_id", value.inference_id);
+            if (value.inference_id) |inference_id| try w.writeStringField("inference_id", inference_id);
             try w.writeBoolField("accepted", value.accepted);
             if (value.honoured) |honoured| try w.writeStringField("honoured", @tagName(honoured));
             if (value.err) |err| {
@@ -563,9 +564,11 @@ fn deserializePayload(
             } };
         },
         .inference_create_response => {
-            const inference_id = try oap_envelope.requiredOwnedString(obj, "inference_id", allocator);
-            errdefer allocator.free(inference_id);
             const accepted = try oap_envelope.requiredBool(obj, "accepted");
+            const inference_id = try oap_envelope.optionalOwnedString(obj, "inference_id", allocator);
+            errdefer if (inference_id) |value| allocator.free(value);
+            if (accepted and inference_id == null) return DecodeError.MissingField;
+            if (!accepted and inference_id != null) return DecodeError.InvalidField;
             const honoured = try oap_envelope.optionalEnum(types.SnapshotPolicy, obj, "honoured");
             var err: ?types.ProtocolError = null;
             if (obj.get("error")) |error_value| {
@@ -874,6 +877,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
                 .policies = try policies.toOwnedSlice(allocator),
                 .answers_sync = answers_sync,
             },
+            .credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none,
             .allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false,
             .context_window = try optionalU32(descriptor_obj, "context_window"),
             .max_output_tokens = try optionalU32(descriptor_obj, "max_output_tokens"),

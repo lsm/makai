@@ -316,6 +316,16 @@ pub fn headerCarriesCredential(header: HeaderPair) bool {
     return looksLikeBearerValue(header.value);
 }
 
+pub const CredentialGrantChannel = enum {
+    none,
+    out_of_band,
+    on_envelope,
+
+    pub fn parse(value: []const u8) ?CredentialGrantChannel {
+        return std.meta.stringToEnum(CredentialGrantChannel, value);
+    }
+};
+
 pub const SnapshotPolicies = struct {
     policies: []const SnapshotPolicy = &.{},
     answers_sync: bool = false,
@@ -341,6 +351,7 @@ pub const ProviderDescriptor = struct {
     headers: []const HeaderPair = &.{},
     compatibility: CompatibilityFacts = .{},
     snapshot_policies: SnapshotPolicies = .{},
+    credential_grant: CredentialGrantChannel = .none,
     allows_anonymous: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -483,13 +494,13 @@ pub const CreateRequest = struct {
 };
 
 pub const CreateResponse = struct {
-    inference_id: []const u8,
+    inference_id: ?[]const u8 = null,
     accepted: bool,
     honoured: ?SnapshotPolicy = null,
     err: ?ProtocolError = null,
 
     pub fn deinit(self: *CreateResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.inference_id);
+        if (self.inference_id) |value| allocator.free(value);
         if (self.err) |*value| value.deinit(allocator);
     }
 };

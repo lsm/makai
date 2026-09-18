@@ -420,19 +420,13 @@ pub const Server = struct {
         errdefer self.allocator.free(id);
         const reply = try self.allocator.dupe(u8, env.id);
         errdefer self.allocator.free(reply);
-        const inference_id = try self.nextId();
-        errdefer self.allocator.free(inference_id);
-        const echoed = try self.allocator.dupe(u8, inference_id);
-        errdefer self.allocator.free(echoed);
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
 
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
-            .inference_id = echoed,
             .payload = .{ .inference_create_response = .{
-                .inference_id = inference_id,
                 .accepted = false,
                 .err = .{ .code = code, .message = owned_message },
             } },
@@ -494,6 +488,7 @@ pub fn cloneDescriptor(
             .policies = policies,
             .answers_sync = descriptor.snapshot_policies.answers_sync,
         },
+        .credential_grant = descriptor.credential_grant,
         .allows_anonymous = descriptor.allows_anonymous,
         .context_window = descriptor.context_window,
         .max_output_tokens = descriptor.max_output_tokens,
@@ -563,6 +558,11 @@ fn testServer(allocator: std.mem.Allocator, options: Options) !Server {
 
     try server.addProvider(.{
         .id = provider_id,
+        .credential_grant = switch (options.grant_channel) {
+            .unsupported => .none,
+            .out_of_band => .out_of_band,
+            .on_envelope => .on_envelope,
+        },
         .wire = .@"openai-chat-completions",
         .framing = .ndjson,
         .endpoint = endpoint,
@@ -870,7 +870,7 @@ test "a supported snapshot policy needs no degrade permission" {
     );
 }
 
-test "the create response carries the scope field and it agrees with the payload" {
+test "a refusal allocates no inference and is correlated by in_reply_to alone" {
     const allocator = std.testing.allocator;
     var server = try testServer(allocator, .{});
     defer server.deinit();
@@ -887,9 +887,9 @@ test "the create response carries the scope field and it agrees with the payload
     var response = try decodeOnly(allocator, &server);
     defer response.deinit(allocator);
 
-    const scope = response.inference_id orelse return error.TestExpectedScopeField;
-    try std.testing.expectEqualStrings(scope, response.payload.inference_create_response.inference_id);
-    try std.testing.expect(response.sequence == null);
+    try std.testing.expect(response.inference_id == null);
+    try std.testing.expect(response.payload.inference_create_response.inference_id == null);
+    try std.testing.expectEqualStrings("q1", response.in_reply_to.?);
 }
 
 test "a model ref naming no described provider is refused before anything is spent" {
@@ -961,5 +961,53 @@ test "a credential ref naming no held grant is refused on a provider that needs 
     try std.testing.expectEqual(
         types.ErrorAction.authenticate,
         refusal.payload.inference_create_response.err.?.code.action(),
+    );
+}
+
+test "describe tells a caller which grant tier the binding uses before it sends anything" {
+    const allocator = std.testing.allocator;
+
+    var silent = try testServer(allocator, .{ .grant_channel = .unsupported });
+    defer silent.deinit();
+    const q1 = try makeRequest(allocator, "provider.describe.request", "{}", "q1");
+    defer allocator.free(q1);
+    try silent.handleLine(q1);
+    var silent_response = try decodeOnly(allocator, &silent);
+    defer silent_response.deinit(allocator);
+    try std.testing.expectEqual(
+        types.CredentialGrantChannel.none,
+        silent_response.payload.provider_describe_response.providers[0].credential_grant,
+    );
+
+    var side_channel = try testServer(allocator, .{ .grant_channel = .out_of_band });
+    defer side_channel.deinit();
+    const q2 = try makeRequest(allocator, "provider.describe.request", "{}", "q2");
+    defer allocator.free(q2);
+    try side_channel.handleLine(q2);
+    var side_response = try decodeOnly(allocator, &side_channel);
+    defer side_response.deinit(allocator);
+    try std.testing.expectEqual(
+        types.CredentialGrantChannel.out_of_band,
+        side_response.payload.provider_describe_response.providers[0].credential_grant,
+    );
+}
+
+test "an accepted response must name its inference and a refusal must not" {
+    const allocator = std.testing.allocator;
+
+    const refusal_with_id =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"payload\":{\"accepted\":false,\"inference_id\":\"inf1\"}}";
+    try std.testing.expectError(
+        envelope.DecodeError.InvalidField,
+        envelope.deserializeEnvelope(refusal_with_id, allocator),
+    );
+
+    const accepted_without_id =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.create.response\",\"id\":\"m1\",\"payload\":{\"accepted\":true}}";
+    try std.testing.expectError(
+        envelope.DecodeError.MissingField,
+        envelope.deserializeEnvelope(accepted_without_id, allocator),
     );
 }
