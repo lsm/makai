@@ -148,6 +148,13 @@ full queue lifetime yet (the Anthropic direct path frees its delta storage when
 its producer thread exits — #192). Owned events remove that race at the cost of
 one deep copy per event.
 
+Anthropic reads the flag rather than only being built by it: when the stream
+clones on push it frees each parsed delta immediately, since the queued event
+holds a copy, and only the borrowed configuration defers to thread exit. So the
+#192 window exists exactly where the flag is off, and asking for owned events
+both removes it and stops the provider holding every delta string until the
+stream ends.
+
 ## Completion is `wait()` → `null` → result, not a `done` event
 
 The `done` variant of `AssistantMessageEvent` exists, but providers are not
@@ -161,6 +168,17 @@ handle it if you receive it, never gate completion on it.
 result signal — some producers mark the thread done *before* publishing the
 final result. Gate on `wait()` → `null` (blocking) or `isDone()` plus a drained
 queue (polling), then read `getError()` / `cloneResult()`.
+
+Nor is it uniformly a *cleanup* signal. Anthropic Messages, Ollama and Azure
+OpenAI Responses defer the mark to thread exit, so `waitForThread()` returning
+true there means every allocation the producer thread owned has been freed.
+OpenAI Completions, OpenAI Responses, Google Generative and Google Vertex still
+mark on each return path, ahead of the function's own `defer`s, so their threads
+are still freeing buffers after the mark. A test that drives one of those four
+with a leak-checking allocator can observe an allocation that is about to be
+freed and report it as a leak; that is a race in the mark, not in the provider.
+Anthropic was in that group until the tool-call leak tests needed a barrier that
+meant what it said.
 
 ## A stream is never freed underneath a live producer thread
 
