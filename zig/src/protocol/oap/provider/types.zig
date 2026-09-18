@@ -645,6 +645,16 @@ pub const CredentialGrantRequest = struct {
     }
 };
 
+pub const CredentialChannel = struct {
+    nonce: []const u8,
+    channel: []const u8,
+
+    pub fn deinit(self: *CredentialChannel, allocator: std.mem.Allocator) void {
+        allocator.free(self.nonce);
+        allocator.free(self.channel);
+    }
+};
+
 pub const CredentialGrantResponse = struct {
     credential_ref: ?[]const u8 = null,
     expires_at_ms: ?i64 = null,
@@ -672,6 +682,7 @@ pub const Payload = union(enum) {
     provider_models_list_request: ModelsListRequest,
     provider_models_list_response: ModelsListResponse,
     provider_credential_grant_request: CredentialGrantRequest,
+    provider_credential_grant_channel: CredentialChannel,
     provider_credential_grant_response: CredentialGrantResponse,
     inference_create_request: CreateRequest,
     inference_create_response: CreateResponse,
@@ -694,6 +705,7 @@ pub const Payload = union(enum) {
             .provider_models_list_request => "provider.models.list.request",
             .provider_models_list_response => "provider.models.list.response",
             .provider_credential_grant_request => "provider.credential.grant.request",
+            .provider_credential_grant_channel => "provider.credential.grant.channel",
             .provider_credential_grant_response => "provider.credential.grant.response",
             .inference_create_request => "inference.create.request",
             .inference_create_response => "inference.create.response",
@@ -730,6 +742,7 @@ pub const Payload = union(enum) {
             .provider_models_list_request => |*value| value.deinit(allocator),
             .provider_models_list_response => |*value| value.deinit(allocator),
             .provider_credential_grant_request => |*value| value.deinit(allocator),
+            .provider_credential_grant_channel => |*value| value.deinit(allocator),
             .provider_credential_grant_response => |*value| value.deinit(allocator),
             .inference_create_request => |*value| value.deinit(allocator),
             .inference_create_response => |*value| value.deinit(allocator),
@@ -757,6 +770,7 @@ pub fn payloadTypeFromName(name: []const u8) ?std.meta.Tag(Payload) {
         .{ .name = "provider.models.list.request", .tag = .provider_models_list_request },
         .{ .name = "provider.models.list.response", .tag = .provider_models_list_response },
         .{ .name = "provider.credential.grant.request", .tag = .provider_credential_grant_request },
+        .{ .name = "provider.credential.grant.channel", .tag = .provider_credential_grant_channel },
         .{ .name = "provider.credential.grant.response", .tag = .provider_credential_grant_response },
         .{ .name = "inference.create.request", .tag = .inference_create_request },
         .{ .name = "inference.create.response", .tag = .inference_create_response },
@@ -838,6 +852,7 @@ fn typeNameForTag(tag: std.meta.Tag(Payload)) []const u8 {
         .provider_models_list_request => "provider.models.list.request",
         .provider_models_list_response => "provider.models.list.response",
         .provider_credential_grant_request => "provider.credential.grant.request",
+        .provider_credential_grant_channel => "provider.credential.grant.channel",
         .provider_credential_grant_response => "provider.credential.grant.response",
         .inference_create_request => "inference.create.request",
         .inference_create_response => "inference.create.response",

@@ -66,6 +66,23 @@ pub const ActiveInference = struct {
     }
 };
 
+pub const GRANT_ARRIVAL_DEADLINE_MS: i64 = 30_000;
+
+pub const PendingGrant = struct {
+    nonce: []const u8,
+    provider_id: []const u8,
+    request_id: []const u8,
+    ttl_ms: ?u64,
+    announced_at_ms: ?i64 = null,
+
+    pub fn deinit(self: *PendingGrant, allocator: std.mem.Allocator) void {
+        allocator.free(self.nonce);
+        allocator.free(self.provider_id);
+        allocator.free(self.request_id);
+        self.* = undefined;
+    }
+};
+
 pub const Server = struct {
     const Self = @This();
 
@@ -77,6 +94,7 @@ pub const Server = struct {
     outbound: std.ArrayList([]const u8),
     active: std.ArrayList(ActiveInference),
     pending_starts: std.ArrayList([]const u8),
+    pending_grants: std.ArrayList(PendingGrant),
     next_grant_ordinal: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
@@ -89,6 +107,7 @@ pub const Server = struct {
             .outbound = std.ArrayList([]const u8).empty,
             .active = std.ArrayList(ActiveInference).empty,
             .pending_starts = std.ArrayList([]const u8).empty,
+            .pending_grants = std.ArrayList(PendingGrant).empty,
         };
     }
 
@@ -105,6 +124,8 @@ pub const Server = struct {
         self.active.deinit(self.allocator);
         for (self.pending_starts.items) |id| self.allocator.free(id);
         self.pending_starts.deinit(self.allocator);
+        for (self.pending_grants.items) |*grant| grant.deinit(self.allocator);
+        self.pending_grants.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -119,6 +140,132 @@ pub const Server = struct {
     pub fn popPendingStart(self: *Self) ?[]const u8 {
         if (self.pending_starts.items.len == 0) return null;
         return self.pending_starts.orderedRemove(0);
+    }
+
+    pub fn nextUnannouncedGrant(self: *Self) ?*PendingGrant {
+        for (self.pending_grants.items) |*grant| {
+            if (grant.announced_at_ms == null) return grant;
+        }
+        return null;
+    }
+
+    pub fn findPendingGrant(self: *Self, nonce: []const u8) ?*PendingGrant {
+        for (self.pending_grants.items) |*grant| {
+            if (std.mem.eql(u8, grant.nonce, nonce)) return grant;
+        }
+        return null;
+    }
+
+    fn burnPendingGrant(self: *Self, nonce: []const u8) void {
+        for (self.pending_grants.items, 0..) |*grant, index| {
+            if (!std.mem.eql(u8, grant.nonce, nonce)) continue;
+            var removed = self.pending_grants.orderedRemove(index);
+            removed.deinit(self.allocator);
+            return;
+        }
+    }
+
+    pub fn announceChannel(self: *Self, nonce: []const u8, channel: []const u8) !void {
+        const grant = self.findPendingGrant(nonce) orelse return error.UnknownNonce;
+        if (grant.announced_at_ms != null) return error.ChannelAlreadyAnnounced;
+        grant.announced_at_ms = compat.time.nowMillis();
+
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const owned_nonce = try self.allocator.dupe(u8, nonce);
+        errdefer self.allocator.free(owned_nonce);
+        const owned_channel = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(owned_channel);
+
+        var env = types.Envelope{
+            .id = id,
+            .payload = .{ .provider_credential_grant_channel = .{
+                .nonce = owned_nonce,
+                .channel = owned_channel,
+            } },
+        };
+        defer env.deinit(self.allocator);
+        try self.push(env);
+    }
+
+    pub fn expiredGrantNonce(self: *Self, now_ms: i64) ?[]const u8 {
+        for (self.pending_grants.items) |*grant| {
+            const announced = grant.announced_at_ms orelse continue;
+            if (now_ms - announced >= GRANT_ARRIVAL_DEADLINE_MS) return grant.nonce;
+        }
+        return null;
+    }
+
+    pub fn completeGrant(self: *Self, nonce: []const u8) ![]const u8 {
+        const grant = self.findPendingGrant(nonce) orelse return error.UnknownNonce;
+
+        const reference = try std.fmt.allocPrint(
+            self.allocator,
+            "grant:{s}:{d}",
+            .{ grant.provider_id, self.next_grant_ordinal },
+        );
+        errdefer self.allocator.free(reference);
+        self.next_grant_ordinal += 1;
+
+        const provider_id = try self.allocator.dupe(u8, grant.provider_id);
+        errdefer self.allocator.free(provider_id);
+        const stored_nonce = try self.allocator.dupe(u8, nonce);
+        errdefer self.allocator.free(stored_nonce);
+
+        const ttl = grant.ttl_ms orelse self.options.default_grant_ttl_ms;
+        const expires_at: i64 = compat.time.nowMillis() + @as(i64, @intCast(ttl));
+
+        try self.grants.append(self.allocator, .{
+            .reference = reference,
+            .provider_id = provider_id,
+            .nonce = stored_nonce,
+            .expires_at_ms = expires_at,
+            .non_persistable = true,
+        });
+
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const reply = try self.allocator.dupe(u8, grant.request_id);
+        errdefer self.allocator.free(reply);
+        const echoed = try self.allocator.dupe(u8, reference);
+        errdefer self.allocator.free(echoed);
+
+        var response = types.Envelope{
+            .id = id,
+            .in_reply_to = reply,
+            .payload = .{ .provider_credential_grant_response = .{
+                .credential_ref = echoed,
+                .expires_at_ms = expires_at,
+            } },
+        };
+        defer response.deinit(self.allocator);
+        try self.push(response);
+
+        const settled = try self.allocator.dupe(u8, reference);
+        self.burnPendingGrant(nonce);
+        return settled;
+    }
+
+    pub fn refuseGrant(self: *Self, nonce: []const u8, message: []const u8) !void {
+        const grant = self.findPendingGrant(nonce) orelse return error.UnknownNonce;
+
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const reply = try self.allocator.dupe(u8, grant.request_id);
+        errdefer self.allocator.free(reply);
+        const owned_message = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(owned_message);
+
+        var response = types.Envelope{
+            .id = id,
+            .in_reply_to = reply,
+            .payload = .{ .provider_credential_grant_response = .{
+                .err = .{ .code = .credential_rejected, .message = owned_message },
+            } },
+        };
+        defer response.deinit(self.allocator);
+        try self.push(response);
+        self.burnPendingGrant(nonce);
     }
 
     pub fn popOutbound(self: *Self) ?[]const u8 {
@@ -336,12 +483,33 @@ pub const Server = struct {
             return;
         }
 
-        if (self.options.grant_channel == .out_of_band and grant_request.value != null) {
-            try self.emitGrantRefusal(
-                env,
-                .invalid_request,
-                "this binding carries the credential out of band; the grant envelope must not carry a value",
-            );
+        if (self.options.grant_channel == .out_of_band) {
+            if (grant_request.value != null) {
+                try self.emitGrantRefusal(
+                    env,
+                    .invalid_request,
+                    "this binding carries the credential out of band; the grant envelope must not carry a value",
+                );
+                return;
+            }
+            if (self.findPendingGrant(grant_request.nonce) != null) {
+                try self.emitGrantRefusal(env, .invalid_request, "this nonce is already in flight");
+                return;
+            }
+
+            const pending_nonce = try self.allocator.dupe(u8, grant_request.nonce);
+            errdefer self.allocator.free(pending_nonce);
+            const pending_provider = try self.allocator.dupe(u8, grant_request.provider_id);
+            errdefer self.allocator.free(pending_provider);
+            const pending_request = try self.allocator.dupe(u8, env.id);
+            errdefer self.allocator.free(pending_request);
+
+            try self.pending_grants.append(self.allocator, .{
+                .nonce = pending_nonce,
+                .provider_id = pending_provider,
+                .request_id = pending_request,
+                .ttl_ms = grant_request.ttl_ms,
+            });
             return;
         }
 
@@ -1320,11 +1488,9 @@ test "an out of band binding refuses a grant envelope that carries the value" {
     defer allocator.free(nonce_only);
     try server.handleLine(nonce_only);
 
-    var granted = try decodeOnly(allocator, &server);
-    defer granted.deinit(allocator);
-    const reference = granted.payload.provider_credential_grant_response.credential_ref.?;
-    try std.testing.expect(reference.len > 0);
-    try std.testing.expectEqual(@as(usize, 1), server.grants.items.len);
+    try std.testing.expect(server.popOutbound() == null);
+    try std.testing.expectEqual(@as(usize, 1), server.pending_grants.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
 }
 
 test "every granted credential is marked non persistable and released with the connection" {
@@ -2015,3 +2181,116 @@ test "a terminal carrying a partial argument fragment is refused on decode" {
 }
 
 
+
+test "an out of band grant answers with a channel before it answers the grant" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band });
+    defer server.deinit();
+
+    const line = try makeRequest(
+        allocator,
+        "provider.credential.grant.request",
+        "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\"}",
+        "q1",
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    try std.testing.expect(server.popOutbound() == null);
+    const pending = server.nextUnannouncedGrant() orelse return error.TestExpectedPendingGrant;
+    try std.testing.expectEqualStrings("n1", pending.nonce);
+
+    try server.announceChannel("n1", "/tmp/grant-n1.sock");
+    var channel = try decodeOnly(allocator, &server);
+    defer channel.deinit(allocator);
+    try std.testing.expectEqualStrings("n1", channel.payload.provider_credential_grant_channel.nonce);
+    try std.testing.expectEqualStrings("/tmp/grant-n1.sock", channel.payload.provider_credential_grant_channel.channel);
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
+
+    const reference = try server.completeGrant("n1");
+    defer allocator.free(reference);
+
+    var response = try decodeOnly(allocator, &server);
+    defer response.deinit(allocator);
+    try std.testing.expectEqualStrings("q1", response.in_reply_to.?);
+    try std.testing.expectEqualStrings(reference, response.payload.provider_credential_grant_response.credential_ref.?);
+    try std.testing.expectEqual(@as(usize, 1), server.grants.items.len);
+    try std.testing.expect(server.grants.items[0].non_persistable);
+}
+
+test "a nonce is burned when its grant settles and cannot be claimed twice" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band });
+    defer server.deinit();
+
+    const line = try makeRequest(
+        allocator,
+        "provider.credential.grant.request",
+        "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\"}",
+        "q1",
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+    try server.announceChannel("n1", "/tmp/grant-n1.sock");
+
+    const reference = try server.completeGrant("n1");
+    defer allocator.free(reference);
+    try std.testing.expect(server.findPendingGrant("n1") == null);
+    try std.testing.expectError(error.UnknownNonce, server.completeGrant("n1"));
+}
+
+test "a grant that outlives the arrival deadline is refused and its nonce burned" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band });
+    defer server.deinit();
+
+    const line = try makeRequest(
+        allocator,
+        "provider.credential.grant.request",
+        "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\"}",
+        "q1",
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+    try server.announceChannel("n1", "/tmp/grant-n1.sock");
+    while (server.popOutbound()) |outbound| allocator.free(outbound);
+
+    const announced = server.findPendingGrant("n1").?.announced_at_ms.?;
+    try std.testing.expect(server.expiredGrantNonce(announced + 1) == null);
+
+    const expired = server.expiredGrantNonce(announced + GRANT_ARRIVAL_DEADLINE_MS) orelse
+        return error.TestExpectedExpiry;
+    try std.testing.expectEqualStrings("n1", expired);
+
+    try server.refuseGrant("n1", "the credential did not arrive before the deadline");
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expectEqual(
+        types.ErrorCode.credential_rejected,
+        refusal.payload.provider_credential_grant_response.err.?.code,
+    );
+    try std.testing.expect(server.findPendingGrant("n1") == null);
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
+}
+
+test "a nonce already in flight is refused rather than opening a second channel" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .grant_channel = .out_of_band });
+    defer server.deinit();
+
+    const first = try makeRequest(allocator, "provider.credential.grant.request", "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\"}", "q1");
+    defer allocator.free(first);
+    try server.handleLine(first);
+
+    const second = try makeRequest(allocator, "provider.credential.grant.request", "{\"provider_id\":\"ollama-local\",\"nonce\":\"n1\"}", "q2");
+    defer allocator.free(second);
+    try server.handleLine(second);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expectEqual(
+        types.ErrorCode.invalid_request,
+        refusal.payload.provider_credential_grant_response.err.?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.pending_grants.items.len);
+}

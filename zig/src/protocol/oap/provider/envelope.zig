@@ -208,6 +208,12 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             if (value.value) |secret| try w.writeStringField("value", secret);
             try w.endObject();
         },
+        .provider_credential_grant_channel => |value| {
+            try w.beginObject();
+            try w.writeStringField("nonce", value.nonce);
+            try w.writeStringField("channel", value.channel);
+            try w.endObject();
+        },
         .provider_credential_grant_response => |value| {
             try w.beginObject();
             if (value.credential_ref) |ref| try w.writeStringField("credential_ref", ref);
@@ -679,6 +685,12 @@ fn deserializePayload(
                 .ttl_ms = ttl_ms,
                 .value = value,
             } };
+        },
+        .provider_credential_grant_channel => {
+            const nonce = try oap_envelope.requiredOwnedString(obj, "nonce", allocator);
+            errdefer allocator.free(nonce);
+            const channel = try oap_envelope.requiredOwnedString(obj, "channel", allocator);
+            return types.Payload{ .provider_credential_grant_channel = .{ .nonce = nonce, .channel = channel } };
         },
         .provider_credential_grant_response => {
             const credential_ref = try oap_envelope.optionalOwnedString(obj, "credential_ref", allocator);
