@@ -11,7 +11,7 @@ fn defaultIo() std.Io {
 
 const auth_file_name = "auth.json";
 const auth_temp_prefix = auth_file_name ++ ".tmp.";
-const keychain_service = "com.makai.auth";
+const keychain_service = "ai.hyperneo.oap";
 const keychain_service_env = "MAKAI_KEYCHAIN_SERVICE";
 const keychain_account = auth_file_name;
 const keychain_shared_account = "auth.shared.json";
