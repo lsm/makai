@@ -355,6 +355,7 @@ pub const Server = struct {
 
     fn emitDecodeError(self: *Self, err: anyerror, in_reply_to: ?[]const u8) !void {
         const code: types.ErrorCode = switch (err) {
+            error.OutOfMemory => .resource_exhausted,
             envelope.DecodeError.VersionMismatch => .unsupported_version,
             envelope.DecodeError.CredentialInHeaders => .invalid_request,
             envelope.DecodeError.UnknownEnvelopeType => .invalid_request,
@@ -363,6 +364,7 @@ pub const Server = struct {
             else => .protocol_violation,
         };
         const message = switch (err) {
+            error.OutOfMemory => "the endpoint could not allocate to decode this envelope",
             envelope.DecodeError.CredentialInHeaders => "a credential must not travel in request headers; use provider.credential.grant.request",
             envelope.DecodeError.ProfileMismatch => "this endpoint serves open-agent-protocol 0.1 model-provider-core only",
             envelope.DecodeError.VersionMismatch => "unsupported protocol version",

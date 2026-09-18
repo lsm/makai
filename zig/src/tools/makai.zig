@@ -6618,6 +6618,7 @@ fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeA
 }
 
 const OAP_PROVIDER_MALFORMED_MESSAGE = "makai --oap-provider: a line on stdin was not a decodable envelope\n";
+const OAP_PROVIDER_EXHAUSTED_MESSAGE = "makai --oap-provider: out of memory decoding a line on stdin; the endpoint is stopping rather than continuing in an unknown state\n";
 
 fn oapProviderCompatibility(
     provider_id: []const u8,
@@ -6858,7 +6859,7 @@ fn pumpOapInferences(
                     server.abandonOpenPart(entry.inference_id);
                     server.settleFailed(
                         entry.inference_id,
-                        .internal_error,
+                        .provider_unavailable,
                         "the endpoint could not deliver the terminal for this inference",
                         null,
                     ) catch {};
@@ -6872,7 +6873,7 @@ fn pumpOapInferences(
                 server.abandonOpenPart(entry.inference_id);
                 server.settleFailed(
                     entry.inference_id,
-                    .internal_error,
+                    .provider_unavailable,
                     "the endpoint could not assemble a terminal for this inference",
                     null,
                 ) catch {};
@@ -7106,10 +7107,13 @@ fn runOapProviderMode(
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
 
-            server.handleLine(line) catch {
+            server.handleLine(line) catch |err| {
                 _ = try drainOapProviderOutbound(stdout, allocator, &server);
-                try compat.stdio.writeAll(stderr, OAP_PROVIDER_MALFORMED_MESSAGE);
-                return error.MalformedProviderLine;
+                try compat.stdio.writeAll(stderr, if (err == error.OutOfMemory)
+                    OAP_PROVIDER_EXHAUSTED_MESSAGE
+                else
+                    OAP_PROVIDER_MALFORMED_MESSAGE);
+                return err;
             };
             did_work = true;
         }

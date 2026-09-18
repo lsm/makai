@@ -394,8 +394,9 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
 }
 
 pub fn deserializeEnvelope(line: []const u8, allocator: std.mem.Allocator) !types.Envelope {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-        return DecodeError.InvalidEnvelope;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return DecodeError.InvalidEnvelope,
     };
     defer parsed.deinit();
 

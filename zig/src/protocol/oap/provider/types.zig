@@ -143,6 +143,7 @@ pub const ReasoningLevel = enum {
 pub const ErrorCode = enum {
     rate_limited,
     provider_unavailable,
+    resource_exhausted,
     credential_expired,
     credential_missing,
     credential_rejected,
@@ -151,7 +152,6 @@ pub const ErrorCode = enum {
     unsupported_version,
     unsupported_feature,
     model_not_found,
-    internal_error,
     aborted,
 
     pub fn parse(value: []const u8) ?ErrorCode {
@@ -160,7 +160,7 @@ pub const ErrorCode = enum {
 
     pub fn action(self: ErrorCode) ErrorAction {
         return switch (self) {
-            .rate_limited, .provider_unavailable => .retry,
+            .rate_limited, .provider_unavailable, .resource_exhausted => .retry,
             .credential_expired => .refresh,
             .credential_missing, .credential_rejected => .authenticate,
             .invalid_request,
@@ -168,7 +168,6 @@ pub const ErrorCode = enum {
             .unsupported_version,
             .unsupported_feature,
             .model_not_found,
-            .internal_error,
             => .report,
             .aborted => .accept,
         };
