@@ -195,7 +195,7 @@ pub const Server = struct {
         const reply = try self.allocator.dupe(u8, grant.request_id);
         errdefer self.allocator.free(reply);
 
-        var env = types.Envelope{
+        const env = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_channel = .{
@@ -203,7 +203,6 @@ pub const Server = struct {
                 .channel = owned_channel,
             } },
         };
-        defer env.deinit(self.allocator);
         try self.push(env);
     }
 
@@ -249,7 +248,7 @@ pub const Server = struct {
         const echoed = try self.allocator.dupe(u8, reference);
         errdefer self.allocator.free(echoed);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
@@ -258,7 +257,6 @@ pub const Server = struct {
                 .expires_at_ms = expires_at,
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
 
         const settled = try self.allocator.dupe(u8, reference);
@@ -276,7 +274,7 @@ pub const Server = struct {
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
@@ -284,7 +282,6 @@ pub const Server = struct {
                 .err = .{ .code = .credential_rejected, .message = owned_message },
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
         self.burnPendingGrant(nonce);
     }
@@ -328,6 +325,8 @@ pub const Server = struct {
         const line = try envelope.serializeEnvelope(env, self.allocator);
         errdefer self.allocator.free(line);
         try self.outbound.append(self.allocator, line);
+        var owned = env;
+        owned.deinit(self.allocator);
     }
 
     fn nextId(self: *Self) ![]const u8 {
@@ -350,11 +349,13 @@ pub const Server = struct {
         const reply = if (in_reply_to) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (reply) |value| self.allocator.free(value);
 
-        var versions = try self.allocator.alloc([]const u8, 1);
+        const version_string = try self.allocator.dupe(u8, types.VERSION);
+        errdefer self.allocator.free(version_string);
+        const versions = try self.allocator.alloc([]const u8, 1);
         errdefer self.allocator.free(versions);
-        versions[0] = try self.allocator.dupe(u8, types.VERSION);
+        versions[0] = version_string;
 
-        var env = types.Envelope{
+        const env = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .protocol_error = .{
@@ -362,7 +363,6 @@ pub const Server = struct {
                 .protocol_versions = versions,
             } },
         };
-        defer env.deinit(self.allocator);
         try self.push(env);
     }
 
@@ -436,9 +436,11 @@ pub const Server = struct {
         const revision = try self.allocator.dupe(u8, self.options.capability_revision);
         errdefer self.allocator.free(revision);
 
-        var versions = try self.allocator.alloc([]const u8, 1);
+        const version_string = try self.allocator.dupe(u8, types.VERSION);
+        errdefer self.allocator.free(version_string);
+        const versions = try self.allocator.alloc([]const u8, 1);
         errdefer self.allocator.free(versions);
-        versions[0] = try self.allocator.dupe(u8, types.VERSION);
+        versions[0] = version_string;
 
         const profile_revision = if (self.options.profile_revision) |value|
             try self.allocator.dupe(u8, value)
@@ -446,7 +448,7 @@ pub const Server = struct {
             null;
         errdefer if (profile_revision) |value| self.allocator.free(value);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .capability_revision = revision,
@@ -456,7 +458,6 @@ pub const Server = struct {
                 .profile_revision = profile_revision,
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 
@@ -493,7 +494,7 @@ pub const Server = struct {
         const revision = try self.allocator.dupe(u8, self.options.capability_revision);
         errdefer self.allocator.free(revision);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .capability_revision = revision,
@@ -501,7 +502,6 @@ pub const Server = struct {
                 .models = entries,
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 
@@ -579,7 +579,7 @@ pub const Server = struct {
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .provider_credential_grant_response = .{
@@ -587,7 +587,6 @@ pub const Server = struct {
                 .err = .{ .code = code, .message = owned_message },
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 
@@ -807,14 +806,13 @@ pub const Server = struct {
         const scope = try self.allocator.dupe(u8, inference.id);
         errdefer self.allocator.free(scope);
 
-        var env = types.Envelope{
+        const env = types.Envelope{
             .id = id,
             .inference_id = scope,
             .sequence = inference.next_sequence,
             .timestamp_ms = compat.time.nowMillis(),
             .payload = payload,
         };
-        defer env.deinit(self.allocator);
         try self.push(env);
         inference.next_sequence += 1;
     }
@@ -1216,7 +1214,7 @@ pub const Server = struct {
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .payload = .{ .inference_create_response = .{
@@ -1224,7 +1222,6 @@ pub const Server = struct {
                 .err = .{ .code = code, .message = owned_message },
             } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 
@@ -1246,13 +1243,12 @@ pub const Server = struct {
         const owned_scope = try self.allocator.dupe(u8, scope);
         errdefer self.allocator.free(owned_scope);
 
-        var response = types.Envelope{
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .inference_id = owned_scope,
             .payload = .{ .inference_cancel_response = .{ .accepted = accepted } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 
@@ -1275,13 +1271,18 @@ pub const Server = struct {
             }
         }
 
-        var response = types.Envelope{
+        const scope_copy = if (env.inference_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (scope_copy) |value| self.allocator.free(value);
+
+        const response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
-            .inference_id = if (env.inference_id) |value| try self.allocator.dupe(u8, value) else null,
+            .inference_id = scope_copy,
             .payload = .{ .inference_sync_response = .{ .snapshot = snapshot } },
         };
-        defer response.deinit(self.allocator);
         try self.push(response);
     }
 };
@@ -2303,6 +2304,47 @@ test "describe advertises the carry round trip a provider is configured with" {
         try std.testing.expect(descriptor.round_trips_carry);
     }
     try std.testing.expect(found);
+}
+
+test "an emission path frees each allocation exactly once when one fails" {
+    const head = "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++ "\",";
+    const lines = [_][]const u8{
+        head ++ "\"type\":\"provider.describe.request\",\"id\":\"q1\",\"payload\":{}}",
+        head ++ "\"type\":\"provider.models.list.request\",\"id\":\"q2\",\"payload\":{}}",
+        head ++ "\"type\":\"inference.sync.request\",\"id\":\"q3\",\"inference_id\":\"none\",\"payload\":{}}",
+        head ++ "\"type\":\"inference.cancel.request\",\"id\":\"q4\",\"inference_id\":\"none\",\"payload\":{}}",
+        head ++ "\"type\":\"provider.credential.grant.request\",\"id\":\"q5\",\"payload\":{\"provider_id\":\"p1\",\"nonce\":\"n1\"}}",
+        head ++ "\"type\":\"inference.create.request\",\"id\":\"q6\",\"payload\":{\"model_ref\":\"nope\",\"messages\":[]}}",
+        head ++ "\"type\":\"nonsense\",\"id\":\"q7\",\"payload\":{}}",
+    };
+
+    var index: usize = 0;
+    while (index < 300) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        const allocator = failing.allocator();
+
+        var server = Server.init(allocator, .{});
+        defer server.deinit();
+
+        const id = allocator.dupe(u8, "p1") catch continue;
+        const endpoint = allocator.dupe(u8, "https://p.test") catch {
+            allocator.free(id);
+            continue;
+        };
+        server.addProvider(.{
+            .id = id,
+            .wire = .@"anthropic-messages",
+            .framing = .sse,
+            .endpoint = endpoint,
+        }) catch {
+            allocator.free(id);
+            allocator.free(endpoint);
+            continue;
+        };
+
+        for (lines) |line| server.handleLine(line) catch {};
+        while (server.popOutbound()) |out| allocator.free(out);
+    }
 }
 
 test "sampling controls the endpoint does forward are carried onto the inference" {
