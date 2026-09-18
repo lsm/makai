@@ -25,6 +25,10 @@ rl.on("line", (line) => {
         payload: { event_json: JSON.stringify({ type: "text_delta", delta: "ok" }) },
       };
       if (!msg.payload?.omit_in_reply_to) reply.in_reply_to = msg.message_id;
+      if (msg.payload?.replies === 2) {
+        process.stdout.write(JSON.stringify(reply) + "\n" + JSON.stringify(reply) + "\n");
+        return;
+      }
       write(reply);
     }
   } catch {
