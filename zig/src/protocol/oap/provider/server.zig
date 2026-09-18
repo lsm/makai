@@ -14,6 +14,7 @@ pub const Options = struct {
     capability_revision: []const u8 = "r1",
     grant_channel: GrantChannel = .unsupported,
     default_grant_ttl_ms: u64 = 300_000,
+    accepts_inference: bool = false,
 };
 
 pub const GrantedCredential = struct {
@@ -31,6 +32,25 @@ pub const GrantedCredential = struct {
     }
 };
 
+pub const ActiveInference = struct {
+    id: []const u8,
+    model_ref: []const u8,
+    include_snapshot: types.SnapshotPolicy,
+    next_sequence: u64 = 1,
+    open_part: ?u32 = null,
+    open_part_offset: usize = 0,
+    text: std.ArrayList(u8),
+    terminal_emitted: bool = false,
+    cancel_requested: bool = false,
+
+    pub fn deinit(self: *ActiveInference, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.model_ref);
+        self.text.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const Server = struct {
     const Self = @This();
 
@@ -40,6 +60,7 @@ pub const Server = struct {
     models: std.ArrayList(types.ModelEntry),
     grants: std.ArrayList(GrantedCredential),
     outbound: std.ArrayList([]const u8),
+    active: std.ArrayList(ActiveInference),
     next_grant_ordinal: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
@@ -50,6 +71,7 @@ pub const Server = struct {
             .models = std.ArrayList(types.ModelEntry).empty,
             .grants = std.ArrayList(GrantedCredential).empty,
             .outbound = std.ArrayList([]const u8).empty,
+            .active = std.ArrayList(ActiveInference).empty,
         };
     }
 
@@ -62,6 +84,8 @@ pub const Server = struct {
         self.grants.deinit(self.allocator);
         for (self.outbound.items) |line| self.allocator.free(line);
         self.outbound.deinit(self.allocator);
+        for (self.active.items) |*inference| inference.deinit(self.allocator);
+        self.active.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -175,6 +199,7 @@ pub const Server = struct {
             .provider_models_list_request => |list_request| try self.handleModelsList(env, list_request),
             .provider_credential_grant_request => |grant_request| try self.handleGrant(env, grant_request),
             .inference_create_request => |create_request| try self.handleCreate(env, create_request),
+            .inference_cancel_request => try self.handleCancel(env),
             .inference_sync_request => try self.handleSyncUnsupported(env),
             else => try self.emitError(
                 .invalid_request,
@@ -407,7 +432,222 @@ pub const Server = struct {
             }
         }
 
-        try self.emitCreateRefusal(env, .provider_unavailable, "no inference backend is attached to this endpoint");
+        if (!self.options.accepts_inference) {
+            try self.emitCreateRefusal(env, .provider_unavailable, "no inference backend is attached to this endpoint");
+            return;
+        }
+
+        var honoured = create_request.include_snapshot;
+        if (!descriptor.snapshot_policies.supports(create_request.include_snapshot)) honoured = .never;
+
+        const inference_id = try self.nextId();
+        errdefer self.allocator.free(inference_id);
+        const model_ref = try self.allocator.dupe(u8, create_request.model_ref);
+        errdefer self.allocator.free(model_ref);
+
+        try self.active.append(self.allocator, .{
+            .id = inference_id,
+            .model_ref = model_ref,
+            .include_snapshot = honoured,
+            .text = std.ArrayList(u8).empty,
+        });
+
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const reply = try self.allocator.dupe(u8, env.id);
+        errdefer self.allocator.free(reply);
+        const scope = try self.allocator.dupe(u8, inference_id);
+        errdefer self.allocator.free(scope);
+        const echoed = try self.allocator.dupe(u8, inference_id);
+        errdefer self.allocator.free(echoed);
+
+        var response = types.Envelope{
+            .id = id,
+            .in_reply_to = reply,
+            .inference_id = scope,
+            .payload = .{ .inference_create_response = .{
+                .inference_id = echoed,
+                .accepted = true,
+                .honoured = honoured,
+            } },
+        };
+        defer response.deinit(self.allocator);
+        try self.push(response);
+    }
+
+    pub fn findInference(self: *Self, id: []const u8) ?*ActiveInference {
+        for (self.active.items) |*inference| {
+            if (std.mem.eql(u8, inference.id, id)) return inference;
+        }
+        return null;
+    }
+
+    fn pushScoped(self: *Self, inference: *ActiveInference, payload: types.Payload) !void {
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const scope = try self.allocator.dupe(u8, inference.id);
+        errdefer self.allocator.free(scope);
+
+        var env = types.Envelope{
+            .id = id,
+            .inference_id = scope,
+            .sequence = inference.next_sequence,
+            .timestamp_ms = compat.time.nowMillis(),
+            .payload = payload,
+        };
+        defer env.deinit(self.allocator);
+        try self.push(env);
+        inference.next_sequence += 1;
+    }
+
+    fn snapshotIfDue(self: *Self, inference: *ActiveInference, at_part_end: bool) !?[]oap_types.Message {
+        const due = switch (inference.include_snapshot) {
+            .never => false,
+            .on_part_end => at_part_end,
+            .every_delta => true,
+        };
+        if (!due) return null;
+
+        const text = try self.allocator.dupe(u8, inference.text.items);
+        errdefer self.allocator.free(text);
+        const messages = try self.allocator.alloc(oap_types.Message, 1);
+        messages[0] = .{ .role = .assistant, .content = .{ .text = text } };
+        return messages;
+    }
+
+    pub fn noteStarted(self: *Self, inference_id: []const u8) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        const model_ref = try self.allocator.dupe(u8, inference.model_ref);
+        errdefer self.allocator.free(model_ref);
+        try self.pushScoped(inference, .{ .inference_started = .{
+            .model_ref = model_ref,
+            .started_at_ms = compat.time.nowMillis(),
+        } });
+    }
+
+    pub fn notePartStarted(
+        self: *Self,
+        inference_id: []const u8,
+        part_index: u32,
+        part_kind: types.PartKind,
+        tool_call_id: ?[]const u8,
+        name: ?[]const u8,
+    ) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        if (inference.open_part != null) return error.PartAlreadyOpen;
+        if (part_kind == .tool_call and (tool_call_id == null or name == null)) return error.ToolCallIdentityRequired;
+        if (part_kind != .tool_call and (tool_call_id != null or name != null)) return error.ToolCallIdentityRefused;
+
+        const owned_id = if (tool_call_id) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_id) |value| self.allocator.free(value);
+        const owned_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_name) |value| self.allocator.free(value);
+
+        inference.open_part = part_index;
+        inference.open_part_offset = inference.text.items.len;
+        try self.pushScoped(inference, .{ .inference_part_started = .{
+            .part_index = part_index,
+            .part_kind = part_kind,
+            .tool_call_id = owned_id,
+            .name = owned_name,
+        } });
+    }
+
+    pub fn notePartDelta(self: *Self, inference_id: []const u8, part_index: u32, delta: []const u8) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        const open = inference.open_part orelse return error.NoOpenPart;
+        if (open != part_index) return error.PartIndexMismatch;
+
+        try inference.text.appendSlice(self.allocator, delta);
+        const owned_delta = try self.allocator.dupe(u8, delta);
+        errdefer self.allocator.free(owned_delta);
+        const snapshot = try self.snapshotIfDue(inference, false);
+        errdefer if (snapshot) |messages| {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+
+        try self.pushScoped(inference, .{ .inference_part_delta = .{
+            .part_index = part_index,
+            .delta = owned_delta,
+            .snapshot = snapshot,
+        } });
+    }
+
+    pub fn notePartEndedText(self: *Self, inference_id: []const u8, part_index: u32, part_kind: types.PartKind, text: []const u8) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        const open = inference.open_part orelse return error.NoOpenPart;
+        if (open != part_index) return error.PartIndexMismatch;
+        if (part_kind == .tool_call) return error.ToolCallNeedsCompleteCall;
+
+        inference.text.shrinkRetainingCapacity(inference.open_part_offset);
+        try inference.text.appendSlice(self.allocator, text);
+
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        const snapshot = try self.snapshotIfDue(inference, true);
+        errdefer if (snapshot) |messages| {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+
+        inference.open_part = null;
+        try self.pushScoped(inference, .{ .inference_part_ended = .{
+            .part_index = part_index,
+            .part_kind = part_kind,
+            .text = owned_text,
+            .snapshot = snapshot,
+        } });
+    }
+
+    pub fn settleCompleted(
+        self: *Self,
+        inference_id: []const u8,
+        stop_reason: types.StopReason,
+        usage: ?oap_types.Usage,
+    ) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        if (inference.terminal_emitted) return error.TerminalAlreadyEmitted;
+        if (inference.open_part != null) return error.PartStillOpen;
+
+        const text = try self.allocator.dupe(u8, inference.text.items);
+        errdefer self.allocator.free(text);
+
+        inference.terminal_emitted = true;
+        try self.pushScoped(inference, .{ .inference_completed = .{
+            .message = .{ .role = .assistant, .content = .{ .text = text } },
+            .stop_reason = stop_reason,
+            .usage = usage,
+        } });
+    }
+
+    pub fn settleFailed(
+        self: *Self,
+        inference_id: []const u8,
+        code: types.ErrorCode,
+        message: []const u8,
+        usage: ?oap_types.Usage,
+    ) !void {
+        const inference = self.findInference(inference_id) orelse return error.UnknownInference;
+        if (inference.terminal_emitted) return error.TerminalAlreadyEmitted;
+
+        const owned_message = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(owned_message);
+
+        inference.terminal_emitted = true;
+        try self.pushScoped(inference, .{ .inference_failed = .{
+            .err = .{ .code = code, .message = owned_message },
+            .usage = usage,
+        } });
+    }
+
+    pub fn releaseInference(self: *Self, inference_id: []const u8) void {
+        for (self.active.items, 0..) |*inference, index| {
+            if (!std.mem.eql(u8, inference.id, inference_id)) continue;
+            var removed = self.active.orderedRemove(index);
+            removed.deinit(self.allocator);
+            return;
+        }
     }
 
     fn emitCreateRefusal(
@@ -435,17 +675,62 @@ pub const Server = struct {
         try self.push(response);
     }
 
+    fn handleCancel(self: *Self, env: types.Envelope) !void {
+        const scope = env.inference_id orelse {
+            try self.emitError(.invalid_request, "a cancel must name the inference it targets", env.id);
+            return;
+        };
+
+        const accepted = if (self.findInference(scope)) |inference| blk: {
+            inference.cancel_requested = true;
+            break :blk !inference.terminal_emitted;
+        } else false;
+
+        const id = try self.nextId();
+        errdefer self.allocator.free(id);
+        const reply = try self.allocator.dupe(u8, env.id);
+        errdefer self.allocator.free(reply);
+        const owned_scope = try self.allocator.dupe(u8, scope);
+        errdefer self.allocator.free(owned_scope);
+
+        var response = types.Envelope{
+            .id = id,
+            .in_reply_to = reply,
+            .inference_id = owned_scope,
+            .payload = .{ .inference_cancel_response = .{ .accepted = accepted } },
+        };
+        defer response.deinit(self.allocator);
+        try self.push(response);
+    }
+
     fn handleSyncUnsupported(self: *Self, env: types.Envelope) !void {
         const id = try self.nextId();
         errdefer self.allocator.free(id);
         const reply = try self.allocator.dupe(u8, env.id);
         errdefer self.allocator.free(reply);
 
+        var snapshot: ?[]oap_types.Message = null;
+        errdefer if (snapshot) |messages| {
+            for (messages) |*message| message.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+        if (env.inference_id) |scope| {
+            if (self.findInference(scope)) |inference| {
+                if (!inference.terminal_emitted) {
+                    const text = try self.allocator.dupe(u8, inference.text.items);
+                    errdefer self.allocator.free(text);
+                    const messages = try self.allocator.alloc(oap_types.Message, 1);
+                    messages[0] = .{ .role = .assistant, .content = .{ .text = text } };
+                    snapshot = messages;
+                }
+            }
+        }
+
         var response = types.Envelope{
             .id = id,
             .in_reply_to = reply,
             .inference_id = if (env.inference_id) |value| try self.allocator.dupe(u8, value) else null,
-            .payload = .{ .inference_sync_response = .{ .snapshot = null } },
+            .payload = .{ .inference_sync_response = .{ .snapshot = snapshot } },
         };
         defer response.deinit(self.allocator);
         try self.push(response);
@@ -1011,4 +1296,215 @@ test "an accepted response must name its inference and a refusal must not" {
         envelope.DecodeError.MissingField,
         envelope.deserializeEnvelope(accepted_without_id, allocator),
     );
+}
+
+fn acceptOne(allocator: std.mem.Allocator, server: *Server, snapshot: []const u8) ![]const u8 {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"include_snapshot\":\"{s}\"}}",
+        .{snapshot},
+    );
+    defer allocator.free(payload);
+    const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var response = try decodeOnly(allocator, server);
+    defer response.deinit(allocator);
+    try std.testing.expect(response.payload.inference_create_response.accepted);
+    return allocator.dupe(u8, response.payload.inference_create_response.inference_id.?);
+}
+
+test "a streamed inference emits one contiguous sequence and exactly one terminal" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+
+    try server.noteStarted(inference_id);
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try server.notePartDelta(inference_id, 0, "hel");
+    try server.notePartDelta(inference_id, 0, "lo");
+    try server.notePartEndedText(inference_id, 0, .text, "hello");
+    try server.settleCompleted(inference_id, .stop, .{ .input_tokens = 3, .output_tokens = 2 });
+
+    var expected_sequence: u64 = 1;
+    var terminals: usize = 0;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+
+        try std.testing.expectEqualStrings(inference_id, env.inference_id.?);
+        try std.testing.expectEqual(expected_sequence, env.sequence.?);
+        expected_sequence += 1;
+
+        switch (env.payload) {
+            .inference_completed => |completed| {
+                terminals += 1;
+                try std.testing.expectEqualStrings("hello", completed.message.content.text);
+                try std.testing.expectEqual(types.StopReason.stop, completed.stop_reason);
+            },
+            .inference_failed => terminals += 1,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(u64, 7), expected_sequence);
+    try std.testing.expectEqual(@as(usize, 1), terminals);
+    try std.testing.expectError(error.TerminalAlreadyEmitted, server.settleCompleted(inference_id, .stop, null));
+}
+
+test "a snapshot arrives only where the honoured policy says it should" {
+    const allocator = std.testing.allocator;
+
+    var never = try testServer(allocator, .{ .accepts_inference = true });
+    defer never.deinit();
+    const quiet = try acceptOne(allocator, &never, "never");
+    defer allocator.free(quiet);
+    try never.notePartStarted(quiet, 0, .text, null, null);
+    try never.notePartDelta(quiet, 0, "a");
+    try never.notePartEndedText(quiet, 0, .text, "a");
+    try std.testing.expectEqual(@as(usize, 0), try countSnapshots(allocator, &never));
+
+    var on_end = try testServer(allocator, .{ .accepts_inference = true });
+    defer on_end.deinit();
+    const ending = try acceptOne(allocator, &on_end, "on_part_end");
+    defer allocator.free(ending);
+    try on_end.notePartStarted(ending, 0, .text, null, null);
+    try on_end.notePartDelta(ending, 0, "a");
+    try on_end.notePartDelta(ending, 0, "b");
+    try on_end.notePartEndedText(ending, 0, .text, "ab");
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshots(allocator, &on_end));
+}
+
+fn countSnapshots(allocator: std.mem.Allocator, server: *Server) !usize {
+    var count: usize = 0;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        var env = try envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .inference_part_delta => |delta| {
+                if (delta.snapshot != null) count += 1;
+            },
+            .inference_part_ended => |ended| {
+                if (ended.snapshot != null) count += 1;
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+test "an unsupported policy is degraded to never and the response says so" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const line = try makeRequest(
+        allocator,
+        "inference.create.request",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[]," ++
+            "\"include_snapshot\":\"every_delta\",\"allow_degraded_features\":[\"include_snapshot\"]}",
+        "q1",
+    );
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var response = try decodeOnly(allocator, &server);
+    defer response.deinit(allocator);
+    try std.testing.expect(response.payload.inference_create_response.accepted);
+    try std.testing.expectEqual(
+        types.SnapshotPolicy.never,
+        response.payload.inference_create_response.honoured.?,
+    );
+}
+
+test "the emission surface refuses a part shape the wire would refuse" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+
+    try std.testing.expectError(
+        error.ToolCallIdentityRequired,
+        server.notePartStarted(inference_id, 0, .tool_call, null, null),
+    );
+    try std.testing.expectError(
+        error.ToolCallIdentityRefused,
+        server.notePartStarted(inference_id, 0, .text, "call_1", "search"),
+    );
+    try std.testing.expectError(error.NoOpenPart, server.notePartDelta(inference_id, 0, "x"));
+
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try std.testing.expectError(error.PartAlreadyOpen, server.notePartStarted(inference_id, 1, .text, null, null));
+    try std.testing.expectError(error.PartIndexMismatch, server.notePartDelta(inference_id, 1, "x"));
+    try std.testing.expectError(error.PartStillOpen, server.settleCompleted(inference_id, .stop, null));
+}
+
+test "sync answers with the running snapshot and with nothing once it has settled" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+
+    try server.notePartStarted(inference_id, 0, .text, null, null);
+    try server.notePartDelta(inference_id, 0, "partial");
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    const sync_line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.sync.request\",\"id\":\"s1\",\"inference_id\":\"{s}\",\"payload\":{{}}}}",
+        .{ types.PROFILE, inference_id },
+    );
+    defer allocator.free(sync_line);
+    try server.handleLine(sync_line);
+
+    var live = try decodeOnly(allocator, &server);
+    defer live.deinit(allocator);
+    try std.testing.expectEqualStrings("partial", live.payload.inference_sync_response.snapshot.?[0].content.text);
+
+    try server.notePartEndedText(inference_id, 0, .text, "partial");
+    try server.settleCompleted(inference_id, .stop, null);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    try server.handleLine(sync_line);
+    var settled = try decodeOnly(allocator, &server);
+    defer settled.deinit(allocator);
+    try std.testing.expect(settled.payload.inference_sync_response.snapshot == null);
+}
+
+test "cancellation is intent and the terminal is the settlement" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    const cancel_line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"inference.cancel.request\",\"id\":\"c1\",\"inference_id\":\"{s}\",\"payload\":{{}}}}",
+        .{ types.PROFILE, inference_id },
+    );
+    defer allocator.free(cancel_line);
+    try server.handleLine(cancel_line);
+
+    var accepted = try decodeOnly(allocator, &server);
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.payload.inference_cancel_response.accepted);
+    try std.testing.expect(server.findInference(inference_id).?.cancel_requested);
+
+    try server.settleCompleted(inference_id, .aborted, null);
+    var terminal = try decodeOnly(allocator, &server);
+    defer terminal.deinit(allocator);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.payload.inference_completed.stop_reason);
 }

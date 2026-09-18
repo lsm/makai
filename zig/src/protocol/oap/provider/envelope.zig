@@ -306,10 +306,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try oap_envelope.serializeMessage(w, value.message);
             try w.writeStringField("stop_reason", @tagName(value.stop_reason));
             if (value.usage) |usage| {
-                if (!usage.isEmpty()) {
-                    try w.writeKey("usage");
-                    try oap_envelope.serializeUsage(w, usage);
-                }
+                if (!usage.isEmpty()) try oap_envelope.serializeUsage(w, usage);
             }
             try w.endObject();
         },
@@ -318,10 +315,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try w.writeKey("error");
             try writeProtocolError(w, value.err);
             if (value.usage) |usage| {
-                if (!usage.isEmpty()) {
-                    try w.writeKey("usage");
-                    try oap_envelope.serializeUsage(w, usage);
-                }
+                if (!usage.isEmpty()) try oap_envelope.serializeUsage(w, usage);
             }
             try w.endObject();
         },

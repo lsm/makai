@@ -33,6 +33,15 @@ pub fn mapApiToWire(api: []const u8) ?WireMapping {
     if (std.mem.eql(u8, api, "openai-codex-responses")) {
         return .{ .wire = .@"openai-responses", .framing = .sse };
     }
+    if (std.mem.eql(u8, api, "google-generative-ai")) {
+        return .{ .wire = .other, .framing = .sse };
+    }
+    if (std.mem.eql(u8, api, "google-gemini-cli")) {
+        return .{ .wire = .other, .framing = .sse };
+    }
+    if (std.mem.eql(u8, api, "ollama")) {
+        return .{ .wire = .other, .framing = .ndjson };
+    }
     return null;
 }
 
@@ -40,32 +49,38 @@ pub fn isExpressible(api: []const u8) bool {
     return mapApiToWire(api) != null;
 }
 
-pub fn unmappableApis(buffer: [][]const u8) [][]const u8 {
+pub fn hasNamedWire(api: []const u8) bool {
+    const mapping = mapApiToWire(api) orelse return false;
+    return mapping.wire.isNamed();
+}
+
+pub fn unnamedWireApis(buffer: [][]const u8) [][]const u8 {
     var count: usize = 0;
     for (MAKAI_API_NAMES) |api| {
-        if (isExpressible(api)) continue;
+        if (hasNamedWire(api)) continue;
         buffer[count] = api;
         count += 1;
     }
     return buffer[0..count];
 }
 
-test "the closed wire set names five of makai's eight registered apis" {
-    var expressible: usize = 0;
+test "every registered api is describable and five earn a named wire" {
+    var named: usize = 0;
     for (MAKAI_API_NAMES) |api| {
-        if (isExpressible(api)) expressible += 1;
+        try std.testing.expect(isExpressible(api));
+        if (hasNamedWire(api)) named += 1;
     }
-    try std.testing.expectEqual(@as(usize, 5), expressible);
+    try std.testing.expectEqual(@as(usize, 5), named);
 }
 
-test "three registered apis have no value in the closed wire set" {
+test "the three that name no wire are the ones no second implementer speaks" {
     var buffer: [MAKAI_API_NAMES.len][]const u8 = undefined;
-    const unmappable = unmappableApis(&buffer);
+    const unnamed = unnamedWireApis(&buffer);
 
-    try std.testing.expectEqual(@as(usize, 3), unmappable.len);
-    try std.testing.expectEqualStrings("google-generative-ai", unmappable[0]);
-    try std.testing.expectEqualStrings("google-gemini-cli", unmappable[1]);
-    try std.testing.expectEqualStrings("ollama", unmappable[2]);
+    try std.testing.expectEqual(@as(usize, 3), unnamed.len);
+    try std.testing.expectEqualStrings("google-generative-ai", unnamed[0]);
+    try std.testing.expectEqualStrings("google-gemini-cli", unnamed[1]);
+    try std.testing.expectEqualStrings("ollama", unnamed[2]);
 }
 
 test "two endpoints share the responses wire and are told apart by provider" {
@@ -78,13 +93,21 @@ test "two endpoints share the responses wire and are told apart by provider" {
     try std.testing.expectEqual(types.Wire.@"openai-responses", native.wire);
 }
 
-test "ollama is the only attestation for ndjson framing and has no wire to carry it" {
-    try std.testing.expect(!isExpressible("ollama"));
-
+test "ndjson is reachable now that an unnamed wire can carry it" {
     var ndjson_sources: usize = 0;
     for (MAKAI_API_NAMES) |api| {
         const mapping = mapApiToWire(api) orelse continue;
         if (mapping.framing == .ndjson) ndjson_sources += 1;
     }
-    try std.testing.expectEqual(@as(usize, 0), ndjson_sources);
+    try std.testing.expectEqual(@as(usize, 1), ndjson_sources);
+
+    const ollama = mapApiToWire("ollama").?;
+    try std.testing.expectEqual(types.Framing.ndjson, ollama.framing);
+    try std.testing.expect(!ollama.wire.isNamed());
+}
+
+test "a named wire is never invented for a shape only its originator speaks" {
+    try std.testing.expect(!hasNamedWire("ollama"));
+    try std.testing.expect(!hasNamedWire("google-generative-ai"));
+    try std.testing.expect(hasNamedWire("anthropic-messages"));
 }

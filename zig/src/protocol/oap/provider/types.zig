@@ -23,6 +23,11 @@ pub const Wire = enum {
     @"openai-responses",
     @"anthropic-messages",
     @"openai-chat-completions",
+    other,
+
+    pub fn isNamed(self: Wire) bool {
+        return self != .other;
+    }
 
     pub fn parse(value: []const u8) ?Wire {
         return std.meta.stringToEnum(Wire, value);
