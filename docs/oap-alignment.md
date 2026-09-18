@@ -423,7 +423,11 @@ shape produced a duplicate `model_ref` parser in this profile, where three tests
 about the other, and the tests are attached to the wrong artifact to tell you so.
 
 Mutation results for the provider decoder, as a baseline for anyone changing it: 49 single-line
-refusals, 29 killed, 20 surviving. The killed set contains every rule the profile makes normative.
+refusals, 29 killed, 20 surviving. That is 49 of the 68 `return DecodeError` sites in the file --
+the other nineteen are `orelse return DecodeError.MissingField`, which has no neutralising mutation
+because removing the return needs a type-appropriate default that does not exist. Those nineteen
+are unmeasured, not verified, and reading "49 guards swept" as "the decode surface is covered" is
+the same mistake as believing a descriptor that under-claims. The killed set contains every rule the profile makes normative.
 The survivors are type tags guarding a union field access — malformed-input robustness, which the
 profile does not specify and which was correct but unverified rather than wrong. Recording which
 test kills each mutant matters as much as the count: a rule killed only by a generically named test
