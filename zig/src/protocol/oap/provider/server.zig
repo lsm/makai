@@ -733,11 +733,11 @@ pub const Server = struct {
         }
 
         for (create_request.messages) |message| {
-            if (messageCarriesNonText(message)) {
+            if (messageCarriesUnforwardablePart(message)) {
                 try self.emitCreateRefusal(
                     env,
                     .unsupported_feature,
-                    "this endpoint forwards text content only; a tool call, tool result or reasoning part cannot be carried",
+                    "this endpoint cannot forward a tool result or a tool-role message",
                 );
                 return;
             }
@@ -1479,15 +1479,15 @@ pub fn cloneHeaders(
     return out;
 }
 
-fn messageCarriesNonText(message: oap_types.Message) bool {
+fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
     if (message.role == .tool) return true;
     return switch (message.content) {
         .text => false,
         .parts => |parts| blk: {
             for (parts) |part| {
                 switch (part) {
-                    .text => {},
-                    else => break :blk true,
+                    .text, .reasoning, .tool_call => {},
+                    .tool_result => break :blk true,
                 }
             }
             break :blk false;
@@ -1558,7 +1558,14 @@ fn clonePart(allocator: std.mem.Allocator, part: oap_types.ContentPart) !oap_typ
             const name = try allocator.dupe(u8, call.name);
             errdefer allocator.free(name);
             const arguments = try allocator.dupe(u8, call.arguments_json);
-            break :blk .{ .tool_call = .{ .tool_call_id = id, .name = name, .arguments_json = arguments } };
+            errdefer allocator.free(arguments);
+            const carry = if (call.carry) |raw| try allocator.dupe(u8, raw) else null;
+            break :blk .{ .tool_call = .{
+                .tool_call_id = id,
+                .name = name,
+                .arguments_json = arguments,
+                .carry = carry,
+            } };
         },
         .tool_result => |result| blk: {
             const id = try allocator.dupe(u8, result.tool_call_id);
@@ -2128,6 +2135,68 @@ test "acceptance is discriminated by the scope field, never by a payload copy" {
     );
 }
 
+test "the terminal assembly repeats the carry each part ended with" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "never");
+    defer allocator.free(inference_id);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    const content = [_]ai_content.AssistantContent{
+        .{ .thinking = .{ .thinking = "weighing", .thinking_signature = "sig-reasoning" } },
+        .{ .tool_call = .{
+            .id = "call_1",
+            .name = "search",
+            .arguments_json = "{}",
+            .thought_signature = "sig-toolcall",
+        } },
+        .{ .text = .{ .text = "answer" } },
+    };
+
+    try server.settleCompletedFromResult(inference_id, .tool_use, null, &content);
+
+    var terminal = try decodeOnly(allocator, &server);
+    defer terminal.deinit(allocator);
+
+    const parts = terminal.payload.inference_completed.message.content.parts;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("sig-reasoning", parts[0].reasoning.carry orelse "");
+    try std.testing.expectEqualStrings("sig-toolcall", parts[1].tool_call.carry orelse "");
+    try std.testing.expect(parts[2] == .text);
+}
+
+test "a replayed carry is refused by a provider whose descriptor does not claim the round trip" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    for (server.providers.items) |descriptor| {
+        try std.testing.expect(!descriptor.round_trips_carry);
+    }
+
+    const cases = [_][]const u8{
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"reasoning\":\"prior\",\"carry\":\"sig\"}]}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\",\"carry\":\"sig\"}]}]}",
+    };
+
+    for (cases) |payload| {
+        const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+        defer allocator.free(line);
+        try server.handleLine(line);
+
+        var refusal = try decodeOnly(allocator, &server);
+        defer refusal.deinit(allocator);
+        try std.testing.expectEqual(
+            types.ErrorCode.unsupported_feature,
+            refusal.payload.inference_create_response.err.?.code,
+        );
+        try std.testing.expect(!refusal.payload.inference_create_response.accepted);
+        try std.testing.expect(refusal.inference_id == null);
+    }
+}
+
 fn acceptOne(allocator: std.mem.Allocator, server: *Server, snapshot: []const u8) ![]const u8 {
     const payload = try std.fmt.allocPrint(
         allocator,
@@ -2388,7 +2457,7 @@ test "a request member the endpoint cannot forward is refused rather than droppe
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"top_p\":0.9}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"stream\":false}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[],\"headers\":{\"X-Tenant\":\"acme\"}}",
-        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\"}]}]}",
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":\"ok\"}]}]}",
         "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"tool\",\"content\":\"result\"}]}",
     };
 

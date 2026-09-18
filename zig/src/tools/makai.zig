@@ -26,6 +26,7 @@ const tui_app = @import("tui_app");
 const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
 const oap_server = @import("oap_server");
+const pre_transform = @import("pre_transform");
 const oap_provider_types = @import("oap_provider_types");
 const oap_provider_server = @import("oap_provider_server");
 const oap_provider_catalog = @import("oap_provider_catalog");
@@ -6937,7 +6938,11 @@ fn startOapInference(
 
     var model = try buildOapInferenceModel(allocator, builtin, model_id);
     errdefer model.deinit(allocator);
-    var context = try buildOapInferenceContext(allocator, inference.messages);
+    var context = try buildOapInferenceContext(allocator, inference.messages, .{
+        .provider = model.provider,
+        .api = model.api,
+        .model_id = model.id,
+    });
     errdefer context.deinit(allocator);
     context.tools = try buildOapInferenceTools(allocator, inference.tools);
 
@@ -7221,9 +7226,16 @@ fn applyOapReasoning(options: *ai_types.StreamOptions, reasoning: ?oap_provider_
     }
 }
 
+const OapModelIdentity = struct {
+    provider: []const u8,
+    api: []const u8,
+    model_id: []const u8,
+};
+
 fn buildOapInferenceContext(
     allocator: std.mem.Allocator,
     source: []const oap_types.Message,
+    identity: OapModelIdentity,
 ) !ai_types.Context {
     var system = std.ArrayList(u8).empty;
     errdefer system.deinit(allocator);
@@ -7252,7 +7264,7 @@ fn buildOapInferenceContext(
         if (message.role == .assistant) {
             allocator.free(text);
             const content = try oapAssistantContent(allocator, message);
-            messages[built] = .{ .assistant = try buildOapAssistantMessage(allocator, content) };
+            messages[built] = .{ .assistant = try buildOapAssistantMessage(allocator, content, identity) };
         } else {
             messages[built] = .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } };
         }
@@ -7326,13 +7338,17 @@ fn oapAssistantContent(
     return blocks.toOwnedSlice(allocator);
 }
 
-fn buildOapAssistantMessage(allocator: std.mem.Allocator, content: []ai_types.AssistantContent) !ai_types.AssistantMessage {
+fn buildOapAssistantMessage(
+    allocator: std.mem.Allocator,
+    content: []ai_types.AssistantContent,
+    identity: OapModelIdentity,
+) !ai_types.AssistantMessage {
     errdefer allocator.free(content);
-    const api = try allocator.dupe(u8, "");
+    const api = try allocator.dupe(u8, identity.api);
     errdefer allocator.free(api);
-    const provider = try allocator.dupe(u8, "");
+    const provider = try allocator.dupe(u8, identity.provider);
     errdefer allocator.free(provider);
-    const model = try allocator.dupe(u8, "");
+    const model = try allocator.dupe(u8, identity.model_id);
 
     return ai_types.AssistantMessage{
         .content = content,
@@ -8037,6 +8053,40 @@ test "the signature lookup finds a carry only on the block that carries one" {
     try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 7) == null);
 }
 
+test "a replayed carry survives the transform that feeds the provider" {
+    const allocator = std.testing.allocator;
+
+    var parts = [_]oap_types.ContentPart{
+        .{ .reasoning = .{ .text = "prior thinking", .carry = "SIG-MARKER" } },
+        .{ .text = "prior answer" },
+    };
+    const source = [_]oap_types.Message{
+        .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
+    };
+
+    var context = try buildOapInferenceContext(allocator, source[0..], .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "claude-sonnet-4-5",
+    });
+    defer context.deinit(allocator);
+
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = "anthropic-messages",
+        .target_provider = "anthropic",
+        .target_model_id = "claude-sonnet-4-5",
+        .max_tool_id_len = 64,
+        .insert_synthetic_results = true,
+        .tools = null,
+        .is_oauth = false,
+    });
+    defer transformed.deinit();
+
+    const content = transformed.messages[0].assistant.content;
+    try std.testing.expect(content[0] == .thinking);
+    try std.testing.expectEqualStrings("SIG-MARKER", content[0].thinking.thinking_signature orelse "");
+}
+
 test "the inbound half puts a replayed carry back on the block it belongs to" {
     const allocator = std.testing.allocator;
 
@@ -8049,7 +8099,11 @@ test "the inbound half puts a replayed carry back on the block it belongs to" {
         .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
     };
 
-    var context = try buildOapInferenceContext(allocator, messages[0..]);
+    var context = try buildOapInferenceContext(allocator, messages[0..], .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "m",
+    });
     defer context.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), context.messages.len);

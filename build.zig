@@ -1719,6 +1719,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
