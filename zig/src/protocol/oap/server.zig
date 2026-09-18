@@ -2342,13 +2342,21 @@ test "a syntactically invalid model selection is refused before admission" {
     try std.testing.expect(server.popPendingSubmission() == null);
 }
 
-test "a submission carrying non-text content is refused instead of silently dropped" {
+test "non-text content is refused on submit, so a carry never reaches a session that would ignore it" {
     const allocator = std.testing.allocator;
 
     const cases = [_]struct { part: oap_types.ContentPart, feature: []const u8 }{
-        .{ .part = .{ .reasoning = .{ .text = "because" } }, .feature = "session.message.content.reasoning" },
         .{
-            .part = .{ .tool_call = .{ .tool_call_id = "c1", .name = "grep", .arguments_json = "{}" } },
+            .part = .{ .reasoning = .{ .text = "because", .carry = "REASON-SIG" } },
+            .feature = "session.message.content.reasoning",
+        },
+        .{
+            .part = .{ .tool_call = .{
+                .tool_call_id = "c1",
+                .name = "grep",
+                .arguments_json = "{}",
+                .carry = "TOOL-SIG",
+            } },
             .feature = "session.message.content.tool_call",
         },
         .{
