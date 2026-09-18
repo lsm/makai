@@ -11,8 +11,8 @@ pub const Outcome = union(enum) {
 
 pub const GrantChannel = struct {
     allocator: std.mem.Allocator,
-    dir_path: [:0]u8,
-    socket_path: [:0]u8,
+    dir_path: []u8,
+    socket_path: []u8,
     server: std.Io.net.Server,
     connection: ?compat.net.Stream = null,
     accepted_one: bool = false,
@@ -29,17 +29,17 @@ pub const GrantChannel = struct {
         defer if (base) |value| allocator.free(value);
         const trimmed = std.mem.trimEnd(u8, base orelse "/tmp", "/");
 
-        const dir_path = try std.fmt.allocPrintSentinel(allocator, "{s}/makai-grant-{d}-{d}", .{
+        const dir_path = try std.fmt.allocPrint(allocator, "{s}/makai-grant-{d}-{d}", .{
             trimmed,
             @as(u64, @bitCast(compat.time.nowMillis())),
             ordinal,
-        }, 0);
+        });
         errdefer allocator.free(dir_path);
 
         try compat.fs.createPrivateDir(dir_path);
         errdefer compat.fs.removeDir(dir_path);
 
-        const socket_path = try std.fmt.allocPrintSentinel(allocator, "{s}/s", .{dir_path}, 0);
+        const socket_path = try std.fmt.allocPrint(allocator, "{s}/s", .{dir_path});
         errdefer allocator.free(socket_path);
 
         const server = try compat.net.unixListen(socket_path);

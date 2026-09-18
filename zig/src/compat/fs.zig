@@ -58,20 +58,18 @@ pub fn createDir(dir: Dir, path: []const u8) !void {
     try dir.createDirPath(defaultIo(), path);
 }
 
-pub fn createPrivateDir(path: [:0]const u8) !void {
-    if (std.c.mkdir(path.ptr, 0o700) != 0) {
-        return switch (std.posix.errno(@as(c_int, -1))) {
-            else => error.CreateDirFailed,
-        };
-    }
+pub const private_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+
+pub fn createPrivateDir(path: []const u8) !void {
+    try getCwd().createDir(defaultIo(), path, private_dir_mode);
 }
 
-pub fn removeDir(path: [:0]const u8) void {
-    _ = std.c.rmdir(path.ptr);
+pub fn removeDir(path: []const u8) void {
+    getCwd().deleteDir(defaultIo(), path) catch {};
 }
 
-pub fn removeFile(path: [:0]const u8) void {
-    _ = std.c.unlink(path.ptr);
+pub fn removeFile(path: []const u8) void {
+    getCwd().deleteFile(defaultIo(), path) catch {};
 }
 
 pub fn directoryPermissions(path: []const u8) !u32 {
