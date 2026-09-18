@@ -785,18 +785,23 @@ pub const AuthStorage = struct {
     ephemeral: ?std.StringHashMap(ProviderAuth) = null,
 
     pub fn putEphemeral(self: *AuthStorage, provider_id: []const u8, auth: ProviderAuth) !void {
+        errdefer {
+            var rejected = auth;
+            rejected.deinit(self.allocator);
+        }
+
         if (self.ephemeral == null) {
             self.ephemeral = std.StringHashMap(ProviderAuth).init(self.allocator);
         }
 
-        const key = try self.allocator.dupe(u8, provider_id);
-        errdefer self.allocator.free(key);
-
-        if (self.ephemeral.?.fetchRemove(key)) |existing| {
-            self.allocator.free(existing.key);
-            existing.value.deinit(self.allocator);
+        if (self.ephemeral.?.getEntry(provider_id)) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            entry.value_ptr.* = auth;
+            return;
         }
 
+        const key = try self.allocator.dupe(u8, provider_id);
+        errdefer self.allocator.free(key);
         try self.ephemeral.?.put(key, auth);
     }
 
@@ -960,8 +965,7 @@ pub const AuthStorage = struct {
     }
 
     pub fn credentialsExpired(self: *const AuthStorage, provider_id: []const u8) bool {
-        if (self.ephemeralAuth(provider_id)) |_| return false;
-        const auth = self.providers.get(provider_id) orelse return false;
+        const auth = self.resolvedCredential(provider_id) orelse return false;
         return switch (auth) {
             .api_key => false,
             .oauth => |credentials| compat.time.nowMillis() >= credentials.expires,
@@ -1627,11 +1631,15 @@ test "a granted oauth credential routes through the refreshable path and never t
     } });
 
     try std.testing.expect(storage.hasRefreshableCredentials("tenant-a"));
+    try std.testing.expect(storage.credentialsExpired("tenant-a"));
+
+    try storage.refreshCredentials("tenant-a", ephemeral_test_provider);
     try std.testing.expect(!storage.credentialsExpired("tenant-a"));
 
     const key = try storage.getApiKey("tenant-a", ephemeral_test_provider) orelse
         return error.TestExpectedKey;
     defer allocator.free(key);
+    try std.testing.expectEqualStrings("refreshed-access", key);
     try std.testing.expectEqual(@as(usize, 0), ephemeral_test_saves);
 }
 
@@ -1722,4 +1730,45 @@ test "a granted credential does not make an expired configured login look curren
 
     try std.testing.expect(!storage.credentialsExpired("anthropic"));
     try std.testing.expect(storage.configuredCredentialsExpired("anthropic"));
+}
+
+test "an expired granted credential reports expired so the locked refresh runs" {
+    const allocator = std.testing.allocator;
+    var storage = emptyTestStorage(allocator);
+    defer storage.deinit();
+
+    try storage.putEphemeral("tenant-a", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = 0,
+    } });
+    try std.testing.expect(storage.credentialsExpired("tenant-a"));
+
+    try storage.putEphemeral("tenant-b", .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "granted-refresh"),
+        .access = try allocator.dupe(u8, "granted-access"),
+        .expires = std.math.maxInt(i64),
+    } });
+    try std.testing.expect(!storage.credentialsExpired("tenant-b"));
+
+    try storage.putEphemeral("tenant-c", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+    try std.testing.expect(!storage.credentialsExpired("tenant-c"));
+}
+
+test "replacing a granted credential cannot lose both on an allocation failure" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var storage = AuthStorage{
+                .providers = std.StringHashMap(ProviderAuth).init(allocator),
+                .allocator = allocator,
+            };
+            defer storage.deinit();
+
+            try storage.putEphemeral("tenant", .{ .api_key = try allocator.dupe(u8, "sk-first") });
+            try storage.putEphemeral("tenant", .{ .api_key = try allocator.dupe(u8, "sk-second") });
+
+            try std.testing.expectEqual(@as(usize, 1), storage.ephemeralCount());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
