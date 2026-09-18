@@ -145,6 +145,7 @@ fn writeSnapshotPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart) !v
                 try w.writeKey("arguments_json");
                 try oap_envelope.writeJsonValueOrString(w, value.arguments_json);
             }
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
             try w.endObject();
         },
         else => try oap_envelope.serializeContentPart(w, part),

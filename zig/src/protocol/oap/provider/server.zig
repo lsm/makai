@@ -1103,11 +1103,16 @@ pub const Server = struct {
         errdefer if (!closed_transferred) self.allocator.free(closed_name);
         const closed_arguments = try self.allocator.dupe(u8, arguments_json);
         errdefer if (!closed_transferred) self.allocator.free(closed_arguments);
+        const closed_carry = if (carry) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (!closed_transferred) {
+            if (closed_carry) |value| self.allocator.free(value);
+        };
         try inference.closed_parts.ensureUnusedCapacity(self.allocator, 1);
         inference.closed_parts.appendAssumeCapacity(.{ .tool_call = .{
             .tool_call_id = closed_id,
             .name = closed_name,
             .arguments_json = closed_arguments,
+            .carry = closed_carry,
         } });
         closed_transferred = true;
 
@@ -1486,7 +1491,8 @@ fn messageCarriesUnforwardablePart(message: oap_types.Message) bool {
         .parts => |parts| blk: {
             for (parts) |part| {
                 switch (part) {
-                    .text, .reasoning, .tool_call => {},
+                    .text => {},
+                    .reasoning, .tool_call => if (message.role != .assistant) break :blk true,
                     .tool_result => break :blk true,
                 }
             }
@@ -2133,6 +2139,50 @@ test "acceptance is discriminated by the scope field, never by a payload copy" {
         envelope.DecodeError.ScopeRepeatedInPayload,
         envelope.deserializeEnvelope(scope_repeated_in_payload, allocator),
     );
+}
+
+test "a tool call keeps its carry through the snapshot and the terminal" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const inference_id = try acceptOne(allocator, &server, "on_part_end");
+    defer allocator.free(inference_id);
+    while (server.popOutbound()) |line| allocator.free(line);
+
+    try server.notePartStarted(inference_id, 0, .tool_call, "c1", "search");
+    while (server.popOutbound()) |line| allocator.free(line);
+    try server.notePartEndedToolCall(inference_id, 0, "c1", "search", "{}", "TOOL-SIG");
+
+    var ended = try decodeOnly(allocator, &server);
+    defer ended.deinit(allocator);
+    const part_ended = ended.payload.inference_part_ended;
+    try std.testing.expectEqualStrings("TOOL-SIG", part_ended.carry orelse "");
+
+    const snapshot = part_ended.snapshot orelse return error.TestExpectedSnapshot;
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    const snapshot_parts = snapshot[0].content.parts;
+    try std.testing.expectEqualStrings("TOOL-SIG", snapshot_parts[0].tool_call.carry orelse "");
+}
+
+test "a carry-bearing part on a non-assistant message is refused rather than dropped" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const payload =
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"reasoning\",\"reasoning\":\"prior\"}]}]}";
+    const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expectEqual(
+        types.ErrorCode.unsupported_feature,
+        refusal.payload.inference_create_response.err.?.code,
+    );
+    try std.testing.expect(!refusal.payload.inference_create_response.accepted);
 }
 
 test "the terminal assembly repeats the carry each part ended with" {

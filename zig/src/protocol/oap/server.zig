@@ -1542,10 +1542,13 @@ pub fn clonePart(allocator: std.mem.Allocator, part: oap_types.ContentPart) !oap
             const name = try allocator.dupe(u8, value.name);
             errdefer allocator.free(name);
             const arguments_json = try allocator.dupe(u8, value.arguments_json);
+            errdefer allocator.free(arguments_json);
+            const carry = if (value.carry) |raw| try allocator.dupe(u8, raw) else null;
             return .{ .tool_call = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
                 .arguments_json = arguments_json,
+                .carry = carry,
             } };
         },
         .tool_result => |value| {

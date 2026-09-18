@@ -7253,6 +7253,13 @@ fn buildOapInferenceContext(
     }
 
     for (source) |message| {
+        if (message.role == .assistant) {
+            const content = try oapAssistantContent(allocator, message);
+            messages[built] = .{ .assistant = try buildOapAssistantMessage(allocator, content, identity) };
+            built += 1;
+            continue;
+        }
+
         const text = try oapMessageText(allocator, message);
         if (oapRoleIsSystem(message.role)) {
             defer allocator.free(text);
@@ -7261,13 +7268,7 @@ fn buildOapInferenceContext(
             continue;
         }
         errdefer allocator.free(text);
-        if (message.role == .assistant) {
-            allocator.free(text);
-            const content = try oapAssistantContent(allocator, message);
-            messages[built] = .{ .assistant = try buildOapAssistantMessage(allocator, content, identity) };
-        } else {
-            messages[built] = .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } };
-        }
+        messages[built] = .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } };
         built += 1;
     }
 
@@ -7343,7 +7344,7 @@ fn buildOapAssistantMessage(
     content: []ai_types.AssistantContent,
     identity: OapModelIdentity,
 ) !ai_types.AssistantMessage {
-    errdefer allocator.free(content);
+    errdefer ai_types.deinitAssistantContent(allocator, content);
     const api = try allocator.dupe(u8, identity.api);
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, identity.provider);
@@ -8051,6 +8052,40 @@ test "the signature lookup finds a carry only on the block that carries one" {
     const signature = oap_provider_runtime.thinkingSignature(partial, 1) orelse return error.TestExpectedSignature;
     try std.testing.expectEqualStrings("sig-abc", signature);
     try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 7) == null);
+}
+
+fn buildContextUnderFailure(allocator: std.mem.Allocator, source: []const oap_types.Message) !void {
+    var context = try buildOapInferenceContext(allocator, source, .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "claude-sonnet-4-5",
+    });
+    context.deinit(allocator);
+}
+
+test "building an inference context leaks nothing and frees nothing twice under allocation failure" {
+    var parts = [_]oap_types.ContentPart{
+        .{ .reasoning = .{ .text = "prior thinking", .carry = "SIG-MARKER" } },
+        .{ .text = "spoken" },
+        .{ .tool_call = .{
+            .tool_call_id = "c1",
+            .name = "search",
+            .arguments_json = "{}",
+            .carry = "TOOL-SIG",
+        } },
+    };
+    const source = [_]oap_types.Message{
+        .{ .role = .system, .content = .{ .text = "be brief" } },
+        .{ .role = .user, .content = .{ .text = "first question" } },
+        .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
+        .{ .role = .user, .content = .{ .text = "second question" } },
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        buildContextUnderFailure,
+        .{source[0..]},
+    );
 }
 
 test "a replayed carry survives the transform that feeds the provider" {
