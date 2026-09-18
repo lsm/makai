@@ -92,6 +92,7 @@ fn writeProviderDescriptor(w: *json_writer.JsonWriter, descriptor: types.Provide
         try w.endArray();
     }
     try w.writeBoolField("allows_anonymous", descriptor.allows_anonymous);
+    try w.writeBoolField("round_trips_carry", descriptor.round_trips_carry);
     if (descriptor.context_window) |value| try w.writeIntField("context_window", value);
     if (descriptor.max_output_tokens) |value| try w.writeIntField("max_output_tokens", value);
     try w.endObject();
@@ -1027,6 +1028,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
 
         const credential_grant = try oap_envelope.optionalEnum(types.CredentialGrantChannel, descriptor_obj, "credential_grant") orelse .none;
         const allows_anonymous = try oap_envelope.optionalBool(descriptor_obj, "allows_anonymous") orelse false;
+        const round_trips_carry = try oap_envelope.optionalBool(descriptor_obj, "round_trips_carry") orelse false;
         const context_window = try optionalU32(descriptor_obj, "context_window");
         const max_output_tokens = try optionalU32(descriptor_obj, "max_output_tokens");
         const grant_kinds = try deserializeGrantKinds(descriptor_obj, allocator);
@@ -1048,6 +1050,7 @@ fn deserializeDescribeResponse(obj: std.json.ObjectMap, allocator: std.mem.Alloc
             .credential_grant = credential_grant,
             .grant_kinds = grant_kinds,
             .allows_anonymous = allows_anonymous,
+            .round_trips_carry = round_trips_carry,
             .context_window = context_window,
             .max_output_tokens = max_output_tokens,
         });
@@ -1328,6 +1331,32 @@ test "a wire id rides only with the unnamed wire" {
     const descriptor = decoded.payload.provider_describe_response.providers[0];
     try std.testing.expectEqual(types.Wire.other, descriptor.wire);
     try std.testing.expectEqualStrings("ollama-chat", descriptor.wire_id.?);
+}
+
+test "a carry round trip claim survives the wire and defaults to absent" {
+    const allocator = std.testing.allocator;
+
+    var decoded = try deserializeEnvelope(DESCRIBE_RESPONSE_LINE, allocator);
+    defer decoded.deinit(allocator);
+    try std.testing.expect(!decoded.payload.provider_describe_response.providers[0].round_trips_carry);
+
+    var env = types.Envelope{
+        .id = try allocator.dupe(u8, "m1"),
+        .payload = .{ .provider_describe_response = .{
+            .providers = try allocator.dupe(types.ProviderDescriptor, &.{.{
+                .id = try allocator.dupe(u8, "gw"),
+                .wire = .@"anthropic-messages",
+                .framing = .sse,
+                .endpoint = try allocator.dupe(u8, "https://gw.test"),
+                .round_trips_carry = true,
+            }}),
+        } },
+    };
+    defer env.deinit(allocator);
+
+    var round_tripped = try expectRoundTrip(allocator, env);
+    defer round_tripped.deinit(allocator);
+    try std.testing.expect(round_tripped.payload.provider_describe_response.providers[0].round_trips_carry);
 }
 
 fn expectNoLeakUnderAllocationFailure(line: []const u8) !void {

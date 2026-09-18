@@ -7488,6 +7488,42 @@ test "a failed start releases the inference it could not run" {
     while (server.popOutbound()) |out| allocator.free(out);
 }
 
+test "the endpoint claims no carry round trip it cannot perform" {
+    const allocator = std.testing.allocator;
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = true,
+        .resolves_own_credentials = true,
+    });
+    defer server.deinit();
+
+    try populateOapProviderCatalog(allocator, &server);
+    try std.testing.expect(server.providers.items.len > 0);
+
+    for (server.providers.items) |descriptor| {
+        if (descriptor.round_trips_carry) {
+            std.debug.print(
+                "\n{s} advertises a carry round trip; nothing populates the carry\n",
+                .{descriptor.id},
+            );
+            return error.CarryRoundTripOverClaimed;
+        }
+    }
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "m",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 0) == null);
+}
+
 fn populateCatalogUnderFailure(allocator: std.mem.Allocator) !void {
     var server = oap_provider_server.Server.init(allocator, .{
         .capability_revision = VERSION,

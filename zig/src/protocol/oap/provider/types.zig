@@ -361,6 +361,7 @@ pub const ProviderDescriptor = struct {
     credential_grant: CredentialGrantChannel = .none,
     grant_kinds: []const GrantKind = &.{},
     allows_anonymous: bool = false,
+    round_trips_carry: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
 
