@@ -1535,7 +1535,7 @@ def main():
     args = parser.parse_args()
     if sys.platform == "darwin":
         parser.error(
-            "macOS is rejected: makai reads the login keychain (com.makai.auth / Codex Auth) "
+            "macOS is rejected: makai reads the login keychain (ai.hyperneo.oap / Codex Auth) "
             "regardless of HOME, so this driver cannot isolate a credential-free run there "
             "(issue #263 tracks a file-only auth mode); run on Linux/CI"
         )

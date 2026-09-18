@@ -174,7 +174,7 @@ code paths; add a transcript row instead.
 ## Credentials and the model catalog
 
 - Credentials stay in the macOS keychain (item label "makai credentials", service
-  `com.makai.auth`, account `auth.shared.json`; the pre-existing `auth.json` item is
+  `ai.hyperneo.oap`, account `auth.shared.json`; the pre-existing `auth.json` item is
   migrated on first read). Keychain access lists are bound to the accessing app's
   signing identity: a Developer ID signed release is identified by its team ID, so
   "Always Allow" persists across updates, whereas an unsigned local build is identified

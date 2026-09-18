@@ -89,6 +89,84 @@ jobs:
           OUT_ROOT="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}"
           zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$OUT_ROOT"
 
+      # Secret names and formats match lsm/hyperneo so one set of values serves both
+      # repos: APPLE_CERTIFICATE is the base64 .p12, APPLE_API_PRIVATE_KEY is the raw
+      # .p8 PEM text (not base64), and APPLE_API_KEY is the key id the .p8 filename
+      # must carry. APPLE_SIGNING_IDENTITY takes either the certificate's SHA-1 hash
+      # or its "Developer ID Application: ..." name; the throwaway keychain below
+      # holds exactly one certificate, so the name cannot be ambiguous here the way
+      # it can on a developer machine that imported the certificate twice.
+      - name: Sign and notarize macOS binary
+        if: matrix.os_name == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          BINARY="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}"
+
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error::APPLE_CERTIFICATE is unset on a tag build; a release must ship signed macOS binaries"
+              exit 1
+            fi
+            echo "::warning::macOS signing secrets are unset; leaving ${{ matrix.arch_name }} binary unsigned (workflow_dispatch only)"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/codesign.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          codesign --force --timestamp --options runtime \
+            --identifier ai.hyperneo.oap \
+            --keychain "$KEYCHAIN" \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$BINARY"
+          codesign --verify --strict --verbose=2 "$BINARY"
+
+          if [ -z "${APPLE_API_PRIVATE_KEY:-}" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error::signing succeeded but APPLE_API_PRIVATE_KEY is unset on a tag build; an unnotarized Developer ID binary is still blocked by Gatekeeper"
+              exit 1
+            fi
+            echo "::warning::notarization secrets are unset; leaving the signed ${{ matrix.arch_name }} binary unnotarized (workflow_dispatch only)"
+            exit 0
+          fi
+
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m
+          rm -f "$KEY_PATH" "$RUNNER_TEMP/notarize.zip"
+
+          codesign --display --verbose=4 "$BINARY" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|flags'
+
+      - name: Discard signing keychain
+        if: always() && matrix.os_name == 'macos'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/codesign.keychain-db" 2>/dev/null || true
+
       - name: Package tar.gz
         if: matrix.archive == 'tar.gz'
         shell: bash
