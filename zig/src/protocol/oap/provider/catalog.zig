@@ -111,3 +111,70 @@ test "a named wire is never invented for a shape only its originator speaks" {
     try std.testing.expect(!hasNamedWire("google-generative-ai"));
     try std.testing.expect(hasNamedWire("anthropic-messages"));
 }
+
+pub const BuiltInProvider = struct {
+    id: []const u8,
+    api: []const u8,
+    endpoint: []const u8,
+    allows_anonymous: bool,
+    model_id: []const u8,
+    display_name: []const u8,
+    context_window: u32,
+    max_output_tokens: u32,
+};
+
+pub const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
+    .{
+        .id = "anthropic",
+        .api = "anthropic-messages",
+        .endpoint = "https://api.anthropic.com",
+        .allows_anonymous = false,
+        .model_id = "claude-sonnet-4-5",
+        .display_name = "Claude Sonnet 4.5",
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+    },
+    .{
+        .id = "openai",
+        .api = "openai-responses",
+        .endpoint = "https://api.openai.com",
+        .allows_anonymous = false,
+        .model_id = "gpt-4o",
+        .display_name = "GPT-4o",
+        .context_window = 128_000,
+        .max_output_tokens = 16_384,
+    },
+    .{
+        .id = "ollama",
+        .api = "ollama",
+        .endpoint = "http://127.0.0.1:11434",
+        .allows_anonymous = true,
+        .model_id = "llama3",
+        .display_name = "Llama 3",
+        .context_window = 128_000,
+        .max_output_tokens = 8_192,
+    },
+};
+
+pub fn buildModelRef(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    wire: types.Wire,
+    model_id: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ provider_id, wire.toString(), model_id });
+}
+
+test "a built in provider yields a model ref that names its own wire" {
+    const allocator = std.testing.allocator;
+    const mapping = mapApiToWire("ollama").?;
+    const model_ref = try buildModelRef(allocator, "ollama", mapping.wire, "llama3");
+    defer allocator.free(model_ref);
+    try std.testing.expectEqualStrings("ollama/other@llama3", model_ref);
+}
+
+test "every built in provider maps to a describable wire" {
+    for (BUILT_IN_PROVIDERS) |provider| {
+        try std.testing.expect(isExpressible(provider.api));
+    }
+}

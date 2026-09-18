@@ -1739,6 +1739,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "provider_base_url", .module = provider_base_url_mod },
             .{ .name = "oap_server", .module = protocol_oap_server_mod },
             .{ .name = "oap_bridge", .module = protocol_oap_bridge_mod },
+            .{ .name = "oap_provider_types", .module = protocol_oap_provider_types_mod },
+            .{ .name = "oap_provider_server", .module = protocol_oap_provider_server_mod },
+            .{ .name = "oap_provider_catalog", .module = protocol_oap_provider_catalog_mod },
         },
     });
 

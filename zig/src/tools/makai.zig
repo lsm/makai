@@ -26,6 +26,9 @@ const tui_app = @import("tui_app");
 const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
 const oap_server = @import("oap_server");
+const oap_provider_types = @import("oap_provider_types");
+const oap_provider_server = @import("oap_provider_server");
+const oap_provider_catalog = @import("oap_provider_catalog");
 const oap_bridge = @import("oap_bridge");
 
 pub const VERSION = "0.0.1";
@@ -6342,6 +6345,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "--oap-provider")) {
+        runOapProviderMode(allocator, stdin, stdout, stderr) catch |err| {
+            if (err == error.MalformedProviderLine) std.process.exit(1);
+            return err;
+        };
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "--tui")) {
         try runTui(allocator, init.io);
         return;
@@ -6589,6 +6600,124 @@ fn parseOapModeArgs(args: []const []const u8, arg_error: *OapArgError) !OapModeA
         return error.InvalidArgument;
     }
     return parsed;
+}
+
+const OAP_PROVIDER_MALFORMED_MESSAGE = "makai --oap-provider: a line on stdin was not a decodable envelope\n";
+
+fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provider_server.Server) !void {
+    for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
+        const mapping = oap_provider_catalog.mapApiToWire(builtin.api) orelse continue;
+
+        const id = try allocator.dupe(u8, builtin.id);
+        errdefer allocator.free(id);
+        const endpoint = try allocator.dupe(u8, builtin.endpoint);
+        errdefer allocator.free(endpoint);
+
+        try server.addProvider(.{
+            .id = id,
+            .wire = mapping.wire,
+            .framing = mapping.framing,
+            .endpoint = endpoint,
+            .allows_anonymous = builtin.allows_anonymous,
+            .credential_grant = .none,
+            .context_window = builtin.context_window,
+            .max_output_tokens = builtin.max_output_tokens,
+        });
+
+        const built_model_ref = try oap_provider_catalog.buildModelRef(
+            allocator,
+            builtin.id,
+            mapping.wire,
+            builtin.model_id,
+        );
+        errdefer allocator.free(built_model_ref);
+        const model_id = try allocator.dupe(u8, builtin.model_id);
+        errdefer allocator.free(model_id);
+        const display_name = try allocator.dupe(u8, builtin.display_name);
+        errdefer allocator.free(display_name);
+        const provider_id = try allocator.dupe(u8, builtin.id);
+        errdefer allocator.free(provider_id);
+        const capabilities = try allocator.dupe(
+            oap_provider_types.ModelCapability,
+            &.{ .chat, .streaming, .tools },
+        );
+        errdefer allocator.free(capabilities);
+
+        try server.addModel(.{
+            .model_ref = built_model_ref,
+            .model_id = model_id,
+            .display_name = display_name,
+            .provider_id = provider_id,
+            .wire = mapping.wire,
+            .capabilities = capabilities,
+            .context_window = builtin.context_window,
+            .max_output_tokens = builtin.max_output_tokens,
+            .source = .fallback,
+            .auth_status = if (builtin.allows_anonymous) .authenticated else .unknown,
+        });
+    }
+}
+
+fn runOapProviderMode(
+    allocator: std.mem.Allocator,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+) !void {
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .unsupported,
+        .accepts_inference = false,
+    });
+    defer server.deinit();
+
+    try populateOapProviderCatalog(allocator, &server);
+
+    var async_receiver = stdio.AsyncStdioReceiver.initWithFile(stdin);
+    var stdin_handle = try async_receiver.receiveStreamWithHandle(allocator);
+    defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
+    const stdin_stream = stdin_handle.getStream();
+
+    while (true) {
+        var did_work = false;
+
+        while (stdin_stream.poll()) |chunk| {
+            var mutable_chunk = chunk;
+            defer mutable_chunk.deinit(allocator);
+
+            const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
+            if (line.len == 0) continue;
+
+            server.handleLine(line) catch {
+                _ = try drainOapProviderOutbound(stdout, allocator, &server);
+                try compat.stdio.writeAll(stderr, OAP_PROVIDER_MALFORMED_MESSAGE);
+                return error.MalformedProviderLine;
+            };
+            did_work = true;
+        }
+
+        if (try drainOapProviderOutbound(stdout, allocator, &server)) did_work = true;
+
+        if (stdin_stream.isDone() and !stdin_stream.hasPending() and !did_work) break;
+        if (!did_work) compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+
+    _ = try drainOapProviderOutbound(stdout, allocator, &server);
+}
+
+fn drainOapProviderOutbound(
+    stdout: std.Io.File,
+    allocator: std.mem.Allocator,
+    server: *oap_provider_server.Server,
+) !bool {
+    var wrote = false;
+    while (server.popOutbound()) |line| {
+        defer allocator.free(line);
+        try compat.stdio.writeAll(stdout, line);
+        try compat.stdio.writeAll(stdout, "\n");
+        wrote = true;
+    }
+    return wrote;
 }
 
 fn runOapMode(
