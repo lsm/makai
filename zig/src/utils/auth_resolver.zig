@@ -49,7 +49,7 @@ pub fn resolveApiKeyOfKind(
     }
 
     if (auth_storage) |storage| {
-        if (storage.providers.get(provider_id)) |auth| {
+        if (storage.resolvedCredential(provider_id)) |auth| {
             switch (auth) {
                 .api_key => |key| {
                     const dup = try allocator.dupe(u8, key);
@@ -252,4 +252,35 @@ test "envKeyForProvider reads the declared variable and ignores other providers"
 
     const unset = try envKeyForProvider(testing.allocator, &providers, "gateway");
     if (unset) |value| testing.allocator.free(value);
+}
+
+test "a granted credential outranks a configured one on the resolution path" {
+    const allocator = std.testing.allocator;
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(storage_mod.ProviderAuth).init(allocator),
+        .allocator = allocator,
+    };
+    defer storage.deinit();
+
+    try storage.providers.put(
+        try allocator.dupe(u8, "tenant"),
+        .{ .api_key = try allocator.dupe(u8, "sk-configured") },
+    );
+
+    var configured = try resolveApiKeyOfKind(allocator, &storage, "tenant", null, .any);
+    defer configured.deinit(allocator);
+    try std.testing.expectEqualStrings("sk-configured", configured.api_key);
+
+    try storage.putEphemeral("tenant", .{ .api_key = try allocator.dupe(u8, "sk-granted") });
+
+    var granted = try resolveApiKeyOfKind(allocator, &storage, "tenant", null, .any);
+    defer granted.deinit(allocator);
+    try std.testing.expectEqualStrings("sk-granted", granted.api_key);
+
+    storage.releaseEphemeral();
+
+    var restored = try resolveApiKeyOfKind(allocator, &storage, "tenant", null, .any);
+    defer restored.deinit(allocator);
+    try std.testing.expectEqualStrings("sk-configured", restored.api_key);
 }

@@ -800,7 +800,7 @@ pub const AuthStorage = struct {
         try self.ephemeral.?.put(key, auth);
     }
 
-    pub fn credentialForOriginCheck(self: *const AuthStorage, provider_id: []const u8) ?ProviderAuth {
+    pub fn resolvedCredential(self: *const AuthStorage, provider_id: []const u8) ?ProviderAuth {
         if (self.ephemeralAuth(provider_id)) |auth| return auth;
         return self.providers.get(provider_id);
     }
@@ -1674,7 +1674,7 @@ test "the origin check sees a granted credential rather than skipping it" {
     var storage = emptyTestStorage(allocator);
     defer storage.deinit();
 
-    try std.testing.expect(storage.credentialForOriginCheck("tenant-a") == null);
+    try std.testing.expect(storage.resolvedCredential("tenant-a") == null);
 
     try storage.putEphemeral("tenant-a", .{ .oauth = .{
         .refresh = try allocator.dupe(u8, "granted-refresh"),
@@ -1682,7 +1682,7 @@ test "the origin check sees a granted credential rather than skipping it" {
         .expires = std.math.maxInt(i64),
     } });
 
-    const auth = storage.credentialForOriginCheck("tenant-a") orelse
+    const auth = storage.resolvedCredential("tenant-a") orelse
         return error.TestExpectedCredential;
     try std.testing.expectEqualStrings("granted-refresh", auth.oauth.refresh);
 
@@ -1691,7 +1691,7 @@ test "the origin check sees a granted credential rather than skipping it" {
         .access = try allocator.dupe(u8, "stored-access"),
         .expires = std.math.maxInt(i64),
     } });
-    const configured = storage.credentialForOriginCheck("configured") orelse
+    const configured = storage.resolvedCredential("configured") orelse
         return error.TestExpectedCredential;
     try std.testing.expectEqualStrings("stored-refresh", configured.oauth.refresh);
 }
