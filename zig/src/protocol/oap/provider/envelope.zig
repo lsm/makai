@@ -235,6 +235,9 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
             try w.writeStringField("include_snapshot", @tagName(value.include_snapshot));
             if (value.headers.len > 0) try writeHeaders(w, value.headers);
             if (value.credential_ref) |ref| try w.writeStringField("credential_ref", ref);
+            if (value.allow_degraded_features.len > 0) {
+                try oap_envelope.serializeStringArray(w, "allow_degraded_features", value.allow_degraded_features);
+            }
             if (value.metadata_json) |metadata| {
                 try w.writeKey("metadata");
                 try oap_envelope.writeJsonValueOrString(w, metadata);
@@ -792,6 +795,12 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
     const metadata = try oap_envelope.optionalRawJson(obj, "metadata", allocator);
     errdefer if (metadata) |value| allocator.free(value);
 
+    const degraded = if (obj.get("allow_degraded_features") != null)
+        try oap_envelope.deserializeStringArray(obj, "allow_degraded_features", allocator)
+    else
+        &.{};
+    errdefer types.freeStringList(allocator, degraded);
+
     return types.Payload{ .inference_create_request = .{
         .model_ref = model_ref,
         .messages = messages,
@@ -807,6 +816,7 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
         .headers = headers,
         .credential_ref = credential_ref,
         .metadata_json = metadata,
+        .allow_degraded_features = degraded,
     } };
 }
 

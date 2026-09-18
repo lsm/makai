@@ -128,6 +128,7 @@ pub const ReasoningLevel = enum {
     low,
     medium,
     high,
+    xhigh,
 
     pub fn parse(value: []const u8) ?ReasoningLevel {
         return std.meta.stringToEnum(ReasoningLevel, value);
@@ -229,22 +230,26 @@ pub const UsageInStreaming = enum {
 };
 
 pub const ToolCallIdFormat = enum {
-    opaque_id,
+    unconstrained,
     constrained,
 
     pub fn parse(value: []const u8) ?ToolCallIdFormat {
-        if (std.mem.eql(u8, value, "opaque")) return .opaque_id;
-        if (std.mem.eql(u8, value, "constrained")) return .constrained;
-        return null;
+        return std.meta.stringToEnum(ToolCallIdFormat, value);
     }
 
     pub fn toString(self: ToolCallIdFormat) []const u8 {
-        return switch (self) {
-            .opaque_id => "opaque",
-            .constrained => "constrained",
-        };
+        return @tagName(self);
     }
 };
+
+pub const DEGRADABLE_SNAPSHOT_KEY = "include_snapshot";
+
+pub fn allowsDegraded(keys: []const []const u8, key: []const u8) bool {
+    for (keys) |candidate| {
+        if (std.mem.eql(u8, candidate, key)) return true;
+    }
+    return false;
+}
 
 pub const CompatibilityFacts = struct {
     max_tokens_field: ?MaxTokensField = null,
@@ -459,6 +464,7 @@ pub const CreateRequest = struct {
     headers: []const HeaderPair = &.{},
     credential_ref: ?[]const u8 = null,
     metadata_json: ?[]const u8 = null,
+    allow_degraded_features: []const []const u8 = &.{},
 
     pub fn deinit(self: *CreateRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.model_ref);
@@ -472,6 +478,7 @@ pub const CreateRequest = struct {
         freeHeaders(allocator, self.headers);
         if (self.credential_ref) |value| allocator.free(value);
         if (self.metadata_json) |value| allocator.free(value);
+        freeStringList(allocator, self.allow_degraded_features);
     }
 };
 
