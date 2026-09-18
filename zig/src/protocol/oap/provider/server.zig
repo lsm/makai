@@ -627,6 +627,7 @@ pub const Server = struct {
             envelope.DecodeError.ProfileMismatch, envelope.DecodeError.ProtocolMismatch => .protocol_violation,
             envelope.DecodeError.MissingField, envelope.DecodeError.InvalidField => .invalid_request,
             envelope.DecodeError.UnknownField => .invalid_request,
+            envelope.DecodeError.CarryInReasoningOptions => .invalid_request,
             else => .protocol_violation,
         };
         const message = switch (err) {
@@ -636,6 +637,7 @@ pub const Server = struct {
             envelope.DecodeError.VersionMismatch => "unsupported protocol version",
             envelope.DecodeError.UnknownEnvelopeType => "unrecognized envelope type for this profile",
             envelope.DecodeError.UnknownField => "this payload carries a member the profile does not define",
+            envelope.DecodeError.CarryInReasoningOptions => "a carry no longer rides reasoning options; put it on the reasoning or tool_call content part it belongs to",
             else => "envelope could not be decoded",
         };
         try self.emitError(code, message, in_reply_to);
@@ -2612,6 +2614,43 @@ test "the terminal assembly repeats the carry each part ended with" {
     try std.testing.expectEqualStrings("sig-reasoning", parts[0].reasoning.carry orelse "");
     try std.testing.expectEqualStrings("sig-toolcall", parts[1].tool_call.carry orelse "");
     try std.testing.expect(parts[2] == .text);
+}
+
+test "a carry sent as a reasoning option is refused and told where the carry moved" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{ .accepts_inference = true });
+    defer server.deinit();
+
+    const payload =
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[]," ++
+        "\"reasoning\":{\"enabled\":true,\"encrypted_carry\":\"prior\"}}";
+    const line = try makeRequest(allocator, "inference.create.request", payload, "q1");
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var refusal = try decodeOnly(allocator, &server);
+    defer refusal.deinit(allocator);
+    try std.testing.expect(refusal.payload == .protocol_error);
+    try std.testing.expectEqual(
+        types.ErrorCode.invalid_request,
+        refusal.payload.protocol_error.err.code,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        refusal.payload.protocol_error.err.message,
+        "reasoning or tool_call content part",
+    ) != null);
+
+    const without_carry =
+        "{\"model_ref\":\"ollama-local/openai-chat-completions@gemma\",\"messages\":[]," ++
+        "\"reasoning\":{\"enabled\":true,\"budget_tokens\":2048,\"effort\":\"high\"}}";
+    const accepted_line = try makeRequest(allocator, "inference.create.request", without_carry, "q2");
+    defer allocator.free(accepted_line);
+    try server.handleLine(accepted_line);
+
+    var answer = try decodeOnly(allocator, &server);
+    defer answer.deinit(allocator);
+    try std.testing.expect(answer.payload == .inference_create_response);
 }
 
 test "a replayed carry is refused by a provider whose descriptor does not claim the round trip" {

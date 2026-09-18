@@ -17,6 +17,7 @@ pub const DecodeError = error{
     PartialArgumentsInTerminal,
     ScopeRepeatedInPayload,
     AcceptanceScopeMismatch,
+    CarryInReasoningOptions,
 };
 
 pub fn serializeEnvelope(env: types.Envelope, allocator: std.mem.Allocator) ![]u8 {
@@ -987,6 +988,7 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
     if (obj.get("reasoning")) |reasoning_value| {
         if (reasoning_value != .object) return DecodeError.InvalidField;
         const reasoning_obj = reasoning_value.object;
+        if (reasoning_obj.get("encrypted_carry") != null) return DecodeError.CarryInReasoningOptions;
         const effort = try oap_envelope.optionalOwnedString(reasoning_obj, "effort", allocator);
         errdefer if (effort) |value| allocator.free(value);
         reasoning = .{
