@@ -31,6 +31,7 @@ const oap_provider_server = @import("oap_provider_server");
 const oap_provider_catalog = @import("oap_provider_catalog");
 const oap_provider_runtime = @import("oap_provider_runtime");
 const oap_provider_grant_channel = @import("oap_provider_grant_channel");
+const auth_resolver = @import("auth_resolver");
 const oap_types = @import("oap_types");
 const oap_bridge = @import("oap_bridge");
 
@@ -6876,6 +6877,21 @@ fn failOapInference(
     server.releaseInference(inference_id);
 }
 
+fn resolveOapStoredCredential(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+) ?auth_resolver.ResolvedKey {
+    var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return null;
+    defer storage.deinit();
+    const resolved = auth_resolver.resolveApiKey(allocator, &storage, provider_id, null) catch return null;
+    if (resolved.api_key.len == 0) {
+        var owned = resolved;
+        owned.deinit(allocator);
+        return null;
+    }
+    return resolved;
+}
+
 fn startOapInference(
     allocator: std.mem.Allocator,
     registry: *api_registry.ApiRegistry,
@@ -6915,8 +6931,15 @@ fn startOapInference(
 
     var options: ai_types.StreamOptions = .{};
     options.requires_owned_stream_events = true;
+    var resolved_credential: ?auth_resolver.ResolvedKey = null;
+    defer if (resolved_credential) |*key| key.deinit(allocator);
+
     if (inference.credential_ref) |reference| {
         if (grantedValueFor(granted, reference)) |value| options.api_key = @TypeOf(options.api_key).initBorrowed(value);
+    }
+    if (options.getApiKey() == null or options.getApiKey().?.len == 0) {
+        resolved_credential = resolveOapStoredCredential(allocator, builtin.id);
+        if (resolved_credential) |key| options.api_key = @TypeOf(options.api_key).initBorrowed(key.api_key);
     }
     options.cancel_token = .{ .cancelled = cancelled };
     if (inference.max_output_tokens) |max| options.max_tokens = max;
@@ -7035,7 +7058,20 @@ fn settleOapInference(
     entry: *const RunningOapInference,
 ) !void {
     if (entry.stream.getError()) |message| {
-        try server.settleFailed(entry.inference_id, .provider_unavailable, message, null);
+        const cancelled_by_caller = if (server.findInference(entry.inference_id)) |inference|
+            inference.cancel_requested
+        else
+            false;
+        if (cancelled_by_caller) {
+            try server.settleFailed(
+                entry.inference_id,
+                .aborted,
+                "the caller cancelled this inference",
+                null,
+            );
+        } else {
+            try server.settleFailed(entry.inference_id, .provider_unavailable, message, null);
+        }
         return;
     }
 
@@ -7678,6 +7714,74 @@ test "a failed start releases the inference it could not run" {
         return error.FailedStartLeakedInference;
     }
     while (server.popOutbound()) |out| allocator.free(out);
+}
+
+fn settleTestInference(
+    allocator: std.mem.Allocator,
+    server: *oap_provider_server.Server,
+    cancel_first: bool,
+) !oap_provider_types.ErrorCode {
+    const line =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_provider_types.PROFILE ++
+        "\",\"type\":\"inference.create.request\",\"id\":\"q1\",\"payload\":{\"model_ref\":\"ollama/other:ollama-chat@llama3\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}}";
+    try server.handleLine(line);
+    while (server.popOutbound()) |out| allocator.free(out);
+
+    const inference_id = try allocator.dupe(u8, server.active.items[0].id);
+    defer allocator.free(inference_id);
+
+    if (cancel_first) server.active.items[0].cancel_requested = true;
+
+    const stream = try allocator.create(event_stream.AssistantMessageStream);
+    stream.* = event_stream.AssistantMessageStream.init(allocator);
+    stream.completeWithError("request cancelled");
+
+    const cancelled = try allocator.create(std.atomic.Value(bool));
+    cancelled.* = std.atomic.Value(bool).init(true);
+
+    var entry = RunningOapInference{
+        .inference_id = inference_id,
+        .stream = stream,
+        .context = .{ .messages = &.{} },
+        .model = .{
+            .id = "m", .name = "m", .api = "ollama", .provider = "ollama", .base_url = "",
+            .reasoning = false, .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 1, .max_tokens = 1,
+        },
+        .cancelled = cancelled,
+        .last_progress_ms = 0,
+    };
+    defer {
+        _ = stream.deinitAndDestroy();
+        allocator.destroy(cancelled);
+    }
+
+    try settleOapInference(server, &entry);
+    const out = server.popOutbound() orelse return error.TestExpectedOutbound;
+    defer allocator.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    const code = parsed.value.object.get("payload").?.object.get("error").?.object.get("code").?.string;
+    return oap_provider_types.ErrorCode.parse(code).?;
+}
+
+test "a cancelled inference settles as aborted and a failed one does not" {
+    const allocator = std.testing.allocator;
+
+    var cancelled_server = oap_provider_server.Server.init(allocator, .{ .accepts_inference = true, .resolves_own_credentials = true });
+    defer cancelled_server.deinit();
+    try populateOapProviderCatalog(allocator, &cancelled_server);
+    const cancelled_code = try settleTestInference(allocator, &cancelled_server, true);
+    try std.testing.expectEqual(oap_provider_types.ErrorCode.aborted, cancelled_code);
+    try std.testing.expectEqual(oap_provider_types.ErrorAction.accept, cancelled_code.action());
+
+    var failed_server = oap_provider_server.Server.init(allocator, .{ .accepts_inference = true, .resolves_own_credentials = true });
+    defer failed_server.deinit();
+    try populateOapProviderCatalog(allocator, &failed_server);
+    const failed_code = try settleTestInference(allocator, &failed_server, false);
+    try std.testing.expectEqual(oap_provider_types.ErrorCode.provider_unavailable, failed_code);
+    try std.testing.expectEqual(oap_provider_types.ErrorAction.retry, failed_code.action());
 }
 
 test "a granted credential crosses the side channel and reaches the inference" {

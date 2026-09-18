@@ -1368,6 +1368,7 @@ pub fn cloneDescriptor(
         .compatibility = descriptor.compatibility,
         .snapshot_policies = policies,
         .answers_sync = descriptor.answers_sync,
+        .round_trips_carry = descriptor.round_trips_carry,
         .credential_grant = descriptor.credential_grant,
         .grant_kinds = try allocator.dupe(types.GrantKind, descriptor.grant_kinds),
         .allows_anonymous = descriptor.allows_anonymous,
@@ -2268,6 +2269,40 @@ test "a request member the endpoint cannot forward is refused rather than droppe
     }
 
     try std.testing.expectEqual(@as(usize, 0), server.active.items.len);
+}
+
+test "describe advertises the carry round trip a provider is configured with" {
+    const allocator = std.testing.allocator;
+    var server = try testServer(allocator, .{});
+    defer server.deinit();
+
+    const id = try allocator.dupe(u8, "carrier");
+    errdefer allocator.free(id);
+    const endpoint = try allocator.dupe(u8, "https://carrier.test");
+    errdefer allocator.free(endpoint);
+    try server.addProvider(.{
+        .id = id,
+        .wire = .@"anthropic-messages",
+        .framing = .sse,
+        .endpoint = endpoint,
+        .round_trips_carry = true,
+    });
+
+    const line = try makeRequest(allocator, "provider.describe.request", "{}", "q1");
+    defer allocator.free(line);
+    try server.handleLine(line);
+
+    var response = try decodeOnly(allocator, &server);
+    defer response.deinit(allocator);
+
+    const providers = response.payload.provider_describe_response.providers;
+    var found = false;
+    for (providers) |descriptor| {
+        if (!std.mem.eql(u8, descriptor.id, "carrier")) continue;
+        found = true;
+        try std.testing.expect(descriptor.round_trips_carry);
+    }
+    try std.testing.expect(found);
 }
 
 test "sampling controls the endpoint does forward are carried onto the inference" {
