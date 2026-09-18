@@ -339,6 +339,13 @@ pub const Server = struct {
         return .unknown;
     }
 
+    pub fn holdsGrant(self: *Self, reference: []const u8) bool {
+        for (self.grants.items) |*grant| {
+            if (std.mem.eql(u8, grant.reference, reference)) return true;
+        }
+        return false;
+    }
+
     pub fn findGrant(self: *Self, reference: []const u8) ?*GrantedCredential {
         if (self.lookupGrant(reference) != .live) return null;
         for (self.grants.items) |*grant| {

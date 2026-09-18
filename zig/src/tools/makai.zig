@@ -6835,6 +6835,18 @@ fn pumpOapGrants(
         removed.deinit(allocator);
         did_work = true;
     }
+
+    server.burnExpiredGrants(now_ms);
+    index = 0;
+    while (index < granted.items.len) {
+        if (server.holdsGrant(granted.items[index].reference)) {
+            index += 1;
+            continue;
+        }
+        var dropped = granted.orderedRemove(index);
+        dropped.deinit(allocator);
+        did_work = true;
+    }
     return did_work;
 }
 
@@ -7782,6 +7794,60 @@ test "a cancelled inference settles as aborted and a failed one does not" {
     const failed_code = try settleTestInference(allocator, &failed_server, false);
     try std.testing.expectEqual(oap_provider_types.ErrorCode.provider_unavailable, failed_code);
     try std.testing.expectEqual(oap_provider_types.ErrorAction.retry, failed_code.action());
+}
+
+test "the host drops a granted secret when the grant passes its expiry" {
+    const allocator = std.testing.allocator;
+
+    var server = oap_provider_server.Server.init(allocator, .{
+        .capability_revision = VERSION,
+        .grant_channel = .out_of_band,
+        .accepts_inference = true,
+        .resolves_own_credentials = false,
+        .profile_revision = OAP_PROVIDER_PROFILE_REVISION,
+        .default_grant_ttl_ms = 1_000,
+    });
+    defer server.deinit();
+    try populateOapProviderCatalog(allocator, &server);
+
+    var channels = std.ArrayList(OapGrantChannel).empty;
+    defer {
+        for (channels.items) |*entry| entry.deinit(allocator);
+        channels.deinit(allocator);
+    }
+    var granted = std.ArrayList(OapGrantedValue).empty;
+    defer {
+        for (granted.items) |*entry| entry.deinit(allocator);
+        granted.deinit(allocator);
+    }
+    var ordinal: u64 = 78000;
+
+    const request =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ oap_provider_types.PROFILE ++
+        "\",\"type\":\"provider.credential.grant.request\",\"id\":\"g1\",\"payload\":{\"provider_id\":\"anthropic\",\"nonce\":\"n-exp\"}}";
+    try server.handleLine(request);
+
+    try std.testing.expect(try announceOapGrants(allocator, &server, &channels, &ordinal));
+    const announced = server.popOutbound() orelse return error.TestExpectedOutbound;
+    defer allocator.free(announced);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, announced, .{});
+    defer parsed.deinit();
+    const channel_path = parsed.value.object.get("payload").?.object.get("channel").?.string;
+
+    try oap_provider_grant_channel.connectAndWrite(channel_path, "n-exp\nsk-expiring-secret");
+
+    var rounds: usize = 0;
+    while (rounds < 200 and granted.items.len == 0) : (rounds += 1) {
+        _ = try pumpOapGrants(allocator, &server, &channels, &granted, compat.time.nowMillis());
+    }
+    try std.testing.expectEqual(@as(usize, 1), granted.items.len);
+    try std.testing.expectEqualStrings("sk-expiring-secret", granted.items[0].value);
+    try std.testing.expect(server.holdsGrant(granted.items[0].reference));
+
+    _ = try pumpOapGrants(allocator, &server, &channels, &granted, compat.time.nowMillis() + 60_000);
+
+    try std.testing.expectEqual(@as(usize, 0), granted.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.grants.items.len);
 }
 
 test "a granted credential crosses the side channel and reaches the inference" {
