@@ -7982,7 +7982,7 @@ test "a granted credential crosses the side channel and reaches the inference" {
     _ = inference_id;
 }
 
-test "a descriptor claims the carry round trip only where both halves run" {
+test "a descriptor claims the carry round trip only where the provider declares reasoning" {
     const allocator = std.testing.allocator;
 
     var server = oap_provider_server.Server.init(allocator, .{
@@ -8016,7 +8016,7 @@ test "a descriptor claims the carry round trip only where both halves run" {
     try std.testing.expect(claimed > 0);
 }
 
-test "the outbound half reads the signature the provider produced" {
+test "the signature lookup finds a carry only on the block that carries one" {
     const content = [_]ai_types.AssistantContent{
         .{ .text = .{ .text = "answer" } },
         .{ .thinking = .{ .thinking = "weighing", .thinking_signature = "sig-abc" } },
