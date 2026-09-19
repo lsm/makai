@@ -447,11 +447,9 @@ pub const ReasoningOptions = struct {
     enabled: ?bool = null,
     budget_tokens: ?u32 = null,
     effort: ?[]const u8 = null,
-    encrypted_carry: ?[]const u8 = null,
 
     pub fn deinit(self: *ReasoningOptions, allocator: std.mem.Allocator) void {
         if (self.effort) |value| allocator.free(value);
-        if (self.encrypted_carry) |value| allocator.free(value);
     }
 };
 

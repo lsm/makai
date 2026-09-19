@@ -17,6 +17,7 @@ pub const DecodeError = error{
     PartialArgumentsInTerminal,
     ScopeRepeatedInPayload,
     AcceptanceScopeMismatch,
+    CarryInReasoningOptions,
 };
 
 pub fn serializeEnvelope(env: types.Envelope, allocator: std.mem.Allocator) ![]u8 {
@@ -145,6 +146,7 @@ fn writeSnapshotPart(w: *json_writer.JsonWriter, part: oap_types.ContentPart) !v
                 try w.writeKey("arguments_json");
                 try oap_envelope.writeJsonValueOrString(w, value.arguments_json);
             }
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
             try w.endObject();
         },
         else => try oap_envelope.serializeContentPart(w, part),
@@ -280,7 +282,6 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: types.Payload) !void {
                 if (reasoning.enabled) |enabled| try w.writeBoolField("enabled", enabled);
                 if (reasoning.budget_tokens) |budget| try w.writeIntField("budget_tokens", budget);
                 if (reasoning.effort) |effort| try w.writeStringField("effort", effort);
-                if (reasoning.encrypted_carry) |carry| try w.writeStringField("encrypted_carry", carry);
                 try w.endObject();
             }
             try w.writeStringField("include_snapshot", @tagName(value.include_snapshot));
@@ -546,12 +547,15 @@ fn deserializeSnapshotPart(
             const empty = try allocator.dupe(u8, "");
             errdefer allocator.free(empty);
             const owned_partial = try allocator.dupe(u8, partial.string);
+            errdefer allocator.free(owned_partial);
+            const carry = try oap_envelope.optionalOwnedString(value.object, "carry", allocator);
 
             return oap_types.ContentPart{ .tool_call = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
                 .arguments_json = empty,
                 .arguments_partial = owned_partial,
+                .carry = carry,
             } };
         }
     }
@@ -755,6 +759,8 @@ fn deserializePayload(
             }
             if (accepted and credential_ref == null) return DecodeError.MissingField;
             if (!accepted and credential_ref != null) return DecodeError.InvalidField;
+            if (accepted and err != null) return DecodeError.InvalidField;
+            if (!accepted and err == null) return DecodeError.MissingField;
             return types.Payload{ .provider_credential_grant_response = .{
                 .accepted = accepted,
                 .credential_ref = credential_ref,
@@ -770,9 +776,13 @@ fn deserializePayload(
                 break :blk try oap_envelope.optionalEnum(types.SnapshotPolicy, value.object, "include_snapshot");
             };
             var err: ?types.ProtocolError = null;
+            errdefer if (err) |*value| value.deinit(allocator);
             if (obj.get("error")) |error_value| {
                 err = try deserializeProtocolError(error_value, allocator);
             }
+            if (accepted and err != null) return DecodeError.InvalidField;
+            if (!accepted and err == null) return DecodeError.MissingField;
+            if (!accepted and honoured != null) return DecodeError.InvalidField;
             return types.Payload{ .inference_create_response = .{
                 .accepted = accepted,
                 .honoured = honoured,
@@ -978,15 +988,13 @@ fn deserializeCreateRequest(obj: std.json.ObjectMap, allocator: std.mem.Allocato
     if (obj.get("reasoning")) |reasoning_value| {
         if (reasoning_value != .object) return DecodeError.InvalidField;
         const reasoning_obj = reasoning_value.object;
+        if (reasoning_obj.get("encrypted_carry") != null) return DecodeError.CarryInReasoningOptions;
         const effort = try oap_envelope.optionalOwnedString(reasoning_obj, "effort", allocator);
         errdefer if (effort) |value| allocator.free(value);
-        const carry = try oap_envelope.optionalOwnedString(reasoning_obj, "encrypted_carry", allocator);
-        errdefer if (carry) |value| allocator.free(value);
         reasoning = .{
             .enabled = try oap_envelope.optionalBool(reasoning_obj, "enabled"),
             .budget_tokens = try optionalU32(reasoning_obj, "budget_tokens"),
             .effort = effort,
-            .encrypted_carry = carry,
         };
     }
 
@@ -1191,6 +1199,85 @@ fn expectRoundTrip(allocator: std.mem.Allocator, env: types.Envelope) !types.Env
     const line = try serializeEnvelope(env, allocator);
     defer allocator.free(line);
     return try deserializeEnvelope(line, allocator);
+}
+
+test "a grant response cannot grant and refuse at the same time" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { payload: []const u8, expected: DecodeError }{
+        .{
+            .payload = "{\"accepted\":true,\"credential_ref\":\"cr1\",\"error\":{\"code\":\"credential_rejected\",\"message\":\"no\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+        .{ .payload = "{\"accepted\":false}", .expected = DecodeError.MissingField },
+    };
+    for (cases) |case| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\",\"type\":\"provider.credential.grant.response\",\"id\":\"g3\",\"payload\":{s}}}",
+            .{ types.PROFILE, case.payload },
+        );
+        defer allocator.free(line);
+        try std.testing.expectError(case.expected, deserializeEnvelope(line, allocator));
+    }
+}
+
+test "a create response cannot accept and refuse at the same time, and a refusal honours nothing" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { scope: []const u8, payload: []const u8, expected: DecodeError }{
+        .{
+            .scope = ",\"inference_id\":\"0123456789abcdef0123456789abcdef\"",
+            .payload = "{\"accepted\":true,\"error\":{\"code\":\"invalid_request\"," ++
+                "\"message\":\"a message long enough to allocate\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+        .{ .scope = "", .payload = "{\"accepted\":false}", .expected = DecodeError.MissingField },
+        .{
+            .scope = "",
+            .payload = "{\"accepted\":false,\"honoured\":{\"include_snapshot\":\"never\"}," ++
+                "\"error\":{\"code\":\"invalid_request\",\"message\":\"a message long enough to allocate\"}}",
+            .expected = DecodeError.InvalidField,
+        },
+    };
+    for (cases) |case| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"{s}\"," ++
+                "\"type\":\"inference.create.response\",\"id\":\"c1\",\"in_reply_to\":\"q1\"{s}," ++
+                "\"payload\":{s}}}",
+            .{ types.PROFILE, case.scope, case.payload },
+        );
+        defer allocator.free(line);
+        try std.testing.expectError(case.expected, deserializeEnvelope(line, allocator));
+    }
+
+    const coherent =
+        "{\"protocol\":\"open-agent-protocol\",\"version\":\"0.1\",\"profile\":\"" ++ types.PROFILE ++
+        "\",\"type\":\"inference.create.response\",\"id\":\"c1\",\"in_reply_to\":\"q1\"," ++
+        "\"inference_id\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"payload\":{\"accepted\":true,\"honoured\":{\"include_snapshot\":\"on_part_end\"}}}";
+    var decoded = try deserializeEnvelope(coherent, allocator);
+    defer decoded.deinit(allocator);
+    try std.testing.expect(decoded.payload.inference_create_response.accepted);
+    try std.testing.expectEqual(types.SnapshotPolicy.on_part_end, decoded.payload.inference_create_response.honoured.?);
+}
+
+test "a tool call keeps its carry through whichever snapshot encoding it uses" {
+    const allocator = std.testing.allocator;
+
+    const forms = [_][]const u8{
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_json\":\"{}\",\"carry\":\"TOOL-SIG\"}",
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"search\",\"arguments_partial\":\"{\\\"q\\\":\",\"carry\":\"TOOL-SIG\"}",
+    };
+
+    for (forms) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        var part = try deserializeSnapshotPart(parsed.value, allocator, true);
+        defer part.deinit(allocator);
+        try std.testing.expectEqualStrings("TOOL-SIG", part.tool_call.carry orelse "");
+    }
 }
 
 test "a tool call part start carries identity and a text part start refuses it" {

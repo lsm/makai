@@ -69,7 +69,8 @@ pub fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentP
         },
         .reasoning => |value| {
             try w.writeStringField("type", "reasoning");
-            try w.writeStringField("reasoning", value);
+            try w.writeStringField("reasoning", value.text);
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
         },
         .tool_call => |value| {
             try w.writeStringField("type", "tool_call");
@@ -77,6 +78,7 @@ pub fn serializeContentPart(w: *json_writer.JsonWriter, part: oap_types.ContentP
             try w.writeStringField("name", value.name);
             try w.writeKey("arguments_json");
             try writeJsonValueOrString(w, value.arguments_json);
+            if (value.carry) |carry| try w.writeStringField("carry", carry);
         },
         .tool_result => |value| {
             try w.writeStringField("type", "tool_result");
@@ -510,13 +512,23 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
     const obj = value.object;
     const part_type = try requiredString(obj, "type");
 
+    if (obj.get("carry") != null and
+        !std.mem.eql(u8, part_type, "reasoning") and
+        !std.mem.eql(u8, part_type, "tool_call"))
+    {
+        return DecodeError.InvalidField;
+    }
+
     if (std.mem.eql(u8, part_type, "text")) {
         const text = try requiredString(obj, "text");
         return .{ .text = try allocator.dupe(u8, text) };
     }
     if (std.mem.eql(u8, part_type, "reasoning")) {
         const reasoning = try requiredString(obj, "reasoning");
-        return .{ .reasoning = try allocator.dupe(u8, reasoning) };
+        const text = try allocator.dupe(u8, reasoning);
+        errdefer allocator.free(text);
+        const carry = try optionalOwnedString(obj, "carry", allocator);
+        return .{ .reasoning = .{ .text = text, .carry = carry } };
     }
     if (std.mem.eql(u8, part_type, "tool_call")) {
         const tool_call_id = try requiredOwnedString(obj, "tool_call_id", allocator);
@@ -525,10 +537,13 @@ pub fn deserializeContentPart(value: std.json.Value, allocator: std.mem.Allocato
         errdefer allocator.free(name);
         const arguments = obj.get("arguments_json") orelse return DecodeError.MissingField;
         const arguments_json = try ownedRawJson(arguments, allocator);
+        errdefer allocator.free(arguments_json);
+        const carry = try optionalOwnedString(obj, "carry", allocator);
         return .{ .tool_call = .{
             .tool_call_id = tool_call_id,
             .name = name,
             .arguments_json = arguments_json,
+            .carry = carry,
         } };
     }
     if (std.mem.eql(u8, part_type, "tool_result")) {
@@ -1056,6 +1071,29 @@ fn deserializeCapabilities(
     return result;
 }
 
+test "a carry on a content part kind that cannot hold one is refused rather than ignored" {
+    const allocator = std.testing.allocator;
+
+    const refused = [_][]const u8{
+        "{\"type\":\"text\",\"text\":\"spoken\",\"carry\":\"sig\"}",
+        "{\"type\":\"tool_result\",\"tool_call_id\":\"c1\",\"result\":\"ok\",\"carry\":\"sig\"}",
+        "{\"type\":\"reasoning\",\"reasoning\":\"prior\",\"carry\":\"\"}",
+        "{\"type\":\"tool_call\",\"tool_call_id\":\"c1\",\"name\":\"s\",\"arguments_json\":\"{}\",\"carry\":\"\"}",
+    };
+    for (refused) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(DecodeError.InvalidField, deserializeContentPart(parsed.value, allocator));
+    }
+
+    const accepted = "{\"type\":\"reasoning\",\"reasoning\":\"prior\",\"carry\":\"sig\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, accepted, .{});
+    defer parsed.deinit();
+    var part = try deserializeContentPart(parsed.value, allocator);
+    defer part.deinit(allocator);
+    try std.testing.expectEqualStrings("sig", part.reasoning.carry orelse "");
+}
+
 test "round trips a message submit request" {
     const allocator = std.testing.allocator;
 
@@ -1313,14 +1351,14 @@ test "round trips reasoning and tool content parts" {
             .session_id = "s",
             .run_id = "r",
             .message_id = "m",
-            .part = .{ .reasoning = "thinking" },
+            .part = .{ .reasoning = .{ .text = "thinking" } },
         } },
     };
     const reasoning_line = try serializeEnvelope(reasoning, allocator);
     defer allocator.free(reasoning_line);
     var decoded_reasoning = try deserializeEnvelope(reasoning_line, allocator);
     defer decoded_reasoning.deinit(allocator);
-    try std.testing.expectEqualStrings("thinking", decoded_reasoning.payload.content_delta.part.reasoning);
+    try std.testing.expectEqualStrings("thinking", decoded_reasoning.payload.content_delta.part.reasoning.text);
     try std.testing.expectEqualStrings("m", decoded_reasoning.payload.content_delta.message_id.?);
 
     const call = oap_types.Envelope{

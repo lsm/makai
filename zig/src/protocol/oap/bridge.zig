@@ -242,7 +242,7 @@ pub const Bridge = struct {
             if (std.mem.eql(u8, inner_type, "text_delta")) {
                 try server.noteContent(oap_session_id, .{ .text = delta });
             } else if (std.mem.eql(u8, inner_type, "thinking_delta")) {
-                try server.noteContent(oap_session_id, .{ .reasoning = delta });
+                try server.noteContent(oap_session_id, .{ .reasoning = .{ .text = delta } });
             }
             return;
         }
@@ -657,7 +657,7 @@ test "native text and thinking deltas become portable content parts" {
 
     var reasoning = try nextOap(&fixture.server, allocator);
     defer reasoning.deinit(allocator);
-    try testing.expectEqualStrings("hmm", reasoning.payload.content_delta.part.reasoning);
+    try testing.expectEqualStrings("hmm", reasoning.payload.content_delta.part.reasoning.text);
     try testing.expectEqual(@as(u64, 3), reasoning.sequence.?);
 }
 

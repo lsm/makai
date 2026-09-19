@@ -118,16 +118,26 @@ pub const ProtocolError = struct {
     }
 };
 
+pub const ReasoningPart = struct {
+    text: []const u8,
+    carry: ?[]const u8 = null,
+
+    pub fn deinit(self: *ReasoningPart, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        if (self.carry) |value| allocator.free(value);
+    }
+};
+
 pub const ContentPart = union(enum) {
     text: []const u8,
-    reasoning: []const u8,
+    reasoning: ReasoningPart,
     tool_call: ToolCallPart,
     tool_result: ToolResultPart,
 
     pub fn deinit(self: *ContentPart, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .text => |value| allocator.free(value),
-            .reasoning => |value| allocator.free(value),
+            .reasoning => |*part| part.deinit(allocator),
             .tool_call => |*part| part.deinit(allocator),
             .tool_result => |*part| part.deinit(allocator),
         }
@@ -139,12 +149,14 @@ pub const ToolCallPart = struct {
     name: []const u8,
     arguments_json: []const u8,
     arguments_partial: ?[]const u8 = null,
+    carry: ?[]const u8 = null,
 
     pub fn deinit(self: *ToolCallPart, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.name);
         allocator.free(self.arguments_json);
         if (self.arguments_partial) |value| allocator.free(value);
+        if (self.carry) |value| allocator.free(value);
     }
 };
 

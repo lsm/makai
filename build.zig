@@ -772,6 +772,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oap_types", .module = protocol_oap_types_mod },
             .{ .name = "oap_provider_types", .module = protocol_oap_provider_types_mod },
             .{ .name = "oap_provider_envelope", .module = protocol_oap_provider_envelope_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
         },
@@ -1719,6 +1720,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "event_stream", .module = event_stream_mod },

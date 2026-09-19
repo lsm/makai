@@ -26,6 +26,7 @@ const tui_app = @import("tui_app");
 const model_catalog = @import("model_catalog");
 const provider_base_url = @import("provider_base_url");
 const oap_server = @import("oap_server");
+const pre_transform = @import("pre_transform");
 const oap_provider_types = @import("oap_provider_types");
 const oap_provider_server = @import("oap_provider_server");
 const oap_provider_catalog = @import("oap_provider_catalog");
@@ -2301,7 +2302,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --oap [--model <model-ref>]
-        \\  makai --oap-provider
+        \\  makai --oap-provider [--specimens]
         \\  makai --tui
         \\  makai -p [--agent] [--storage] [--model <id>] "<prompt>"
         \\  makai auth providers [--json]
@@ -6352,18 +6353,23 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--oap-provider")) {
+        var answers_specimens = false;
         if (args.len > 2) {
-            var buf: [256]u8 = undefined;
-            const msg = try std.fmt.bufPrint(
-                &buf,
-                "--oap-provider takes no arguments: {s}\n\n",
-                .{args[2]},
-            );
-            try compat.stdio.writeAll(stderr, msg);
-            try printUsage(stderr);
-            return error.UnknownOapProviderArgument;
+            if (args.len == 3 and std.mem.eql(u8, args[2], "--specimens")) {
+                answers_specimens = true;
+            } else {
+                var buf: [256]u8 = undefined;
+                const msg = try std.fmt.bufPrint(
+                    &buf,
+                    "--oap-provider takes only --specimens: {s}\n\n",
+                    .{args[2]},
+                );
+                try compat.stdio.writeAll(stderr, msg);
+                try printUsage(stderr);
+                return error.UnknownOapProviderArgument;
+            }
         }
-        try runOapProviderMode(allocator, stdin, stdout, stderr);
+        try runOapProviderMode(allocator, stdin, stdout, stderr, answers_specimens);
         return;
     }
 
@@ -6691,6 +6697,7 @@ fn populateOapProviderCatalog(allocator: std.mem.Allocator, server: *oap_provide
             .grant_kinds = grant_kinds,
             .context_window = builtin.context_window,
             .max_output_tokens = builtin.max_output_tokens,
+            .round_trips_carry = builtin.round_trips_carry,
         });
         provider_transferred = true;
 
@@ -6936,7 +6943,11 @@ fn startOapInference(
 
     var model = try buildOapInferenceModel(allocator, builtin, model_id);
     errdefer model.deinit(allocator);
-    var context = try buildOapInferenceContext(allocator, inference.messages);
+    var context = try buildOapInferenceContext(allocator, inference.messages, .{
+        .provider = model.provider,
+        .api = model.api,
+        .model_id = model.id,
+    });
     errdefer context.deinit(allocator);
     context.tools = try buildOapInferenceTools(allocator, inference.tools);
 
@@ -7220,26 +7231,68 @@ fn applyOapReasoning(options: *ai_types.StreamOptions, reasoning: ?oap_provider_
     }
 }
 
+const OapModelIdentity = struct {
+    provider: []const u8,
+    api: []const u8,
+    model_id: []const u8,
+};
+
 fn buildOapInferenceContext(
     allocator: std.mem.Allocator,
     source: []const oap_types.Message,
+    identity: OapModelIdentity,
 ) !ai_types.Context {
     var system = std.ArrayList(u8).empty;
     errdefer system.deinit(allocator);
 
-    var conversation: usize = 0;
-    for (source) |message| {
-        if (!oapRoleIsSystem(message.role)) conversation += 1;
-    }
-
-    const messages = try allocator.alloc(ai_types.Message, conversation);
-    var built: usize = 0;
+    var built_messages = std.ArrayList(ai_types.Message).empty;
     errdefer {
-        for (messages[0..built]) |*message| message.deinit(allocator);
-        allocator.free(messages);
+        for (built_messages.items) |*message| message.deinit(allocator);
+        built_messages.deinit(allocator);
     }
 
     for (source) |message| {
+        if (message.role == .assistant) {
+            const content = try oapAssistantContent(allocator, message);
+            const assistant = try buildOapAssistantMessage(allocator, content, identity);
+            var assistant_transferred = false;
+            errdefer if (!assistant_transferred) {
+                var owned = assistant;
+                owned.deinit(allocator);
+            };
+            try built_messages.ensureUnusedCapacity(allocator, 1);
+            built_messages.appendAssumeCapacity(.{ .assistant = assistant });
+            assistant_transferred = true;
+            continue;
+        }
+
+        if (oapMessageToolResults(message)) |parts| {
+            for (parts) |part| {
+                if (part != .tool_result) continue;
+                const result = try buildOapToolResult(allocator, part.tool_result, source);
+                var result_transferred = false;
+                errdefer if (!result_transferred) {
+                    var owned = result;
+                    owned.deinit(allocator);
+                };
+                try built_messages.ensureUnusedCapacity(allocator, 1);
+                built_messages.appendAssumeCapacity(.{ .tool_result = result });
+                result_transferred = true;
+            }
+
+            const spoken = try oapMessageText(allocator, message);
+            errdefer allocator.free(spoken);
+            if (spoken.len == 0) {
+                allocator.free(spoken);
+                continue;
+            }
+            try built_messages.ensureUnusedCapacity(allocator, 1);
+            built_messages.appendAssumeCapacity(.{
+                .user = .{ .content = .{ .text = spoken }, .timestamp = compat.time.nowMillis() },
+            });
+            continue;
+        }
+
         const text = try oapMessageText(allocator, message);
         if (oapRoleIsSystem(message.role)) {
             defer allocator.free(text);
@@ -7248,11 +7301,14 @@ fn buildOapInferenceContext(
             continue;
         }
         errdefer allocator.free(text);
-        messages[built] = switch (message.role) {
-            .assistant => .{ .assistant = try buildOapAssistantMessage(allocator, text) },
-            else => .{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } },
-        };
-        built += 1;
+        try built_messages.ensureUnusedCapacity(allocator, 1);
+        built_messages.appendAssumeCapacity(.{ .user = .{ .content = .{ .text = text }, .timestamp = compat.time.nowMillis() } });
+    }
+
+    const messages = try built_messages.toOwnedSlice(allocator);
+    errdefer {
+        for (messages) |*message| message.deinit(allocator);
+        allocator.free(messages);
     }
 
     const system_prompt = try system.toOwnedSlice(allocator);
@@ -7265,15 +7321,122 @@ fn buildOapInferenceContext(
     };
 }
 
-fn buildOapAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !ai_types.AssistantMessage {
-    const content = try allocator.alloc(ai_types.AssistantContent, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = text } };
-    const api = try allocator.dupe(u8, "");
+fn oapMessageToolResults(message: oap_types.Message) ?[]const oap_types.ContentPart {
+    const parts = switch (message.content) {
+        .parts => |value| value,
+        else => return null,
+    };
+    for (parts) |part| {
+        if (part == .tool_result) return parts;
+    }
+    return null;
+}
+
+fn oapToolNameForCall(source: []const oap_types.Message, tool_call_id: []const u8) []const u8 {
+    for (source) |message| {
+        const parts = switch (message.content) {
+            .parts => |value| value,
+            else => continue,
+        };
+        for (parts) |part| {
+            if (part != .tool_call) continue;
+            if (std.mem.eql(u8, part.tool_call.tool_call_id, tool_call_id)) return part.tool_call.name;
+        }
+    }
+    return "";
+}
+
+fn buildOapToolResult(
+    allocator: std.mem.Allocator,
+    part: oap_types.ToolResultPart,
+    source: []const oap_types.Message,
+) !ai_types.ToolResultMessage {
+    const id = try allocator.dupe(u8, part.tool_call_id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, oapToolNameForCall(source, part.tool_call_id));
+    errdefer allocator.free(name);
+    const body = try allocator.dupe(u8, part.result_json);
+    errdefer allocator.free(body);
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{ .text = body } };
+
+    return ai_types.ToolResultMessage{
+        .tool_call_id = id,
+        .tool_name = name,
+        .content = content,
+        .is_error = part.is_error orelse false,
+        .timestamp = compat.time.nowMillis(),
+    };
+}
+
+fn oapAssistantContent(
+    allocator: std.mem.Allocator,
+    message: oap_types.Message,
+) ![]ai_types.AssistantContent {
+    var blocks = std.ArrayList(ai_types.AssistantContent).empty;
+    errdefer {
+        ai_types.deinitAssistantContentElements(allocator, blocks.items);
+        blocks.deinit(allocator);
+    }
+
+    switch (message.content) {
+        .text => |value| {
+            const owned = try allocator.dupe(u8, value);
+            errdefer allocator.free(owned);
+            try blocks.append(allocator, .{ .text = .{ .text = owned } });
+        },
+        .parts => |parts| {
+            for (parts) |part| switch (part) {
+                .text => |value| {
+                    const owned = try allocator.dupe(u8, value);
+                    errdefer allocator.free(owned);
+                    try blocks.append(allocator, .{ .text = .{ .text = owned } });
+                },
+                .reasoning => |value| {
+                    const owned = try allocator.dupe(u8, value.text);
+                    errdefer allocator.free(owned);
+                    const signature = if (value.carry) |carry| try allocator.dupe(u8, carry) else null;
+                    errdefer if (signature) |owned_carry| allocator.free(owned_carry);
+                    try blocks.append(allocator, .{ .thinking = .{
+                        .thinking = owned,
+                        .thinking_signature = signature,
+                    } });
+                },
+                .tool_call => |value| {
+                    const id = try allocator.dupe(u8, value.tool_call_id);
+                    errdefer allocator.free(id);
+                    const name = try allocator.dupe(u8, value.name);
+                    errdefer allocator.free(name);
+                    const arguments = try allocator.dupe(u8, value.arguments_json);
+                    errdefer allocator.free(arguments);
+                    const signature = if (value.carry) |carry| try allocator.dupe(u8, carry) else null;
+                    errdefer if (signature) |owned_carry| allocator.free(owned_carry);
+                    try blocks.append(allocator, .{ .tool_call = .{
+                        .id = id,
+                        .name = name,
+                        .arguments_json = arguments,
+                        .thought_signature = signature,
+                    } });
+                },
+                else => {},
+            };
+        },
+    }
+
+    return blocks.toOwnedSlice(allocator);
+}
+
+fn buildOapAssistantMessage(
+    allocator: std.mem.Allocator,
+    content: []ai_types.AssistantContent,
+    identity: OapModelIdentity,
+) !ai_types.AssistantMessage {
+    errdefer ai_types.deinitAssistantContent(allocator, content);
+    const api = try allocator.dupe(u8, identity.api);
     errdefer allocator.free(api);
-    const provider = try allocator.dupe(u8, "");
+    const provider = try allocator.dupe(u8, identity.provider);
     errdefer allocator.free(provider);
-    const model = try allocator.dupe(u8, "");
+    const model = try allocator.dupe(u8, identity.model_id);
 
     return ai_types.AssistantMessage{
         .content = content,
@@ -7287,11 +7450,25 @@ fn buildOapAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !ai_
     };
 }
 
+fn oapSpecimenRequestId(line: []const u8, allocator: std.mem.Allocator) !?[]const u8 {
+    if (std.mem.indexOf(u8, line, "\"control\"") == null) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const control = parsed.value.object.get("control") orelse return null;
+    if (control != .string) return null;
+    if (!std.mem.eql(u8, control.string, "specimen")) return null;
+    const id = parsed.value.object.get("id") orelse return try allocator.dupe(u8, "");
+    if (id != .string) return try allocator.dupe(u8, "");
+    return try allocator.dupe(u8, id.string);
+}
+
 fn runOapProviderMode(
     allocator: std.mem.Allocator,
     stdin: std.Io.File,
     stdout: std.Io.File,
     stderr: std.Io.File,
+    answers_specimens: bool,
 ) !void {
     var registry = api_registry.ApiRegistry.init(allocator);
     defer registry.deinit();
@@ -7342,6 +7519,20 @@ fn runOapProviderMode(
 
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
+
+            if (try oapSpecimenRequestId(line, allocator)) |request_id| {
+                defer allocator.free(request_id);
+                if (answers_specimens) {
+                    try server.emitSpecimens(request_id);
+                } else {
+                    try server.emitSpecimenError(
+                        request_id,
+                        "this endpoint was not started with --specimens",
+                    );
+                }
+                did_work = true;
+                continue;
+            }
 
             server.handleLine(line) catch |err| {
                 _ = try drainOapProviderOutbound(stdout, allocator, &server);
@@ -7923,7 +8114,7 @@ test "a granted credential crosses the side channel and reaches the inference" {
     _ = inference_id;
 }
 
-test "the endpoint claims no carry round trip it cannot perform" {
+test "a descriptor claims the carry round trip only where the provider declares reasoning" {
     const allocator = std.testing.allocator;
 
     var server = oap_provider_server.Server.init(allocator, .{
@@ -7937,18 +8128,33 @@ test "the endpoint claims no carry round trip it cannot perform" {
     try populateOapProviderCatalog(allocator, &server);
     try std.testing.expect(server.providers.items.len > 0);
 
+    var claimed: usize = 0;
     for (server.providers.items) |descriptor| {
-        if (descriptor.round_trips_carry) {
+        if (!descriptor.round_trips_carry) continue;
+        claimed += 1;
+        var declares_reasoning = false;
+        for (oap_provider_catalog.BUILT_IN_PROVIDERS) |builtin| {
+            if (!std.mem.eql(u8, builtin.id, descriptor.id)) continue;
+            declares_reasoning = builtin.supports_reasoning;
+        }
+        if (!declares_reasoning) {
             std.debug.print(
-                "\n{s} advertises a carry round trip; nothing populates the carry\n",
+                "\n{s} claims a carry round trip without declaring reasoning\n",
                 .{descriptor.id},
             );
             return error.CarryRoundTripOverClaimed;
         }
     }
+    try std.testing.expect(claimed > 0);
+}
 
+test "the signature lookup finds a carry only on the block that carries one" {
+    const content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "answer" } },
+        .{ .thinking = .{ .thinking = "weighing", .thinking_signature = "sig-abc" } },
+    };
     const partial = ai_types.AssistantMessage{
-        .content = &.{},
+        .content = &content,
         .api = "anthropic-messages",
         .provider = "anthropic",
         .model = "m",
@@ -7956,14 +8162,116 @@ test "the endpoint claims no carry round trip it cannot perform" {
         .stop_reason = .stop,
         .timestamp = 0,
     };
+
     try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 0) == null);
+    const signature = oap_provider_runtime.thinkingSignature(partial, 1) orelse return error.TestExpectedSignature;
+    try std.testing.expectEqualStrings("sig-abc", signature);
+    try std.testing.expect(oap_provider_runtime.thinkingSignature(partial, 7) == null);
+}
+
+fn buildContextUnderFailure(allocator: std.mem.Allocator, source: []const oap_types.Message) !void {
+    var context = try buildOapInferenceContext(allocator, source, .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "claude-sonnet-4-5",
+    });
+    context.deinit(allocator);
+}
+
+test "building an inference context leaks nothing and frees nothing twice under allocation failure" {
+    var parts = [_]oap_types.ContentPart{
+        .{ .reasoning = .{ .text = "prior thinking", .carry = "SIG-MARKER" } },
+        .{ .text = "spoken" },
+        .{ .tool_call = .{
+            .tool_call_id = "c1",
+            .name = "search",
+            .arguments_json = "{}",
+            .carry = "TOOL-SIG",
+        } },
+    };
+    const source = [_]oap_types.Message{
+        .{ .role = .system, .content = .{ .text = "be brief" } },
+        .{ .role = .user, .content = .{ .text = "first question" } },
+        .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
+        .{ .role = .user, .content = .{ .text = "second question" } },
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        buildContextUnderFailure,
+        .{source[0..]},
+    );
+}
+
+test "a replayed carry survives the transform that feeds the provider" {
+    const allocator = std.testing.allocator;
+
+    var parts = [_]oap_types.ContentPart{
+        .{ .reasoning = .{ .text = "prior thinking", .carry = "SIG-MARKER" } },
+        .{ .text = "prior answer" },
+    };
+    const source = [_]oap_types.Message{
+        .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
+    };
+
+    var context = try buildOapInferenceContext(allocator, source[0..], .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "claude-sonnet-4-5",
+    });
+    defer context.deinit(allocator);
+
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = "anthropic-messages",
+        .target_provider = "anthropic",
+        .target_model_id = "claude-sonnet-4-5",
+        .max_tool_id_len = 64,
+        .insert_synthetic_results = true,
+        .tools = null,
+        .is_oauth = false,
+    });
+    defer transformed.deinit();
+
+    const content = transformed.messages[0].assistant.content;
+    try std.testing.expect(content[0] == .thinking);
+    try std.testing.expectEqualStrings("SIG-MARKER", content[0].thinking.thinking_signature orelse "");
+}
+
+test "the inbound half puts a replayed carry back on the block it belongs to" {
+    const allocator = std.testing.allocator;
+
+    var parts = [_]oap_types.ContentPart{
+        .{ .reasoning = .{ .text = "first", .carry = "sig-one" } },
+        .{ .text = "spoken" },
+        .{ .reasoning = .{ .text = "second", .carry = "sig-two" } },
+    };
+    const messages = [_]oap_types.Message{
+        .{ .role = .assistant, .content = .{ .parts = parts[0..] } },
+    };
+
+    var context = try buildOapInferenceContext(allocator, messages[0..], .{
+        .provider = "anthropic",
+        .api = "anthropic-messages",
+        .model_id = "m",
+    });
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    const content = context.messages[0].assistant.content;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+
+    try std.testing.expectEqualStrings("sig-one", content[0].thinking.thinking_signature orelse "");
+    try std.testing.expectEqualStrings("first", content[0].thinking.thinking);
+    try std.testing.expect(content[1] == .text);
+    try std.testing.expectEqualStrings("sig-two", content[2].thinking.thinking_signature orelse "");
+    try std.testing.expectEqualStrings("second", content[2].thinking.thinking);
 }
 
 test "reasoning options reach the stream options and the model declares reasoning" {
     const allocator = std.testing.allocator;
 
     var options: ai_types.StreamOptions = .{};
-    applyOapReasoning(&options, .{ .enabled = true, .budget_tokens = 2048, .effort = null, .encrypted_carry = null });
+    applyOapReasoning(&options, .{ .enabled = true, .budget_tokens = 2048, .effort = null });
     try std.testing.expect(options.thinking_enabled);
     try std.testing.expectEqual(@as(?u32, 2048), options.thinking_budget_tokens);
 
